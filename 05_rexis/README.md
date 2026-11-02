@@ -261,7 +261,7 @@ shaped the library:
 ## Known limitations
 
 * Plaintext RESP only.  No TLS yet (TLS-Redis is a separate exercise;
-  see `docs/M_TLS.md` and the existing `xtc_tls` API for the building
+  see libxtc's `docs/tls.md` and the existing `xtc_tls` API for the building
   blocks).
 * Persistence is a log-structured **bitcask** store (`bitcask.c`), not
   Redis's AOF/RDB formats: run with `--persist=DIR` and the keyspace is
