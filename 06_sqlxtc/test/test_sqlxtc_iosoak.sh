@@ -1,5 +1,5 @@
 #!/bin/bash
-# test/sqlxtc/test_sqlxtc_iosoak.sh
+# 06_sqlxtc/test/test_sqlxtc_iosoak.sh
 #   Concurrent network + storage soak for sqlxtc-server: one loop per CPU,
 #   a durable store whose working set outgrows its buffer pool (so page
 #   eviction, write-back and page reads from disk run alongside the WAL's
@@ -16,7 +16,7 @@
 #   Portable (Linux + macOS); never uses setsid or `timeout`.
 set -u
 DIR=$(cd "$(dirname "$0")" && pwd)
-SVR_BIN=${SQLXTC_SERVER:-$DIR/../../examples/06_sqlxtc/sqlxtc-server}
+SVR_BIN=${SQLXTC_SERVER:-$DIR/../sqlxtc-server}
 CLIENTS=${CLIENTS:-32}
 SECS=${SECS:-15}
 FRAMES=${FRAMES:-512}

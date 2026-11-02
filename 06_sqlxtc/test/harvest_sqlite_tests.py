@@ -2,7 +2,7 @@
 # Copyright (c) 2026, The XTC Project
 # Use of this source code is governed by the ISC License.
 #
-# test/sqlxtc/harvest_sqlite_tests.py
+# 06_sqlxtc/test/harvest_sqlite_tests.py
 #
 # Harvest executable SQL statements out of SQLite's own TCL test
 # corpus (~/src/sqlite/test/*.test) and run each through BOTH the

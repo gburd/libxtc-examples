@@ -2,7 +2,7 @@
 # Copyright (c) 2026, The XTC Project
 # Use of this source code is governed by the ISC License.
 #
-# test/sqlxtc/test_sqlxtc_oracle.py
+# 06_sqlxtc/test/test_sqlxtc_oracle.py
 #
 # Differential test: run a corpus of SQL statements through both
 # sqlxtc-via-Quack and python's stdlib sqlite3 (which embeds the
@@ -324,8 +324,7 @@ CORPUS = [
 
 def main():
     here = os.path.abspath(os.path.dirname(__file__))
-    server_bin = os.path.normpath(os.path.join(here, "..", "..",
-                                                 "examples", "06_sqlxtc",
+    server_bin = os.path.normpath(os.path.join(here, "..",
                                                  "sqlxtc-server"))
     if not os.access(server_bin, os.X_OK):
         print("FAIL: %s not built" % server_bin)

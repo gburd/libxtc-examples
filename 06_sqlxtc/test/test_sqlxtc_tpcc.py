@@ -2,7 +2,7 @@
 # Copyright (c) 2026, The XTC Project
 # Use of this source code is governed by the ISC License.
 #
-# test/sqlxtc/test_sqlxtc_tpcc.py
+# 06_sqlxtc/test/test_sqlxtc_tpcc.py
 #
 # Differential test of the TPROC-C statement surface, against python's
 # sqlite3 as the oracle.  Two drivers are covered:

@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: ISC
  *
- * bench/sqlxtc/engine_loop.c
+ * 06_sqlxtc/bench/engine_loop.c
  *	Loop/proc A/B: the same random point-op SQL workload as engine_mt,
  *	but driven the way sqlxtc is DESIGNED to run -- as libxtc processes
  *	on a multi-loop executor, with the storage engine's group-commit

@@ -5,7 +5,7 @@
 #
 # SPDX-License-Identifier: ISC
 #
-# test/sqlxtc/test_sqlxtc_kill.sh
+# 06_sqlxtc/test/test_sqlxtc_kill.sh
 #	A running sqlxtc server under commit load with one of its storage
 #	procs killed (the SQLXTC_TEST_KILL=1 "KILL <proc>" hook):
 #	  - bm-provider, bm-trickler: restarted; the server keeps serving,
@@ -20,7 +20,7 @@ set -u
 
 PORT=${PORT:-15497}
 DIR=$(cd "$(dirname "$0")" && pwd)
-SVR_BIN=${SQLXTC_SERVER:-$DIR/../../examples/06_sqlxtc/sqlxtc-server}
+SVR_BIN=${SQLXTC_SERVER:-$DIR/../sqlxtc-server}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sqlxtc-kill.XXXXXX")
 SVR_PID=
 FAIL=0

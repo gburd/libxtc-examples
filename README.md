@@ -1,13 +1,52 @@
-# xtc examples
+# libxtc-examples
 
-Self-contained programs demonstrating each major xtc feature.  Build
-each via:
+Example code that uses [libxtc](https://codeberg.org/gregburd/libxtc) in a
+variety of modes to demonstrate its utility, functionality, and concepts in
+practice.  It ranges from 30-line teaching programs to full applications: a
+SQL engine (`06_sqlxtc`), a Redis-compatible server (`05_rexis`), and a
+Kafka-shaped broker (`07_kaka`).  The examples use only the public `xtc_*`
+API.
+
+## Layout and building
+
+This repository is carried by libxtc as the git submodule `examples/`, and
+that is the normal way to build it:
 
 ```
-cd build_unix
-make examples
-./01_hello       # or ./02_pingpong, etc.
+git clone --recurse-submodules https://codeberg.org/gregburd/libxtc.git
+cd libxtc/dist && autoreconf -i && cd ..
+mkdir build_unix && cd build_unix && ../dist/configure && make
+make examples          # the teaching examples 01-04, 08, 10
+make check             # includes check-examples and check-rexis
 ```
+
+The larger examples build with their own Makefiles, against a libxtc build
+tree (`XTC_BUILD`) and its headers (`XTC_INC`).  Inside the libxtc
+checkout the defaults (`../../build_unix`, `../../src/inc`) work:
+
+```
+cd examples/06_sqlxtc && make XTC_BUILD=../../build_unix sqlxtc-server
+```
+
+Standalone (this repository cloned on its own), point those at an
+installed or separately built libxtc:
+
+```
+make -C 06_sqlxtc XTC_BUILD=/path/to/libxtc/build_unix \
+                  XTC_INC=/path/to/libxtc/src/inc sqlxtc-server
+```
+
+`06_sqlxtc/lime` is a nested submodule (the Lime parser generator), needed
+only to regenerate the committed SQL parser.  Each example's tests live
+next to it (`06_sqlxtc/test`, `05_rexis/test`); its benchmarks in
+`06_sqlxtc/bench`.
+
+The libxtc deterministic-simulation tier links the `06_sqlxtc` storage
+engine as its durability client, so a libxtc commit pins the exact commit
+of this repository it was tested with.
+
+History: split from libxtc's `examples/` (and `test/sqlxtc`, `test/m99`,
+`bench/sqlxtc`) in 2026-11 with history preserved.
 
 | File | Demonstrates |
 |---|---|

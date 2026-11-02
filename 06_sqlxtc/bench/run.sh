@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench/sqlxtc/run.sh -- reproducible sweep of the sqlxtc MVCC engine.
+# 06_sqlxtc/bench/run.sh -- reproducible sweep of the sqlxtc MVCC engine.
 #
 # Copyright (c) 2026, The XTC Project -- ISC License.
 #
@@ -30,7 +30,8 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p results
 OUT="results/${HOST}-${STAMP}.jsonl"
 
-ROOT="$(cd ../.. && pwd)"
+EX="$(cd .. && pwd)"                 # 06_sqlxtc
+ROOT="${XTC_SRC:-$(cd ../../.. && pwd)}"   # the libxtc tree (examples/ is its submodule)
 BUILD="$ROOT/build_unix"
 
 # Build libxtc if needed (a host without build_unix builds it fresh).
@@ -46,8 +47,8 @@ LIBS="-pthread -ldl -lm"
 if grep -q "luring\|HAVE_LIBURING" "$BUILD/Makefile" 2>/dev/null; then LIBS="$LIBS -luring"; fi
 
 echo "building mvcc_bench ..."
-$CC -std=c11 -O2 -g -D_GNU_SOURCE -I"$ROOT/src/inc" -I"$ROOT/examples/06_sqlxtc" \
-	-o mvcc_bench mvcc_bench.c "$ROOT/examples/06_sqlxtc/mvcc.c" "$BUILD/libxtc.a" $LIBS
+$CC -std=c11 -O2 -g -D_GNU_SOURCE -I"$ROOT/src/inc" -I"$EX" \
+	-o mvcc_bench mvcc_bench.c "$EX/mvcc.c" "$BUILD/libxtc.a" $LIBS
 
 NCPU="$(nproc 2>/dev/null || echo 8)"
 echo "host=$HOST cpus=$NCPU reps=$REPS clients=$CLIENTS ops=$OPS keyspace=$KEYSPACE"

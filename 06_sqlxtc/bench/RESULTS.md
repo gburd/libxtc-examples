@@ -1,6 +1,6 @@
 # sqlxtc saturation benchmark results
 
-This file accumulates results from `bench/sqlxtc/saturate.sh`.
+This file accumulates results from `06_sqlxtc/bench/saturate.sh`.
 
 Each run writes a row.  Fields:
 

@@ -85,10 +85,10 @@ xstore.plant.o: xstore.c
 # control: with the planted lost write armed the soak must FAIL.
 .PHONY: soak soak-plant
 soak: $(TARGET)
-	bash ../../test/sqlxtc/test_sqlxtc_iosoak.sh
+	bash test/test_sqlxtc_iosoak.sh
 soak-plant: sqlxtc-server-plant
 	@if env SQLXTC_PLANT_DROP=1000 SQLXTC_SERVER=./sqlxtc-server-plant \
-	    SECS=$${SECS:-3} bash ../../test/sqlxtc/test_sqlxtc_iosoak.sh \
+	    SECS=$${SECS:-3} bash test/test_sqlxtc_iosoak.sh \
 	    > soak-plant.out 2>&1; then cat soak-plant.out; \
 	    echo "FAIL: the io soak passed with SQLXTC_PLANT_DROP=1000"; exit 1; fi
 	@grep -m3 'FAIL' soak-plant.out; rm -f soak-plant.out
@@ -193,12 +193,12 @@ clean:
 
 distclean: clean
 	rm -rf *.dSYM
-	rm -rf ../../test/sqlxtc/test_quack ../../test/sqlxtc/*.dSYM
+	rm -rf test/test_quack test/*.dSYM
 	-$(MAKE) -C lime clean 2>/dev/null || true
 	rm -f sql_parse_gen.c sql_parse_gen.h sql_grammar.out
 
 test: $(TARGET) test-quack test-quack-range test-sql-parse test-admin test-wal test-wal-group-sync test-wal-bigtxn test-wal-prealloc test-wal-recover test-wal-fail test-torn-smo test-wal-compact test-wal-lsn-monotone test-shard test-mvcc test-xstore test-xstore-scan test-index test-tpcc-seek test-bulk-insert test-plan-cache test-rowid-minmax test-cat-reopen test-savepoint test-isolation test-ww-conflict test-row-intents test-intents-thread test-snap-registry test-commit-visibility test-ssi-skew test-dup-insert test-dup-composite test-ckpt-bound test-ckpt-online test-torn-base test-recover-fast test-native-txn test-xlog test-recover-undo test-bufmgr test-redo-page test-inplace-redo test-fuzzy-checkpoint test-bufmgr-mt test-scan-resist test-sweep-bound test-persist test-cursor-resume test-clean-restart test-dw-fail test-steal test-steal-reclaim test-dio-restart test-steal-torn test-steal-page test-steal-leaf test-btnode test-btree test-btree-fill test-btree-loop test-btree-mt test-btree-delete-merge
-	@bash ../../test/sqlxtc/test_sqlxtc_smoke.sh
+	@bash test/test_sqlxtc_smoke.sh
 
 # ---- amalgamation build ----
 # Builds sqlxtc against the single-file xtc amalgamation instead of
@@ -236,7 +236,7 @@ amalg: sqlxtc-server-amalg
 
 amalg-test: sqlxtc-server-amalg
 	@SQLXTC_SERVER=$(CURDIR)/sqlxtc-server-amalg \
-		bash ../../test/sqlxtc/test_sqlxtc_smoke.sh
+		bash test/test_sqlxtc_smoke.sh
 
 # ---- xtc VFS test (in-process, no daemon) ----
 # Builds the VFS test against both libxtc.a and the amalgamation, so
@@ -1076,22 +1076,22 @@ test-btree-sample: test_btree_sample
 
 
 
-test-quack: ../../test/sqlxtc/test_quack
-	../../test/sqlxtc/test_quack
+test-quack: test/test_quack
+	test/test_quack
 
 test-oracle: $(TARGET)
-	bash ../../test/sqlxtc/test_sqlxtc_oracle.sh
+	bash test/test_sqlxtc_oracle.sh
 
 test-compat: $(TARGET)
-	bash ../../test/sqlxtc/test_sqlxtc_compat.sh
+	bash test/test_sqlxtc_compat.sh
 
-../../test/sqlxtc/test_quack: ../../test/sqlxtc/test_quack.c quack.o
+test/test_quack: test/test_quack.c quack.o
 	$(CC) $(CFLAGS) -o $@ $< quack.o
 
-test-sql-parse: ../../test/sqlxtc/test_sql_parse
-	../../test/sqlxtc/test_sql_parse
+test-sql-parse: test/test_sql_parse
+	test/test_sql_parse
 
-../../test/sqlxtc/test_sql_parse: ../../test/sqlxtc/test_sql_parse.c \
+test/test_sql_parse: test/test_sql_parse.c \
         sql_parse.o $(LIME_OBJ)
 	$(CC) $(CFLAGS) -o $@ $< sql_parse.o $(LIME_OBJ)
 
@@ -1106,8 +1106,8 @@ bufmgr_probe.o: bufmgr.c bufmgr.h
 # uses the internal __os_* topology surface deliberately -- so it lives in
 # bench/, not in examples/ (which is the consumer exemplar and must stay
 # clean under test/dist/test_api_discipline.sh).
-numa_claim_probe: ../../bench/sqlxtc/numa_claim_probe.c btree.c bufmgr_probe.o btnode.c
-	$(CC) $(CFLAGS) -o $@ ../../bench/sqlxtc/numa_claim_probe.c btree.c bufmgr_probe.o btnode.c $(LDFLAGS)
+numa_claim_probe: bench/numa_claim_probe.c btree.c bufmgr_probe.o btnode.c
+	$(CC) $(CFLAGS) -o $@ bench/numa_claim_probe.c btree.c bufmgr_probe.o btnode.c $(LDFLAGS)
 
 # ---- eviction-policy research prototype (standalone, no libxtc/bufmgr) ----
 # Self-contained proving ground for the NUMA buffer-pool eviction policy
@@ -1281,7 +1281,7 @@ test-storage-sup: test_storage_sup
 # is restarted, a killed WAL writer/checkpoint stops the server (exit 1).
 test: test-sqlxtc-kill
 test-sqlxtc-kill: $(TARGET)
-	TMPDIR=$${TMPDIR:-/tmp} bash ../../test/sqlxtc/test_sqlxtc_kill.sh
+	TMPDIR=$${TMPDIR:-/tmp} bash test/test_sqlxtc_kill.sh
 
 # Warm statements of several connections sharing one OS thread (fibers
 # on a server loop) take no global catalog lock.

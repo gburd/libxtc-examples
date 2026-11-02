@@ -1,5 +1,5 @@
 #!/bin/sh
-# test/sqlxtc/test_sqlxtc_oracle.sh
+# 06_sqlxtc/test/test_sqlxtc_oracle.sh
 # Differential test: run a corpus of SQL through sqlxtc and
 # compare results against python sqlite3 (which embeds SQLite
 # directly).  Validates the Quack frontend doesn't lose data
@@ -7,8 +7,8 @@
 
 set -e
 
-XTC_SRC_DIR="${XTC_SRC_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
-SERVER="$XTC_SRC_DIR/examples/06_sqlxtc/sqlxtc-server"
+HERE="$(cd "$(dirname "$0")" && pwd)"   # 06_sqlxtc/test
+SERVER="${SQLXTC_SERVER:-$HERE/../sqlxtc-server}"
 
 if [ ! -x "$SERVER" ]; then
 	echo "  [sqlxtc-oracle] SKIP: $SERVER not built"
@@ -25,7 +25,7 @@ if ! python3 -c "import sqlite3" 2>/dev/null; then
 	exit 0
 fi
 
-cd "$XTC_SRC_DIR"
-python3 "$XTC_SRC_DIR/test/sqlxtc/test_sqlxtc_oracle.py" 2>&1 | \
+cd "$HERE"
+python3 "$HERE/test_sqlxtc_oracle.py" 2>&1 | \
 	grep -E "ok|FAIL|Results:" | tail -10
 exit ${PIPESTATUS[0]:-0}

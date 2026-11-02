@@ -1,5 +1,5 @@
 #!/bin/bash
-# bench/sqlxtc/saturate.sh -- concurrent saturation bench.
+# 06_sqlxtc/bench/saturate.sh -- concurrent saturation bench.
 #
 # Usage:
 #   ./saturate.sh [n_clients] [n_queries] [port]
@@ -12,7 +12,7 @@ N_QUERIES=${2:-1000}
 PORT=${3:-15436}
 
 DIR=$(dirname "$(readlink -f "$0")")
-SVR=$DIR/../../examples/06_sqlxtc/sqlxtc-server
+SVR=$DIR/../sqlxtc-server
 DBFILE=/tmp/sqlxtc-bench.db
 LOGFILE=/tmp/sqlxtc-bench.log
 PIDFILE=/tmp/sqlxtc-bench.pid

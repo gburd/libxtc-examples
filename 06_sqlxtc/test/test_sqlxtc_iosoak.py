@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test/sqlxtc/test_sqlxtc_iosoak.py -- concurrent network + storage soak.
+"""06_sqlxtc/test/test_sqlxtc_iosoak.py -- concurrent network + storage soak.
 
 N clients for SECS seconds over TCP against one sqlxtc-server whose
 durable store is larger than its buffer pool, so commits (WAL fsync),

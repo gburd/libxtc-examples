@@ -1,10 +1,10 @@
 #!/bin/bash
-# test/sqlxtc/test_sqlxtc_budgets.sh -- enforce hard caps.
+# 06_sqlxtc/test/test_sqlxtc_budgets.sh -- enforce hard caps.
 set -u
 
 PORT=${PORT:-15435}
 DIR=$(dirname "$0")
-SVR_BIN=$DIR/../../examples/06_sqlxtc/sqlxtc-server
+SVR_BIN=$DIR/../sqlxtc-server
 LOGFILE=/tmp/sqlxtc-budget.log
 DBFILE=/tmp/sqlxtc-budget.db
 

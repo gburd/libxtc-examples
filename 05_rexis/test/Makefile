@@ -2,12 +2,12 @@
 # Copyright (c) 2026, The XTC Project -- All rights reserved.
 # Use of this source code is governed by the ISC License.
 #
-# test/m99/Makefile
+# 05_rexis/test/Makefile
 #	Build tests for the Redis-compatible server example.
 
-XTC_BUILD ?= ../../build_unix
-XTC_INC   ?= ../../src/inc
-REXIS_DIR ?= ../../examples/05_rexis
+XTC_BUILD ?= ../../../build_unix
+XTC_INC   ?= ../../../src/inc
+REXIS_DIR ?= ..
 
 CC       = cc
 CFLAGS   = -O2 -g -std=c11 -Wall -Wextra -Wpedantic \
@@ -86,4 +86,4 @@ check: all
 	REXIS_ARGS=--loops=2 $(TIMEOUT) ./test_rexis_loopback
 	REXIS_ARGS=--loops=2 $(TIMEOUT) ./test_rexis_budgets
 	REXIS_ARGS=--loops=2 $(TIMEOUT) ./test_rexis_pbt
-	XTC_SRC_DIR=$(abspath ../..) sh ./test_rexis_persist.sh
+	sh ./test_rexis_persist.sh

@@ -1,5 +1,5 @@
 #!/bin/sh
-# test/sqlxtc/test_sqlxtc_compat.sh
+# 06_sqlxtc/test/test_sqlxtc_compat.sh
 # SQL-dialect compatibility differential test: run a self-contained
 # corpus through sqlxtc (via Quack) and python sqlite3, asserting
 # identical result sets on the supported-feature set and reporting
@@ -12,8 +12,8 @@
 
 set -e
 
-XTC_SRC_DIR="${XTC_SRC_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
-SERVER="$XTC_SRC_DIR/examples/06_sqlxtc/sqlxtc-server"
+HERE="$(cd "$(dirname "$0")" && pwd)"   # 06_sqlxtc/test
+SERVER="${SQLXTC_SERVER:-$HERE/../sqlxtc-server}"
 
 if [ ! -x "$SERVER" ]; then
 	echo "  [sqlxtc-compat] SKIP: $SERVER not built"
@@ -28,7 +28,7 @@ if ! python3 -c "import sqlite3" 2>/dev/null; then
 	exit 0
 fi
 
-cd "$XTC_SRC_DIR"
-python3 "$XTC_SRC_DIR/test/sqlxtc/test_sqlxtc_compat.py" 2>&1 | \
+cd "$HERE"
+python3 "$HERE/test_sqlxtc_compat.py" 2>&1 | \
 	grep -E "FAIL|XBUG|xpass|CORPUS|XFAIL|compat" | tail -20
 exit ${PIPESTATUS[0]:-0}

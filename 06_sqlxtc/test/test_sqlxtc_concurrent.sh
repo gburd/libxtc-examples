@@ -1,10 +1,10 @@
 #!/bin/bash
-# test/sqlxtc/test_sqlxtc_concurrent.sh -- Phase 3 concurrent stress.
+# 06_sqlxtc/test/test_sqlxtc_concurrent.sh -- Phase 3 concurrent stress.
 set -u
 
 PORT=${PORT:-15434}
 DIR=$(dirname "$0")
-SVR_BIN=$DIR/../../examples/06_sqlxtc/sqlxtc-server
+SVR_BIN=$DIR/../sqlxtc-server
 PIDFILE=/tmp/sqlxtc-conc.pid
 LOGFILE=/tmp/sqlxtc-conc.log
 DBFILE=/tmp/sqlxtc-conc.db

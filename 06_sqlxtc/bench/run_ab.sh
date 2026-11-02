@@ -1,5 +1,5 @@
 #!/bin/sh
-# bench/sqlxtc/run_ab.sh -- build and run the larger-than-RAM A/B
+# 06_sqlxtc/bench/run_ab.sh -- build and run the larger-than-RAM A/B
 # (engine_ab.c): the same SQL workload through the same VDBE, differing
 # only in the storage engine (xstore = libxtc-native, vs SQLite's own).
 #
@@ -8,8 +8,8 @@
 #       --command 'sh run_ab.sh > results/engine_ab-$(hostname -s).jsonl'
 set -eu
 
-EX=../../examples/06_sqlxtc
-XTC_BUILD=${XTC_BUILD:-../../build_unix}
+EX=..
+XTC_BUILD=${XTC_BUILD:-../../../build_unix}
 CPU=${CPU:-2}                      # core to pin to (taskset)
 ROWS=${ROWS:-200000}
 ROW_BYTES=${ROW_BYTES:-512}
@@ -20,7 +20,7 @@ REPS=${REPS:-3}
 # The vendored engine compiled with the xsql_ rename (force-include).
 [ -f "$EX/sqlite3.o" ] || make -C "$EX" XTC_BUILD="$XTC_BUILD" sqlite3.o >&2
 
-gcc -O2 -g -std=c11 -D_GNU_SOURCE -include "$EX/xsql.h" -I"$EX" -I../../src/inc \
+gcc -O2 -g -std=c11 -D_GNU_SOURCE -include "$EX/xsql.h" -I"$EX" -I../../../src/inc \
     engine_ab.c "$EX/xstore.c" "$EX/xlog.c" "$EX/wal.c" "$EX/btree.c" "$EX/btnode.c" "$EX/bufmgr.c" \
     "$EX/sqlite3.o" "$XTC_BUILD/libxtc.a" -pthread -ldl -lm -luring \
     -o engine_ab >&2

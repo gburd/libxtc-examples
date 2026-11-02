@@ -2,7 +2,7 @@
 # Copyright (c) 2026, The XTC Project
 # Use of this source code is governed by the ISC License.
 #
-# test/sqlxtc/test_sqlxtc_compat.py
+# 06_sqlxtc/test/test_sqlxtc_compat.py
 #
 # Wired-in (make check + CI) SQL-compatibility differential test for
 # the sqlxtc engine.  Each case runs the SAME SQL through BOTH sqlxtc

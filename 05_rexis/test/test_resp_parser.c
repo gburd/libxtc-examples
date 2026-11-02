@@ -2,7 +2,7 @@
  * Copyright (c) 2026, The XTC Project -- All rights reserved.
  * Use of this source code is governed by the ISC License.
  *
- * test/m99/test_resp_parser.c
+ * 05_rexis/test/test_resp_parser.c
  *	Table-driven tests for the RESP protocol parser.
  */
 
@@ -11,7 +11,7 @@
 #include <string.h>
 
 #include "munit.h"
-#include "../../examples/05_rexis/proto.h"
+#include "../proto.h"
 
 /* Test case structure */
 typedef struct {

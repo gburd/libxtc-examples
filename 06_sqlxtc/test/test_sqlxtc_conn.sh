@@ -1,5 +1,5 @@
 #!/bin/bash
-# test/sqlxtc/test_sqlxtc_conn.sh
+# 06_sqlxtc/test/test_sqlxtc_conn.sh
 #   Two connection-handling bugs, both in conn.c's request loop:
 #   1. Pipelined requests stalled.  A pass stops running requests once
 #      256 KiB of output is pending; when the socket then took all of
@@ -20,7 +20,7 @@ set -u
 
 PORT=${PORT:-15495}
 DIR=$(cd "$(dirname "$0")" && pwd)
-SVR_BIN=${SQLXTC_SERVER:-$DIR/../../examples/06_sqlxtc/sqlxtc-server}
+SVR_BIN=${SQLXTC_SERVER:-$DIR/../sqlxtc-server}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sqlxtc-conn.XXXXXX")
 SVR_PID=
 

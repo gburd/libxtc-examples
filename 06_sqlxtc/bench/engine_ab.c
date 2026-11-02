@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: ISC
  *
- * bench/sqlxtc/engine_ab.c
+ * 06_sqlxtc/bench/engine_ab.c
  *	Larger-than-RAM A/B: the SAME SQL workload through the SAME VDBE,
  *	differing only in the storage engine underneath:
  *

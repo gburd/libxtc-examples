@@ -2,7 +2,7 @@
 # Copyright (c) 2026, The XTC Project
 # Use of this source code is governed by the ISC License.
 #
-# test/sqlxtc/compat_common.py
+# 06_sqlxtc/test/compat_common.py
 #
 # Shared plumbing for the sqlxtc SQL-compatibility harnesses:
 #   - Quack        JSON-over-TCP client for the sqlxtc server
@@ -178,7 +178,7 @@ class Server:
     def __init__(self, port=16455, server_bin=None):
         here = os.path.abspath(os.path.dirname(__file__))
         self.bin = server_bin or os.path.normpath(os.path.join(
-            here, "..", "..", "examples", "06_sqlxtc", "sqlxtc-server"))
+            here, "..", "sqlxtc-server"))
         self.port = port
         self.proc = None
         self.log = None

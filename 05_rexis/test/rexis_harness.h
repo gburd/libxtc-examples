@@ -2,7 +2,7 @@
  * Copyright (c) 2026, The XTC Project -- All rights reserved.
  * Use of this source code is governed by the ISC License.
  *
- * test/m99/rexis_harness.h
+ * 05_rexis/test/rexis_harness.h
  *	Start / stop a real rexis-server-xtc for the m99 tests.  Header-only
  *	(static functions); each test binary includes it once.
  *
@@ -25,7 +25,7 @@
  *	Orphans: the child sets PR_SET_PDEATHSIG (Linux), so a test runner
  *	killed by a timeout cannot leave servers holding ports behind.
  *
- *	The binary is $REXIS_SERVER, else ../../examples/05_rexis/rexis-server-xtc
+ *	The binary is $REXIS_SERVER, else ../rexis-server-xtc
  *	relative to the current directory (test/m99).  $REXIS_ARGS (words
  *	split on spaces) is appended to every server's arguments: check-rexis
  *	runs the suites a second time with REXIS_ARGS=--loops=2 so the
@@ -55,7 +55,7 @@
 #include <sys/prctl.h>
 #endif
 
-#define REXIS_DEFAULT_BIN  "../../examples/05_rexis/rexis-server-xtc"
+#define REXIS_DEFAULT_BIN  "../rexis-server-xtc"
 #define REXIS_READY_MS     5000   /* max wait for the "listening" line */
 #define REXIS_STOP_MS      5000   /* max wait for exit after SIGTERM */
 #define REXIS_START_TRIES  5

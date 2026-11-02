@@ -2,7 +2,7 @@
  * Copyright (c) 2026, The XTC Project -- All rights reserved.
  * Use of this source code is governed by the ISC License.
  *
- * test/m99/test_rexis_budgets.c
+ * 05_rexis/test/test_rexis_budgets.c
  *	Budget enforcement: each --max-* cap is checked by MEASURING the
  *	running server, not by trusting its replies or its exit code.
  *

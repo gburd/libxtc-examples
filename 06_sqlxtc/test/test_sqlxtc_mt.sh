@@ -1,5 +1,5 @@
 #!/bin/bash
-# test/sqlxtc/test_sqlxtc_mt.sh
+# 06_sqlxtc/test/test_sqlxtc_mt.sh
 #   Multi-threaded (multi-loop) regression guard: run sqlxtc-server with
 #   one worker loop per host CPU under concurrent load and assert it does
 #   not crash. Guards the cross-loop xtc_amutex hand-off bug.
@@ -11,7 +11,7 @@ set -u
 
 PORT=${PORT:-15490}
 DIR=$(cd "$(dirname "$0")" && pwd)
-SVR_BIN=${SQLXTC_SERVER:-$DIR/../../examples/06_sqlxtc/sqlxtc-server}
+SVR_BIN=${SQLXTC_SERVER:-$DIR/../sqlxtc-server}
 DBFILE=${TMPDIR:-/tmp}/sqlxtc-mt.$$.db
 LOGFILE=${TMPDIR:-/tmp}/sqlxtc-mt.$$.log
 CLIENTS=${CLIENTS:-64}

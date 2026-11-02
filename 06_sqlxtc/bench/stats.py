@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# bench/sqlxtc/stats.py -- aggregate mvcc_bench JSONL into a report.
+# 06_sqlxtc/bench/stats.py -- aggregate mvcc_bench JSONL into a report.
 #
 # Copyright (c) 2026, The XTC Project -- ISC License.
 #

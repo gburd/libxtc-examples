@@ -1,5 +1,5 @@
 #!/bin/bash
-# test/sqlxtc/test_sqlxtc_maxmem.sh
+# 06_sqlxtc/test/test_sqlxtc_maxmem.sh
 #   --max-memory bounds the memory the connections' buffers take.  It
 #   used to bound nothing: the cap was checked against xtc_res's
 #   MEM_BYTES counter, but nothing in sqlxtc ever charged that counter,
@@ -21,7 +21,7 @@ set -u
 
 PORT=${PORT:-15494}
 DIR=$(cd "$(dirname "$0")" && pwd)
-SVR_BIN=${SQLXTC_SERVER:-$DIR/../../examples/06_sqlxtc/sqlxtc-server}
+SVR_BIN=${SQLXTC_SERVER:-$DIR/../sqlxtc-server}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sqlxtc-maxmem.XXXXXX")
 SVR_PID=
 

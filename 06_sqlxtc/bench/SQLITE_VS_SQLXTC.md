@@ -6,7 +6,7 @@ vectorized executor `vexec` for reads / the native write path for DML),
 both running in one process over the SAME on-disk xstore B-tree, so the
 only variable is the execution engine.
 
-Harness: `bench/sqlxtc/native_vs_vdbe.c`.  It creates one table as an
+Harness: `06_sqlxtc/bench/native_vs_vdbe.c`.  It creates one table as an
 xstore vtab (so the rows are visible to BOTH engines), seeds it, warms
 both, then times the same query set `--iters` times under the native
 driver (`sx_native_driver(1)`) and under the VDBE

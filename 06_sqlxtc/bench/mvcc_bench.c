@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: ISC
  *
- * bench/sqlxtc/mvcc_bench.c
+ * 06_sqlxtc/bench/mvcc_bench.c
  *	A YCSB-shaped load generator for the sqlxtc MVCC engine
  *	(examples/06_sqlxtc/mvcc.c), measuring throughput and latency
  *	percentiles for the libxtc concurrency model directly.

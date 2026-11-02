@@ -1,5 +1,5 @@
 #!/bin/bash
-# test/sqlxtc/test_sqlxtc_exclusive.sh
+# 06_sqlxtc/test/test_sqlxtc_exclusive.sh
 #   One server per store, one server per port.
 #
 #   (1) A second sqlxtc-server started on the SAME --db (another port)
@@ -18,7 +18,7 @@ set -u
 
 PORT=${PORT:-15494}
 DIR=$(cd "$(dirname "$0")" && pwd)
-SVR_BIN=${SQLXTC_SERVER:-$DIR/../../examples/06_sqlxtc/sqlxtc-server}
+SVR_BIN=${SQLXTC_SERVER:-$DIR/../sqlxtc-server}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sqlxtc-excl.XXXXXX")
 PIDS=""
 

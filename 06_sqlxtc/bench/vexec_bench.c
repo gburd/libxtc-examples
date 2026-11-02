@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: ISC
  *
- * bench/sqlxtc/vexec_bench.c
+ * 06_sqlxtc/bench/vexec_bench.c
  *	Analytic A/B benchmark: the same query through SQLite's VDBE, the
  *	single-threaded vectorized executor (vexec), and the morsel-
  *	parallel vexec at N worker loops.  Measures the V2/V3 parallelism

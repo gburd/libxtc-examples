@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: ISC
  *
- * test/sqlxtc/test_sql_parse.c
+ * 06_sqlxtc/test/test_sql_parse.c
  *	Tests for sql_parse() which combines a keyword classifier with
  *	the Lime-generated grammar parser.
  *
@@ -16,8 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../../examples/06_sqlxtc/sql_parse.h"
-#include "../../examples/06_sqlxtc/sql_ast.h"
+#include "../sql_parse.h"
+#include "../sql_ast.h"
 
 static int n_pass = 0;
 static int n_fail = 0;

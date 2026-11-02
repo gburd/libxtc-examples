@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: ISC
  *
- * test/sqlxtc/test_quack.c
+ * 06_sqlxtc/test/test_quack.c
  *	Quack JSON parser + encoder unit tests.  Standalone, no munit
  *	dependency: built and run by examples/06_sqlxtc/Makefile.
  *
@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../../examples/06_sqlxtc/quack.h"
+#include "../quack.h"
 
 static int n_pass = 0;
 static int n_fail = 0;

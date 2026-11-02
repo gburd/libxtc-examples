@@ -40,7 +40,7 @@
  *	(the sketch/aggregation/sharing-degree math is identical); it does
  *	NOT prove the hardware coherence win -- that needs a real multi-node
  *	box and is an explicit follow-up.  On a real NUMA box, set
- *	PROBE_REAL_NUMA=1 to use __os_numa_node_of_cpu instead.
+ *	PROBE_REAL_NUMA=1 to use xtc_numa_node_of_cpu instead.
  *
  *	Usage: numa_claim_probe [n_keys] [iters_per_reader]
  */
@@ -63,7 +63,6 @@
 #include "xtc_proc.h"
 #include "bufmgr.h"
 #include "btree.h"
-#include "os_cpu.h"          /* __os_numa_node_of_cpu, __os_numa_nnodes */
 
 /* ---- sizing (design section 6.1, scaled down for a probe) ---- */
 #define PAGE_SZ            4096
@@ -171,7 +170,7 @@ static inline int
 this_domain(int cpu)
 {
 #if PROBE_REAL_NUMA
-	int n = __os_numa_node_of_cpu(cpu);
+	int n = xtc_numa_node_of_cpu(cpu);
 	return n < 0 ? 0 : (n % N_SYNTH_DOMAINS);
 #else
 	return cpu % N_SYNTH_DOMAINS;      /* synthesise domains on 1 node */
@@ -560,7 +559,7 @@ main(int argc, char **argv)
 	g_n_keys = n < 1 ? 1 : n;
 	g_iters_per_reader = iters < 1 ? 1 : iters;
 	g_partition = argc > 3 ? atoi(argv[3]) : 0;   /* 1 = per-domain key range */
-	g_ncores = __os_ncpus();
+	g_ncores = xtc_ncpus();
 	if (g_ncores < 1) g_ncores = 1;
 	if (g_ncores > MAX_CORES) g_ncores = MAX_CORES;
 

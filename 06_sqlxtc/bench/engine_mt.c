@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: ISC
  *
- * bench/sqlxtc/engine_mt.c
+ * 06_sqlxtc/bench/engine_mt.c
  *	Multi-threaded A/B: the same random point-operation SQL workload
  *	run by T OS threads against the SAME storage, differing only in
  *	the engine underneath:

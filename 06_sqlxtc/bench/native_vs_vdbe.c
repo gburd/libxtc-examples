@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: ISC
  *
- * bench/sqlxtc/native_vs_vdbe.c
+ * 06_sqlxtc/bench/native_vs_vdbe.c
  *	End-to-end A/B: the SAME SQL workload over the SAME on-disk xstore
  *	B-tree, executed two ways --
  *	  - NATIVE   : the from-scratch sqlxtc engine (Lime parser ->

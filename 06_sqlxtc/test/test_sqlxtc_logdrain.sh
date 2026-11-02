@@ -1,5 +1,5 @@
 #!/bin/bash
-# test/sqlxtc/test_sqlxtc_logdrain.sh
+# 06_sqlxtc/test/test_sqlxtc_logdrain.sh
 #   The server's log reaches its sink WHILE the server runs.  Before,
 #   nothing drained the xtc_log ring between startup and exit, so the
 #   5-second metrics line and the loop stall watchdog's warning were
@@ -13,7 +13,7 @@ set -u
 
 PORT=${PORT:-15493}
 DIR=$(cd "$(dirname "$0")" && pwd)
-SVR_BIN=${SQLXTC_SERVER:-$DIR/../../examples/06_sqlxtc/sqlxtc-server}
+SVR_BIN=${SQLXTC_SERVER:-$DIR/../sqlxtc-server}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sqlxtc-logdrain.XXXXXX")
 LOGFILE=$WORK/log
 

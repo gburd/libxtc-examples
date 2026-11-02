@@ -1,5 +1,5 @@
 #!/bin/sh
-# bench/sqlxtc/run_mt.sh -- multi-threaded A/B sweep (engine_mt.c):
+# 06_sqlxtc/bench/run_mt.sh -- multi-threaded A/B sweep (engine_mt.c):
 # the same random point-op SQL workload run by T OS threads against the
 # same storage, xstore (libxtc-native) vs SQLite (WAL), sweeping thread
 # count (1..max cores), cache budget (RAM pressure), and read mix.
@@ -9,8 +9,8 @@
 #       --command 'sh run_mt.sh > results/engine_mt-$(hostname -s).jsonl'
 set -eu
 
-EX=../../examples/06_sqlxtc
-XTC_BUILD=${XTC_BUILD:-../../build_unix}
+EX=..
+XTC_BUILD=${XTC_BUILD:-../../../build_unix}
 ROWS=${ROWS:-1000000}            # ~ROWS*ROW_BYTES working set
 ROW_BYTES=${ROW_BYTES:-200}
 OPS=${OPS:-200000}               # per thread
@@ -23,7 +23,7 @@ READMIX=${READMIX:-"100 95 50"}
 
 [ -f "$EX/sqlite3.o" ] || make -C "$EX" XTC_BUILD="$XTC_BUILD" sqlite3.o >&2
 
-gcc -O2 -g -std=c11 -D_GNU_SOURCE -include "$EX/xsql.h" -I"$EX" -I../../src/inc \
+gcc -O2 -g -std=c11 -D_GNU_SOURCE -include "$EX/xsql.h" -I"$EX" -I../../../src/inc \
     engine_mt.c "$EX/xstore.c" "$EX/xlog.c" "$EX/wal.c" "$EX/btree.c" \
     "$EX/btnode.c" "$EX/bufmgr.c" "$EX/sqlite3.o" "$XTC_BUILD/libxtc.a" \
     -pthread -ldl -lm -luring -o engine_mt >&2
