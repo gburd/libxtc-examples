@@ -1,7 +1,7 @@
 test_book
 bench_book
 l2book
-l2flow
+l2book-flow
 test_venue
 *.o
 web/book.wasm

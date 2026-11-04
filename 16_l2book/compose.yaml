@@ -1,0 +1,39 @@
+# 16_l2book/compose.yaml -- a venue with a market already trading.
+#
+#   docker compose -f examples/16_l2book/compose.yaml up --build
+#   then open http://127.0.0.1:8080/
+#
+# Run from a libxtc checkout (the build context is the checkout root, so
+# the image builds libxtc and the example from one tree).  Only the
+# console is published, on 127.0.0.1: order entry and market data stay
+# on the compose network.
+name: l2book
+
+services:
+  venue:
+    build:
+      context: ../..
+      dockerfile: examples/16_l2book/Dockerfile
+    image: l2book:local
+    command: ["--flow", "--rate", "200", "--shards", "2",
+              "--web-root", "/srv/l2book/web"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  # A second, independent flow: TCP sessions from another container,
+  # through the venue's real order-entry port, so the book trades
+  # against an outside client as well as the built-in flow.
+  flow:
+    image: l2book:local
+    entrypoint: ["l2book-flow"]
+    command: ["--venue", "venue:9000", "--rate", "100"]
+    depends_on:
+      venue:
+        condition: service_healthy
+    restart: unless-stopped

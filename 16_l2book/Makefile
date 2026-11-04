@@ -42,7 +42,10 @@ WASM_LDFLAGS = -Wl,--no-entry -Wl,--export-dynamic \
 VENUE_SRC = book.c venue.c fibers.c main.c
 VENUE_HDR = book.h venue.h hist.h
 
-all: test_book bench_book l2book
+all: test_book bench_book l2book l2book-flow
+
+l2book-flow: flow.c
+	$(CC) $(CFLAGS) -o $@ flow.c
 
 l2book: $(VENUE_SRC) $(VENUE_HDR) $(XTC_BUILD)/libxtc.a
 	$(CC) $(CFLAGS) $(XTC_CINC) -o $@ $(VENUE_SRC) $(LIBXTC)
@@ -60,13 +63,14 @@ wasm: web/book.wasm
 web/book.wasm: book.c book.h wasm.c
 	$(WASM_CC) $(WASM_FLAGS) $(WASM_LDFLAGS) -o $@ book.c wasm.c
 
-check: test_book l2book
+check: test_book l2book l2book-flow
 	./test_book
 	./l2book --self-test
 	./l2book --help >/dev/null
+	./l2book-flow --help >/dev/null
 
 bench: bench_book
 	taskset -c 2 ./bench_book 2>/dev/null || ./bench_book
 
 clean:
-	rm -f test_book bench_book l2book
+	rm -f test_book bench_book l2book l2book-flow
