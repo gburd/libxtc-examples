@@ -1,0 +1,187 @@
+<!doctype html>
+<!--
+  16_l2book/web/index.html -- the l2book console.
+
+  LIVE:  the venue's own market data over SSE (/md?sym=...), and "trade
+         as you" through /order.  The book you see is the server's.
+  LOCAL: book.wasm -- the same book.c the venue's Isolates run, compiled
+         to wasm32 -- driven by an in-page market maker and noise flow.
+         The digest is the engine's book_digest: same seed, same steps,
+         same number, on any machine.
+  No framework, no external requests.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>l2book -- a libxtc limit order book</title>
+<style>
+:root { --bg:#0d1117; --fg:#c9d1d9; --dim:#8b949e; --bid:#3fb950; --ask:#f85149; --line:#30363d; --acc:#58a6ff; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }
+header { display:flex; gap:16px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+header b { color:var(--acc); }
+select, button, input { background:#161b22; color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:3px 6px; font:inherit; }
+button:hover { border-color:var(--acc); cursor:pointer; }
+main { display:grid; grid-template-columns: 340px 1fr 300px; gap:12px; padding:12px; }
+.panel { border:1px solid var(--line); border-radius:6px; padding:8px; min-height:120px; }
+.panel h2 { margin:0 0 6px; font-size:11px; color:var(--dim); font-weight:normal; }
+.panel h2 code { color:var(--acc); }
+table { width:100%; border-collapse:collapse; }
+td { padding:1px 4px; text-align:right; white-space:nowrap; }
+.bid { color:var(--bid); } .ask { color:var(--ask); }
+.bar { height:12px; display:inline-block; vertical-align:middle; opacity:.35; }
+#mid { text-align:center; padding:3px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); color:var(--dim); }
+#tape div { display:flex; justify-content:space-between; }
+canvas { width:100%; height:110px; display:block; }
+.kv { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; }
+.kv span:nth-child(odd) { color:var(--dim); }
+#log { height:140px; overflow:auto; color:var(--dim); font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <b>l2book</b>
+  <label>mode <select id="mode"><option value="live">LIVE (venue)</option><option value="local">LOCAL (book.wasm)</option></select></label>
+  <label>symbol <select id="sym"></select></label>
+  <span id="status">connecting...</span>
+  <span style="flex:1"></span>
+  <span>digest <code id="digest">-</code></span>
+</header>
+<main>
+  <section class="panel">
+    <h2>depth ladder -- <code>book_depth(b, side, 15, px, qty)</code> / SSE <code>level</code></h2>
+    <table id="asks"></table>
+    <div id="mid">-</div>
+    <table id="bids"></table>
+  </section>
+  <section>
+    <div class="panel"><h2>mid price -- <code>book_best()</code></h2><canvas id="spark"></canvas></div>
+    <div class="panel" style="margin-top:12px"><h2>top-5 depth imbalance (contemporaneous, not predictive)</h2><canvas id="imb"></canvas></div>
+    <div class="panel" style="margin-top:12px">
+      <h2>trade as you -- <code>book_submit()</code> / POST <code>/order</code></h2>
+      <select id="side"><option value="b">buy</option><option value="s">sell</option></select>
+      <select id="type"><option value="l">limit</option><option value="m">market</option></select>
+      <select id="tif"><option value="g">GTC</option><option value="i">IOC</option></select>
+      qty <input id="qty" size="5" value="100"> @ <input id="px" size="7" value="">
+      <button id="send">send</button>
+      <button id="spoof" title="layer far-from-touch size, cancel it 2 s later">spoof</button>
+      <button id="flood" title="a burst of IOC orders that never fill">flood</button>
+    </div>
+  </section>
+  <section>
+    <div class="panel"><h2>tape -- <code>BOOK_EV_TRADE</code></h2><div id="tape"></div></div>
+    <div class="panel" style="margin-top:12px"><h2>venue -- GET <code>/stats</code></h2><div class="kv" id="stats"></div></div>
+    <div class="panel" style="margin-top:12px"><h2>events</h2><div id="log"></div></div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const fmt = p => (Number(p) / 100).toFixed(2);
+const S = { mode: "live", sym: "AAPL", bids: new Map(), asks: new Map(), mids: [], imbs: [], tape: [], es: null, wasm: null, timer: null };
+
+function log(s) { const d = $("log"); d.textContent = s + "\n" + d.textContent.slice(0, 4000); }
+
+// ---- rendering (shared by both modes) -------------------------------
+function levels(map, desc) { return [...map.entries()].filter(e => e[1] > 0).sort((a, b) => desc ? b[0] - a[0] : a[0] - b[0]).slice(0, 15); }
+function render() {
+  const bids = levels(S.bids, true), asks = levels(S.asks, false);
+  const max = Math.max(1, ...bids.map(l => l[1]), ...asks.map(l => l[1]));
+  const row = (l, cls) => `<tr><td class="${cls}">${fmt(l[0])}</td><td>${l[1]}</td><td style="text-align:left"><span class="bar" style="width:${120 * l[1] / max}px;background:var(--${cls})"></span></td></tr>`;
+  $("asks").innerHTML = asks.slice().reverse().map(l => row(l, "ask")).join("");
+  $("bids").innerHTML = bids.map(l => row(l, "bid")).join("");
+  const bb = bids[0], ba = asks[0];
+  if (bb && ba) {
+    const mid = (bb[0] + ba[0]) / 2;
+    $("mid").textContent = `mid ${fmt(mid)}   spread ${ba[0] - bb[0]} ticks`;
+    if (!$("px").value) $("px").value = fmt(bb[0]);
+    S.mids.push(mid); if (S.mids.length > 300) S.mids.shift();
+    const bv = bids.slice(0, 5).reduce((a, l) => a + l[1], 0), av = asks.slice(0, 5).reduce((a, l) => a + l[1], 0);
+    S.imbs.push((bv - av) / Math.max(1, bv + av)); if (S.imbs.length > 300) S.imbs.shift();
+  }
+  spark($("spark"), S.mids, false); spark($("imb"), S.imbs, true);
+  $("tape").innerHTML = S.tape.slice(0, 18).map(t => `<div class="${t.s ? "ask" : "bid"}"><span>${fmt(t.p)}</span><span>${t.q}</span></div>`).join("");
+}
+function spark(c, v, zero) {
+  const w = c.width = c.clientWidth, h = c.height = c.clientHeight, g = c.getContext("2d");
+  g.clearRect(0, 0, w, h); if (v.length < 2) return;
+  const lo = zero ? -1 : Math.min(...v), hi = zero ? 1 : Math.max(...v), r = hi - lo || 1;
+  if (zero) { g.strokeStyle = "#30363d"; g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke(); }
+  g.strokeStyle = "#58a6ff"; g.beginPath();
+  v.forEach((x, i) => { const px = i * w / (v.length - 1), py = h - (x - lo) / r * (h - 4) - 2; i ? g.lineTo(px, py) : g.moveTo(px, py); });
+  g.stroke();
+}
+function trade(side, p, q) { S.tape.unshift({ s: side, p: p, q: q }); if (S.tape.length > 50) S.tape.pop(); }
+
+// ---- LIVE: the venue's SSE stream ----------------------------------
+function startLive() {
+  stopAll(); S.bids.clear(); S.asks.clear(); S.tape = []; S.mids = []; S.imbs = [];
+  const es = S.es = new EventSource(`/md?sym=${S.sym}`);
+  es.onopen = () => $("status").textContent = `LIVE ${S.sym}: the venue's book`;
+  es.onerror = () => $("status").textContent = "LIVE: disconnected (retrying)";
+  es.addEventListener("level", e => { const m = JSON.parse(e.data); (m.s ? S.asks : S.bids).set(m.p, m.q); $("digest").textContent = "seq " + m.seq; });
+  es.addEventListener("trade", e => { const m = JSON.parse(e.data); trade(m.s, m.p, m.q); });
+  es.addEventListener("phase", e => log("phase " + JSON.parse(e.data).phase));
+  es.addEventListener("stats", e => {
+    const st = JSON.parse(e.data), me = st.symbols.find(x => x.sym === S.sym) || {};
+    $("stats").innerHTML = [["shards", st.shards], ["commands", me.commands], ["trades", me.trades], ["volume", me.volume],
+      ["rejects", me.rejects], ["ring drops", me.drops], ["match p50/p99 ns", `${me.match_ns.p50} / ${me.match_ns.p99}`],
+      ["hop p50/p99 ns", `${me.queue_ns.p50} / ${me.queue_ns.p99}`]].map(kv => `<span>${kv[0]}</span><span>${kv[1]}</span>`).join("");
+  });
+  S.timer = setInterval(render, 100);
+}
+async function liveOrder(o) {
+  const q = new URLSearchParams({ sym: S.sym, side: o.side ? "s" : "b", type: o.market ? "m" : "l", tif: o.ioc ? "i" : "g", price: o.price, qty: o.qty });
+  const r = await fetch("/order?" + q, { method: "POST" }); log("order " + (await r.text()).trim());
+}
+
+// ---- LOCAL: book.wasm, the same engine, in the page -----------------
+let rng = 42n;
+function rnd() { rng ^= rng << 13n; rng &= 0xffffffffffffffffn; rng ^= rng >> 7n; rng ^= rng << 17n; rng &= 0xffffffffffffffffn; return Number(rng & 0xffffffn); }
+async function startLocal() {
+  stopAll(); S.bids.clear(); S.asks.clear(); S.tape = []; S.mids = []; S.imbs = []; rng = 42n;
+  if (!S.wasm) { const { instance } = await WebAssembly.instantiateStreaming(fetch("book.wasm")); S.wasm = instance.exports; }
+  const e = S.wasm; e.lob_init(10000n, 1 << 15);
+  let id = 1, mid = 10000, quotes = [];
+  $("status").textContent = "LOCAL: book.wasm in this page (seed 42)";
+  const read = () => {
+    const n = e.lob_ev_count(), sz = e.lob_ev_size(), base = e.lob_ev(), dv = new DataView(e.memory.buffer);
+    for (let i = 0; i < n; i++) {
+      const o = base + i * sz, k = dv.getUint8(o), side = dv.getUint8(o + 1), p = Number(dv.getBigInt64(o + 24, true)), q = Number(dv.getBigInt64(o + 32, true));
+      if (k === 9) (side ? S.asks : S.bids).set(p, q);       // BOOK_EV_LEVEL
+      else if (k === 2) trade(side, p, q);                  // BOOK_EV_TRADE
+    }
+  };
+  S.submit = (o) => { e.lob_submit(BigInt(id++), o.acct || 1, o.side, o.market ? 1 : 0, o.ioc ? 1 : 0, 0, BigInt(o.price || 0), 0n, BigInt(o.qty), 0n); read(); };
+  S.timer = setInterval(() => {
+    for (let step = 0; step < 20; step++) {
+      if (step === 0) {                       // the market maker re-quotes
+        quotes.forEach(q => { e.lob_cancel(BigInt(q), 2); read(); }); quotes = [];
+        mid += (rnd() % 5) - 2;
+        for (let l = 0; l < 5; l++) for (let s = 0; s < 2; s++) {
+          const qid = id; S.submit({ acct: 2, side: s, price: s ? mid + 2 + l : mid - 2 - l, qty: 100 * (l + 1) }); quotes.push(qid);
+        }
+      }
+      const s = rnd() & 1, ioc = rnd() % 4 === 0;        // noise flow
+      S.submit({ acct: 3, side: s, ioc: ioc, price: ioc ? (s ? mid - 10 : mid + 10) : (s ? mid + 1 + rnd() % 8 : mid - 1 - rnd() % 8), qty: 100 * (1 + rnd() % 3) });
+    }
+    $("digest").textContent = e.lob_digest().toString(16) + " @seq " + e.lob_seq() + (e.lob_check() ? " CHECK FAILED" : "");
+    $("stats").innerHTML = [["engine", "book.c -> wasm32"], ["trades", e.lob_trades()], ["seq", e.lob_seq()], ["book_check", e.lob_check() ? "FAIL" : "ok"]].map(kv => `<span>${kv[0]}</span><span>${kv[1]}</span>`).join("");
+    render();
+  }, 100);
+}
+
+function stopAll() { if (S.es) S.es.close(); S.es = null; if (S.timer) clearInterval(S.timer); S.timer = null; }
+function order(o) { return S.mode === "live" ? liveOrder(o) : S.submit(o); }
+function uiOrder() { return { side: $("side").value === "s" ? 1 : 0, market: $("type").value === "m", ioc: $("tif").value === "i", qty: +$("qty").value, price: Math.round(parseFloat($("px").value) * 100) }; }
+$("send").onclick = () => order(uiOrder());
+$("spoof").onclick = () => { const b = levels(S.bids, true)[0]; if (!b) return; for (let i = 0; i < 5; i++) order({ side: 0, qty: 5000, price: b[0] - 5 - i }); log("spoof: 25,000 shares layered 5-9 ticks under the bid"); };
+$("flood").onclick = () => { const a = levels(S.asks, false)[0]; if (!a) return; for (let i = 0; i < 30; i++) order({ side: 0, ioc: true, qty: 100, price: a[0] - 50 }); log("flood: 30 IOC orders that cannot fill"); };
+$("mode").onchange = () => { S.mode = $("mode").value; S.mode === "live" ? startLive() : startLocal(); };
+$("sym").onchange = () => { S.sym = $("sym").value; if (S.mode === "live") startLive(); };
+fetch("/symbols").then(r => r.json()).then(list => {
+  $("sym").innerHTML = list.map(s => `<option>${s}</option>`).join(""); S.sym = list[0]; startLive();
+}).catch(() => { $("mode").value = "local"; S.mode = "local"; $("sym").innerHTML = "<option>LOCAL</option>"; startLocal(); });
+</script>
+</body>
+</html>

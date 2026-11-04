@@ -34,7 +34,7 @@ LIBXTC = $(XTC_LDFLAGS) $(XTC_BUILD)/libxtc.a -pthread -ldl -lm $(XTC_LIBS)
 WASM_CC     ?= clang
 WASM_FLAGS   = --target=wasm32 -nostdlib -ffreestanding -O3 -std=c11 \
                -mbulk-memory -Wall -Wextra -I.
-WASM_LDFLAGS = -Wl,--no-entry -Wl,--export-dynamic -Wl,--allow-undefined \
+WASM_LDFLAGS = -Wl,--no-entry -Wl,--export-dynamic \
                -Wl,--initial-memory=33554432
 
 .PHONY: all check bench wasm clean
@@ -52,6 +52,13 @@ test_book: book.c book.h refbook.h test_book.c
 
 bench_book: book.c book.h hist.h bench_book.c
 	$(CC) $(CFLAGS) -o $@ book.c bench_book.c
+
+# The browser engine: book.c + wasm.c, freestanding wasm32.  WASM_CC must
+# be a clang with the wasm32 target and wasm-ld on PATH.
+wasm: web/book.wasm
+
+web/book.wasm: book.c book.h wasm.c
+	$(WASM_CC) $(WASM_FLAGS) $(WASM_LDFLAGS) -o $@ book.c wasm.c
 
 check: test_book l2book
 	./test_book

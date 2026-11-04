@@ -108,6 +108,7 @@ typedef struct {
 	long		bench_ops;	/* > 0: run the loopback benchmark, exit */
 	int		self_test;	/* run the end-to-end self-test, exit */
 	int64_t		ref_price;
+	int64_t		spin_ns;	/* shard busy-poll before parking */
 } venue_opts_t;
 
 int	venue_main(const venue_opts_t *opts);

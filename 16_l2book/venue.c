@@ -492,6 +492,9 @@ venue_main(const venue_opts_t *opts)
 	spec.shard_count = g_shards;
 	spec.scratch_size = 1u << 16;
 	spec.boot_type = T_BOOT;
+	/* A matching engine owns its cores: an idle shard busy-polls its
+	 * rings for 50 us before it parks, so a burst never pays a wake. */
+	spec.spin_ns = opts->spin_ns;
 
 	if (venue_fibers_start(opts) != 0)
 		return 1;

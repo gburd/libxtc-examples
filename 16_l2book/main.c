@@ -51,6 +51,7 @@ usage(FILE *f)
 	    "  -f, --flow         run the built-in market maker + noise flow\n"
 	    "      --rate=R       flow commands/s per symbol (default 200)\n"
 	    "      --ref=TICKS    reference price in cents (default 10000)\n"
+	    "      --spin-us=U    shard busy-poll before parking (default 50; 0 = park)\n"
 	    "      --self-test    run the end-to-end self-test and exit\n"
 	    "      --bench=N      loopback round-trip benchmark, N orders/client\n"
 	    "      --help         show this help and exit\n");
@@ -414,7 +415,7 @@ on_signal(int sig)
 int
 main(int argc, char **argv)
 {
-	enum { O_HELP = 1000, O_SELF, O_BENCH, O_RATE, O_REF };
+	enum { O_HELP = 1000, O_SELF, O_BENCH, O_RATE, O_REF, O_SPIN };
 	static const struct option lo[] = {
 		{ "shards", required_argument, NULL, 's' },
 		{ "symbols", required_argument, NULL, 'y' },
@@ -425,6 +426,7 @@ main(int argc, char **argv)
 		{ "flow", no_argument, NULL, 'f' },
 		{ "rate", required_argument, NULL, O_RATE },
 		{ "ref", required_argument, NULL, O_REF },
+		{ "spin-us", required_argument, NULL, O_SPIN },
 		{ "self-test", no_argument, NULL, O_SELF },
 		{ "bench", required_argument, NULL, O_BENCH },
 		{ "help", no_argument, NULL, O_HELP },
@@ -443,6 +445,7 @@ main(int argc, char **argv)
 	o.symbols = "AAPL,MSFT,NVDA,AMZN,GOOG,META,TSLA,SPY";
 	o.flow_rate = 200;
 	o.ref_price = 10000;
+	o.spin_ns = 50000;
 	while ((c = getopt_long(argc, argv, "s:y:p:m:w:r:f", lo, NULL)) != -1) {
 		switch (c) {
 		case 's': o.shards = atoi(optarg); break;
@@ -454,6 +457,7 @@ main(int argc, char **argv)
 		case 'f': o.flow = 1; break;
 		case O_RATE: o.flow_rate = atof(optarg); break;
 		case O_REF: o.ref_price = atoll(optarg); break;
+		case O_SPIN: o.spin_ns = atoll(optarg) * 1000; break;
 		case O_SELF: o.self_test = 1; break;
 		case O_BENCH: o.bench_ops = atol(optarg); break;
 		case O_HELP: usage(stdout); return 0;
