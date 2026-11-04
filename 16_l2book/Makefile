@@ -39,7 +39,13 @@ WASM_LDFLAGS = -Wl,--no-entry -Wl,--export-dynamic -Wl,--allow-undefined \
 
 .PHONY: all check bench wasm clean
 
-all: test_book bench_book
+VENUE_SRC = book.c venue.c fibers.c main.c
+VENUE_HDR = book.h venue.h hist.h
+
+all: test_book bench_book l2book
+
+l2book: $(VENUE_SRC) $(VENUE_HDR) $(XTC_BUILD)/libxtc.a
+	$(CC) $(CFLAGS) $(XTC_CINC) -o $@ $(VENUE_SRC) $(LIBXTC)
 
 test_book: book.c book.h refbook.h test_book.c
 	$(CC) $(CFLAGS) -o $@ book.c test_book.c
@@ -47,11 +53,13 @@ test_book: book.c book.h refbook.h test_book.c
 bench_book: book.c book.h hist.h bench_book.c
 	$(CC) $(CFLAGS) -o $@ book.c bench_book.c
 
-check: test_book
+check: test_book l2book
 	./test_book
+	./l2book --self-test
+	./l2book --help >/dev/null
 
 bench: bench_book
 	taskset -c 2 ./bench_book 2>/dev/null || ./bench_book
 
 clean:
-	rm -f test_book bench_book
+	rm -f test_book bench_book l2book
