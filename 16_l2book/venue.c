@@ -44,6 +44,9 @@ struct sym {
 };
 
 static struct sym syms[VENUE_MAX_SYMS];
+/* Each book's memory, recorded by its Isolate's init so the venue frees
+ * it after xtc_tnt_start returns (an Isolate has no teardown hook). */
+static void *book_mem[VENUE_MAX_SYMS];
 static int nsyms;
 static int64_t g_ref = 10000;
 
@@ -283,6 +286,7 @@ book_init_fn(void *self, const void *args, size_t n)
 	if (posix_memalign(&bi->mem, 64, len) != 0 ||
 	    book_init(&bi->b, bi->mem, len, &cfg) != 0)
 		return xtc_tnt_transition_to_crash(XTC_TNT_FAULT_CONTRACT_VIOLATION);
+	book_mem[a->sym] = bi->mem;
 	atomic_store(&syms[a->sym].bid, BOOK_NO_PRICE);
 	atomic_store(&syms[a->sym].ask, BOOK_NO_PRICE);
 	atomic_store(&syms[a->sym].last, g_ref);
@@ -460,7 +464,7 @@ venue_main(const venue_opts_t *opts)
 {
 	static xtc_tnt_type_t types[2];
 	xtc_tnt_spec_t spec;
-	int rc;
+	int rc, i;
 
 	g_shards = opts->shards;
 	g_ref = opts->ref_price > 0 ? opts->ref_price : 10000;
@@ -501,5 +505,9 @@ venue_main(const venue_opts_t *opts)
 	rc = xtc_tnt_start(&spec);	/* blocks until xtc_tnt_stop */
 	atomic_store(&venue_stopping, 1);
 	venue_fibers_join();
+	for (i = 0; i < nsyms; i++) {
+		free(book_mem[i]);
+		book_mem[i] = NULL;
+	}
 	return rc == 0 ? 0 : 1;
 }
