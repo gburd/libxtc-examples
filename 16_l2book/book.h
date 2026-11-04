@@ -272,6 +272,11 @@ int64_t	book_level_qty(const book_t *b, book_side_t s, int64_t price);
 uint32_t book_depth(const book_t *b, book_side_t s, uint32_t depth,
 	    int64_t *price, int64_t *qty);
 const book_slot_t *book_find(const book_t *b, uint64_t id);
+/* Every resting order, in priority order (each side best price first,
+ * FIFO within a level), to fn; stops are not included.  For reading the
+ * terminal book out of the engine (tests, cross-engine comparison). */
+void	book_foreach_resting(const book_t *b,
+	    void (*fn)(const book_slot_t *o, void *arg), void *arg);
 /* FNV-1a over the canonical book (every live order, in priority order,
  * plus the stops and the sequence): equal books have equal digests. */
 uint64_t book_digest(const book_t *b);

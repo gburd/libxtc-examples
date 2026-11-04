@@ -1312,6 +1312,23 @@ fnv(uint64_t h, const void *p, size_t n)
 	return h;
 }
 
+void
+book_foreach_resting(const book_t *b,
+    void (*fn)(const book_slot_t *o, void *arg), void *arg)
+{
+	int s;
+	for (s = 0; s < 2; s++) {
+		uint32_t i = side_best(b, s);
+		while (i != BOOK_NONE) {
+			uint32_t ix;
+			for (ix = b->side[s].lv[i].head; ix != BOOK_NONE;
+			    ix = b->pool[ix].next)
+				fn(&b->pool[ix], arg);
+			i = side_next(b, s, i);
+		}
+	}
+}
+
 uint64_t
 book_digest(const book_t *b)
 {

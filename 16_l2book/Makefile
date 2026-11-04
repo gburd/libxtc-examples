@@ -42,7 +42,12 @@ WASM_LDFLAGS = -Wl,--no-entry -Wl,--export-dynamic \
 VENUE_SRC = book.c venue.c fibers.c main.c
 VENUE_HDR = book.h venue.h hist.h
 
-all: test_book bench_book l2book l2book-flow
+all: test_book bench_book l2book l2book-flow l2book-xeng
+
+# The cross-engine adapter (intrepidkarthi/orderbook docs/CROSS-ENGINE.md):
+# the engine only, no libxtc.
+l2book-xeng: xeng.c book.c book.h
+	$(CC) $(CFLAGS) -o $@ xeng.c book.c
 
 l2book-flow: flow.c
 	$(CC) $(CFLAGS) -o $@ flow.c
@@ -73,4 +78,4 @@ bench: bench_book
 	taskset -c 2 ./bench_book 2>/dev/null || ./bench_book
 
 clean:
-	rm -f test_book bench_book l2book l2book-flow
+	rm -f test_book bench_book l2book l2book-flow l2book-xeng

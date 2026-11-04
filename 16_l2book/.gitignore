@@ -5,3 +5,4 @@ l2book-flow
 test_venue
 *.o
 web/book.wasm
+l2book-xeng
