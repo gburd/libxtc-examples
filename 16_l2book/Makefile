@@ -42,7 +42,11 @@ WASM_LDFLAGS = -Wl,--no-entry -Wl,--export-dynamic \
 VENUE_SRC = book.c venue.c fibers.c main.c
 VENUE_HDR = book.h venue.h hist.h
 
-all: test_book bench_book l2book l2book-flow l2book-xeng
+all: test_book bench_book bench_scenarios l2book l2book-flow l2book-xeng
+
+# intrepidkarthi/orderbook's per-op latency scenarios, ported (COMPARISON.md).
+bench_scenarios: bench_scenarios.c book.c book.h
+	$(CC) $(CFLAGS) -o $@ bench_scenarios.c book.c
 
 # The cross-engine adapter (intrepidkarthi/orderbook docs/CROSS-ENGINE.md):
 # the engine only, no libxtc.
@@ -78,4 +82,4 @@ bench: bench_book
 	taskset -c 2 ./bench_book 2>/dev/null || ./bench_book
 
 clean:
-	rm -f test_book bench_book l2book l2book-flow l2book-xeng
+	rm -f test_book bench_book bench_scenarios l2book l2book-flow l2book-xeng

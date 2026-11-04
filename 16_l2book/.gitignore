@@ -6,3 +6,4 @@ test_venue
 *.o
 web/book.wasm
 l2book-xeng
+bench_scenarios

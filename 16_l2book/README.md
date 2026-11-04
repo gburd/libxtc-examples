@@ -69,6 +69,23 @@ point on the money path, no allocation after the book is created.
 Per-operation figures include a ~18 ns `clock_gettime` pair; the median to
 tail shape is the signal.  None includes a log: there is no WAL here.
 
+Against [intrepidkarthi/orderbook](https://github.com/intrepidkarthi/orderbook),
+the engine this one takes its feature set from, on one bare-metal host
+(COMPARISON.md has the method and every number):
+
+- **Same tape, same checksum.** On their cross-engine tape (50,000
+  commands) all five engines produce the same OBDG digest. Median replay
+  time: l2book 2.76 ms, CppTrader 4.26, geseq 5.93, theirs 9.60,
+  OrderBook-rs 54.9.
+- **Their latency scenarios, ported operation for operation.** l2book's
+  medians are 1.9x-4.4x lower. Its p99.99 stays below 0.75 us in every
+  scenario; theirs reaches 28-114 us wherever an operation allocates.
+- **End to end over loopback TCP, one closed-loop client.** l2book's p50
+  is 17.4 us (55k round trips/s). Their gateway as shipped is 2.1 ms (500
+  round trips/s), because it polls each session's outbound stream every
+  2 ms. With that poll set to 20 us it is 74 us. The two venues do not do
+  the same work per order; see COMPARISON.md.
+
 ## Run it
 
 ```
@@ -129,4 +146,7 @@ anywhere; see `fibers.c`.
 | `flow.c` | `l2book-flow`, the outside order-flow client |
 | `wasm.c`, `web/index.html` | the browser exports and the console |
 | `PROTOCOL.md` | order entry, market data and web endpoints |
+| `xeng.c` | `l2book-xeng`, the adapter for intrepidkarthi's cross-engine harness |
+| `bench_scenarios.c` | their per-operation latency scenarios, ported |
+| `COMPARISON.md` | the comparison with intrepidkarthi/orderbook |
 | `Dockerfile`, `compose.yaml`, `smoke.sh` | the box |
