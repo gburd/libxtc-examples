@@ -54,6 +54,7 @@ int venue_nsyms(void) { return nsyms; }
 const char *venue_sym_name(int i) { return syms[i].name; }
 xtc_tnt_handle_t venue_sym_book(int i) { return atomic_load(&syms[i].book); }
 struct venue_stats *venue_sym_stats(int i) { return &syms[i].stats; }
+int venue_sym_shard(int i) { return syms[i].shard; }
 
 int
 venue_sym_index(const char *name)
@@ -421,14 +422,6 @@ boot_handler(void *self, xtc_tnt_message_t *msg)
 	return XTC_TNT_TRANSITION_WAIT_MESSAGE;
 }
 
-static uint32_t
-hash_sym(const char *s)
-{
-	uint32_t h = 2166136261u;
-	while (*s)
-		h = (h ^ (uint8_t)*s++) * 16777619u;
-	return h;
-}
 
 static int
 parse_symbols(const char *list)
@@ -440,10 +433,12 @@ parse_symbols(const char *list)
 		if (k > 0 && k < VENUE_SYM_LEN) {
 			memcpy(syms[nsyms].name, p, k);
 			syms[nsyms].name[k] = '\0';
-			/* Symbols spread over shards by hash, then by index so
-			 * a small list still uses every shard. */
-			syms[nsyms].shard = (int)((hash_sym(syms[nsyms].name) +
-			    (uint32_t)nsyms) % (uint32_t)g_shards);
+			/* Symbols go round-robin over the shards, so every
+			 * shard gets a book whenever there are at least as many
+			 * symbols as shards (a hash left 3 of 8 shards empty for
+			 * the default 8 symbols).  A venue with a symbol
+			 * universe would place by measured load instead. */
+			syms[nsyms].shard = nsyms % g_shards;
 			nsyms++;
 		}
 		p += k;

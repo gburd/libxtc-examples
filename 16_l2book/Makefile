@@ -75,6 +75,7 @@ web/book.wasm: book.c book.h wasm.c
 check: test_book l2book l2book-flow
 	./test_book
 	./l2book --self-test
+	./l2book --self-test --shards 4
 	./l2book --help >/dev/null
 	./l2book-flow --help >/dev/null
 

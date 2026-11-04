@@ -54,6 +54,7 @@ usage(FILE *f)
 	    "      --spin-us=U    shard busy-poll before parking (default 50; 0 = park)\n"
 	    "      --self-test    run the end-to-end self-test and exit\n"
 	    "      --bench=N      loopback round-trip benchmark, N orders/client\n"
+	    "      --clients=C    bench clients, 1..64, one symbol each (default 4)\n"
 	    "      --help         show this help and exit\n");
 }
 
@@ -218,6 +219,7 @@ mono_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+static int g_shards = 2;	/* the shard count the run started with */
 static int failures;
 #define T(c) do { if (!(c)) { fprintf(stderr, "  self-test FAIL %s:%d: %s\n", \
 	__func__, __LINE__, #c); failures++; goto done; } } while (0)
@@ -237,12 +239,41 @@ expect(int fd, char want, uint64_t cid, unsigned char *rec)
 	return -1;
 }
 
+/* Collect one `want` reply for each client id base..base+n-1, in any
+ * order (a session with orders on several shards' books gets their
+ * reports in whatever order the shards ran).  qty > 0: an 'E' must
+ * report that fill quantity.  0 when every id was seen. */
+static int
+expect_all(int fd, char want, uint64_t base, int n, uint64_t qty)
+{
+	unsigned char rec[256], seen[64];
+	int got = 0, i;
+	if (n > 64)
+		return -1;
+	memset(seen, 0, sizeof seen);
+	for (i = 0; i < 64 * n && got < n; i++) {
+		uint64_t id;
+		if (recv_rec(fd, rec, sizeof rec, 3000) < 0)
+			return -1;
+		id = g64(rec + 1);
+		if (rec[0] != want || id < base || id >= base + (uint64_t)n ||
+		    seen[id - base])
+			continue;
+		if (qty > 0 && g64(rec + 20) != qty)
+			return -1;
+		seen[id - base] = 1;
+		got++;
+	}
+	return got == n ? 0 : -1;
+}
+
 static void *
 self_test(void *arg)
 {
 	int a = -1, b = -1, md = -1;
 	unsigned char rec[256];
 	int n, i, saw_level = 0, saw_trade = 0;
+	uint64_t shard_cmds[VENUE_MAX_SHARDS];
 	(void)arg;
 
 	wait_ready();
@@ -298,8 +329,31 @@ self_test(void *arg)
 			break;
 	}
 	T(i < 200);
+	/* Every symbol, so every shard: A rests a sell on each book, B
+	 * crosses each, all sent before any reply is read, so the books on
+	 * different shards run at the same time; every fill comes back to
+	 * the session that sent the order. */
+	b = dial(g_oe_port);
+	T(b >= 0 && login(b, 13) == 0);
+	for (i = 0; i < venue_nsyms(); i++)
+		T(order(a, 100 + (uint64_t)i, (uint16_t)i, BOOK_SELL, BOOK_LIMIT,
+		    BOOK_GTC, 10100, 10) == 0);
+	/* Books on different shards answer in any order. */
+	T(expect_all(a, 'A', 100, venue_nsyms(), 0) == 0);
+	for (i = 0; i < venue_nsyms(); i++)
+		T(order(b, 200 + (uint64_t)i, (uint16_t)i, BOOK_BUY, BOOK_LIMIT,
+		    BOOK_IOC, 10100, 10) == 0);
+	T(expect_all(b, 'E', 200, venue_nsyms(), 10) == 0);
+	for (i = 0; i < VENUE_MAX_SHARDS; i++)
+		shard_cmds[i] = 0;
+	for (i = 0; i < venue_nsyms(); i++)
+		shard_cmds[venue_sym_shard(i)] +=
+		    atomic_load(&venue_sym_stats(i)->commands);
+	for (i = 0; i < g_shards; i++)
+		T(shard_cmds[i] > 0);
 	fprintf(stderr, "  self-test: order entry, fills both sides, "
-	    "ownership, cancel, market data, cancel-on-disconnect: OK\n");
+	    "ownership, cancel, market data, cancel-on-disconnect, every "
+	    "symbol on %d shard(s): OK\n", g_shards);
 done:
 	if (a >= 0)
 		close(a);
@@ -327,7 +381,7 @@ static void *
 bench_client(void *arg)
 {
 	struct bench_arg *ba = arg;
-	static hist_t local[16];
+	static hist_t local[64];
 	hist_t *h = &local[ba->id];
 	int fd = dial(g_oe_port), sym = ba->id % venue_nsyms();
 	unsigned char rec[256];
@@ -367,8 +421,8 @@ out:
 static void *
 bench_main(void *arg)
 {
-	static struct bench_arg ba[16];
-	pthread_t th[16];
+	static struct bench_arg ba[64];
+	pthread_t th[64];
 	uint64_t t0, t1;
 	int i;
 	(void)arg;
@@ -415,7 +469,8 @@ on_signal(int sig)
 int
 main(int argc, char **argv)
 {
-	enum { O_HELP = 1000, O_SELF, O_BENCH, O_RATE, O_REF, O_SPIN };
+	enum { O_HELP = 1000, O_SELF, O_BENCH, O_RATE, O_REF, O_SPIN,
+	    O_CLIENTS };
 	static const struct option lo[] = {
 		{ "shards", required_argument, NULL, 's' },
 		{ "symbols", required_argument, NULL, 'y' },
@@ -429,6 +484,7 @@ main(int argc, char **argv)
 		{ "spin-us", required_argument, NULL, O_SPIN },
 		{ "self-test", no_argument, NULL, O_SELF },
 		{ "bench", required_argument, NULL, O_BENCH },
+		{ "clients", required_argument, NULL, O_CLIENTS },
 		{ "help", no_argument, NULL, O_HELP },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -460,9 +516,15 @@ main(int argc, char **argv)
 		case O_SPIN: o.spin_ns = atoll(optarg) * 1000; break;
 		case O_SELF: o.self_test = 1; break;
 		case O_BENCH: o.bench_ops = atol(optarg); break;
+		case O_CLIENTS: g_bench_clients = atoi(optarg); break;
 		case O_HELP: usage(stdout); return 0;
 		default: usage(stderr); return 2;
 		}
+	}
+	g_shards = o.shards;
+	if (g_bench_clients < 1 || g_bench_clients > 64) {
+		fprintf(stderr, "l2book: --clients must be 1..64\n");
+		return 2;
 	}
 	if (o.shards < 1 || o.shards > VENUE_MAX_SHARDS) {
 		fprintf(stderr, "l2book: --shards must be 1..%d\n",

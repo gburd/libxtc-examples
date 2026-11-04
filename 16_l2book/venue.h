@@ -119,6 +119,7 @@ const char	*venue_sym_name(int i);
 int		venue_sym_index(const char *name);
 xtc_tnt_handle_t venue_sym_book(int i);	/* the book Isolate */
 struct venue_stats *venue_sym_stats(int i);
+int		venue_sym_shard(int i);	/* the shard (core) a symbol's book is on */
 
 /* Session helpers (venue.c, used by the fibers). */
 xtc_tnt_send_result_t venue_to_book(int sym, uint16_t tag,
