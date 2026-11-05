@@ -129,7 +129,7 @@ Write-heavy (50% read), in-cache, arnold (20c, NVMe), median kops/s:
 | cores | bt_insert BEFORE (excl. from root) | AFTER (optimistic) | gain |
 | ----: | ---------------------------------: | -----------------: | :--- |
 |   1 |  676 |  522 | 0.77x (re-latch overhead) |
-|   2 |   -- |  957 | -- |
+|   2 |  not run on arnold (the 2026-11 re-measurement below has it) |  957 | not computable |
 |   4 |  612 | 1169 | 1.91x (peak) |
 |   8 |  338 |  764 | 2.26x |
 |  16 |  177 |  290 | 1.64x |
@@ -144,6 +144,41 @@ pessimistic exclusive-coupling from the root -- plus the single global
 commit-clock atomic (g_xclock); making splits optimistic (B-link sibling
 chasing) and sharding the clock are the next steps, with diminishing
 returns and rising complexity.
+
+**Re-measured 2026-11, both columns, on a two-socket 64-core x86-64
+bare-metal host** (Ice Lake, 128 threads; Debian 13, kernel 6.12).
+BEFORE is libxtc `07df756d` and AFTER `54275336`, the commit that made
+the change; the two trees differ only in `btree.c`, and `engine_mt.c`
+is the same file in both.  Same workload (`--engine xstore
+--read-pct 50 --rows 1000000 --row-bytes 200 --cache-kb 262144
+--ops 200000`), threads pinned to NUMA node 0 (physical cores first),
+3 interleaved runs, median kops/s [range].  engine_mt keeps its store
+in `/tmp`, a tmpfs on this host.  A second sweep with the store on XFS
+over NVMe gave the same shape, each cell 0.85-1.02x of its tmpfs value:
+
+| cores | BEFORE | AFTER | gain |
+| ----: | -----: | ----: | :--- |
+|   1 | 202.9 [202.8-203.6] | 202.5 [201.9-204.2] | 1.00x |
+|   2 | 202.2 [190.7-229.7] | 251.3 [195.8-268.6] | 1.24x (ranges overlap) |
+|   4 | 138.6 [127.8-154.0] | 150.7 [131.8-169.7] | 1.09x (ranges overlap) |
+|   8 |  93.9 [90.5-97.9]   | 119.5 [109.7-121.4] | 1.27x |
+|  16 |  64.6 [62.5-70.2]   |  66.4 [62.9-75.9]   | 1.03x (ranges overlap) |
+|  20 |  54.9 [51.5-55.2]   |  53.7 [51.6-56.4]   | 0.98x (ranges overlap) |
+|  32 |  38.9 [38.1-40.5]   |  32.5 [32.1-36.6]   | 0.84x |
+
+On this host neither tree scales past 2 threads, and the optimistic
+insert is a clear gain only at 8 (1.27x, no overlap); at 32 it is
+slower.  The single-thread regression measured on arnold (676 -> 522)
+does not appear (203 both), and both trees run at a third of arnold's
+single-thread rate.  A profile of the 4-thread run (perf, 999 Hz)
+puts 63% (BEFORE) and 70% (AFTER) of the samples in the buffer pool's
+`evict_one`, though the 195 MB working set is inside the 256 MB cache
+(the June pool kept 20% of its frames cooling): on this host the bench
+is bound by the pool's eviction, not by the B-tree latches the table
+is about.  The arnold run recorded neither its build nor its commit,
+so why it differs is not known.  Its numbers are kept as the
+record of that run; its conclusion, that the optimistic insert scales
+writes to a 4-thread peak, does not hold on this host.
 
 ## B-link splits + HLC commit clock (7dc290b / c5ae116)
 
