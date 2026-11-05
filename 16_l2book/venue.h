@@ -98,6 +98,7 @@ struct venue_stats {
 
 typedef struct {
 	int		shards;		/* 1..VENUE_MAX_SHARDS */
+	int		fiber_loops;	/* the session fibers' exec, 1..64 */
 	int		oe_port;	/* order entry, 0 = off */
 	int		md_port;	/* binary market data, 0 = off */
 	int		web_port;	/* HTTP + SSE console, 0 = off */

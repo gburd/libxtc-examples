@@ -164,10 +164,14 @@ about 4 us:
 
 **More clients.** l2book's throughput levels off at about 140,000 round
 trips per second from 4 clients up. The cause is that one standalone loop
-runs every session fiber. That is a workaround for a libxtc bug (a pid
-sent across two `xtc_exec`s reached the wrong process); the fix moves the
-sessions onto an executor of their own. The book shards are not the
-limit: the slowest book handler measured is about 0.2 us.
+ran every session fiber: a workaround for a libxtc bug (a pid sent across
+two `xtc_exec`s reached the wrong process). With the bug fixed (libxtc
+2.2), the sessions run on an `xtc_exec` of their own (`--fiber-loops`).
+On the 48-core development host, with 8 shards and 16 clients, 1/2/4/8
+fiber loops give 54k/149k/313k/383k round trips/s, so the ceiling moves
+with the loops. That run was not on the bare-metal host above, and is not
+part of the tables. The book shards are not the limit: the slowest book
+handler measured is about 0.2 us.
 
 **Busy-polling.** `--spin-us 0` turns off the shards' busy-poll before
 parking. That costs 4 us at the median with one client, and less as load

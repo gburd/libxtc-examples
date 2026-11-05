@@ -5,15 +5,17 @@
  * 16_l2book/fibers.c -- everything that blocks: sessions, market data,
  * the web console, and the flow generator, as supervised fibers.
  *
- *	The fibers run on ONE standalone loop on its own OS thread, next to
- *	the book shards.  Not an xtc_exec: a pid is executor-relative
- *	(loop_id = exec slot + 1), and xtc_tnt runs the books on an exec of
- *	its own, so a book's xtc_send to a fiber on a second exec resolves
- *	to the same-numbered loop of the BOOK's exec and is misdelivered
- *	(libxtc finding, .agent/l2book-2026-11/FINDING-twoexec-pid.md).  A
- *	standalone loop's pids (loop_id 0) resolve correctly from any exec.
- *	One loop is plenty: a session fiber does a recv, a decode and a ring
- *	push per command; the matching runs on the shards.  Each connection is one
+ *	The fibers run on an xtc_exec of their own (--fiber-loops, default
+ *	2), beside the book shards' exec.  The listeners and the boot fiber
+ *	run on loop 0; each accepted connection goes to the next loop in
+ *	turn and stays there for its life, so its socket, its parks and its
+ *	mailbox are one thread's.  A book answers a session with xtc_send
+ *	to the session's pid, which names the session's loop process-wide
+ *	(through libxtc 2.1 a pid named an exec SLOT, so a book's reply to a
+ *	fiber on a second exec reached the same slot of the book's own exec;
+ *	this example ran its fibers on one standalone loop until 2.2 fixed
+ *	it).  A session fiber does a recv, a decode and a ring push per
+ *	command; the matching runs on the shards.  Each connection is one
  *	xtc_proc: straight-line code that reads a frame, sends a command to
  *	a book Isolate, and parks on xtc_proc_wait_fd -- which returns on
  *	socket readiness OR on a message in the proc's mailbox, so the same
@@ -33,6 +35,7 @@
 #include <unistd.h>
 
 #include "venue.h"
+#include "xtc_exec.h"
 #include "xtc_loop.h"
 #include "xtc_net.h"
 #include "xtc_orc.h"
@@ -40,8 +43,19 @@
 
 _Atomic int venue_stopping;
 
-static xtc_loop_t *g_loop;
+static xtc_exec_t *g_exec;
+static xtc_loop_t *g_loop;		/* loop 0: listeners, boot, stopper */
 static pthread_t g_loop_thread;
+static _Atomic unsigned g_next_loop;	/* round-robin for connections */
+
+/* The loop the next connection runs on. */
+static xtc_loop_t *
+conn_loop(void)
+{
+	int n = xtc_exec_n_loops(g_exec);
+	return xtc_exec_loop(g_exec,
+	    (int)(atomic_fetch_add(&g_next_loop, 1) % (unsigned)n));
+}
 static const venue_opts_t *g_opts;
 static _Atomic uint32_t g_next_account = 100;
 static int g_ready_fd = -1;
@@ -777,7 +791,7 @@ listener_fiber(void *arg)
 			}
 			ca->fd = cfd;
 			po.name = l->name;
-			if (xtc_proc_spawn(g_loop, l->fiber, ca, &po, &pid) !=
+			if (xtc_proc_spawn(conn_loop(), l->fiber, ca, &po, &pid) !=
 			    XTC_OK) {
 				xtc_free(ca);
 				xtc_net_close(cfd);
@@ -950,7 +964,8 @@ boot_fiber(void *arg)
 				continue;
 			fa->sym = i;
 			po.name = "flow";
-			(void)xtc_proc_spawn(g_loop, flow_fiber, fa, &po, &pid);
+			(void)xtc_proc_spawn(conn_loop(), flow_fiber, fa, &po,
+			    &pid);
 		}
 	if (g_ready_fd >= 0) {
 		char b = 'r';
@@ -962,21 +977,21 @@ boot_fiber(void *arg)
 	    g_opts->shards, g_opts->oe_port, g_opts->md_port, g_opts->web_port);
 }
 
-/* Stops the standalone loop once the venue is stopping. */
+/* Stops the fibers' exec once the venue is stopping. */
 static void
 stopper_fiber(void *arg)
 {
 	(void)arg;
 	while (!atomic_load(&venue_stopping))
 		(void)xtc_proc_sleep(50LL * 1000 * 1000);
-	(void)xtc_loop_stop(g_loop);
+	(void)xtc_exec_stop(g_exec);
 }
 
 static void *
 loop_thread(void *arg)
 {
 	(void)arg;
-	(void)xtc_loop_run(g_loop);
+	(void)xtc_exec_run(g_exec);
 	return NULL;
 }
 
@@ -998,8 +1013,13 @@ venue_fibers_start(const venue_opts_t *opts)
 	    listen_on(opts->md_port, md_fiber, "md") != 0 ||
 	    listen_on(opts->web_port, web_fiber, "web") != 0)
 		return -1;
-	if (xtc_loop_init(&g_loop) != XTC_OK)
+	if (xtc_exec_init(&g_exec, opts->fiber_loops > 0 ?
+	    opts->fiber_loops : 2) != XTC_OK)
 		return -1;
+	/* A service: the exec runs until the stopper stops it, not until it
+	 * goes idle (a venue with no connections is idle, not finished). */
+	xtc_exec_set_service_mode(g_exec, 1);
+	g_loop = xtc_exec_loop(g_exec, 0);
 	po.name = "boot";
 	if (xtc_proc_spawn(g_loop, boot_fiber, NULL, &po, &pid) != XTC_OK)
 		return -1;
@@ -1014,9 +1034,10 @@ venue_fibers_start(const venue_opts_t *opts)
 void
 venue_fibers_join(void)
 {
-	if (g_loop == NULL)
+	if (g_exec == NULL)
 		return;
 	(void)pthread_join(g_loop_thread, NULL);
-	(void)xtc_loop_fini(g_loop);
+	(void)xtc_exec_fini(g_exec);
+	g_exec = NULL;
 	g_loop = NULL;
 }

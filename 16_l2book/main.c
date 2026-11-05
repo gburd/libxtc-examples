@@ -43,6 +43,7 @@ usage(FILE *f)
 	    "market data and the web console.\n"
 	    "\n"
 	    "  -s, --shards=N     book shards (cores), 1..8 (default 2)\n"
+	    "      --fiber-loops=L  loops (threads) for the session fibers, 1..64 (default 2)\n"
 	    "  -y, --symbols=L    comma list (default AAPL,MSFT,NVDA,AMZN,GOOG,META,TSLA,SPY)\n"
 	    "  -p, --oe-port=P    order entry TCP port (default 9000; 0 = off)\n"
 	    "  -m, --md-port=P    market data TCP port (default 9001; 0 = off)\n"
@@ -470,7 +471,7 @@ int
 main(int argc, char **argv)
 {
 	enum { O_HELP = 1000, O_SELF, O_BENCH, O_RATE, O_REF, O_SPIN,
-	    O_CLIENTS };
+	    O_CLIENTS, O_FLOOPS };
 	static const struct option lo[] = {
 		{ "shards", required_argument, NULL, 's' },
 		{ "symbols", required_argument, NULL, 'y' },
@@ -485,6 +486,7 @@ main(int argc, char **argv)
 		{ "self-test", no_argument, NULL, O_SELF },
 		{ "bench", required_argument, NULL, O_BENCH },
 		{ "clients", required_argument, NULL, O_CLIENTS },
+		{ "fiber-loops", required_argument, NULL, O_FLOOPS },
 		{ "help", no_argument, NULL, O_HELP },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -494,6 +496,7 @@ main(int argc, char **argv)
 
 	memset(&o, 0, sizeof o);
 	o.shards = 2;
+	o.fiber_loops = 2;
 	o.oe_port = 9000;
 	o.md_port = 9001;
 	o.web_port = 8080;
@@ -517,6 +520,7 @@ main(int argc, char **argv)
 		case O_SELF: o.self_test = 1; break;
 		case O_BENCH: o.bench_ops = atol(optarg); break;
 		case O_CLIENTS: g_bench_clients = atoi(optarg); break;
+		case O_FLOOPS: o.fiber_loops = atoi(optarg); break;
 		case O_HELP: usage(stdout); return 0;
 		default: usage(stderr); return 2;
 		}
@@ -524,6 +528,10 @@ main(int argc, char **argv)
 	g_shards = o.shards;
 	if (g_bench_clients < 1 || g_bench_clients > 64) {
 		fprintf(stderr, "l2book: --clients must be 1..64\n");
+		return 2;
+	}
+	if (o.fiber_loops < 1 || o.fiber_loops > 64) {
+		fprintf(stderr, "l2book: --fiber-loops must be 1..64\n");
 		return 2;
 	}
 	if (o.shards < 1 || o.shards > VENUE_MAX_SHARDS) {

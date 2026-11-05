@@ -134,10 +134,14 @@ Writing this example found two libxtc bugs, both now addressed in libxtc:
 an `xtc_tnt_send` to an Isolate on another shard wrote that shard's
 mailbox from the sender's thread and lost messages (fixed: per-pair
 rings, and `xtc_tnt_send_from` for senders outside a handler); and a pid
-is executor-relative, so a book's `xtc_send` to a fiber on a second
-`xtc_exec` reached the proc with the same slot on the book's exec.  The
-fibers therefore run on one standalone loop, whose pids resolve from
-anywhere; see `fibers.c`.
+was executor-relative, so a book's `xtc_send` to a fiber on a second
+`xtc_exec` reached the proc with the same slot on the book's exec (fixed
+in 2.2: a pid now names its loop by a process-wide id).  Until the fix
+the fibers ran on one standalone loop, which capped the venue near 140k
+round trips/s; they now run on an `xtc_exec` of their own
+(`--fiber-loops`, default 2), each connection pinned to one loop.  With
+8 fiber loops, 8 shards and 16 clients on a 48-core host: 383k round
+trips/s, p50 38 us.
 
 ## Files
 
