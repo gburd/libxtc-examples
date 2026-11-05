@@ -54,8 +54,10 @@ the same events as JSON lines (`event: book|level|trade|phase|stats`).
 
 | path | what |
 |------|------|
-| `/` | the console (web/index.html) |
-| `/book.wasm` | the engine, for the console's local mode |
+| `/` | the landing page (web/index.html); any other path is a file under `--web-root` |
+| `/console.html` | the console: LIVE (this venue's books) or SIM (book.wasm) |
+| `/book.wasm` | the engine and the console's market, for the pages |
+| `/symbols` | JSON: the symbols (the console's LIVE probe) |
 | `/md?sym=AAPL` | SSE market data for one symbol |
 | `/order` | POST (query string) an order as the "you" account: `sym, side, type, price, qty, tif` |
 | `/stats` | JSON: per-shard and per-stage latency percentiles, throughput |

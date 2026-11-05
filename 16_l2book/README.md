@@ -1,10 +1,14 @@
 # 16_l2book -- a level-2 limit order book on libxtc
 
-**[Live console](https://gburd.github.io/libxtc-examples/l2book/)**: this
-example's engine, compiled to a 23 KB WebAssembly module, running a market
-in your browser (LOCAL mode: a market maker and noise flow against the
-same `book.c` the venue's Isolates run).  `docker compose up` gives the
-LIVE mode, the console attached to a running venue (below).
+**[Live console](https://gburd.github.io/libxtc-examples/l2book/console.html)**
+([landing page](https://gburd.github.io/libxtc-examples/l2book/)): this
+example's engine, compiled to a 41 KB WebAssembly module, running a market
+in your browser.  The console is a reproduction of
+[intrepidkarthi/orderbook's console](https://intrepidkarthi.github.io/orderbook/console.html)
+on this engine, with the same panels, the same noise-trader market and
+the same signals and detectors, ported to C.  A seed opens the same market
+on both pages, print for print (`web/README.md`).  `docker compose up`
+adds the console's LIVE mode: the venue's own books (below).
 
 A US-equities limit order book and matching venue that uses libxtc's two
 concurrency models together, each where it fits:
@@ -30,8 +34,9 @@ concurrency models together, each where it fits:
 ```
 
 The engine (`book.c`) is pure C11 with no libc beyond `mem*`, so the same
-file compiles to a 23 KB freestanding `wasm32` module: the browser
-console's LOCAL mode runs the engine the venue runs.
+file compiles to a freestanding `wasm32` module (41 KB with the console's
+market, signals and detectors, no imports): the browser console runs the
+engine the venue runs.
 
 ## Features
 
@@ -95,34 +100,48 @@ the engine this one takes its feature set from, on one bare-metal host
 ## Run it
 
 ```
-make XTC_BUILD=../../build_unix check     # engine tests, venue self-test
+make XTC_BUILD=../../build_unix check     # engine + console tests, venue self-test
 make bench                                 # the bare engine
-./l2book --flow                            # venue + flow; console on :8080
+./l2book --flow                            # venue + flow; pages on :8080
 ./l2book --bench 20000                     # loopback round-trip latency
-make wasm WASM_CC=clang                    # web/book.wasm for LOCAL mode
+make wasm WASM_CC=clang                    # web/book.wasm for the console
+make check-wasm                            # book.wasm against known answers (node)
 ```
 
 A running market in one command, from the libxtc checkout root:
 
 ```
 docker compose -f examples/16_l2book/compose.yaml up --build
-open http://127.0.0.1:8080/
+open http://127.0.0.1:8080/console.html
 ```
 
 `venue` builds libxtc and the example from one tree and runs the venue
 with its built-in market maker and noise flow; `flow` is `l2book-flow`, an
 outside client trading through the real order-entry port.
 `smoke.sh "docker compose"` (or `"podman compose"`) brings it up and
-checks it: ready, every book quoted, trades rising, the console, book.wasm
-and SSE served, and a restart that comes back.
+checks it: ready, every book quoted, trades rising, the landing page, the
+console, book.wasm, `/symbols` and SSE served, and a restart that comes back.
+
+The console served by the venue starts in LIVE mode (the switch in its
+bar lists every symbol, and SIM): the ladder and tape are the venue's
+SSE feed, "you" trades through `/order`, and the console's signal code
+runs over what the venue publishes.  The spoof and flood buttons, the
+seed and "your resting orders" are SIM only.  The feed is level 2 with no
+order ids, and the web port has no open-orders endpoint.
 
 ## Tests
 
-- `test_book`: 17 unit cases, a differential test of 200,000 random
+- `test_book`: 19 unit cases, a differential test of 200,000 random
   commands against `refbook.h` (a naive reference matcher sharing no code),
   and a determinism check.  Clean under ASan and UBSan.  Three planted bugs
   (LIFO within a level, an iceberg refill keeping its place, stops on the
   wrong side) each fail it.
+- `test_signals`: the console's market, signals and detectors against
+  known answers: intrepidkarthi's own signal and surveillance test vectors,
+  Go's `math/rand` golden values, their console's output for seed 1 (79
+  and 1,000 steps, and a spoof / flood / "you" run with its 9 alerts), and
+  a seed replay.  `check_wasm.mjs` runs the same answers against
+  `book.wasm` before every Pages deploy.
 - `l2book --self-test`: two TCP sessions and a market-data subscriber
   against a running venue -- rest, cross (both fills), ownership, cancel,
   level and trade on the feed, cancel-on-disconnect.
@@ -154,7 +173,9 @@ trips/s, p50 38 us.
 | `fibers.c` | sessions, market data, the web console, the flow, as fibers |
 | `main.c` | options, `--self-test`, `--bench` |
 | `flow.c` | `l2book-flow`, the outside order-flow client |
-| `wasm.c`, `web/index.html` | the browser exports and the console |
+| `console.c`, `signals.c`, `gorand.c` | the console's market, signals and detectors; Go's `math/rand` |
+| `test_signals.c`, `check_wasm.mjs` | their tests, native and against `book.wasm` |
+| `wasm.c`, `web/` | the browser exports; the landing page and the console (`web/README.md`) |
 | `PROTOCOL.md` | order entry, market data and web endpoints |
 | `xeng.c` | `l2book-xeng`, the adapter for intrepidkarthi's cross-engine harness |
 | `bench_scenarios.c` | their per-operation latency scenarios, ported |

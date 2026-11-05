@@ -1,187 +1,328 @@
 <!doctype html>
 <!--
-  16_l2book/web/index.html -- the l2book console.
+  16_l2book/web/index.html -- the l2book landing page.
 
-  LIVE:  the venue's own market data over SSE (/md?sym=...), and "trade
-         as you" through /order.  The book you see is the server's.
-  LOCAL: book.wasm -- the same book.c the venue's Isolates run, compiled
-         to wasm32 -- driven by an in-page market maker and noise flow.
-         The digest is the engine's book_digest: same seed, same steps,
-         same number, on any machine.
-  No framework, no external requests.
+  Structure, sections and styles are intrepidkarthi/orderbook's
+  web/index.html (3fffc25), reused under the MIT License
+  (Copyright (c) 2026 Karthikeyan NG; the full notice is in style.css and
+  web/README.md).  The text is rewritten for l2book; every number on it
+  is from 16_l2book/README.md or COMPARISON.md.  The two live ladders run
+  book.wasm (the engine) in the page; no framework, no external request.
 -->
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>l2book -- a libxtc limit order book</title>
-<style>
-:root { --bg:#0d1117; --fg:#c9d1d9; --dim:#8b949e; --bid:#3fb950; --ask:#f85149; --line:#30363d; --acc:#58a6ff; }
-* { box-sizing: border-box; }
-body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }
-header { display:flex; gap:16px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
-header b { color:var(--acc); }
-select, button, input { background:#161b22; color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:3px 6px; font:inherit; }
-button:hover { border-color:var(--acc); cursor:pointer; }
-main { display:grid; grid-template-columns: 340px 1fr 300px; gap:12px; padding:12px; }
-.panel { border:1px solid var(--line); border-radius:6px; padding:8px; min-height:120px; }
-.panel h2 { margin:0 0 6px; font-size:11px; color:var(--dim); font-weight:normal; }
-.panel h2 code { color:var(--acc); }
-table { width:100%; border-collapse:collapse; }
-td { padding:1px 4px; text-align:right; white-space:nowrap; }
-.bid { color:var(--bid); } .ask { color:var(--ask); }
-.bar { height:12px; display:inline-block; vertical-align:middle; opacity:.35; }
-#mid { text-align:center; padding:3px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); color:var(--dim); }
-#tape div { display:flex; justify-content:space-between; }
-canvas { width:100%; height:110px; display:block; }
-.kv { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; }
-.kv span:nth-child(odd) { color:var(--dim); }
-#log { height:140px; overflow:auto; color:var(--dim); font-size:11px; }
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>l2book &mdash; a level-2 limit order book &amp; matching venue on libxtc</title>
+  <meta name="description" content="A US-equities limit order book and matching venue in C on libxtc: one Isolate per book, fibers for every session. Integer-exact, deterministic, no allocation after init, the order surface of intrepidkarthi/orderbook, and the same engine runs in your browser as a 41 KB WebAssembly module." />
+  <link rel="stylesheet" href="style.css" />
+  <!-- l2book: wide code blocks scroll inside their column, not the page. -->
+  <style>.two-col > div { min-width: 0; }</style>
 </head>
 <body>
-<header>
-  <b>l2book</b>
-  <label>mode <select id="mode"><option value="live">LIVE (venue)</option><option value="local">LOCAL (book.wasm)</option></select></label>
-  <label>symbol <select id="sym"></select></label>
-  <span id="status">connecting...</span>
-  <span style="flex:1"></span>
-  <span>digest <code id="digest">-</code></span>
-</header>
-<main>
-  <section class="panel">
-    <h2>depth ladder -- <code>book_depth(b, side, 15, px, qty)</code> / SSE <code>level</code></h2>
-    <table id="asks"></table>
-    <div id="mid">-</div>
-    <table id="bids"></table>
-  </section>
-  <section>
-    <div class="panel"><h2>mid price -- <code>book_best()</code></h2><canvas id="spark"></canvas></div>
-    <div class="panel" style="margin-top:12px"><h2>top-5 depth imbalance (contemporaneous, not predictive)</h2><canvas id="imb"></canvas></div>
-    <div class="panel" style="margin-top:12px">
-      <h2>trade as you -- <code>book_submit()</code> / POST <code>/order</code></h2>
-      <select id="side"><option value="b">buy</option><option value="s">sell</option></select>
-      <select id="type"><option value="l">limit</option><option value="m">market</option></select>
-      <select id="tif"><option value="g">GTC</option><option value="i">IOC</option></select>
-      qty <input id="qty" size="5" value="100"> @ <input id="px" size="7" value="">
-      <button id="send">send</button>
-      <button id="spoof" title="layer far-from-touch size, cancel it 2 s later">spoof</button>
-      <button id="flood" title="a burst of IOC orders that never fill">flood</button>
+  <nav class="nav">
+    <a class="brand" href="#top">&#x1F4C8; l2book</a>
+    <div class="nav-links">
+      <a href="#what">What is it</a>
+      <a href="#basics">Order books</a>
+      <a href="#matching">How it works</a>
+      <a href="#features">Features</a>
+      <a href="console.html">Live console</a>
+      <a href="#production">Production</a>
+      <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">Numbers</a>
+      <a href="#run">Run it</a>
+      <a class="nav-gh" href="https://github.com/gburd/libxtc-examples/tree/main/16_l2book">GitHub &#x2605;</a>
     </div>
-  </section>
-  <section>
-    <div class="panel"><h2>tape -- <code>BOOK_EV_TRADE</code></h2><div id="tape"></div></div>
-    <div class="panel" style="margin-top:12px"><h2>venue -- GET <code>/stats</code></h2><div class="kv" id="stats"></div></div>
-    <div class="panel" style="margin-top:12px"><h2>events</h2><div id="log"></div></div>
-  </section>
-</main>
-<script>
-"use strict";
-const $ = id => document.getElementById(id);
-const fmt = p => (Number(p) / 100).toFixed(2);
-const S = { mode: "live", sym: "AAPL", bids: new Map(), asks: new Map(), mids: [], imbs: [], tape: [], es: null, wasm: null, timer: null };
+  </nav>
 
-function log(s) { const d = $("log"); d.textContent = s + "\n" + d.textContent.slice(0, 4000); }
+  <header id="top" class="hero">
+    <span class="eyebrow">OPEN SOURCE &middot; C11 &middot; LIBXTC &middot; ISC</span>
+    <h1>A limit order book &amp; matching venue in C &mdash;<br />Isolates for the books, fibers for everything that blocks.</h1>
+    <p class="lede">
+      The piece of software at the heart of every exchange: it holds every buy and sell
+      order and matches them, fairly and fast. l2book is a <strong>US-equities venue</strong>
+      built on <a href="https://codeberg.org/gregburd/libxtc">libxtc</a>: each symbol's book is a
+      <strong>single-writer Isolate</strong> on its own core, every session is a
+      <strong>fiber</strong>. The engine uses <strong>integer-exact pricing</strong> (int64 ticks,
+      never floats), is fully <strong>deterministic</strong>, <strong>allocates nothing</strong> after
+      the book is created, and ships the order surface of
+      <a href="https://github.com/intrepidkarthi/orderbook">intrepidkarthi/orderbook</a>.
+      The engine below is the real thing &mdash; the same <code>book.c</code>, compiled to WebAssembly,
+      running in your browser.
+    </p>
+    <div class="hero-cta">
+      <a class="btn primary" href="console.html">Run the live console</a>
+      <a class="btn" href="#run">Run it</a>
+      <a class="btn ghost" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">Read the benchmark notes</a>
+    </div>
+    <div class="stat-row">
+      <div><b>2.76&nbsp;ms</b><span>50k-command tape (5 engines, same digest)</span></div>
+      <div><b>&lt;0.75&nbsp;&micro;s</b><span>p99.99, every latency scenario</span></div>
+      <div><b>17.4&nbsp;&micro;s</b><span>TCP round trip p50, 1 client</span></div>
+      <div><b>0</b><span>allocations after book_init</span></div>
+    </div>
+    <p class="hint">One bare-metal 48-core x86-64 host, one core per engine; the round trip is loopback TCP, order + ack. These are measurements of this venue and engine, not of a production exchange. <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">Read the method &rarr;</a></p>
+  </header>
 
-// ---- rendering (shared by both modes) -------------------------------
-function levels(map, desc) { return [...map.entries()].filter(e => e[1] > 0).sort((a, b) => desc ? b[0] - a[0] : a[0] - b[0]).slice(0, 15); }
-function render() {
-  const bids = levels(S.bids, true), asks = levels(S.asks, false);
-  const max = Math.max(1, ...bids.map(l => l[1]), ...asks.map(l => l[1]));
-  const row = (l, cls) => `<tr><td class="${cls}">${fmt(l[0])}</td><td>${l[1]}</td><td style="text-align:left"><span class="bar" style="width:${120 * l[1] / max}px;background:var(--${cls})"></span></td></tr>`;
-  $("asks").innerHTML = asks.slice().reverse().map(l => row(l, "ask")).join("");
-  $("bids").innerHTML = bids.map(l => row(l, "bid")).join("");
-  const bb = bids[0], ba = asks[0];
-  if (bb && ba) {
-    const mid = (bb[0] + ba[0]) / 2;
-    $("mid").textContent = `mid ${fmt(mid)}   spread ${ba[0] - bb[0]} ticks`;
-    if (!$("px").value) $("px").value = fmt(bb[0]);
-    S.mids.push(mid); if (S.mids.length > 300) S.mids.shift();
-    const bv = bids.slice(0, 5).reduce((a, l) => a + l[1], 0), av = asks.slice(0, 5).reduce((a, l) => a + l[1], 0);
-    S.imbs.push((bv - av) / Math.max(1, bv + av)); if (S.imbs.length > 300) S.imbs.shift();
-  }
-  spark($("spark"), S.mids, false); spark($("imb"), S.imbs, true);
-  $("tape").innerHTML = S.tape.slice(0, 18).map(t => `<div class="${t.s ? "ask" : "bid"}"><span>${fmt(t.p)}</span><span>${t.q}</span></div>`).join("");
-}
-function spark(c, v, zero) {
-  const w = c.width = c.clientWidth, h = c.height = c.clientHeight, g = c.getContext("2d");
-  g.clearRect(0, 0, w, h); if (v.length < 2) return;
-  const lo = zero ? -1 : Math.min(...v), hi = zero ? 1 : Math.max(...v), r = hi - lo || 1;
-  if (zero) { g.strokeStyle = "#30363d"; g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke(); }
-  g.strokeStyle = "#58a6ff"; g.beginPath();
-  v.forEach((x, i) => { const px = i * w / (v.length - 1), py = h - (x - lo) / r * (h - 4) - 2; i ? g.lineTo(px, py) : g.moveTo(px, py); });
-  g.stroke();
-}
-function trade(side, p, q) { S.tape.unshift({ s: side, p: p, q: q }); if (S.tape.length > 50) S.tape.pop(); }
+  <main>
+    <section class="sec" aria-labelledby="choose-heading">
+      <h2 id="choose-heading">Where to start</h2>
+      <p class="sec-lede">Pick the path that matches what you are trying to do. The pages and the venue use the same engine.</p>
+      <div class="path-grid">
+        <a class="path" href="#basics"><b>I&rsquo;m new to order books &rarr;</b><span>Read the two sections below. Both ladders are a real book from this engine, running in the page.</span></a>
+        <a class="path" href="console.html"><b>I want to see it run &rarr;</b><span>Watch a simulated market, place your own orders, and trigger the surveillance detectors.</span></a>
+        <a class="path" href="#run"><b>I want to run the venue &rarr;</b><span><code>docker compose up</code>: the venue, its flow, and this console attached to the live books.</span></a>
+        <a class="path" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md"><b>I want the numbers &rarr;</b><span>The engine, the latency scenarios and the venue over TCP, against intrepidkarthi/orderbook &mdash; and what the numbers do not say.</span></a>
+      </div>
+    </section>
+    <!-- WHAT -->
+    <section id="what" class="sec">
+      <h2>What is this?</h2>
+      <p class="sec-lede">
+        <code>16_l2book</code> is an example in <a href="https://github.com/gburd/libxtc-examples">libxtc-examples</a>:
+        a <strong>central limit order book (CLOB)</strong>, a <strong>matching engine</strong>, and a
+        <strong>venue</strong> around them &mdash; order entry over TCP, a binary market-data feed, and
+        this web console over HTTP and SSE. It exists to show libxtc&rsquo;s two concurrency models
+        working together, each where it fits: stackless Isolates (<code>xtc_tnt</code>) for the books,
+        and fibers (<code>xtc_proc</code>) for everything that blocks.
+      </p>
+      <p class="sec-lede">
+        The engine (<code>book.c</code>, <code>book.h</code>) is pure C11 with no libc beyond
+        <code>mem*</code>, so the same file builds into the venue and into a freestanding
+        <code>wasm32</code> module. It&rsquo;s not a hosted service or a production exchange &mdash; no
+        accounts, custody, settlement, durability or authentication (<a href="#production">the honest
+        list is below</a>). Everything you see on this page is powered by that exact engine.
+      </p>
+      <pre class="code"><code> TCP order entry --&gt; session fiber --\                      +--&gt; exec reports -&gt; session mailbox
+ market data     --&gt; md fiber        +-- xtc_tnt_send_from --&gt; book Isolate (1 per symbol,
+ browser (SSE)   --&gt; web fiber       |   (per-shard ring)       single writer, book.c)
+ built-in flow   --&gt; flow fiber -----/                      +--&gt; L2 levels / trades -&gt; md subscribers</code></pre>
+    </section>
 
-// ---- LIVE: the venue's SSE stream ----------------------------------
-function startLive() {
-  stopAll(); S.bids.clear(); S.asks.clear(); S.tape = []; S.mids = []; S.imbs = [];
-  const es = S.es = new EventSource(`/md?sym=${S.sym}`);
-  es.onopen = () => $("status").textContent = `LIVE ${S.sym}: the venue's book`;
-  es.onerror = () => $("status").textContent = "LIVE: disconnected (retrying)";
-  es.addEventListener("level", e => { const m = JSON.parse(e.data); (m.s ? S.asks : S.bids).set(m.p, m.q); $("digest").textContent = "seq " + m.seq; });
-  es.addEventListener("trade", e => { const m = JSON.parse(e.data); trade(m.s, m.p, m.q); });
-  es.addEventListener("phase", e => log("phase " + JSON.parse(e.data).phase));
-  es.addEventListener("stats", e => {
-    const st = JSON.parse(e.data), me = st.symbols.find(x => x.sym === S.sym) || {};
-    $("stats").innerHTML = [["shards", st.shards], ["commands", me.commands], ["trades", me.trades], ["volume", me.volume],
-      ["rejects", me.rejects], ["ring drops", me.drops], ["match p50/p99 ns", `${me.match_ns.p50} / ${me.match_ns.p99}`],
-      ["hop p50/p99 ns", `${me.queue_ns.p50} / ${me.queue_ns.p99}`]].map(kv => `<span>${kv[0]}</span><span>${kv[1]}</span>`).join("");
-  });
-  S.timer = setInterval(render, 100);
-}
-async function liveOrder(o) {
-  const q = new URLSearchParams({ sym: S.sym, side: o.side ? "s" : "b", type: o.market ? "m" : "l", tif: o.ioc ? "i" : "g", price: o.price, qty: o.qty });
-  const r = await fetch("/order?" + q, { method: "POST" }); log("order " + (await r.text()).trim());
-}
+    <!-- BASICS -->
+    <section id="basics" class="sec">
+      <h2>First, what is an order book?</h2>
+      <p class="sec-lede">If you&rsquo;ve never seen one, here it is from the ground up.</p>
+      <div class="two-col">
+        <div>
+          <ol class="explain">
+            <li><b>People post offers.</b> A <span class="g">bid</span> is a buy order (&ldquo;I&rsquo;ll buy 5 at 100&rdquo;). An <span class="r">ask</span> is a sell order (&ldquo;I&rsquo;ll sell 3 at 101&rdquo;).</li>
+            <li><b>They&rsquo;re sorted by price.</b> Best <span class="g">bid</span> (highest a buyer will pay) and best <span class="r">ask</span> (lowest a seller will accept) sit in the middle. The gap between them is the <b>spread</b>.</li>
+            <li><b>Size at each price is depth.</b> Lots of size = a deep, liquid market that&rsquo;s hard to move. Little size = thin, and prices swing.</li>
+            <li><b>That whole ladder is the order book</b> &mdash; a live list of everyone&rsquo;s intentions, updating constantly. &rarr;</li>
+          </ol>
+          <p class="hint">The ladder on the right is a <strong>real</strong> book from this engine (<code>book_depth()</code>). Best bid/ask are highlighted; the spread is the gap in the middle.</p>
+        </div>
+        <div class="ob-panel">
+          <div class="ob-head"><span>PRICE</span><span>SIZE</span></div>
+          <div id="ladderAsks" class="ob-side"></div>
+          <div class="ob-mid"><span id="obSpread">spread &mdash;</span><span id="obMid">mid &mdash;</span></div>
+          <div id="ladderBids" class="ob-side"></div>
+        </div>
+      </div>
+    </section>
 
-// ---- LOCAL: book.wasm, the same engine, in the page -----------------
-let rng = 42n;
-function rnd() { rng ^= rng << 13n; rng &= 0xffffffffffffffffn; rng ^= rng >> 7n; rng ^= rng << 17n; rng &= 0xffffffffffffffffn; return Number(rng & 0xffffffn); }
-async function startLocal() {
-  stopAll(); S.bids.clear(); S.asks.clear(); S.tape = []; S.mids = []; S.imbs = []; rng = 42n;
-  if (!S.wasm) { const { instance } = await WebAssembly.instantiateStreaming(fetch("book.wasm")); S.wasm = instance.exports; }
-  const e = S.wasm; e.lob_init(10000n, 1 << 15);
-  let id = 1, mid = 10000, quotes = [];
-  $("status").textContent = "LOCAL: book.wasm in this page (seed 42)";
-  const read = () => {
-    const n = e.lob_ev_count(), sz = e.lob_ev_size(), base = e.lob_ev(), dv = new DataView(e.memory.buffer);
-    for (let i = 0; i < n; i++) {
-      const o = base + i * sz, k = dv.getUint8(o), side = dv.getUint8(o + 1), p = Number(dv.getBigInt64(o + 24, true)), q = Number(dv.getBigInt64(o + 32, true));
-      if (k === 9) (side ? S.asks : S.bids).set(p, q);       // BOOK_EV_LEVEL
-      else if (k === 2) trade(side, p, q);                  // BOOK_EV_TRADE
-    }
-  };
-  S.submit = (o) => { e.lob_submit(BigInt(id++), o.acct || 1, o.side, o.market ? 1 : 0, o.ioc ? 1 : 0, 0, BigInt(o.price || 0), 0n, BigInt(o.qty), 0n); read(); };
-  S.timer = setInterval(() => {
-    for (let step = 0; step < 20; step++) {
-      if (step === 0) {                       // the market maker re-quotes
-        quotes.forEach(q => { e.lob_cancel(BigInt(q), 2); read(); }); quotes = [];
-        mid += (rnd() % 5) - 2;
-        for (let l = 0; l < 5; l++) for (let s = 0; s < 2; s++) {
-          const qid = id; S.submit({ acct: 2, side: s, price: s ? mid + 2 + l : mid - 2 - l, qty: 100 * (l + 1) }); quotes.push(qid);
-        }
-      }
-      const s = rnd() & 1, ioc = rnd() % 4 === 0;        // noise flow
-      S.submit({ acct: 3, side: s, ioc: ioc, price: ioc ? (s ? mid - 10 : mid + 10) : (s ? mid + 1 + rnd() % 8 : mid - 1 - rnd() % 8), qty: 100 * (1 + rnd() % 3) });
-    }
-    $("digest").textContent = e.lob_digest().toString(16) + " @seq " + e.lob_seq() + (e.lob_check() ? " CHECK FAILED" : "");
-    $("stats").innerHTML = [["engine", "book.c -> wasm32"], ["trades", e.lob_trades()], ["seq", e.lob_seq()], ["book_check", e.lob_check() ? "FAIL" : "ok"]].map(kv => `<span>${kv[0]}</span><span>${kv[1]}</span>`).join("");
-    render();
-  }, 100);
-}
+    <!-- MATCHING -->
+    <section id="matching" class="sec">
+      <h2>How matching works</h2>
+      <p class="sec-lede">
+        When a new order can trade, the engine matches it by <b>price&ndash;time priority</b>:
+        best price first, and among equal prices, first-come-first-served. Walk through it &mdash;
+        each step runs on the real engine.
+      </p>
+      <div class="two-col">
+        <div class="ob-panel">
+          <div class="ob-head"><span>PRICE</span><span>SIZE</span></div>
+          <div id="mAsks" class="ob-side"></div>
+          <div class="ob-mid"><span id="mSpread">spread &mdash;</span><span id="mLast">last &mdash;</span></div>
+          <div id="mBids" class="ob-side"></div>
+          <div id="mTape" class="tape"></div>
+        </div>
+        <div>
+          <div class="steps">
+            <button id="stepBtn" class="btn primary">&#x25B6; Start</button>
+            <button id="stepReset" class="btn ghost">Reset</button>
+          </div>
+          <p id="stepText" class="step-text">Press <b>Start</b> to build a book, rest an order, and send a market order that matches.</p>
+          <ul class="mini">
+            <li><b>Maker</b> &mdash; a limit order that rests and provides liquidity.</li>
+            <li><b>Taker</b> &mdash; a market/crossing order that removes it, paying the spread.</li>
+            <li>Trades print at the <b>maker&rsquo;s</b> price. Big orders &ldquo;walk the book&rdquo; and pay more (slippage).</li>
+          </ul>
+        </div>
+      </div>
+    </section>
 
-function stopAll() { if (S.es) S.es.close(); S.es = null; if (S.timer) clearInterval(S.timer); S.timer = null; }
-function order(o) { return S.mode === "live" ? liveOrder(o) : S.submit(o); }
-function uiOrder() { return { side: $("side").value === "s" ? 1 : 0, market: $("type").value === "m", ioc: $("tif").value === "i", qty: +$("qty").value, price: Math.round(parseFloat($("px").value) * 100) }; }
-$("send").onclick = () => order(uiOrder());
-$("spoof").onclick = () => { const b = levels(S.bids, true)[0]; if (!b) return; for (let i = 0; i < 5; i++) order({ side: 0, qty: 5000, price: b[0] - 5 - i }); log("spoof: 25,000 shares layered 5-9 ticks under the bid"); };
-$("flood").onclick = () => { const a = levels(S.asks, false)[0]; if (!a) return; for (let i = 0; i < 30; i++) order({ side: 0, ioc: true, qty: 100, price: a[0] - 50 }); log("flood: 30 IOC orders that cannot fill"); };
-$("mode").onchange = () => { S.mode = $("mode").value; S.mode === "live" ? startLive() : startLocal(); };
-$("sym").onchange = () => { S.sym = $("sym").value; if (S.mode === "live") startLive(); };
-fetch("/symbols").then(r => r.json()).then(list => {
-  $("sym").innerHTML = list.map(s => `<option>${s}</option>`).join(""); S.sym = list[0]; startLive();
-}).catch(() => { $("mode").value = "local"; S.mode = "local"; $("sym").innerHTML = "<option>LOCAL</option>"; startLocal(); });
-</script>
+    <!-- FEATURES -->
+    <section id="features" class="sec">
+      <h2>Everything it does</h2>
+      <p class="sec-lede">The order surface of <a href="https://github.com/intrepidkarthi/orderbook">intrepidkarthi/orderbook</a>, in C &mdash; all in the engine (<a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/book.h">book.h</a>).</p>
+      <div class="feat-grid">
+        <div class="feat">
+          <h3>Order types</h3>
+          <ul>
+            <li>Market &amp; Limit</li>
+            <li>Stop &amp; Stop-limit</li>
+            <li>Trailing stop</li>
+            <li>Iceberg (the refill goes to the back of the queue)</li>
+            <li>Post-only (rejected if it would trade on entry)</li>
+            <li>Pegged (to bid / ask / mid + offset, priced at entry)</li>
+            <li>OCO (one-cancels-other)</li>
+          </ul>
+        </div>
+        <div class="feat">
+          <h3>Matching &amp; priority</h3>
+          <ul>
+            <li>Price&ndash;time priority (FIFO)</li>
+            <li>Pro-rata allocation at a level</li>
+            <li>Trades at the maker price</li>
+            <li>Self-trade prevention (5 modes)</li>
+            <li>Time-in-force: GTC &middot; IOC &middot; FOK &middot; DAY &middot; GTD</li>
+            <li>Uniform-price opening auction (max volume, min imbalance, nearest the reference)</li>
+          </ul>
+        </div>
+        <div class="feat">
+          <h3>Market integrity</h3>
+          <ul>
+            <li>Price-band circuit breaker (&plusmn; basis points of a reference)</li>
+            <li>Sessions: pre-open, continuous, halted, cancel-only, closed</li>
+            <li>Cancel, reduce keeping priority, replace losing it</li>
+            <li>Cancel-all for an account; cancel-on-disconnect</li>
+            <li>Ownership: a session never names another account&rsquo;s order</li>
+            <li>Console only: spoof and order-to-trade-ratio detectors (<code>signals.c</code>)</li>
+          </ul>
+        </div>
+        <div class="feat">
+          <h3>Market data</h3>
+          <ul>
+            <li>L2 level events (a price level&rsquo;s new total)</li>
+            <li>Snapshot + deltas, gap-free sequence numbers</li>
+            <li>Trade tape with the aggressor side</li>
+            <li>Binary TCP feed and SSE for browsers</li>
+            <li>A book digest that two equal books share</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- PRODUCTION -->
+    <section id="production" class="sec">
+      <h2>Built to venue standards &mdash; and honest about the rest</h2>
+      <div class="prod-grid">
+        <div class="prod">
+          <h3>Money is never a float</h3>
+          <p>Prices are <code>int64</code> ticks (cents) and quantities <code>int64</code> shares &mdash;
+          no floating point on the money path, no clock and no globals in the engine. The console&rsquo;s
+          signals are floats; the book they are computed from is not.</p>
+        </div>
+        <div class="prod">
+          <h3>Deterministic &amp; replayable</h3>
+          <p>Every call is a command whose effects come back as events in a caller&rsquo;s buffer. The same
+          command stream produces the same events and the same digest, byte for byte, on every platform
+          &mdash; the console&rsquo;s digest is the native build&rsquo;s, and its seed replays the market of
+          <a href="https://intrepidkarthi.github.io/orderbook/console.html">intrepidkarthi&rsquo;s console</a>
+          print for print.</p>
+        </div>
+        <div class="prod">
+          <h3>Fast, with real numbers</h3>
+          <p>On their cross-engine tape (50,000 commands) all five engines produce the same digest; median
+          replay: <b>l2book 2.76&nbsp;ms</b>, CppTrader 4.26, geseq 5.93, intrepidkarthi 9.60,
+          OrderBook-rs 54.9. On their latency scenarios, ported operation for operation, l2book&rsquo;s
+          medians are <b>1.9&ndash;4.4&times;</b> lower and its p99.99 stays below <b>0.75&nbsp;&micro;s</b>;
+          theirs reaches 28&ndash;114&nbsp;&micro;s wherever an operation allocates.
+          <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">COMPARISON.md</a></p>
+        </div>
+        <div class="prod">
+          <h3>End to end, over TCP</h3>
+          <p>One closed-loop client, loopback TCP, order + acknowledgement: l2book <b>p50 17.4&nbsp;&micro;s</b>,
+          55k round trips/s (a plain loopback echo costs about 13&nbsp;&micro;s of that). Their gateway as
+          shipped is 2.1&nbsp;ms, because it polls each session&rsquo;s outbound stream every 2&nbsp;ms; with that
+          poll set to 20&nbsp;&micro;s it is 74&nbsp;&micro;s. With sessions on an <code>xtc_exec</code>
+          (<code>--fiber-loops</code>), 8 shards and 16 clients: 1/2/4/8 loops give
+          <b>54k/149k/313k/383k</b> round trips/s on the 48-core development host.</p>
+        </div>
+        <div class="prod">
+          <h3>Tested hard</h3>
+          <p><code>test_book</code>: unit cases, a differential test of 200,000 random commands against a naive
+          reference matcher that shares no code, and a determinism check, clean under ASan and UBSan; planted
+          bugs (LIFO within a level, an iceberg refill keeping its place, stops on the wrong side) each fail it.
+          <code>test_signals</code> checks the console against intrepidkarthi&rsquo;s own test vectors and
+          their console&rsquo;s output. <code>l2book --self-test</code> drives every shard over TCP;
+          <code>smoke.sh</code> checks the compose box.</p>
+        </div>
+        <div class="prod">
+          <h3>How it handles things</h3>
+          <p>Each side is a dense array of 4,096 price levels under a two-level bitmap: best bid and ask, and the
+          next level, are a find-first-set each. Orders live in a fixed pool indexed by <code>uint32</code>,
+          FIFO per level; an open-addressed id map gives O(1) cancel. One writer per book, no locks: cross-core
+          traffic is one SPSC ring per (sender, shard), and a shard busy-polls (<code>--spin-us</code>) before
+          it parks.</p>
+        </div>
+        <div class="prod">
+          <h3>What it does not have</h3>
+          <p>No WAL and no durability: a restart loses every book. No authentication (a login names an
+          account), no resumable sessions, no rate limit, no pre-trade risk caps. The venue table compares two
+          programs that do different amounts of work; durability is not measured, and with a WAL that fsyncs
+          every command both venues would be bound by the disk.
+          <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md#what-the-numbers-do-not-say">What the numbers do not say</a></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- RUN -->
+    <section id="run" class="sec">
+      <h2>Run it</h2>
+      <div class="two-col start-col">
+        <div>
+          <p class="sec-lede">A running market in one command, from a libxtc checkout:</p>
+          <pre class="code"><code>docker compose -f examples/16_l2book/compose.yaml up --build
+open http://127.0.0.1:8080/</code></pre>
+          <p class="hint">The venue with its built-in market maker and noise flow, plus an outside flow client
+          trading through the real order-entry port. The console at <code>/console.html</code> attaches to the
+          live books (LIVE mode); <code>smoke.sh</code> checks the box end to end.</p>
+          <p class="sec-lede">Or build it:</p>
+          <pre class="code"><code>cd examples/16_l2book
+make XTC_BUILD=../../build_unix check   # engine + console tests, venue self-test
+make bench                              # the bare engine, one pinned core
+./l2book --flow                         # venue + flow; console on :8080
+./l2book --bench 20000                  # loopback round-trip latency
+make wasm WASM_CC=clang                 # web/book.wasm for the console</code></pre>
+        </div>
+        <div>
+          <p class="sec-lede">The engine on its own: rest a sell, cross it with a buy.</p>
+          <pre class="code"><code>book_config_t cfg = { .max_orders = 1u &lt;&lt; 16, .tick = 1,
+    .ref_price = 10000 };                 /* $100.00 in cents */
+void *mem = aligned_alloc(64, book_bytes(&amp;cfg));
+book_t *b;
+book_init(&amp;b, mem, book_bytes(&amp;cfg), &amp;cfg);
+
+book_event_t ev[64];
+book_out_t out = { ev, 64, 0, 0 };
+book_order_t ask = { .id = 1, .account = 1, .side = BOOK_SELL,
+    .type = BOOK_LIMIT, .price = 10100, .qty = 5 };
+book_submit(b, &amp;ask, 0, &amp;out);
+book_order_t bid = { .id = 2, .account = 2, .side = BOOK_BUY,
+    .type = BOOK_LIMIT, .tif = BOOK_IOC, .price = 10100, .qty = 3 };
+book_submit(b, &amp;bid, 0, &amp;out);   /* BOOK_EV_TRADE: 3 @ 101.00 */</code></pre>
+          <ul class="doclist">
+            <li><a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/README.md">README</a> &mdash; design, features, numbers, tests</li>
+            <li><a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">COMPARISON.md</a> &mdash; against intrepidkarthi/orderbook, on bare metal</li>
+            <li><a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/PROTOCOL.md">PROTOCOL.md</a> &mdash; order entry, market data and web endpoints</li>
+            <li><a href="https://codeberg.org/gregburd/libxtc">libxtc</a> &mdash; the runtime: fibers, Isolates, deterministic simulation</li>
+          </ul>
+          <a class="btn primary wide" href="https://github.com/gburd/libxtc-examples">&#x2B50; libxtc-examples on GitHub</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="loading" class="loading">loading the engine&hellip;</div>
+
+  <footer class="foot">
+    <span>Built in C on libxtc &middot; the engine on this page is the same <code>book.c</code> the venue runs &middot; page design and styles from <a href="https://github.com/intrepidkarthi/orderbook">intrepidkarthi/orderbook</a>, &copy; 2026 Karthikeyan NG, MIT License</span>
+    <a href="https://github.com/gburd/libxtc-examples/tree/main/16_l2book">github.com/gburd/libxtc-examples</a>
+  </footer>
+
+  <script src="app.js"></script>
 </body>
 </html>

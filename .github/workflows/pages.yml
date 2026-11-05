@@ -1,11 +1,13 @@
 name: Pages
 
-# Publishes 16_l2book's console, running its LOCAL mode (book.wasm: the
-# engine the venue runs, compiled to wasm32, matching an in-page flow) at
-#   https://gburd.github.io/libxtc-examples/l2book/
+# Publishes 16_l2book's pages at https://gburd.github.io/libxtc-examples/l2book/
+#   index.html    the landing page (what l2book is, its numbers, how to run it)
+#   console.html  the console: book.wasm (the engine the venue runs, compiled
+#                 to wasm32) matching a simulated market in the page
+#   style.css, app.js, console.js, book.wasm
 # No venue is behind a static page, so the console's /symbols probe fails and
-# it starts in LOCAL mode by itself.  The page is the example's own
-# web/index.html, unchanged.
+# it runs its simulated market (SIM) only.  The pages are the example's own
+# web/ files, unchanged.
 
 on:
   push:
@@ -14,6 +16,10 @@ on:
       - '16_l2book/book.c'
       - '16_l2book/book.h'
       - '16_l2book/wasm.c'
+      - '16_l2book/console.[ch]'
+      - '16_l2book/signals.[ch]'
+      - '16_l2book/gorand.[ch]'
+      - '16_l2book/check_wasm.mjs'
       - '16_l2book/web/**'
       - '16_l2book/Makefile'
       - '.github/workflows/pages.yml'
@@ -40,34 +46,27 @@ jobs:
           sudo apt-get install -y -q clang lld
           make wasm WASM_CC=clang
           ls -l web/book.wasm
-      - name: Check the engine in wasm against a known replay
+      - name: Check book.wasm against known answers
         working-directory: 16_l2book
         run: |
-          # The quickstart: a resting sell, a crossing buy, then a book
-          # with a bid and an ask.  Fails the deploy if book.wasm does not
-          # match what the native engine does.
-          cat > /tmp/check.mjs <<'EOF'
-          import { readFileSync } from 'node:fs';
-          const { instance } = await WebAssembly.instantiate(readFileSync('web/book.wasm'));
-          const w = instance.exports;
-          if (w.lob_init(10000n, 1 << 15) !== 0) throw new Error('lob_init');
-          w.lob_submit(1n, 1, 1, 0, 0, 0, 10100n, 0n, 6n, 0n);
-          w.lob_submit(2n, 2, 0, 0, 1, 0, 10100n, 0n, 5n, 0n);
-          w.lob_submit(3n, 3, 0, 0, 0, 0, 9900n, 0n, 10n, 0n);
-          if (w.lob_trades() !== 1n && w.lob_trades() !== 1) throw new Error('trades ' + w.lob_trades());
-          if (Number(w.lob_best(0)) !== 9900 || Number(w.lob_best(1)) !== 10100) throw new Error('bbo');
-          if (w.lob_check() !== 0) throw new Error('lob_check');
-          console.log('book.wasm: 1 trade, bid 9900 ask 10100, check 0');
-          EOF
-          node /tmp/check.mjs
+          # The engine's quickstart; the console market at seed 1, step 79,
+          # against the values intrepidkarthi/orderbook's console shows for
+          # the same seed (OFI, CVD, imbalance, Kyle's lambda, R^2, n);
+          # 20,000 steps with book_check clean and the digest replayed; the
+          # spoof and flood alerts; the LIVE signal path.  Fails the deploy
+          # if book.wasm does not do what the native engine does.
+          node check_wasm.mjs web/book.wasm
       - name: Assemble the site
         run: |
           mkdir -p _site/l2book
-          cp 16_l2book/web/index.html 16_l2book/web/book.wasm _site/l2book/
+          cp 16_l2book/web/index.html 16_l2book/web/console.html \
+             16_l2book/web/style.css 16_l2book/web/app.js \
+             16_l2book/web/console.js 16_l2book/web/book.wasm _site/l2book/
           cat > _site/index.html <<'EOF'
           <!doctype html><meta charset="utf-8"><title>libxtc examples</title>
-          <p><a href="l2book/">16_l2book</a>: a level-2 limit order book; the
-          console runs the engine in your browser (book.wasm).</p>
+          <p><a href="l2book/">16_l2book</a>: a level-2 limit order book and
+          matching venue on libxtc; <a href="l2book/console.html">its console</a>
+          runs the engine in your browser (book.wasm).</p>
           <p>Source: <a href="https://github.com/gburd/libxtc-examples">libxtc-examples</a>.</p>
           EOF
       - uses: actions/upload-pages-artifact@v3

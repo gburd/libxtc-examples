@@ -5,8 +5,9 @@
 #   2. the books are quoted (every symbol has a bid and an ask);
 #   3. the market trades (trades rise over 10 s), including the outside
 #      flow container's orders;
-#   4. the console serves its page and book.wasm, and its SSE stream
-#      carries level and trade events;
+#   4. the landing page, the console (console.html, console.js) and
+#      book.wasm are served, the venue answers the console's /symbols probe
+#      (LIVE mode), and its SSE stream carries level and trade events;
 #   5. the venue restarts and comes back ready and quoted.
 # Usage: smoke.sh [compose command]   (default: "docker compose";
 #        "podman compose" works too).  Run from the libxtc checkout root.
@@ -31,12 +32,16 @@ echo "  [l2book-box] every book quoted"
 t0=$(trades); sleep 10; t1=$(trades)
 [ "$t1" -gt "$t0" ] || fail "no trades in 10 s ($t0 -> $t1)"
 echo "  [l2book-box] trading: $t0 -> $t1 trades in 10 s"
-wget -qO- $URL/ | grep -q '<title>l2book' || fail "console page"
+wget -qO- $URL/ | grep -q '<title>l2book' || fail "landing page"
+wget -qO- $URL/console.html | grep -q '<title>l2book console' || fail "console page"
+wget -qO- $URL/console.js | grep -q 'con_reset' || fail "console.js"
+wget -qO /dev/null $URL/style.css || fail "style.css"
 wget -qO /dev/null $URL/book.wasm || fail "book.wasm"
+wget -qO- $URL/symbols | grep -q '"AAPL"' || fail "/symbols (the console's LIVE probe)"
 sse=$(timeout 3 wget -qO- "$URL/md?sym=AAPL" 2>/dev/null || true)
 echo "$sse" | grep -q '^event: level' || fail "SSE: no level events"
 echo "$sse" | grep -q '^event: trade' || fail "SSE: no trade events"
-echo "  [l2book-box] console, book.wasm and SSE market data served"
+echo "  [l2book-box] landing page, console, book.wasm, /symbols and SSE market data served"
 $DC -f $F restart venue
 i=0
 until wget -qO- $URL/readyz >/dev/null 2>&1; do

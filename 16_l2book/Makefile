@@ -7,6 +7,7 @@
 #                     the venue's self-test, and the --help lint
 #   make bench        the bare-engine benchmark (pinned to one core)
 #   make wasm         web/book.wasm (the engine for the browser console)
+#   make check-wasm   book.wasm against known answers (node)
 #   make clean
 #
 # XTC_BUILD / XTC_INC point at a libxtc build tree and its headers; the
@@ -38,7 +39,7 @@ WASM_FLAGS   = --target=wasm32 -nostdlib -ffreestanding -O3 -std=c11 \
 WASM_LDFLAGS = -Wl,--no-entry -Wl,--export-dynamic \
                -Wl,--initial-memory=67108864
 
-.PHONY: all check bench wasm clean
+.PHONY: all check check-wasm bench wasm clean
 
 VENUE_SRC = book.c venue.c fibers.c main.c
 # The console's market (book.wasm, and test_signals natively).
@@ -80,6 +81,11 @@ wasm: web/book.wasm
 
 web/book.wasm: book.c book.h wasm.c $(CONSOLE_SRC) $(CONSOLE_HDR)
 	$(WASM_CC) $(WASM_FLAGS) $(WASM_LDFLAGS) -o $@ book.c wasm.c $(CONSOLE_SRC)
+
+# The wasm build against known answers: the engine, the console market
+# (intrepidkarthi's console, seed 1), replay, the detectors, LIVE signals.
+check-wasm: web/book.wasm check_wasm.mjs
+	node check_wasm.mjs web/book.wasm
 
 check: test_book test_signals l2book l2book-flow
 	./test_book

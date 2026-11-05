@@ -1,0 +1,373 @@
+<!doctype html>
+<!--
+  16_l2book/web/console.html -- the l2book console: a live market running
+  this example's engine (book.c, compiled to book.wasm) in the browser.
+
+  Layout, panels, controls and styles are intrepidkarthi/orderbook's
+  web/console.html (3fffc25), reused under the MIT License:
+
+    Copyright (c) 2026 Karthikeyan NG
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  What changed: every panel is computed by this example's C (console.c,
+  signals.c, book.c) and its "call" link names that function; the
+  market runs in SIM mode (book.wasm, the default and the only mode on a
+  static page) or in LIVE mode (the venue's own book over SSE, when the
+  page is served by a running l2book); no framework, no external request.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>l2book console &mdash; a live market, running the real engine in your browser</title>
+  <meta name="description" content="A live limit-order-book console: l2book's C matching engine compiled to WebAssembly, noise-trader flow, order-flow signals (OFI, CVD, imbalance, Kyle's &lambda;) and market surveillance &mdash; every panel titled by the C function that produces it." />
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    /* Console-specific (theirs).  Palette note: bid green / ask red are the
+       site's domain tokens and are deutan-hostile as a pair, so color is
+       REINFORCEMENT only -- side is always also carried by position (asks
+       above / bids below, sign left/right of zero) and by text (section
+       labels, B/S glyphs). */
+    .console { max-width: 1280px; margin: 0 auto; padding: 18px 20px 40px; }
+    .mkt-bar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 14px 22px;
+      padding: 12px 16px; margin-bottom: 14px;
+      background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+    }
+    .mkt-bar .sym { font-weight: 700; letter-spacing: .06em; }
+    .mkt-bar .sim-label { color: var(--gold); font-size: 11px; letter-spacing: .08em; }
+    .mkt-bar .kv { color: var(--muted); }
+    .mkt-bar .kv b { color: var(--fg); font-weight: 600; margin-left: 6px; }
+    .mkt-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+    .mkt-controls .sep { width: 1px; height: 20px; background: var(--line); }
+    .cbtn {
+      font: inherit; color: var(--fg); background: var(--bg2);
+      border: 1px solid var(--line); border-radius: 7px; padding: 5px 12px; cursor: pointer;
+    }
+    .cbtn:hover { border-color: var(--muted); }
+    .cbtn:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+    .cbtn.warn { border-color: var(--gold); color: var(--gold); }
+    .cbtn:disabled { opacity: .45; cursor: default; }
+    .cinp { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; width: 74px; }
+    select.cinp { width: auto; }
+
+    .con-grid { display: grid; grid-template-columns: 250px minmax(360px, 1fr) 330px; gap: 14px; }
+    @media (max-width: 1020px) { .con-grid { grid-template-columns: 1fr; } }
+
+    .panel { background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+    .panel-head {
+      display: flex; align-items: baseline; gap: 10px; padding: 10px 14px 8px;
+      border-bottom: 1px solid var(--line); flex-wrap: nowrap; white-space: nowrap;
+    }
+    .panel-head .eyebrow { font-size: 11px; letter-spacing: .08em; margin: 0; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
+    .panel-head .call {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+      color: var(--muted); margin-left: auto; text-decoration: none; flex-shrink: 0;
+    }
+    .panel-head .call:hover { color: var(--link); }
+    .panel-cur { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: var(--fg); flex-shrink: 0; }
+    /* Signal tiles are narrow: the head wraps to two rows -- human label +
+       live value first, the producing call on its own line -- so neither
+       truncates. */
+    .tiles .panel-head { flex-wrap: wrap; }
+    .tiles .panel-head .eyebrow { flex: 1 1 auto; overflow: visible; }
+    .tiles .panel-head .panel-cur { order: 2; }
+    .tiles .panel-head .call { order: 3; flex-basis: 100%; margin-left: 0; margin-top: 2px; }
+
+    /* Ladder */
+    .ladder { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; padding: 8px 0; }
+    .lrow { position: relative; display: flex; justify-content: space-between; padding: 3px 14px; margin: 2px 0; }
+    .lrow .bar { position: absolute; inset: 0 0 0 auto; width: 0; border-radius: 4px 0 0 4px; }
+    .lrow.ask .bar { background: var(--askDim); }
+    .lrow.bid .bar { background: var(--bidDim); }
+    .lrow .p, .lrow .q { position: relative; }
+    .lrow.ask .p { color: var(--ask); }
+    .lrow.bid .p { color: var(--bid); }
+    .lrow .q { color: var(--fg); }
+    .lrow.flash { animation: tradeflash .5s ease-out; }
+    @keyframes tradeflash { from { background: color-mix(in srgb, var(--gold) 22%, transparent); } to { background: transparent; } }
+    @media (prefers-reduced-motion: reduce) { .lrow.flash { animation: none; } }
+    .lmid {
+      display: flex; justify-content: space-between; gap: 10px; padding: 7px 14px; margin: 4px 0;
+      border-top: 1px dashed var(--line); border-bottom: 1px dashed var(--line);
+      color: var(--muted); font-size: 12px;
+    }
+    .lmid b { color: var(--fg); font-weight: 600; }
+    .lsec { padding: 2px 14px; font-size: 10.5px; letter-spacing: .1em; color: var(--muted); }
+
+    /* Tape */
+    .tape { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; padding: 6px 0; max-height: 560px; overflow-y: auto; }
+    .trow { display: flex; gap: 10px; padding: 2.5px 14px; }
+    .trow .side { width: 3.2em; color: var(--muted); }
+    .trow.b .px { color: var(--bid); }
+    .trow.s .px { color: var(--ask); }
+    .trow .qy { margin-left: auto; color: var(--fg); }
+    .tape-empty { padding: 12px 14px; color: var(--muted); font-size: 12.5px; }
+
+    /* Signal tiles */
+    .tiles { display: flex; flex-direction: column; gap: 14px; }
+    .spark { display: block; width: 100%; height: 64px; }
+    .gauge-wrap { padding: 12px 14px 14px; }
+    .gauge { position: relative; height: 14px; background: var(--bg2); border-radius: 7px; overflow: hidden; }
+    .gauge .zero { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--muted); }
+    .gauge .fill { position: absolute; top: 2px; bottom: 2px; border-radius: 5px; }
+    .gauge .fill.pos { left: 50%; background: var(--bid); }
+    .gauge .fill.neg { right: 50%; background: var(--ask); }
+    .gauge-scale { display: flex; justify-content: space-between; color: var(--muted); font-size: 10.5px; margin-top: 4px; font-family: ui-monospace, Menlo, monospace; }
+    .lam { display: flex; align-items: baseline; gap: 14px; padding: 12px 14px 14px; font-family: ui-monospace, Menlo, monospace; }
+    .lam .v { font-size: 24px; font-weight: 650; }
+    .lam .u { color: var(--muted); font-size: 11.5px; }
+    .lam .r2 { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+    /* Surveillance */
+    .surv { margin-top: 14px; border-left: 3px solid var(--gold); }
+    .alist { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; max-height: 180px; overflow-y: auto; padding: 6px 0; }
+    .arow { display: flex; gap: 12px; padding: 4px 14px; align-items: baseline; }
+    .arow .chip { color: var(--gold); border: 1px solid color-mix(in srgb, var(--gold) 45%, transparent); border-radius: 5px; padding: 0 6px; font-size: 11px; }
+    .arow .who { color: var(--fg); font-weight: 600; }
+    .arow .det { color: var(--muted); }
+    .surv-empty { padding: 12px 14px; color: var(--muted); font-size: 13px; }
+
+    .guide {
+      margin-bottom: 14px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 10px;
+      background: var(--card); color: var(--muted); font-size: 13px; line-height: 1.55;
+    }
+    .guide summary { color: var(--fg); cursor: pointer; font-weight: 650; }
+    .guide ol { margin: 8px 0 0 20px; padding: 0; }
+    .guide code { font-size: .9em; }
+    .fineprint {
+      margin-top: 14px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px;
+      color: var(--muted); font-size: 13px; line-height: 1.55;
+    }
+    .fineprint code { font-size: .9em; }
+    .boot { padding: 60px 20px; text-align: center; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+    .note { padding: 0 14px 10px; color: var(--muted); font-size: 11px; }
+    .trade { padding: 10px 14px 6px; }
+    .trow2 { display: flex; gap: 8px; margin-bottom: 8px; }
+    .trow2 .cinp { flex: 1; min-width: 0; }
+    .trow2 .cbtn { flex: 1; padding: 5px 2px; font-size: 12px; white-space: nowrap; }
+    #t-err:empty { display: none; }
+    #t-err { color: var(--ask); }
+    .own { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; padding: 4px 0 8px; }
+    .orow { display: flex; gap: 8px; align-items: baseline; padding: 2.5px 14px; }
+    .orow .oside { width: 2.6em; color: var(--muted); }
+    .orow .oq { color: var(--muted); }
+    .orow .ox { margin-left: auto; background: none; border: none; color: var(--muted); cursor: pointer; font: inherit; padding: 0 4px; }
+    .orow .ox:hover { color: var(--ask); }
+    .orow .ox:focus-visible { outline: 2px solid var(--link); }
+    .lrow .own-dot { position: relative; color: var(--link); margin-right: 5px; font-size: 10px; }
+    .trow.big .px, .trow.big .qy { font-weight: 700; }
+    .mkt-bar #mv-digest { letter-spacing: 0; }
+    /* l2book: the LIVE / SIM switch, shown only when a venue answers. */
+    #c-mode[hidden], .live-only[hidden], .sim-only[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <nav class="nav">
+    <a class="brand" href="index.html">&#x1F4C8; l2book</a>
+    <div class="nav-links">
+      <a href="index.html#what">What is it</a>
+      <a href="index.html#run">Run it</a>
+      <a href="console.html"><b>Live console</b></a>
+      <a href="index.html#features">Features</a>
+      <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">Numbers</a>
+      <a class="nav-gh" href="https://github.com/gburd/libxtc-examples/tree/main/16_l2book">GitHub &#x2605;</a>
+    </div>
+  </nav>
+
+  <div class="console">
+    <div id="boot" class="boot">loading the engine (WebAssembly)&hellip;</div>
+
+    <div id="ui" hidden>
+      <details class="guide" open>
+        <summary>First run: make one trade, then trip a detector</summary>
+        <ol>
+          <li>Let the market run for a few seconds, then press <b>Pause</b>.</li>
+          <li>Place a limit order away from the touch. It will rest and appear with a <b>&#x25CF;</b>.</li>
+          <li>Send a market order, then read the print in the tape.</li>
+          <li>Press <b>Run a spoof</b>. <code>signals.c</code> raises the alert you see, not the page.</li>
+          <li>Change the seed and press <b>Copy link</b> to share the same starting market.</li>
+        </ol>
+      </details>
+      <div class="mkt-bar">
+        <span class="sym" id="mv-sym">DEMO</span>
+        <span class="sim-label" id="mv-label">SIMULATED FLOW &middot; REAL ENGINE</span>
+        <span class="kv">mid<b id="mv-mid">&mdash;</b></span>
+        <span class="kv">spread<b id="mv-spread">&mdash;</b></span>
+        <span class="kv">last<b id="mv-last">&mdash;</b></span>
+        <span class="kv">step<b id="mv-step">0</b></span>
+        <span class="kv" title="book_digest() -- same seed, same steps &rArr; same digest, on any machine">digest<b id="mv-digest">&mdash;</b></span>
+        <div class="mkt-controls">
+          <select id="c-mode" class="cinp" aria-label="Market" hidden>
+            <option value="sim">SIM (book.wasm)</option>
+          </select>
+          <button id="c-run" class="cbtn">Pause</button>
+          <select id="c-speed" class="cinp sim-only" aria-label="Simulation speed">
+            <option value="1">1&times;</option>
+            <option value="2">2&times;</option>
+            <option value="5">5&times;</option>
+          </select>
+          <label class="kv sim-only" for="c-seed">seed</label>
+          <input id="c-seed" class="cinp sim-only" type="number" value="1" />
+          <button id="c-reset" class="cbtn sim-only">Reset</button>
+          <button id="c-share" class="cbtn sim-only" title="Copy a link with this seed">Copy link</button>
+          <span class="sep"></span>
+          <button id="c-spoof" class="cbtn warn">Run a spoof</button>
+          <button id="c-flood" class="cbtn warn">Run a flood</button>
+        </div>
+      </div>
+
+      <div class="con-grid">
+        <div class="tiles">
+          <section class="panel">
+            <div class="panel-head">
+              <p class="eyebrow">Trade as &ldquo;you&rdquo;</p>
+              <a class="call" id="call-submit" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/book.c#L947">book_submit(b, o)</a>
+            </div>
+            <form id="trade-form" class="trade">
+              <div class="trow2">
+                <select id="t-side" class="cinp" aria-label="Side"><option value="BUY">Buy</option><option value="SELL">Sell</option></select>
+                <input id="t-price" class="cinp" inputmode="decimal" placeholder="price" aria-label="Limit price" />
+                <input id="t-qty" class="cinp" inputmode="decimal" value="1.0" aria-label="Quantity" />
+              </div>
+              <div class="trow2">
+                <button type="submit" class="cbtn">Place limit</button>
+                <button type="button" id="c-buy" class="cbtn">Buy mkt</button>
+                <button type="button" id="c-sell" class="cbtn">Sell mkt</button>
+              </div>
+              <div id="t-err" class="note" role="alert"></div>
+            </form>
+            <div class="panel-head">
+              <p class="eyebrow">Your resting orders</p>
+              <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/console.c#L419">con_open_orders(c, YOU)</a>
+            </div>
+            <div id="own" class="own"><div class="tape-empty">Nothing resting. A limit order away from the touch will sit in the book &mdash; marked &#x25CF; on the ladder.</div></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <p class="eyebrow">Tape</p>
+              <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/book.h#L122">BOOK_EV_TRADE</a>
+            </div>
+            <div id="tape" class="tape"><div class="tape-empty">No prints yet.</div></div>
+          </section>
+        </div>
+
+        <section class="panel">
+          <div class="panel-head">
+            <p class="eyebrow">Depth ladder</p>
+            <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/book.c#L1288">book_depth(b, side, 10)</a>
+          </div>
+          <div id="ladder" class="ladder"></div>
+        </section>
+
+        <div class="tiles">
+          <section class="panel">
+            <div class="panel-head">
+              <p class="eyebrow">Mid price</p>
+              <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/console.c#L374">con_signals(c).mid</a>
+              <span class="panel-cur" id="cur-mid">&mdash;</span>
+            </div>
+            <canvas id="sp-mid" class="spark" role="img" aria-label="Mid price history"></canvas>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <p class="eyebrow">Order-flow imbalance</p>
+              <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/signals.c#L60">sig_ofi_observe(o, snap)</a>
+              <span class="panel-cur" id="cur-ofi">&mdash;</span>
+            </div>
+            <canvas id="sp-ofi" class="spark" role="img" aria-label="Cumulative order-flow imbalance history"></canvas>
+            <div class="note">contemporaneous, not predictive &mdash; <a href="https://github.com/intrepidkarthi/orderbook/blob/main/docs/research/ofi.md">the study</a></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <p class="eyebrow">Volume delta (CVD)</p>
+              <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/console.c#L109">signed flow, summed</a>
+              <span class="panel-cur" id="cur-cvd">&mdash;</span>
+            </div>
+            <canvas id="sp-cvd" class="spark" role="img" aria-label="Cumulative volume delta history"></canvas>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <p class="eyebrow">Depth imbalance &middot; top 5</p>
+              <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/signals.c#L79">sig_depth_imbalance(snap, 5)</a>
+              <span class="panel-cur" id="cur-imb">&mdash;</span>
+            </div>
+            <div class="gauge-wrap">
+              <div class="gauge"><span class="zero"></span><span id="g-fill" class="fill pos" style="width:0"></span></div>
+              <div class="gauge-scale"><span>&minus;1 &middot; ask-heavy</span><span>0</span><span>bid-heavy &middot; +1</span></div>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <p class="eyebrow">Kyle's &lambda;</p>
+              <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/signals.c#L151">sig_lambda_fit(flow, &Delta;P)</a>
+            </div>
+            <div class="lam">
+              <span class="v" id="lam-v">&mdash;</span><span class="u">ticks / 1.0 qty</span>
+              <span class="r2" id="lam-r2">warming up</span>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <section class="panel surv">
+        <div class="panel-head">
+          <p class="eyebrow">Surveillance</p>
+          <a class="call" href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/signals.c#L337">sv_observe(m, event)</a>
+          <span class="panel-cur" id="cur-alerts">0 alerts</span>
+        </div>
+        <div id="alist" class="alist" aria-live="polite"><div class="surv-empty">Quiet &mdash; the detector is watching every event this page generates. Provoke it: <b>Run a spoof</b> places layered size and pulls it, and the spoof detector in <code>signals.c</code> names the account here.</div></div>
+      </section>
+
+      <div class="fineprint">
+        <b>What this is.</b> The real engine &mdash; <code>book.c</code>, the C file each of the venue's book
+        Isolates runs, compiled to a 41&nbsp;KB WebAssembly module with no imports &mdash; matching a market of
+        noise traders, with every panel computed by C (<code>console.c</code>, <code>signals.c</code>) and titled
+        by the function that produced it. The market, the signals and the detectors follow
+        <a href="https://intrepidkarthi.github.io/orderbook/console.html">intrepidkarthi/orderbook's console</a>
+        definition for definition, and the flow draws from a port of Go's <code>math/rand</code>, so a seed
+        here opens the market the same seed opens there: same orders, same prints, same signals.
+        Same seed, same market, every time: that is the engine's determinism, demonstrated rather than
+        claimed. Put a seed in the URL (<code>?seed=42</code>) and whoever you send it to opens the same market.
+        <span id="fp-live" hidden><b>LIVE.</b> Served by a running l2book, the switch above shows the venue's own
+        books: levels and prints over SSE (<code>/md</code>), your orders through <code>/order</code>, and the
+        same signal code run over what the venue publishes. Spoof and flood are SIM-only.</span>
+        <b>What it is not.</b> A trading signal. The noise market contains none by construction, and the
+        <a href="https://github.com/intrepidkarthi/orderbook/blob/main/docs/research/ofi.md">OFI study</a>
+        found a ~540&times; R&sup2; gap between contemporaneous and predictive even in richer flow. Latency
+        numbers are deliberately absent: browser-WASM timings would be noise presented as measurement &mdash;
+        the measured ones live in
+        <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">COMPARISON.md</a>.
+        <b>Adapt it:</b> <code>16_l2book/</code> in
+        <a href="https://github.com/gburd/libxtc-examples">libxtc-examples</a> &mdash; the console's whole
+        market is <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/console.c">console.c</a>
+        against <code>book.h</code>.
+        <br /><span style="font-size:12px">Page design, layout and styles from
+        <a href="https://github.com/intrepidkarthi/orderbook">intrepidkarthi/orderbook</a>,
+        &copy; 2026 Karthikeyan NG, MIT License; the engine and everything it computes, l2book (ISC).</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="console.js"></script>
+</body>
+</html>
