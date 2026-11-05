@@ -278,10 +278,28 @@ shaped the library:
   writers to that shard serialize).  A command takes only the shards of
   its keys, in ascending order (`db_lock`; DEL and EXISTS may name
   several); KEYS, FLUSHDB, expiry and the persistence replay take all
-  of them.  Measured, 32-vCPU x86-64 host, valkey-benchmark -c 200
-  --threads 8 -P 16, 32 B, 1M keys, median of 3: SET at `--loops=2`
-  1.14M/s and at `--loops=4` 1.60M/s, where one latch for the whole
-  keyspace gave 0.23M and 0.14M (one loop: 0.89M).  The shards are not
+  of them.  SET/s with valkey-benchmark -c 200 --threads 8 -P 16
+  -t set -d 32 -r 1000000, median of 3 interleaved runs [range]:
+
+  | `--loops` | 1 | 2 | 4 | 8 | 16 | 32 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | SET/s | 0.78M [0.78-0.79] | 1.14M [1.14-1.14] | 1.75M [1.70-1.78] | 2.53M [2.48-2.53] | 3.20M [3.06-3.25] | 3.50M [3.33-3.61] |
+  | server cores busy | 1.0 | 1.9 | 3.4 | 6.0 | 10.3 | 16.7 |
+
+  Measured on libxtc 2.1.1-37 (`a2134a08`, examples `7748ab9`) on a
+  two-socket 64-core x86-64 bare-metal host (Ice Lake, 128 threads),
+  Debian 13, the server on NUMA node 0 (its first N cores, then their
+  SMT siblings) and the client on node 1.  A client four times as wide
+  (--threads 32 -c 512) is no faster (2.40M at 8 loops, 2.93M at 16,
+  3.36M at 32), so the server, not the client, bounds it.  Every SET
+  write-latches its key's shard, and past 16 loops each extra loop adds
+  less than a tenth of a loop's worth: 16 more loops buy 9%.  The same
+  client against DragonFly (`--proactor_threads N`): 0.38M, 0.72M,
+  1.36M, 2.57M, 4.33M, 4.30M; against Valkey (`--io-threads N`) at most
+  0.87M (at 2).  rexis leads to 4, they are level at 8, and DragonFly
+  leads at 16 and 32.  On a 32-vCPU host, one latch
+  for the whole keyspace gave 0.23M at `--loops=2` and 0.14M at
+  `--loops=4` (one loop: 0.89M).  The shards are not
   a DragonFly design: any loop runs any command on any shard, so a hot
   key still serializes its writers and its cache lines move between
   cores -- see `docs/examples/rexis-vs-dragonfly.md`.
@@ -306,25 +324,38 @@ shaped the library:
 
 ## Comparison vs Valkey and DragonFly
 
-Measured 2026-10 on a 64-vCPU x86-64 host (32 cores x 2 SMT, one NUMA
-node), loopback, memtier_benchmark GET:SET 10:1, 32 B values, 1M keys
-prefilled, one server thread each, client on separate cores, medians
-of 3 runs (method and the open-loop tails in
+Measured 2026-11 on libxtc 2.1.1-37 (`a2134a08`, examples `7748ab9`), a
+two-socket 64-core x86-64 bare-metal host (Ice Lake, 128 threads),
+Debian 13, loopback, memtier_benchmark GET:SET 10:1, 32 B values, 1M
+keys prefilled, the server on NUMA node 0 and the client on node 1,
+medians of 3 interleaved runs (the method, every thread count, the
+open-loop tails and the persistence table are in
 `docs/examples/rexis-vs-dragonfly.md`):
 
-| | Valkey 9.0 | DragonFly (1 thread) | rexis-server-xtc |
+| | Valkey 9.0.6 | DragonFly | rexis-server-xtc |
 |---|---:|---:|---:|
-| ops/s, no pipelining | 219,000 | 195,000 | 153,000 |
-| ops/s, pipeline 16 | 1,262,000 | 707,000 | 1,130,000 |
-| open-loop p99 at 100k ops/s | 34 us | 34 us | 34 us |
-| load 5M keys (pipelined SET) | 6.0 s | 7.0 s | 5.0 s |
+| ops/s, 1 thread, no pipelining | 101,000 | 92,000 | 103,000 |
+| ops/s, 1 thread, pipeline 16 | 752,000 | 442,000 | 848,000 |
+| ops/s, 1 thread, client on the server's node | 169,000 | 147,000 | 174,000 |
+| ops/s, 32 threads (`--loops=32`), no pipelining | 645,000 | 2,305,000 | 2,387,000 |
+| ops/s, 32 threads, pipeline 16 | 1,064,000 | 9,093,000 | 11,274,000 |
+| open-loop p99 at 50k ops/s, 1 thread | 32 us | 32 us | 30 us |
+| load 5M keys (pipelined SET; memtier reports whole seconds) | 8 s | 11 s | 6 s |
 
-Without pipelining rexis pays for ~7 syscalls per request (a one-shot
-poll re-armed per park, and two `rt_sigprocmask` per fiber switch from
-glibc's `swapcontext`) against Valkey's 2.  DragonFly's strength is the
-other axis: it shards the keyspace over threads and scales to 2.7M
-ops/s (8.4M pipelined) at 32 threads, where Valkey peaks near 1.1M and
-rexis cannot use a second core.
+The old gap at one thread without pipelining is gone: rexis makes 2.1
+system calls per request (recvfrom + sendto, and one `io_uring_enter`
+per 8 requests; strace -c over 5 s at one thread), Valkey 2.0, DragonFly
+2.0, where 1.59 rexis made about 7.  fcontext is the default fiber
+switch on glibc x86-64 now, so a switch makes no `rt_sigprocmask` call,
+and the io_uring backend submits a park's poll in the same
+`io_uring_enter` that waits.  Polls are still one-shot: a
+socket whose poll fired is re-armed at its next park (DragonFly keeps one
+multishot poll per socket).
+With `--loops=N`, rexis scales on this read-heavy load as far as
+DragonFly does. That is a 64-shard latched keyspace, not DragonFly's
+shard per thread, so a hot key or a write-heavy load still serializes
+on a latch (the rexis-vs-dragonfly page shows where its tail rises
+first).
 
 We are NOT claiming faster than real Redis here; the value is in the
 **bounded behaviour under stress** (all 5 caps hold; real Redis lets you
