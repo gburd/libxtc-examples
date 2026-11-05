@@ -88,12 +88,17 @@ separate rule the venue turns on.
 
 ## Numbers (this host, measured; regenerate on yours)
 
+Measured on libxtc 2.1.1-37 (`a2134a08`), examples `7748ab9` plus the
+order-id map fix, on a two-socket 64-core x86-64 bare-metal host (Xeon
+Ice Lake, 128 threads), Debian 13, everything on NUMA node 0; medians of
+5 runs (`make bench`) and 3 runs (the rest).
+
 | what | how | result |
 |---|---|---|
-| bare engine | `make bench` (one pinned core, warm 20k-order book, -O3) | cancel-heavy 28.2 M ops/s, p50 49 ns, p99 204 ns, p999 480 ns; mixed 7.3 M ops/s, p50 124 ns |
-| book handler | `l2book --bench`, the Isolate's `book_*` call | p50 ~140 ns, p99 ~500 ns |
-| session -> book hop | ingress timestamp to handler start | p50 0.6 us (idle shard, spinning); 3-9 us parked |
-| round trip | 4 TCP clients, order + cancel, loopback | p50 45 us, p99 96 us; the kernel's own loopback TCP echo is p50 21 us |
+| bare engine | `make bench` (one pinned core, warm 20k-order book, -O3) | cancel-heavy 18.9 M ops/s, p50 59 ns, p99 160 ns, p999 288 ns; mixed 7.8 M ops/s, p50 116 ns; sweep 8.3 M ops/s, p50 108 ns |
+| book handler | `l2book --bench`, the Isolate's `book_*` call | p50 ~105 ns, p99 ~600 ns |
+| session -> book hop | ingress timestamp to handler start, `l2book --bench` | p50 0.66 us, p99 0.85 us (spinning shard); p50 4.2-4.4 us with `--spin-us 0` (parked shard) |
+| round trip | `l2book --bench`: 4 TCP clients, order + cancel, loopback | 174k round trips/s, p50 22 us, p99 27 us; a plain loopback TCP echo is p50 9.9 us on this socket |
 
 Per-operation figures include a ~18 ns `clock_gettime` pair; the median to
 tail shape is the signal.  None includes a log: there is no WAL here.
@@ -104,16 +109,18 @@ the engine this one takes its feature set from, on one bare-metal host
 
 - **Same tape, same checksum.** On their cross-engine tape (50,000
   commands) all five engines produce the same OBDG digest. Median replay
-  time: l2book 2.76 ms, CppTrader 4.26, geseq 5.93, theirs 9.60,
-  OrderBook-rs 54.9.
+  time: l2book 3.85 ms, CppTrader 5.75, geseq 8.33, theirs 13.67,
+  OrderBook-rs 68.0.
 - **Their latency scenarios, ported operation for operation.** l2book's
-  medians are 1.9x-4.4x lower. Its p99.99 stays below 0.75 us in every
-  scenario; theirs reaches 28-114 us wherever an operation allocates.
-- **End to end over loopback TCP, one closed-loop client.** l2book's p50
-  is 17.4 us (55k round trips/s). Their gateway as shipped is 2.1 ms (500
-  round trips/s), because it polls each session's outbound stream every
-  2 ms. With that poll set to 20 us it is 74 us. The two venues do not do
-  the same work per order; see COMPARISON.md.
+  medians are 2.1x-4.7x lower. Its p99.99 stays below 1.3 us in every
+  scenario; theirs reaches 23-183 us wherever an operation allocates.
+- **End to end over loopback TCP, one closed-loop client** (client on
+  the other socket). l2book's p50 is 26.6 us (36k round trips/s); with
+  8 shards, 8 fiber loops and 16 clients it carries 482k round trips/s
+  at a 31 us p50. Their gateway as shipped is 2.1 ms (500 round
+  trips/s), because it polls each session's outbound stream every 2 ms.
+  With that poll set to 20 us it is 94 us. The two venues do not do the
+  same work per order; see COMPARISON.md.
 
 ## Run it
 
@@ -186,8 +193,9 @@ in 2.2: a pid now names its loop by a process-wide id).  Until the fix
 the fibers ran on one standalone loop, which capped the venue near 140k
 round trips/s; they now run on an `xtc_exec` of their own
 (`--fiber-loops`, default 2), each connection pinned to one loop.  With
-8 fiber loops, 8 shards and 16 clients on a 48-core host: 383k round
-trips/s, p50 38 us.
+8 fiber loops, 8 shards and 16 clients on a two-socket 64-core host:
+482k round trips/s, p50 31 us (1, 2 and 4 loops: 86k, 169k, 324k; see
+`COMPARISON.md`).
 
 ## Files
 
