@@ -756,6 +756,75 @@ run_tape(uint64_t seed, uint64_t *ev_hash)
 	return book_digest(b);
 }
 
+/*
+ * A book that stays small but sees many orders over its life (every
+ * venue, and the browser console) must keep accepting them: the id map
+ * may not fill up with the ids of orders long gone.  64 slots give a
+ * 128-entry map with 8 orders live; before the fix (tombstones that
+ * never came back) the first order refused BOOK_R_FULL was number
+ * 11,142.  50,000 is 4.5x that.
+ */
+static void
+t_id_churn(void)
+{
+	book_t *b = mkbook(64, 0, 0);
+	book_order_t o;
+	uint64_t id;
+
+	for (id = 1; id <= 50000; id++) {
+		reset_out();
+		o = lim(id, (int)(id & 1), id & 1 ? 10010 : 9990, 10);
+		book_submit(b, &o, 0, &out);
+		if (count(BOOK_EV_REJECTED) != 0)
+			printf("  id_churn: order %" PRIu64 " refused\n", id);
+		CHECK(count(BOOK_EV_REJECTED) == 0);
+		if (id > 8) {
+			reset_out();
+			book_cancel(b, id - 8, 0, &out);
+			CHECK(count(BOOK_EV_CANCELED) == 1);
+		}
+	}
+	for (id = 49993; id <= 50000; id++)
+		CHECK(book_find(b, id) != NULL && book_find(b, id)->live == 1);
+	CHECK(book_find(b, 49992) == NULL);
+	CHECK(b->map_used == 8);
+	CHECK(book_check(b) == 0);
+}
+
+/* Random victims, up to 64 live (half the map): deletes land in the
+ * middle of probe runs, including runs that wrap the table. */
+static void
+t_id_churn_random(void)
+{
+	book_t *b = mkbook(64, 0, 0);
+	book_order_t o;
+	uint64_t live[64], r = 7, id;
+	int n = 0, i;
+
+	for (id = 1; id <= 200000; id++) {
+		r ^= r << 13;
+		r ^= r >> 7;
+		r ^= r << 17;
+		if (n == 64 || (n > 0 && (r & 3) == 0)) {
+			int k = (int)((r >> 8) % (uint64_t)n);
+			reset_out();
+			book_cancel(b, live[k], 0, &out);
+			CHECK(count(BOOK_EV_CANCELED) == 1);
+			CHECK(book_find(b, live[k]) == NULL);
+			live[k] = live[--n];
+		}
+		reset_out();
+		o = lim(id, (int)(r >> 20 & 1), r >> 20 & 1 ? 10010 : 9990, 10);
+		book_submit(b, &o, 0, &out);
+		CHECK(count(BOOK_EV_REJECTED) == 0);
+		live[n++] = id;
+	}
+	for (i = 0; i < n; i++)
+		CHECK(book_find(b, live[i]) != NULL);
+	CHECK(b->map_used == (uint32_t)n);
+	CHECK(book_check(b) == 0);
+}
+
 static void
 t_determinism(void)
 {
@@ -793,6 +862,8 @@ main(int argc, char **argv)
 		{ "circuit_breaker", t_circuit_breaker },
 		{ "pro_rata", t_pro_rata },
 		{ "rejects", t_rejects },
+		{ "id_churn", t_id_churn },
+		{ "id_churn_random", t_id_churn_random },
 		{ "differential", t_differential },
 		{ "determinism", t_determinism },
 	};

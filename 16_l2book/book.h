@@ -218,7 +218,7 @@ typedef struct {
 	uint64_t	*map_id;
 	uint32_t	*map_ix;
 	uint32_t	map_mask;
-	uint32_t	map_used;	/* live + tombstones */
+	uint32_t	map_used;	/* live ids */
 	/* stops, sorted by trigger: buys ascending, sells descending */
 	uint32_t	*stops[2];
 	uint32_t	n_stops[2];

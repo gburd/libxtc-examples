@@ -219,7 +219,6 @@ emit_reject(book_t *b, book_out_t *out, const book_order_t *o, uint8_t reason)
 /* ---- id map -------------------------------------------------------- */
 
 #define MAP_EMPTY	0ull
-#define MAP_TOMB	~0ull
 
 static inline uint32_t
 map_hash(uint64_t id)
@@ -247,7 +246,7 @@ map_get(const book_t *b, uint64_t id)
 static int
 map_put(book_t *b, uint64_t id, uint32_t ix)
 {
-	uint32_t h, tomb = BOOK_NONE;
+	uint32_t h;
 	if (b->map_used + 1 > (b->map_mask + 1) / 4 * 3)
 		return -1;
 	h = map_hash(id) & b->map_mask;
@@ -255,40 +254,45 @@ map_put(book_t *b, uint64_t id, uint32_t ix)
 		uint64_t k = b->map_id[h];
 		if (k == id)
 			return -1;
-		if (k == MAP_TOMB && tomb == BOOK_NONE)
-			tomb = h;
 		if (k == MAP_EMPTY)
 			break;
 		h = (h + 1) & b->map_mask;
 	}
-	if (tomb != BOOK_NONE)
-		h = tomb;
-	else
-		b->map_used++;
+	b->map_used++;
 	b->map_id[h] = id;
 	b->map_ix[h] = ix;
 	return 0;
 }
 
+/*
+ * Backward-shift deletion (Knuth, TAOCP vol. 3, 6.4 Algorithm R): no
+ * tombstones, so map_used counts live ids only and a long-lived book
+ * never fills its map with the ids of orders long gone.  Each later
+ * entry of the run moves into the hole if the hole lies on its probe
+ * path (between its home slot and where it sits).
+ */
 static void
 map_del(book_t *b, uint64_t id)
 {
-	uint32_t h = map_hash(id) & b->map_mask;
+	uint32_t m = b->map_mask, h = map_hash(id) & m, j;
 	for (;;) {
 		uint64_t k = b->map_id[h];
-		if (k == id) {
-			/* An empty successor lets this slot be empty too. */
-			if (b->map_id[(h + 1) & b->map_mask] == MAP_EMPTY) {
-				b->map_id[h] = MAP_EMPTY;
-				b->map_used--;
-			} else
-				b->map_id[h] = MAP_TOMB;
-			return;
-		}
+		if (k == id)
+			break;
 		if (k == MAP_EMPTY)
 			return;
-		h = (h + 1) & b->map_mask;
+		h = (h + 1) & m;
 	}
+	for (j = (h + 1) & m; b->map_id[j] != MAP_EMPTY; j = (j + 1) & m) {
+		uint32_t home = map_hash(b->map_id[j]) & m;
+		if (((j - home) & m) >= ((j - h) & m)) {
+			b->map_id[h] = b->map_id[j];
+			b->map_ix[h] = b->map_ix[j];
+			h = j;
+		}
+	}
+	b->map_id[h] = MAP_EMPTY;
+	b->map_used--;
 }
 
 /* ---- pool ---------------------------------------------------------- */
@@ -948,7 +952,7 @@ book_submit(book_t *b, const book_order_t *o, int64_t now_ns, book_out_t *out)
 		emit_reject(b, out, o, BOOK_R_BAD_QTY);
 		return;
 	}
-	if (o->id == 0 || o->id == MAP_TOMB || map_get(b, o->id) != BOOK_NONE) {
+	if (o->id == 0 || map_get(b, o->id) != BOOK_NONE) {
 		emit_reject(b, out, o, BOOK_R_DUPLICATE_ID);
 		return;
 	}
@@ -1401,6 +1405,9 @@ book_check(const book_t *b)
 	}
 	if (live != b->n_live)
 		return 7;
+	/* Every live order has one id-map entry and nothing else does. */
+	if (b->map_used != b->n_live)
+		return 9;
 	/* Uncrossed in continuous trading. */
 	if (b->phase == BOOK_CONTINUOUS) {
 		int64_t bid = book_best(b, BOOK_BUY), ask = book_best(b, BOOK_SELL);
