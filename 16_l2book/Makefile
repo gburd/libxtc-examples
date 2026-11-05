@@ -3,6 +3,7 @@
 # Targets:
 #   make              the engine tests, the engine benchmark and the venue
 #   make check        run test_book (unit + differential + determinism),
+#                     test_signals (the console's market and signals),
 #                     the venue's self-test, and the --help lint
 #   make bench        the bare-engine benchmark (pinned to one core)
 #   make wasm         web/book.wasm (the engine for the browser console)
@@ -35,14 +36,17 @@ WASM_CC     ?= clang
 WASM_FLAGS   = --target=wasm32 -nostdlib -ffreestanding -O3 -std=c11 \
                -mbulk-memory -Wall -Wextra -I.
 WASM_LDFLAGS = -Wl,--no-entry -Wl,--export-dynamic \
-               -Wl,--initial-memory=33554432
+               -Wl,--initial-memory=67108864
 
 .PHONY: all check bench wasm clean
 
 VENUE_SRC = book.c venue.c fibers.c main.c
+# The console's market (book.wasm, and test_signals natively).
+CONSOLE_SRC = console.c signals.c gorand.c
+CONSOLE_HDR = console.h signals.h gorand.h
 VENUE_HDR = book.h venue.h hist.h
 
-all: test_book bench_book bench_scenarios l2book l2book-flow l2book-xeng
+all: test_book test_signals bench_book bench_scenarios l2book l2book-flow l2book-xeng
 
 # intrepidkarthi/orderbook's per-op latency scenarios, ported (COMPARISON.md).
 bench_scenarios: bench_scenarios.c book.c book.h
@@ -62,6 +66,11 @@ l2book: $(VENUE_SRC) $(VENUE_HDR) $(XTC_BUILD)/libxtc.a
 test_book: book.c book.h refbook.h test_book.c
 	$(CC) $(CFLAGS) -o $@ book.c test_book.c
 
+# The console's market, signals and surveillance (what book.wasm runs in
+# the page), against known answers from intrepidkarthi/orderbook.
+test_signals: test_signals.c book.c book.h $(CONSOLE_SRC) $(CONSOLE_HDR)
+	$(CC) $(CFLAGS) -o $@ test_signals.c book.c $(CONSOLE_SRC) -lm
+
 bench_book: book.c book.h hist.h bench_book.c
 	$(CC) $(CFLAGS) -o $@ book.c bench_book.c
 
@@ -69,11 +78,12 @@ bench_book: book.c book.h hist.h bench_book.c
 # be a clang with the wasm32 target and wasm-ld on PATH.
 wasm: web/book.wasm
 
-web/book.wasm: book.c book.h wasm.c
-	$(WASM_CC) $(WASM_FLAGS) $(WASM_LDFLAGS) -o $@ book.c wasm.c
+web/book.wasm: book.c book.h wasm.c $(CONSOLE_SRC) $(CONSOLE_HDR)
+	$(WASM_CC) $(WASM_FLAGS) $(WASM_LDFLAGS) -o $@ book.c wasm.c $(CONSOLE_SRC)
 
-check: test_book l2book l2book-flow
+check: test_book test_signals l2book l2book-flow
 	./test_book
+	./test_signals
 	./l2book --self-test
 	./l2book --self-test --shards 4
 	./l2book --help >/dev/null
@@ -83,4 +93,4 @@ bench: bench_book
 	taskset -c 2 ./bench_book 2>/dev/null || ./bench_book
 
 clean:
-	rm -f test_book bench_book bench_scenarios l2book l2book-flow l2book-xeng
+	rm -f test_book test_signals bench_book bench_scenarios l2book l2book-flow l2book-xeng
