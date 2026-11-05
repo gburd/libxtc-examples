@@ -1,5 +1,11 @@
 # 16_l2book -- a level-2 limit order book on libxtc
 
+**[Live console](https://gburd.github.io/libxtc-examples/l2book/)**: this
+example's engine, compiled to a 23 KB WebAssembly module, running a market
+in your browser (LOCAL mode: a market maker and noise flow against the
+same `book.c` the venue's Isolates run).  `docker compose up` gives the
+LIVE mode, the console attached to a running venue (below).
+
 A US-equities limit order book and matching venue that uses libxtc's two
 concurrency models together, each where it fits:
 
