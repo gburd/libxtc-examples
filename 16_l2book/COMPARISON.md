@@ -85,7 +85,7 @@ operation, median over the rounds.
 | CancelOnly (201k book) | 160 | 81 | 1578 | 145 | 1819 | 181 | 28803 | 224 |
 | AggressiveWalk (5-lot sweeps) | 857 | 196 | 2920 | 431 | 3422 | 585 | 9874 | 742 |
 | Mixed 70/20/10 | 241 | 61 | 1809 | 130 | 3001 | 166 | 35553 | 209 |
-| ThinBook (10-level walks) | 224 | 67 | 1724 | 114 | 4810 | 155 | 113762 | 334 |
+| ThinBook (see note) | 224 | to re-measure | 1724 | to re-measure | 4810 | to re-measure | 113762 | to re-measure |
 | STP Allow | 183 | 72 | 1530 | 92 | 1582 | 118 | 2663 | 229 |
 | STP CancelNewest | 115 | 62 | 151 | 102 | 1444 | 143 | 1518 | 251 |
 | STP CancelOldest | 231 | 90 | 1538 | 112 | 1607 | 123 | 3117 | 212 |
@@ -99,10 +99,23 @@ operation, median over the rounds.
   Mixed, ThinBook and AggressiveWalk). l2book allocates nothing after
   `book_init`, and its p99.99 stays below 0.75 us in every scenario.
 - **ThinBook:** its 5,000 one-lot levels span more than l2book's
-  4,096-tick ladder, so l2book refuses the top 904 levels at preload.
-  `bench_scenarios` prints that count rather than hiding it. A US-equity
-  book does not span $50 at a penny tick, and the ladder re-centres when
-  the touch moves.
+  4,096-tick price window. When this table was measured the window did
+  not move, so l2book refused the top 904 levels at preload and held a
+  smaller book than the Go engine; its figures in this row are struck
+  until they are measured again. l2book now accepts every level: the
+  904 above the window wait in its overflow store, and `bench_scenarios`
+  prints 0 refused.
+- **What ThinBook times:** the scenario's taker is a good-till-cancelled
+  buy of 10 limited at 3020, the same in their test and in this port.
+  The first two take the asks at 3000-3020; every later one finds
+  nothing at or below 3020 and rests as a bid. So 199,997 of the
+  200,000 timed operations rest an order behind a growing queue at one
+  price; they do not walk 10 levels. Both engines run the same
+  operations, so the row is still like for like. For a real 10-level
+  walk across all 5,000 levels, with the taker priced above the book,
+  l2book on the 48-core development host takes about 450 ns at the
+  median. The window then moves once every 400 walks or so, and that
+  walk takes about 11 us (worst seen: 29 us).
 
 ## 3. The venue, over TCP
 

@@ -2,7 +2,7 @@
 
 **[Live console](https://gburd.github.io/libxtc-examples/l2book/console.html)**
 ([landing page](https://gburd.github.io/libxtc-examples/l2book/)): this
-example's engine, compiled to a 41 KB WebAssembly module, running a market
+example's engine, compiled to a 50 KB WebAssembly module, running a market
 in your browser.  The console is a reproduction of
 [intrepidkarthi/orderbook's console](https://intrepidkarthi.github.io/orderbook/console.html)
 on this engine, with the same panels, the same noise-trader market and
@@ -34,7 +34,7 @@ concurrency models together, each where it fits:
 ```
 
 The engine (`book.c`) is pure C11 with no libc beyond `mem*`, so the same
-file compiles to a freestanding `wasm32` module (41 KB with the console's
+file compiles to a freestanding `wasm32` module (50 KB with the console's
 market, signals and detectors, no imports): the browser console runs the
 engine the venue runs.
 
@@ -53,13 +53,31 @@ price-band circuit breaker; L2 level events, trades, and a book digest
 that two equal books share.
 
 Prices are int64 ticks (cents) and quantities int64 shares: no floating
-point on the money path, no allocation after the book is created.
+point on the money path, no allocation after the book is created.  Any
+positive whole number of ticks is a valid price; the price band is a
+separate rule the venue turns on.
 
 ## Why it is fast
 
-- **Price ladder, not a tree.**  Each side is a dense array of 4096 levels
-  (+-$20 around the touch at a penny tick) under a two-level bitmap: best
-  bid and ask, and the next level, are a find-first-set each.
+- **Price ladder, not a tree.**  Each side is a dense window of 4096
+  levels (+-$20 at a penny tick) under a two-level bitmap: best bid and
+  ask, and the next level, are a find-first-set each.
+- **The window follows the book.**  A price outside the window is not
+  refused.  Its level goes into a small overflow store: per side, an
+  array of levels sorted by price.  The best-price search and a sweep
+  fall through to it only when the window runs out on that side.  At the
+  end of each command the window moves if it has to (a re-base): onto
+  the whole book when every level fits in 4096 ticks, and otherwise onto
+  the touch, leaving the far levels in the overflow.  A re-base copies
+  the occupied levels and shifts the 64 bitmap words; orders hold prices,
+  not ladder indices, so no order is touched, and L2 events carry
+  prices, so nothing outside the engine can see it.  A US-equity book
+  near its touch never leaves the window; there the overflow costs a few
+  well-predicted tests per command (about 30 instructions on
+  `bench_book`'s flows, +5.7%, with no wall-time difference this host
+  could resolve).  A re-base over a 5,000-level book takes about 11 us.
+  The overflow is sized at `book_init` from `max_orders` (every level
+  holds at least one order), so it never allocates: 40 bytes per order.
 - **Pointer-free pool.**  Orders live in a fixed pool indexed by `uint32`,
   linked FIFO per level; an open-addressed id map gives O(1) cancel.
 - **One writer per book, no locks.**  Cross-core traffic is one SPSC ring
@@ -131,11 +149,20 @@ order ids, and the web port has no open-orders endpoint.
 
 ## Tests
 
-- `test_book`: 19 unit cases, a differential test of 200,000 random
-  commands against `refbook.h` (a naive reference matcher sharing no code),
-  and a determinism check.  Clean under ASan and UBSan.  Three planted bugs
-  (LIFO within a level, an iceberg refill keeping its place, stops on the
-  wrong side) each fail it.
+- `test_book`: 24 unit cases, two differential tests of 200,000 random
+  commands each against `refbook.h` (a naive reference matcher sharing no
+  code, with no price window), and a determinism check.  The first
+  differential keeps prices within +-20 ticks; the second spreads them
+  over +-20,000 ticks, ten windows wide, so the window moves 32,889 times
+  and the overflow holds up to 26 levels, and neither may change a fill.  The unit cases include prices
+  far outside the first window, a 20,000-tick trend up and back,
+  intrepidkarthi's ThinBook (5,000 one-lot levels), the opening auction
+  over a book wider than the window, and two books with different
+  re-base histories that must emit the same events and digests.  Clean
+  under ASan and UBSan.  Planted bugs each fail it: LIFO within a level,
+  an iceberg refill keeping its place, stops on the wrong side, and
+  `-DPLANT_REBASE_NOBITMAP` (a re-base that does not shift one bitmap
+  word).
 - `test_signals`: the console's market, signals and detectors against
   known answers: intrepidkarthi's own signal and surveillance test vectors,
   Go's `math/rand` golden values, their console's output for seed 1 (79

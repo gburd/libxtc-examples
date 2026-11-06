@@ -14,7 +14,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>l2book &mdash; a level-2 limit order book &amp; matching venue on libxtc</title>
-  <meta name="description" content="A US-equities limit order book and matching venue in C on libxtc: one Isolate per book, fibers for every session. Integer-exact, deterministic, no allocation after init, the order surface of intrepidkarthi/orderbook, and the same engine runs in your browser as a 41 KB WebAssembly module." />
+  <meta name="description" content="A US-equities limit order book and matching venue in C on libxtc: one Isolate per book, fibers for every session. Integer-exact, deterministic, no allocation after init, the order surface of intrepidkarthi/orderbook, and the same engine runs in your browser as a 50 KB WebAssembly module." />
   <link rel="stylesheet" href="style.css" />
   <!-- l2book: wide code blocks scroll inside their column, not the page. -->
   <style>.two-col > div { min-width: 0; }</style>
@@ -243,17 +243,19 @@
         </div>
         <div class="prod">
           <h3>Tested hard</h3>
-          <p><code>test_book</code>: unit cases, a differential test of 200,000 random commands against a naive
-          reference matcher that shares no code, and a determinism check, clean under ASan and UBSan; planted
-          bugs (LIFO within a level, an iceberg refill keeping its place, stops on the wrong side) each fail it.
+          <p><code>test_book</code>: unit cases, two differential tests of 200,000 random commands against a naive
+          reference matcher that shares no code (one near the touch, one over &plusmn;20,000 ticks), and a
+          determinism check, clean under ASan and UBSan; planted bugs (LIFO within a level, an iceberg refill
+          keeping its place, stops on the wrong side, a re-base that skips a bitmap word) each fail it.
           <code>test_signals</code> checks the console against intrepidkarthi&rsquo;s own test vectors and
           their console&rsquo;s output. <code>l2book --self-test</code> drives every shard over TCP;
           <code>smoke.sh</code> checks the compose box.</p>
         </div>
         <div class="prod">
           <h3>How it handles things</h3>
-          <p>Each side is a dense array of 4,096 price levels under a two-level bitmap: best bid and ask, and the
-          next level, are a find-first-set each. Orders live in a fixed pool indexed by <code>uint32</code>,
+          <p>Each side is a dense window of 4,096 price levels under a two-level bitmap: best bid and ask, and the
+          next level, are a find-first-set each. The window follows the book (a re-base), and levels outside it
+          wait in a sorted overflow store, so any positive price rests. Orders live in a fixed pool indexed by <code>uint32</code>,
           FIFO per level; an open-addressed id map gives O(1) cancel. One writer per book, no locks: cross-core
           traffic is one SPSC ring per (sender, shard), and a shard busy-polls (<code>--spin-us</code>) before
           it parks.</p>

@@ -13,10 +13,9 @@
  *	accounts mirror theirs ("mm", "tk", "self"); STP is the engine's
  *	default for theirs (Config{}: ALLOW) except STPSweep, which runs all
  *	five modes as they do.  Each scenario's book is centred on its price
- *	range; every range fits this engine's 4096-tick ladder except
- *	ThinBook's 5000 levels, whose top 904 are refused (BOOK_R_BAD_PRICE;
- *	a US-equity book never spans $50 at a penny tick) -- the "refused"
- *	column counts every refusal, so nothing hides in it.
+ *	range.  Every range fits this engine's 4096-tick window except
+ *	ThinBook's 5000 levels, whose top 904 rest in the overflow store.
+ *	The "refused" column counts every refusal, so nothing hides in it.
  *
  *	usage: bench_scenarios [N]   (default 200000, their -benchtime=200000x)
  */
@@ -59,8 +58,8 @@ count_refused(void)
 			g_refused++;
 }
 
-/* ref = the centre of the scenario's price range: the 4096-tick ladder
- * spans ref +- 2048, and every scenario's prices fit inside it. */
+/* ref = the centre of the scenario's price range: the 4096-tick window
+ * starts on ref +- 2048. */
 static book_t *
 mkbook(uint32_t max_orders, int64_t ref, void **mem)
 {
@@ -275,7 +274,9 @@ main(int argc, char **argv)
 	free(mem);
 
 	/* ThinBook: 5000 levels of one lot at 3000..4999; a 10-lot buy at
-	 * 3020 walks ~10; refill 4000 untimed below 200 resting. */
+	 * 3020 ("walks ~10"); refill 4000 untimed below 200 resting.  As
+	 * in theirs, the buy is GTC, so from the third on each one finds
+	 * nothing <= 3020 and rests: the timed op is a resting insert. */
 	b = mkbook((uint32_t)(5000 + N * 2 + 16), 3000 + BOOK_LADDER / 2, &mem);
 	for (i = 0; i < 5000; i++)
 		submit(b, MM, BOOK_SELL, 3000 + i, 1, BOOK_STP_ALLOW);
