@@ -49,7 +49,7 @@ con_book_bytes(void)
 }
 
 /* reset / newConsole: their engine has no price band, so neither does
- * this one; the ladder still spans +-2048 ticks of the touch. */
+ * this one: any positive price rests. */
 int
 con_init(con_t *c, void *mem, size_t len, int64_t seed)
 {

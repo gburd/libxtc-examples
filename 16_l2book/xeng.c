@@ -238,8 +238,6 @@ main(int argc, char **argv)
 			if (cmds[i].price > g_hi)
 				g_hi = cmds[i].price;
 		}
-	if (g_hi - g_lo >= BOOK_LADDER / 2)
-		die("tape's price range is wider than this adapter's ladder");
 	/* A command trades at most once per resting order, and every order
 	 * rests at most once: trades < commands. */
 	trade_cap = ncmd + 1;

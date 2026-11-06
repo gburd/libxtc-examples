@@ -4,17 +4,21 @@
  *
  * 16_l2book/book.c -- the matching engine.  See book.h for the shape.
  *
- *	Price-time priority.  A price is an index into a dense ladder of
- *	BOOK_LADDER levels starting at b->base.  Each side keeps a bitmap of
- *	non-empty levels under a one-word summary, so "best bid" is the
- *	highest set bit and "best ask" the lowest, two find-first-set
- *	instructions, and walking the book is a scan of set bits.
+ *	Price-time priority.  A price inside the window is an index into a
+ *	dense ladder of BOOK_LADDER levels starting at b->base.  Each side
+ *	keeps a bitmap of the window's non-empty levels under a one-word
+ *	summary, so "best bid" is the highest set bit and "best ask" the
+ *	lowest, two find-first-set instructions, and walking the book is a
+ *	scan of set bits.
  *
- *	A price outside the band is rejected with BOOK_R_BAD_PRICE unless
- *	the band can re-centre on it (only when the book is empty on the
- *	far side of the move).  For US equities a 4096-cent band around the
- *	touch is +-$20 on a penny tick, wider than any LULD limit band, so
- *	re-centring is an edge case, not the hot path.
+ *	Any valid price rests.  A level outside the window lives in its
+ *	side's overflow list (sorted by price); the walks fall through to it
+ *	when the window runs out.  At the end of every command settle()
+ *	moves the window: onto the whole book when it fits, else onto the
+ *	touch.  For US equities a 4096-cent window is +-$20 on a penny tick,
+ *	wider than any LULD band, so the overflow and re-bases are the edge
+ *	case, not the hot path: with the overflow empty, each best-price
+ *	lookup, level step and level lookup costs one predicted branch.
  */
 #include "book.h"
 
@@ -51,24 +55,72 @@ hi_bit(uint64_t x)	/* index of the highest set bit; x != 0 */
 
 /* ---- ladder -------------------------------------------------------- */
 
+/*
+ * A level handle names a level of one side: h < BOOK_LADDER is window
+ * index h, the price base + h * tick; h >= BOOK_LADDER is overflow slot
+ * h - BOOK_LADDER, whose price is stored in it.  Handles are valid
+ * within one command: the window moves only in settle(), after the
+ * command's last walk.  A freed overflow slot keeps its price, and the
+ * walks navigate by price, so a handle to a level that emptied under a
+ * walk (an OCO partner cancelled ahead of it) still finds the next one.
+ */
+#define XH(x) ((uint32_t)(x) + BOOK_LADDER)
+#define IN_WIN(h) __builtin_expect((h) < BOOK_LADDER, 1)
+
+static inline int64_t
+win_top(const book_t *b) /* first price above the window */
+{
+	return b->base + (int64_t)BOOK_LADDER * b->cfg.tick;
+}
+
+/* One compare: prices and the base are positive and below
+ * BOOK_PRICE_MAX, so price - base cannot overflow. */
+static inline int
+in_win(const book_t *b, int64_t price)
+{
+	return (uint64_t)(price - b->base) <
+	    (uint64_t)BOOK_LADDER * (uint64_t)b->cfg.tick;
+}
+
 static inline uint32_t
-lv_index(const book_t *b, int64_t price)
+lv_index(const book_t *b, int64_t price) /* in_win(price) */
 {
 	return (uint32_t)((price - b->base) / b->cfg.tick);
 }
 
 static inline int64_t
-lv_price(const book_t *b, uint32_t i)
+lv_price(const book_t *b, uint32_t h)
 {
-	return b->base + (int64_t)i * b->cfg.tick;
+	if (IN_WIN(h))
+		return b->base + (int64_t)h * b->cfg.tick;
+	return b->xlv[h - BOOK_LADDER].price;
 }
 
-static inline int
-in_band(const book_t *b, int64_t price)
+static inline book_level_t *
+lv_at(book_t *b, int s, uint32_t h)
 {
-	return price >= b->base &&
-	    price < b->base + (int64_t)BOOK_LADDER * b->cfg.tick &&
-	    (price - b->base) % b->cfg.tick == 0;
+	return IN_WIN(h) ? &b->side[s].lv[h] : &b->xlv[h - BOOK_LADDER].lv;
+}
+
+static inline const book_level_t *
+lv_cat(const book_t *b, int s, uint32_t h)
+{
+	return IN_WIN(h) ? &b->side[s].lv[h] : &b->xlv[h - BOOK_LADDER].lv;
+}
+
+/* A price the book accepts: a positive whole number of ticks. */
+static inline int
+valid_price(const book_t *b, int64_t price)
+{
+	return price > 0 && price <= BOOK_PRICE_MAX && price % b->cfg.tick == 0;
+}
+
+/* Is price a strictly worse than c for side s (a bid lower, an ask
+ * higher)? */
+static inline int
+worse(int s, int64_t a, int64_t c)
+{
+	return s == BOOK_BUY ? a < c : a > c;
 }
 
 static inline void
@@ -144,20 +196,106 @@ ladder_above(const book_ladder_t *l, uint32_t i)
 	return w * 64 + (uint32_t)ctz64(l->bits[w]);
 }
 
-/* Best level index of a side (bid: highest, ask: lowest). */
+/* ---- overflow ------------------------------------------------------ */
+
+/*
+ * The overflow store holds the levels outside the window.  Per side,
+ * xord[s][0 .. nx[s]) are slot numbers sorted worst price first, best
+ * last, so a side's overflow is two runs: the levels worse than the
+ * window (a prefix) and the levels better than it (a suffix).  A slot
+ * is in at most one list, and a slot in no list is on the free list.
+ */
+
+/* How many of side s's overflow levels are strictly worse than p. */
+static uint32_t
+xrank(const book_t *b, int s, int64_t p)
+{
+	uint32_t lo = 0, hi = b->nx[s];
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+		if (worse(s, b->xlv[b->xord[s][mid]].price, p))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* Side s's overflow levels worse than the whole window. */
 static inline uint32_t
-side_best(const book_t *b, int s)
+xworse(const book_t *b, int s)
+{
+	return s == BOOK_BUY ? xrank(b, s, b->base) :
+	                       xrank(b, s, win_top(b) - b->cfg.tick);
+}
+
+/* Is overflow level price p better than the whole window? */
+static inline int
+x_better(const book_t *b, int s, int64_t p)
+{
+	return s == BOOK_BUY ? p >= win_top(b) : p < b->base;
+}
+
+/* Best window index of a side (bid: highest, ask: lowest). */
+static inline uint32_t
+win_best(const book_t *b, int s)
 {
 	return s == BOOK_BUY ? ladder_max(&b->side[0]) :
 	    ladder_min(&b->side[1]);
 }
 
+/* Best level of a side: the window's best unless the side's best
+ * overflow level is better than the window, or the window is empty. */
+static inline uint32_t
+side_best(const book_t *b, int s)
+{
+	uint32_t i = win_best(b, s), x;
+	if (__builtin_expect(b->nx[s] == 0, 1))
+		return i;
+	x = b->xord[s][b->nx[s] - 1];
+	if (i == BOOK_NONE || x_better(b, s, b->xlv[x].price))
+		return XH(x);
+	return i;
+}
+
+/*
+ * The next level of side s away from the touch, once the window has
+ * none past h or h is an overflow level.  The overflow's worse run lies
+ * past the window's worst level, its better run before the window's
+ * best, so from the better run the window comes next.
+ */
+static uint32_t
+side_next_x(const book_t *b, int s, uint32_t h)
+{
+	uint32_t k, c = BOOK_NONE, i;
+	int64_t p;
+
+	if (h < BOOK_LADDER) {
+		k = xworse(b, s);
+		return k > 0 ? XH(b->xord[s][k - 1]) : BOOK_NONE;
+	}
+	p = lv_price(b, h);
+	k = xrank(b, s, p);
+	if (k > 0)
+		c = b->xord[s][k - 1];
+	if (x_better(b, s, p) &&
+	    (c == BOOK_NONE || !x_better(b, s, b->xlv[c].price)) &&
+	    (i = win_best(b, s)) != BOOK_NONE)
+		return i;
+	return c == BOOK_NONE ? BOOK_NONE : XH(c);
+}
+
 /* The next level away from the touch. */
 static inline uint32_t
-side_next(const book_t *b, int s, uint32_t i)
+side_next(const book_t *b, int s, uint32_t h)
 {
-	return s == BOOK_BUY ? ladder_below(&b->side[0], i) :
-	    ladder_above(&b->side[1], i);
+	uint32_t i = BOOK_NONE;
+	if (h < BOOK_LADDER)
+		i = s == BOOK_BUY ? ladder_below(&b->side[0], h) :
+		                    ladder_above(&b->side[1], h);
+	if (__builtin_expect(i != BOOK_NONE || b->nx[s] == 0, 1))
+		return i;
+	return side_next_x(b, s, h);
 }
 
 /* ---- events -------------------------------------------------------- */
@@ -183,12 +321,12 @@ emit(book_t *b, book_out_t *out, uint8_t kind)
 }
 
 static void
-emit_level(book_t *b, book_out_t *out, int s, uint32_t i)
+emit_level(book_t *b, book_out_t *out, int s, uint32_t h)
 {
 	book_event_t *e = emit(b, out, BOOK_EV_LEVEL);
 	e->side = (uint8_t)s;
-	e->price = lv_price(b, i);
-	e->qty = b->side[s].lv[i].qty;
+	e->price = lv_price(b, h);
+	e->qty = lv_cat(b, s, h)->qty;
 }
 
 static void
@@ -317,12 +455,84 @@ pool_put(book_t *b, uint32_t ix)
 	b->n_live--;
 }
 
+/* ---- overflow slots ------------------------------------------------ */
+
+static inline void
+lv_clear(book_level_t *lv)
+{
+	lv->head = lv->tail = BOOK_NONE;
+	lv->qty = 0;
+	lv->count = 0;
+	lv->xnext = 0;
+}
+
+/* A free slot for a level at price; there is always one (see book.h). */
+static uint32_t
+x_alloc(book_t *b, int64_t price)
+{
+	uint32_t x = b->xfree;
+	b->xfree = b->xlv[x].lv.xnext;
+	lv_clear(&b->xlv[x].lv);
+	b->xlv[x].price = price;
+	return x;
+}
+
+/* The slot keeps its price and an empty level, so a walk that holds its
+ * handle still reads price, qty 0, and finds the next level. */
+static inline void
+x_free(book_t *b, uint32_t x)
+{
+	lv_clear(&b->xlv[x].lv);
+	b->xlv[x].lv.xnext = b->xfree;
+	b->xfree = x;
+}
+
+/* The handle of side s's level at price, or BOOK_NONE if it has none. */
+static uint32_t
+lv_find(const book_t *b, int s, int64_t price)
+{
+	uint32_t k;
+	if (in_win(b, price))
+		return lv_index(b, price);
+	k = xrank(b, s, price);
+	if (k < b->nx[s] && b->xlv[b->xord[s][k]].price == price)
+		return XH(b->xord[s][k]);
+	return BOOK_NONE;
+}
+
+/* The handle of side s's level at price, made (empty) if need be. */
+static uint32_t
+lv_get(book_t *b, int s, int64_t price)
+{
+	uint32_t k, x, *a = b->xord[s];
+	if (in_win(b, price))
+		return lv_index(b, price);
+	k = xrank(b, s, price);
+	if (k < b->nx[s] && b->xlv[a[k]].price == price)
+		return XH(a[k]);
+	x = x_alloc(b, price);
+	memmove(&a[k + 1], &a[k], (b->nx[s] - k) * sizeof *a);
+	a[k] = x;
+	b->nx[s]++;
+	return XH(x);
+}
+
+/* Side s's overflow level x has emptied: out of the list, slot freed. */
+static void
+x_remove(book_t *b, int s, uint32_t x)
+{
+	uint32_t k = xrank(b, s, b->xlv[x].price), *a = b->xord[s];
+	memmove(&a[k], &a[k + 1], (b->nx[s] - k - 1) * sizeof *a);
+	b->nx[s]--;
+	x_free(b, x);
+}
+
 /* ---- level queue --------------------------------------------------- */
 
 static void
 level_push(book_t *b, int s, uint32_t li, uint32_t ix)
 {
-	book_level_t *lv = &b->side[s].lv[li];
+	book_level_t *lv = lv_at(b, s, li);
 	book_slot_t *o = &b->pool[ix];
 
 	o->next = BOOK_NONE;
@@ -334,15 +544,18 @@ level_push(book_t *b, int s, uint32_t li, uint32_t ix)
 	lv->tail = ix;
 	lv->qty += o->shown;
 	if (lv->count++ == 0) {
-		ladder_set(&b->side[s], li);
-		b->side[s].nlevels++;
+		b->moved = 1;
+		if (li < BOOK_LADDER) {
+			ladder_set(&b->side[s], li);
+			b->side[s].nlevels++;
+		}
 	}
 }
 
 static void
 level_unlink(book_t *b, int s, uint32_t li, uint32_t ix)
 {
-	book_level_t *lv = &b->side[s].lv[li];
+	book_level_t *lv = lv_at(b, s, li);
 	book_slot_t *o = &b->pool[ix];
 
 	if (o->prev != BOOK_NONE)
@@ -356,9 +569,290 @@ level_unlink(book_t *b, int s, uint32_t li, uint32_t ix)
 	lv->qty -= o->shown;
 	if (--lv->count == 0) {
 		lv->head = lv->tail = BOOK_NONE;
-		ladder_clear(&b->side[s], li);
-		b->side[s].nlevels--;
+		b->moved = 1;
+		if (li >= BOOK_LADDER)
+			x_remove(b, s, li - BOOK_LADDER);
+		else {
+			ladder_clear(&b->side[s], li);
+			b->side[s].nlevels--;
+		}
 	}
+}
+
+/* An iceberg's next peak. */
+static inline int64_t
+peak(const book_slot_t *o)
+{
+	return o->leaves < o->display ? o->leaves : o->display;
+}
+
+/* An iceberg's peak refills to `shown` and goes to the back of its level.
+ * The level never empties on the way, so a walk's handles stay put. */
+static void
+level_requeue(book_t *b, int s, uint32_t li, uint32_t ix, int64_t shown)
+{
+	book_level_t *lv = lv_at(b, s, li);
+	book_slot_t *o = &b->pool[ix];
+
+	lv->qty += shown - o->shown;
+	o->shown = shown;
+	if (lv->tail == ix)
+		return;
+	if (o->prev != BOOK_NONE)
+		b->pool[o->prev].next = o->next;
+	else
+		lv->head = o->next;
+	b->pool[o->next].prev = o->prev;
+	o->prev = lv->tail;
+	o->next = BOOK_NONE;
+	b->pool[lv->tail].next = ix;
+	lv->tail = ix;
+}
+
+/* ---- the window moves ---------------------------------------------- */
+
+/* Price of side s's worst level, or BOOK_NO_PRICE if the side is empty. */
+static int64_t
+side_worst(const book_t *b, int s)
+{
+	uint32_t w =
+	    s == BOOK_BUY ? ladder_min(&b->side[0]) : ladder_max(&b->side[1]);
+	if (b->nx[s] > 0) {
+		int64_t x0 = b->xlv[b->xord[s][0]].price;
+		if (w == BOOK_NONE || !x_better(b, s, x0))
+			return x0;
+	}
+	return w == BOOK_NONE ? BOOK_NO_PRICE : lv_price(b, w);
+}
+
+static inline int64_t
+dist(int64_t a, int64_t c)
+{
+	return a > c ? a - c : c - a;
+}
+
+/* The base that centres the window on [lo, hi] (which fits in it). */
+static int64_t
+centre(const book_t *b, int64_t lo, int64_t hi)
+{
+	int64_t t = b->cfg.tick, nb;
+	int64_t slack = (int64_t)BOOK_LADDER - 1 - (hi - lo) / t;
+	nb = lo - slack / 2 * t;
+	return nb < t ? t : nb; /* no window slot below the tick */
+}
+
+/*
+ * Where the window belongs, the invariant settle() keeps after every
+ * command (book_check verifies it):
+ *   - the overflow is empty (every level is in the window), or
+ *   - the levels of both sides span more than the window, and it holds
+ *     the touch: both best prices if they fit in it together, else at
+ *     least one of them.
+ * Returns 1 and the new base if the window must move to restore it.
+ */
+static int
+settle_base(const book_t *b, int64_t *nb)
+{
+	int64_t t = b->cfg.tick, lo = INT64_MAX, hi = INT64_MIN, p[2], m;
+	int s;
+
+	if (b->nx[0] + b->nx[1] == 0)
+		return 0;
+	for (s = 0; s < 2; s++) {
+		int64_t w = side_worst(b, s);
+		p[s] = book_best(b, (book_side_t)s);
+		if (p[s] == BOOK_NO_PRICE)
+			continue;
+		lo = p[s] < lo ? p[s] : lo;
+		hi = p[s] > hi ? p[s] : hi;
+		lo = w < lo ? w : lo;
+		hi = w > hi ? w : hi;
+	}
+	if ((hi - lo) / t < (int64_t)BOOK_LADDER) {
+		*nb = centre(b, lo, hi); /* everything fits: take it all */
+		return *nb != b->base;
+	}
+	if (p[0] != BOOK_NO_PRICE && p[1] != BOOK_NO_PRICE) {
+		lo = p[0] < p[1] ? p[0] : p[1];
+		hi = p[0] < p[1] ? p[1] : p[0];
+		if ((hi - lo) / t < (int64_t)BOOK_LADDER) {
+			if (in_win(b, lo) && in_win(b, hi))
+				return 0;
+			*nb = centre(b, lo, hi);
+			return 1;
+		}
+		if (in_win(b, p[0]) || in_win(b, p[1]))
+			return 0;
+		/* Neither touch: the one nearer the window's middle. */
+		m = b->base + (int64_t)(BOOK_LADDER / 2) * t;
+		s = dist(p[0], m) <= dist(p[1], m) ? BOOK_BUY : BOOK_SELL;
+	} else
+		s = p[0] != BOOK_NO_PRICE ? 0 : 1;
+	if (in_win(b, p[s]))
+		return 0;
+	*nb = centre(b, p[s], p[s]);
+	return 1;
+}
+
+/* Set bits of w in [lo, hi). */
+static uint32_t
+bits_count(const uint64_t *w, uint32_t lo, uint32_t hi)
+{
+	uint32_t n = 0, i = lo;
+	for (; i < hi && (i & 63) != 0; i++)
+		n += (uint32_t)(w[i >> 6] >> (i & 63)) & 1;
+	for (; i + 64 <= hi; i += 64)
+		n += (uint32_t)__builtin_popcountll(w[i >> 6]);
+	for (; i < hi; i++)
+		n += (uint32_t)(w[i >> 6] >> (i & 63)) & 1;
+	return n;
+}
+
+/* The bitmap of a window moved up by d levels (d < 0: down): new bit j
+ * is old bit j + d; bits shifted out of range are dropped. */
+static void
+bits_shift(uint64_t *w, int64_t d)
+{
+	uint64_t nw[BOOK_WORDS];
+	int64_t q = d >= 0 ? d / 64 : -((63 - d) / 64), a;
+	unsigned r = (unsigned)(d - q * 64);
+	uint32_t i;
+
+	for (i = 0; i < BOOK_WORDS; i++) {
+		uint64_t lo, hi;
+#ifdef PLANT_REBASE_NOBITMAP
+		/* Planted bug: one word of the bitmap is not shifted. */
+		if (i == BOOK_WORDS / 2) {
+			nw[i] = w[i];
+			continue;
+		}
+#endif
+		a = (int64_t)i + q;
+		lo = a >= 0 && a < (int64_t)BOOK_WORDS ? w[a] : 0;
+		hi = a + 1 >= 0 && a + 1 < (int64_t)BOOK_WORDS ? w[a + 1] : 0;
+		nw[i] = r ? lo >> r | hi << (64 - r) : lo;
+	}
+	memcpy(w, nw, sizeof nw);
+}
+
+/*
+ * Move side s's half of the window to base nb, levels as whole structs
+ * (their FIFOs are pool indices, and nothing else holds a window index:
+ * orders and stops keep prices), so no order is touched.  The levels
+ * that leave go to the overflow as one block: the window held no
+ * overflow level, so they all sort into the gap between its two runs.
+ * The rest shift; the bitmap shifts by words.  Cost: the levels that
+ * leave, the occupied span that moves, and BOOK_WORDS words.
+ */
+static void
+rebase_side(book_t *b, int s, int64_t d)
+{
+	const int64_t L = (int64_t)BOOK_LADDER;
+	book_ladder_t *l = &b->side[s];
+	uint32_t *a = b->xord[s], wl = ladder_min(l), wh, rlo, rhi, m, k, i;
+	int64_t sl, sh, dl, dh;
+
+	if (wl == BOOK_NONE)
+		return;
+	wh = ladder_max(l);
+	/* Old indices [rlo, rhi) leave: the end the window moves away from. */
+	rlo = 0;
+	rhi = BOOK_LADDER;
+	if (d > 0 && d < L)
+		rhi = (uint32_t)d;
+	else if (d < 0 && d > -L)
+		rlo = (uint32_t)(L + d);
+	m = bits_count(l->bits, rlo, rhi);
+	if (m > 0) {
+		k = xworse(b, s);
+		memmove(&a[k + m], &a[k], (b->nx[s] - k) * sizeof *a);
+		b->nx[s] += m;
+		/* worst first: bids upward, asks downward */
+		if (s == BOOK_BUY)
+			i = rlo == 0 ? ladder_min(l) : ladder_above(l, rlo - 1);
+		else
+			i = rhi == BOOK_LADDER ? ladder_max(l) :
+			                         ladder_below(l, rhi);
+		for (; i != BOOK_NONE && i >= rlo && i < rhi;
+		     i = s == BOOK_BUY ? ladder_above(l, i) :
+		                         ladder_below(l, i)) {
+			uint32_t x = x_alloc(b, lv_price(b, i));
+			b->xlv[x].lv = l->lv[i];
+			b->xlv[x].lv.xnext = 0;
+			a[k++] = x;
+		}
+	}
+	/* The occupied survivors [sl, sh) move to [dl, dh). */
+	sl = (int64_t)wl > d ? (int64_t)wl : d;
+	sh = (int64_t)wh + 1 < L + d ? (int64_t)wh + 1 : L + d;
+	if (sl < sh) {
+		memmove(&l->lv[sl - d], &l->lv[sl],
+		    (size_t)(sh - sl) * sizeof l->lv[0]);
+		dl = sl - d;
+		dh = sh - d;
+	} else
+		dl = dh = (int64_t)wh + 1;
+	/* What the move did not overwrite is stale: [wl, dl) and [dh, wh]. */
+	for (i = wl; (int64_t)i < dl && i <= wh; i++)
+		lv_clear(&l->lv[i]);
+	for (i = dh > (int64_t)wl ? (uint32_t)dh : wl; i <= wh; i++)
+		lv_clear(&l->lv[i]);
+	bits_shift(l->bits, d);
+}
+
+/* Move the window to base nb, then pull in the overflow levels that are
+ * inside it and rebuild each side's summary and level count. */
+static void
+rebase(book_t *b, int64_t nb)
+{
+	int64_t t = b->cfg.tick, d = (nb - b->base) / t;
+	uint32_t k, k1, k2, w, *a;
+	int s;
+
+	for (s = 0; s < 2; s++)
+		rebase_side(b, s, d);
+	b->base = nb;
+	for (s = 0; s < 2; s++) {
+		book_ladder_t *l = &b->side[s];
+		a = b->xord[s];
+		k1 = xworse(b, s);
+		k2 = xrank(b, s, s == BOOK_BUY ? win_top(b) : b->base - t);
+		for (k = k1; k < k2; k++) {
+			uint32_t x = a[k], i = lv_index(b, b->xlv[x].price);
+			l->lv[i] = b->xlv[x].lv;
+			l->lv[i].xnext = 0;
+			l->bits[i >> 6] |= 1ull << (i & 63);
+			x_free(b, x);
+		}
+		memmove(&a[k1], &a[k2], (b->nx[s] - k2) * sizeof *a);
+		b->nx[s] -= k2 - k1;
+		l->summary = 0;
+		l->nlevels = 0;
+		for (w = 0; w < BOOK_WORDS; w++) {
+			if (l->bits[w])
+				l->summary |= 1ull << w;
+			l->nlevels +=
+			    (uint32_t)__builtin_popcountll(l->bits[w]);
+		}
+	}
+	b->rebases++;
+}
+
+/*
+ * End of every command: put the window where it belongs.  With the
+ * overflow empty (the common case) this is one test.  Where the window
+ * belongs depends only on the base and on which levels exist, so it is
+ * worked out again only after a level appeared or emptied.
+ */
+static inline void
+settle(book_t *b)
+{
+	int64_t nb;
+	if (__builtin_expect((b->nx[0] | b->nx[1]) == 0 || !b->moved, 1))
+		return;
+	b->moved = 0;
+	if (settle_base(b, &nb))
+		rebase(b, nb);
 }
 
 /* ---- stops --------------------------------------------------------- */
@@ -410,7 +904,7 @@ static void
 rest_remove(book_t *b, uint32_t ix, book_out_t *out)
 {
 	book_slot_t *o = &b->pool[ix];
-	uint32_t li = lv_index(b, o->price);
+	uint32_t li = lv_find(b, o->side, o->price);
 	level_unlink(b, o->side, li, ix);
 	emit_level(b, out, o->side, li);
 }
@@ -483,7 +977,7 @@ fillable(const book_t *b, int s, int64_t px, int is_market, int64_t want,
 	uint32_t i = side_best(b, os);
 	int64_t got = 0;
 	while (i != BOOK_NONE && got < want && crosses(b, s, px, i, is_market)) {
-		uint32_t ix = b->side[os].lv[i].head;
+		uint32_t ix = lv_cat(b, os, i)->head;
 		/* Hidden iceberg reserve trades too, so count leaves. */
 		for (; ix != BOOK_NONE && got < want; ix = b->pool[ix].next) {
 			const book_slot_t *m = &b->pool[ix];
@@ -533,7 +1027,7 @@ match(book_t *b, const book_order_t *t, int64_t px, int is_market,
 	*killed = 0;
 	while (leaves > 0 && i != BOOK_NONE &&
 	    crosses(b, s, px, i, is_market)) {
-		book_level_t *lv = &b->side[os].lv[i];
+		book_level_t *lv = lv_at(b, os, i);
 		uint32_t next_level = side_next(b, os, i);
 		int touched = 0;
 
@@ -646,10 +1140,7 @@ match(book_t *b, const book_order_t *t, int64_t px, int is_market,
 				} else if (m->shown == 0) {
 					/* Iceberg: refill the peak and go to the
 					 * back of the queue at this price. */
-					level_unlink(b, os, i, ix);
-					m->shown = m->leaves < m->display ?
-					    m->leaves : m->display;
-					level_push(b, os, i, ix);
+					level_requeue(b, os, i, ix, peak(m));
 				}
 			}
 		}
@@ -696,7 +1187,7 @@ enter_limit(book_t *b, const book_order_t *o, int64_t price, int64_t now_ns,
 	book_slot_t *s;
 
 	(void)now_ns;
-	if (!in_band(b, price)) {
+	if (!valid_price(b, price)) {
 		emit_reject(b, out, o, BOOK_R_BAD_PRICE);
 		return;
 	}
@@ -764,7 +1255,7 @@ enter_limit(book_t *b, const book_order_t *o, int64_t price, int64_t now_ns,
 	s->tif = o->tif;
 	s->stp = o->stp;
 	s->live = 1;
-	li = lv_index(b, price);
+	li = lv_get(b, o->side, price);
 	level_push(b, o->side, li, ix);
 	emit_order(b, out, BOOK_EV_ACCEPTED, s, BOOK_R_NONE);
 	emit_level(b, out, o->side, li);
@@ -943,8 +1434,8 @@ trigger_stops(book_t *b, int64_t now_ns, book_out_t *out)
 	}
 }
 
-void
-book_submit(book_t *b, const book_order_t *o, int64_t now_ns, book_out_t *out)
+static void
+submit(book_t *b, const book_order_t *o, int64_t now_ns, book_out_t *out)
 {
 	int64_t px;
 
@@ -987,7 +1478,7 @@ book_submit(book_t *b, const book_order_t *o, int64_t now_ns, book_out_t *out)
 			emit_reject(b, out, o, BOOK_R_PHASE);
 			return;
 		}
-		if (o->type == BOOK_STOP_LIMIT && !in_band(b, o->price)) {
+		if (o->type == BOOK_STOP_LIMIT && !valid_price(b, o->price)) {
 			emit_reject(b, out, o, BOOK_R_BAD_PRICE);
 			return;
 		}
@@ -1002,6 +1493,13 @@ book_submit(book_t *b, const book_order_t *o, int64_t now_ns, book_out_t *out)
 		emit_reject(b, out, o, BOOK_R_BAD_PRICE);
 		break;
 	}
+}
+
+void
+book_submit(book_t *b, const book_order_t *o, int64_t now_ns, book_out_t *out)
+{
+	submit(b, o, now_ns, out);
+	settle(b);
 }
 
 /* ---- amend --------------------------------------------------------- */
@@ -1029,6 +1527,7 @@ book_cancel(book_t *b, uint64_t id, uint32_t account, book_out_t *out)
 		return;
 	}
 	cancel_ix(b, ix, BOOK_R_USER, out);
+	settle(b);
 }
 
 void
@@ -1048,6 +1547,7 @@ book_reduce(book_t *b, uint64_t id, uint32_t account, int64_t new_qty,
 	o = &b->pool[ix];
 	if (new_qty <= 0) {
 		cancel_ix(b, ix, BOOK_R_USER, out);
+		settle(b);
 		return;
 	}
 	if (new_qty >= o->leaves) {
@@ -1059,14 +1559,15 @@ book_reduce(book_t *b, uint64_t id, uint32_t account, int64_t new_qty,
 		return;
 	}
 	if (o->live == 1) {
-		book_level_t *lv = &b->side[o->side].lv[lv_index(b, o->price)];
+		uint32_t li = lv_find(b, o->side, o->price);
+		book_level_t *lv = lv_at(b, o->side, li);
 		int64_t was = o->shown;
 		o->leaves = new_qty;
 		if (o->shown > new_qty)
 			o->shown = new_qty;
 		lv->qty -= was - o->shown;
 		emit_order(b, out, BOOK_EV_REDUCED, o, BOOK_R_NONE);
-		emit_level(b, out, o->side, lv_index(b, o->price));
+		emit_level(b, out, o->side, li);
 	} else {
 		o->leaves = new_qty;
 		o->shown = new_qty;
@@ -1121,6 +1622,7 @@ book_replace(book_t *b, uint64_t id, uint32_t account, uint64_t new_id,
 	o->live = 0;
 	release(b, ix);
 	enter_limit(b, &no, price, now_ns, out);
+	settle(b);
 }
 
 uint32_t
@@ -1132,6 +1634,7 @@ book_cancel_all(book_t *b, uint32_t account, book_out_t *out)
 			cancel_ix(b, ix, BOOK_R_USER, out);
 			n++;
 		}
+	settle(b);
 	return n;
 }
 
@@ -1149,6 +1652,7 @@ book_expire(book_t *b, int64_t now_ns, book_out_t *out)
 			n++;
 		}
 	}
+	settle(b);
 	return n;
 }
 
@@ -1156,101 +1660,138 @@ book_expire(book_t *b, int64_t now_ns, book_out_t *out)
 
 /* Volume executable at price p: min(bids >= p, asks <= p). */
 static void
-auction_at(const book_t *b, uint32_t i, int64_t *exec, int64_t *imb)
+auction_at(const book_t *b, int64_t p, int64_t *exec, int64_t *imb)
 {
-	int64_t bids = 0, asks = 0;
-	uint32_t j;
-	for (j = ladder_max(&b->side[0]); j != BOOK_NONE && j >= i;
-	    j = ladder_below(&b->side[0], j)) {
-		uint32_t ix;
-		for (ix = b->side[0].lv[j].head; ix != BOOK_NONE;
-		    ix = b->pool[ix].next)
-			bids += b->pool[ix].leaves;
+	int64_t q[2] = { 0, 0 };
+	int s;
+	for (s = 0; s < 2; s++) {
+		uint32_t j, ix;
+		for (j = side_best(b, s);
+		     j != BOOK_NONE && !worse(s, lv_price(b, j), p);
+		     j = side_next(b, s, j))
+			for (ix = lv_cat(b, s, j)->head; ix != BOOK_NONE;
+			     ix = b->pool[ix].next)
+				q[s] += b->pool[ix].leaves;
 	}
-	for (j = ladder_min(&b->side[1]); j != BOOK_NONE && j <= i;
-	    j = ladder_above(&b->side[1], j)) {
-		uint32_t ix;
-		for (ix = b->side[1].lv[j].head; ix != BOOK_NONE;
-		    ix = b->pool[ix].next)
-			asks += b->pool[ix].leaves;
+	*exec = q[0] < q[1] ? q[0] : q[1];
+	*imb = q[0] > q[1] ? q[0] - q[1] : q[1] - q[0];
+}
+
+typedef struct {
+	int64_t price, exec, imb, dist;
+} auc_best_t;
+
+/*
+ * Consider clearing price p in [lo, hi].  The order is total: maximum
+ * volume, then minimum imbalance, then nearest the reference, then the
+ * lower price.  The volume and imbalance are constant between level
+ * prices, so the best price is one of: the crossed range's ends, each
+ * level's price and its neighbour tick, and the ticks either side of
+ * the reference.  The caller offers exactly those.
+ */
+static void
+auction_try(const book_t *b, int64_t p, int64_t lo, int64_t hi,
+    auc_best_t *best)
+{
+	int64_t ex, imb, d;
+	if (p < lo || p > hi)
+		return;
+	auction_at(b, p, &ex, &imb);
+	d = dist(p, b->ref);
+	if (ex == 0 || ex < best->exec)
+		return;
+	if (best->exec == ex) {
+		if (imb != best->imb) {
+			if (imb > best->imb)
+				return;
+		} else if (d != best->dist) {
+			if (d > best->dist)
+				return;
+		} else if (p >= best->price)
+			return;
 	}
-	*exec = bids < asks ? bids : asks;
-	*imb = bids > asks ? bids - asks : asks - bids;
+	best->price = p;
+	best->exec = ex;
+	best->imb = imb;
+	best->dist = d;
 }
 
 int64_t
 book_auction(book_t *b, book_out_t *out)
 {
-	uint32_t lo = ladder_min(&b->side[1]), hi = ladder_max(&b->side[0]);
-	uint32_t i, best = BOOK_NONE;
-	int64_t best_exec = 0, best_imb = 0, crossed = 0;
+	int64_t lo = book_best(b, BOOK_SELL), hi = book_best(b, BOOK_BUY);
+	int64_t t = b->cfg.tick, fr, crossed = 0;
 	uint8_t saved = b->phase;
-	book_order_t t;
+	auc_best_t best;
+	book_order_t o;
+	uint32_t j;
+	int s;
 
-	if (lo == BOOK_NONE || hi == BOOK_NONE || lo > hi)
+	if (lo == BOOK_NO_PRICE || hi == BOOK_NO_PRICE || lo > hi)
 		return 0;		/* not crossed */
-	for (i = lo; i <= hi; i++) {
-		int64_t ex, imb, d, bd;
-		auction_at(b, i, &ex, &imb);
-		if (ex > best_exec || (ex == best_exec && ex > 0 &&
-		    (imb < best_imb || (imb == best_imb &&
-		    (d = lv_price(b, i) - b->ref, d < 0 ? -d : d) <
-		    (bd = lv_price(b, best) - b->ref, bd < 0 ? -bd : bd))))) {
-			best = i;
-			best_exec = ex;
-			best_imb = imb;
+	memset(&best, 0, sizeof best);
+	auction_try(b, lo, lo, hi, &best);
+	auction_try(b, hi, lo, hi, &best);
+	fr = b->ref - b->ref % t;
+	auction_try(b, fr, lo, hi, &best);
+	auction_try(b, fr + t, lo, hi, &best);
+	for (s = 0; s < 2; s++)
+		for (j = side_best(b, s); j != BOOK_NONE &&
+		     lv_price(b, j) >= lo && lv_price(b, j) <= hi;
+		     j = side_next(b, s, j)) {
+			auction_try(b, lv_price(b, j), lo, hi, &best);
+			auction_try(b,
+			    lv_price(b, j) + (s == BOOK_BUY ? t : -t), lo, hi,
+			    &best);
 		}
-	}
-	if (best == BOOK_NONE || best_exec == 0)
+	if (best.exec == 0)
 		return 0;
 	/* Execute: walk the bids in priority order, each one matched as a
 	 * limit at the clearing price, printing at that single price. */
 	b->phase = BOOK_CONTINUOUS;
-	while (crossed < best_exec) {
-		uint32_t bi = ladder_max(&b->side[0]), ai = ladder_min(&b->side[1]);
+	while (crossed < best.exec) {
+		uint32_t li[2], ixs[2];
 		book_slot_t *bo, *ao;
 		int64_t q;
-		if (bi == BOOK_NONE || ai == BOOK_NONE || bi < best || ai > best)
+		int k;
+		li[0] = side_best(b, BOOK_BUY);
+		li[1] = side_best(b, BOOK_SELL);
+		if (li[0] == BOOK_NONE || li[1] == BOOK_NONE ||
+		    lv_price(b, li[0]) < best.price ||
+		    lv_price(b, li[1]) > best.price)
 			break;
-		bo = &b->pool[b->side[0].lv[bi].head];
-		ao = &b->pool[b->side[1].lv[ai].head];
+		ixs[0] = lv_cat(b, 0, li[0])->head;
+		ixs[1] = lv_cat(b, 1, li[1])->head;
+		bo = &b->pool[ixs[0]];
+		ao = &b->pool[ixs[1]];
 		q = bo->shown < ao->shown ? bo->shown : ao->shown;
-		if (q > best_exec - crossed)
-			q = best_exec - crossed;
-		memset(&t, 0, sizeof t);
-		t.id = bo->id;
-		t.account = bo->account;
-		t.side = BOOK_BUY;
-		trade(b, out, &t, bo->leaves, ao, q, lv_price(b, best));
+		if (q > best.exec - crossed)
+			q = best.exec - crossed;
+		memset(&o, 0, sizeof o);
+		o.id = bo->id;
+		o.account = bo->account;
+		o.side = BOOK_BUY;
+		trade(b, out, &o, bo->leaves, ao, q, best.price);
 		crossed += q;
-		{
-			uint32_t bix = b->side[0].lv[bi].head;
-			uint32_t aix = b->side[1].lv[ai].head;
-			int k;
-			for (k = 0; k < 2; k++) {
-				uint32_t ix = k ? aix : bix, li = k ? ai : bi;
-				book_slot_t *o = &b->pool[ix];
-				o->leaves -= q;
-				o->shown -= q;
-				b->side[k].lv[li].qty -= q;
-				if (o->leaves == 0) {
-					uint64_t partner = o->oco;
-					o->live = 0;
-					level_unlink(b, k, li, ix);
-					release(b, ix);
-					oco_kill(b, partner, out);
-				} else if (o->shown == 0) {
-					level_unlink(b, k, li, ix);
-					o->shown = o->leaves < o->display ?
-					    o->leaves : o->display;
-					level_push(b, k, li, ix);
-				}
-				emit_level(b, out, k, li);
-			}
+		for (k = 0; k < 2; k++) {
+			book_slot_t *m = &b->pool[ixs[k]];
+			m->leaves -= q;
+			m->shown -= q;
+			lv_at(b, k, li[k])->qty -= q;
+			if (m->leaves == 0) {
+				uint64_t partner = m->oco;
+				m->live = 0;
+				level_unlink(b, k, li[k], ixs[k]);
+				release(b, ixs[k]);
+				oco_kill(b, partner, out);
+			} else if (m->shown == 0)
+				level_requeue(b, k, li[k], ixs[k], peak(m));
+			emit_level(b, out, k, li[k]);
 		}
 	}
 	b->phase = saved;
-	b->ref = lv_price(b, best);
+	b->ref = best.price;
+	settle(b);
 	return crossed;
 }
 
@@ -1279,9 +1820,11 @@ book_best(const book_t *b, book_side_t s)
 int64_t
 book_level_qty(const book_t *b, book_side_t s, int64_t price)
 {
-	if (!in_band(b, price))
+	uint32_t h;
+	if (!valid_price(b, price))
 		return 0;
-	return b->side[s].lv[lv_index(b, price)].qty;
+	h = lv_find(b, s, price);
+	return h == BOOK_NONE ? 0 : lv_cat(b, s, h)->qty;
 }
 
 uint32_t
@@ -1291,7 +1834,7 @@ book_depth(const book_t *b, book_side_t s, uint32_t depth, int64_t *price,
 	uint32_t i = side_best(b, s), n = 0;
 	while (i != BOOK_NONE && n < depth) {
 		price[n] = lv_price(b, i);
-		qty[n] = b->side[s].lv[i].qty;
+		qty[n] = lv_cat(b, s, i)->qty;
 		n++;
 		i = side_next(b, s, i);
 	}
@@ -1325,8 +1868,8 @@ book_foreach_resting(const book_t *b,
 		uint32_t i = side_best(b, s);
 		while (i != BOOK_NONE) {
 			uint32_t ix;
-			for (ix = b->side[s].lv[i].head; ix != BOOK_NONE;
-			    ix = b->pool[ix].next)
+			for (ix = lv_cat(b, s, i)->head; ix != BOOK_NONE;
+			     ix = b->pool[ix].next)
 				fn(&b->pool[ix], arg);
 			i = side_next(b, s, i);
 		}
@@ -1346,8 +1889,8 @@ book_digest(const book_t *b)
 			uint32_t ix;
 			int64_t p = lv_price(b, i);
 			h = fnv(h, &p, sizeof p);
-			for (ix = b->side[s].lv[i].head; ix != BOOK_NONE;
-			    ix = b->pool[ix].next) {
+			for (ix = lv_cat(b, s, i)->head; ix != BOOK_NONE;
+			     ix = b->pool[ix].next) {
 				const book_slot_t *o = &b->pool[ix];
 				h = fnv(h, &o->id, sizeof o->id);
 				h = fnv(h, &o->leaves, sizeof o->leaves);
@@ -1364,43 +1907,76 @@ book_digest(const book_t *b)
 	return h;
 }
 
+/* The FIFO of one level: links, owners, totals.  0 = sound. */
+static int
+check_level(const book_t *b, int s, const book_level_t *lv, int64_t price)
+{
+	int64_t q = 0;
+	uint32_t c = 0, ix, prev = BOOK_NONE;
+	for (ix = lv->head; ix != BOOK_NONE; ix = b->pool[ix].next) {
+		const book_slot_t *o = &b->pool[ix];
+		if (ix >= b->cfg.max_orders || c >= b->cfg.max_orders ||
+		    o->prev != prev || o->live != 1 || o->side != s ||
+		    o->price != price || o->shown <= 0 || o->shown > o->leaves)
+			return 3;
+		if (map_get(b, o->id) != ix)
+			return 4;
+		q += o->shown;
+		c++;
+		prev = ix;
+	}
+	if (lv->tail != prev || q != lv->qty || c != lv->count)
+		return 5;
+	return 0;
+}
+
 int
 book_check(const book_t *b)
 {
-	int s;
-	uint32_t live = 0;
+	int s, rc;
+	uint32_t live = 0, k, x, nfree = 0;
+	int64_t nb;
+
+	if (b->base < b->cfg.tick || b->base % b->cfg.tick != 0)
+		return 10;
 	for (s = 0; s < 2; s++) {
 		uint32_t i, nl = 0;
 		for (i = 0; i < BOOK_LADDER; i++) {
 			const book_level_t *lv = &b->side[s].lv[i];
 			int set = (b->side[s].bits[i >> 6] >> (i & 63)) & 1;
-			int64_t q = 0;
-			uint32_t c = 0, ix, prev = BOOK_NONE;
 			if (set != (lv->count > 0))
 				return 1;
 			if (((b->side[s].summary >> (i >> 6)) & 1) !=
 			    (b->side[s].bits[i >> 6] != 0))
 				return 2;
-			for (ix = lv->head; ix != BOOK_NONE; ix = b->pool[ix].next) {
-				const book_slot_t *o = &b->pool[ix];
-				if (o->prev != prev || o->live != 1 || o->side != s ||
-				    lv_index(b, o->price) != i || o->shown <= 0 ||
-				    o->shown > o->leaves)
-					return 3;
-				if (map_get(b, o->id) != ix)
-					return 4;
-				q += o->shown;
-				c++;
-				prev = ix;
-			}
-			if (lv->tail != prev || q != lv->qty || c != lv->count)
-				return 5;
+			if ((rc = check_level(b, s, lv, lv_price(b, i))) != 0)
+				return rc;
 			if (lv->count)
 				nl++;
-			live += c;
+			live += lv->count;
 		}
 		if (nl != b->side[s].nlevels)
 			return 6;
+		/* Overflow: sorted worst first, outside the window, whole
+		 * ticks, no empty level. */
+		if (b->nx[s] > b->cfg.max_orders)
+			return 10;
+		for (k = 0; k < b->nx[s]; k++) {
+			const book_xlevel_t *xl;
+			x = b->xord[s][k];
+			if (x >= b->cfg.max_orders)
+				return 10;
+			xl = &b->xlv[x];
+			if (in_win(b, xl->price) ||
+			    !valid_price(b, xl->price) || xl->lv.count == 0 ||
+			    (k > 0 &&
+			        !worse(s, b->xlv[b->xord[s][k - 1]].price,
+			            xl->price)))
+				return 10;
+			if ((rc = check_level(b, s, &xl->lv, xl->price)) != 0)
+				return rc;
+			live += xl->lv.count;
+		}
 		live += b->n_stops[s];
 	}
 	if (live != b->n_live)
@@ -1408,6 +1984,15 @@ book_check(const book_t *b)
 	/* Every live order has one id-map entry and nothing else does. */
 	if (b->map_used != b->n_live)
 		return 9;
+	/* Every overflow slot is in a side's list or on the free list. */
+	for (x = b->xfree; x != BOOK_NONE; x = b->xlv[x].lv.xnext)
+		if (x >= b->cfg.max_orders || ++nfree > b->cfg.max_orders)
+			return 10;
+	if (nfree + b->nx[0] + b->nx[1] != b->cfg.max_orders)
+		return 10;
+	/* The window is where settle() puts it. */
+	if (settle_base(b, &nb))
+		return 11;
 	/* Uncrossed in continuous trading. */
 	if (b->phase == BOOK_CONTINUOUS) {
 		int64_t bid = book_best(b, BOOK_BUY), ask = book_best(b, BOOK_SELL);
@@ -1441,10 +2026,14 @@ book_bytes(const book_config_t *cfg)
 	if (cfg == NULL || cfg->max_orders == 0)
 		return 0;
 	mc = pow2_at_least(cfg->max_orders * 2);
+	/* book, pool, id map, two stop arrays, and the overflow store:
+	 * max_orders level slots and two sorted slot arrays. */
 	return align64(sizeof(book_t)) +
 	    align64((size_t)cfg->max_orders * sizeof(book_slot_t)) +
 	    align64((size_t)mc * sizeof(uint64_t)) +
 	    align64((size_t)mc * sizeof(uint32_t)) +
+	    2 * align64((size_t)cfg->max_orders * sizeof(uint32_t)) +
+	    align64((size_t)cfg->max_orders * sizeof(book_xlevel_t)) +
 	    2 * align64((size_t)cfg->max_orders * sizeof(uint32_t));
 }
 
@@ -1457,7 +2046,9 @@ book_init(book_t **out, void *mem, size_t len, const book_config_t *cfg)
 	int s;
 
 	if (out == NULL || mem == NULL || cfg == NULL || cfg->max_orders == 0 ||
-	    cfg->tick <= 0 || cfg->ref_price <= 0 || len < book_bytes(cfg) ||
+	    cfg->max_orders >= BOOK_NONE / 2 || cfg->tick <= 0 ||
+	    cfg->tick > BOOK_PRICE_MAX / BOOK_LADDER || cfg->ref_price <= 0 ||
+	    cfg->ref_price > BOOK_PRICE_MAX || len < book_bytes(cfg) ||
 	    ((uintptr_t)mem & 63) != 0)
 		return -1;
 	memset(mem, 0, book_bytes(cfg));
@@ -1474,14 +2065,26 @@ book_init(book_t **out, void *mem, size_t len, const book_config_t *cfg)
 	b->stops[0] = (uint32_t *)p;
 	p += align64((size_t)cfg->max_orders * sizeof(uint32_t));
 	b->stops[1] = (uint32_t *)p;
+	p += align64((size_t)cfg->max_orders * sizeof(uint32_t));
+	b->xlv = (book_xlevel_t *)p;
+	p += align64((size_t)cfg->max_orders * sizeof(book_xlevel_t));
+	b->xord[0] = (uint32_t *)p;
+	p += align64((size_t)cfg->max_orders * sizeof(uint32_t));
+	b->xord[1] = (uint32_t *)p;
 	b->map_mask = mc - 1;
 	for (i = 0; i < cfg->max_orders; i++)
 		b->pool[i].next = i + 1 < cfg->max_orders ? i + 1 : BOOK_NONE;
 	b->free_head = 0;
+	for (i = 0; i < cfg->max_orders; i++) {
+		lv_clear(&b->xlv[i].lv);
+		b->xlv[i].lv.xnext =
+		    i + 1 < cfg->max_orders ? i + 1 : BOOK_NONE;
+	}
+	b->xfree = 0;
 	for (s = 0; s < 2; s++)
 		for (i = 0; i < BOOK_LADDER; i++)
 			b->side[s].lv[i].head = b->side[s].lv[i].tail = BOOK_NONE;
-	/* Centre the band on the reference price, aligned to the tick. */
+	/* Centre the window on the reference price, aligned to the tick. */
 	b->base = cfg->ref_price - (int64_t)(BOOK_LADDER / 2) * cfg->tick;
 	b->base -= b->base % cfg->tick;
 	if (b->base < cfg->tick)

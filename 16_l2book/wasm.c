@@ -97,7 +97,7 @@ WASM_EXPORT int lob_check(void) { return book_check(b); }
 
 /* ---- the console market (console.c) -------------------------------- */
 
-static unsigned char con_mem[14u << 20] __attribute__((aligned(64)));
+static unsigned char con_mem[18u << 20] __attribute__((aligned(64)));
 static con_t con;
 static sig_snap_t con_snap;
 static con_signals_t con_sig;

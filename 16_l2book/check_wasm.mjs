@@ -10,7 +10,10 @@
 //   3. the console's step loop: 20,000 steps, book_check clean, the digest
 //      the same twice for a seed and different for another; the spoof and
 //      flood raise their alerts;
-//   4. LIVE signals (live_*): OFI, CVD and imbalance over two given books.
+//   4. LIVE signals (live_*): OFI, CVD and imbalance over two given books;
+//   5. any price rests: "you" place a sell at $900.00 and a buy at one cent
+//      in the console's market (far outside the first window), the market
+//      runs on, the book stays sound, and both orders are still there.
 import { readFileSync } from 'node:fs';
 
 const path = process.argv[2] || new URL('web/book.wasm', import.meta.url);
@@ -70,5 +73,18 @@ put(8); w.live_trade(0, 2n);
 s = sigs(w.live_tick());
 if (s.ofi !== 3 || s.cvd !== 2 || !near(s.imb, 3 / 13) || s.mid !== 100) fail('live ' + JSON.stringify(s));
 
+// 5. far prices: accepted (reason 0), the market runs 2,000 steps, both rest.
+w.con_reset(7n);
+w.con_run(100);
+if (w.con_order(1, 1, 0, 90000n, 3n) !== 0) fail('far sell refused');
+const farSell = w.con_order_id();
+if (w.con_order(1, 0, 0, 1n, 2n) !== 0) fail('one-cent buy refused');
+const farBuy = w.con_order_id();
+w.con_run(2000);
+if (w.con_check() !== 0) fail('book_check after far orders ' + w.con_check());
+if (w.con_pull(farSell, 1) !== 0 || w.con_pull(farBuy, 1) !== 0) fail('far orders not resting');
+if (w.con_check() !== 0) fail('book_check after cancels ' + w.con_check());
+
 console.log(`check_wasm: ok (lob quickstart; seed 1 x79 = intrepidkarthi's console; ` +
-  `seed 42 x20000 digest ${d1} twice, seed 43 differs; 3 spoof + 6 OTR alerts; live OFI/CVD/imbalance)`);
+  `seed 42 x20000 digest ${d1} twice, seed 43 differs; 3 spoof + 6 OTR alerts; live OFI/CVD/imbalance; ` +
+  `far prices rest)`);

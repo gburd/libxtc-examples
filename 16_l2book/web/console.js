@@ -104,8 +104,7 @@
       if (p === null) return { error: REASON[4] };
       const r = W.con_order(YOU, side === "SELL" ? 1 : 0, market ? 1 : 0, p, q);
       const res = { id: Number(W.con_order_id()), trades: readTrades() };
-      if (r === 4 && p > 0n) res.error = "price is outside the book's 4096-tick ladder";
-      else if (r) res.error = REASON[r] || "refused (reason " + r + ")";
+      if (r) res.error = REASON[r] || "refused (reason " + r + ")";
       return res;
     },
     snapshot() {

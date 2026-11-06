@@ -15,12 +15,22 @@
  *	buffer (book_out_t).  The same command stream produces the same
  *	events and the same digest, byte for byte, on every platform.
  *
+ *	Any price that is a positive whole number of ticks, up to
+ *	BOOK_PRICE_MAX, is accepted (the circuit breaker, band_pct_bp, is a
+ *	separate rule the venue configures).
+ *
  *	Layout (why it is fast):
- *	  - Price ladder: a dense array of levels indexed by price - base,
- *	    over a band of BOOK_LADDER ticks that re-centres when the touch
- *	    walks off it.  A two-level bitmap per side (64 words of 64 bits
- *	    under one summary word) finds the best price and the next level
- *	    with a find-first-set, not a tree walk.
+ *	  - Price ladder: a dense window of BOOK_LADDER levels indexed by
+ *	    (price - base) / tick.  A two-level bitmap per side (64 words of
+ *	    64 bits under one summary word) finds the best price and the next
+ *	    level with a find-first-set, not a tree walk.
+ *	  - The window moves (a re-base): when every live level fits in it,
+ *	    it is centred on them; when they do not, it is centred on the
+ *	    touch.  Levels outside it live in a per-side overflow store, a
+ *	    sorted array of level slots, which best-price search and sweeps
+ *	    fall through to when the window runs out.  A re-base is
+ *	    O(BOOK_LADDER + levels moved) and rare; L2 events carry prices,
+ *	    so it is invisible outside the engine.
  *	  - Orders: a fixed pool indexed by uint32 (no pointers, so the
  *	    pool is relocatable and wasm-safe), linked into a FIFO per level.
  *	  - Order ids: open-addressed hash, id -> pool index, O(1) cancel.
@@ -36,6 +46,9 @@
 #define BOOK_WORDS	(BOOK_LADDER / 64u)
 #define BOOK_NONE	0xffffffffu
 #define BOOK_NO_PRICE	INT64_MIN
+/* The largest price accepted: differences and sums of two prices, and a
+ * price plus the window, never overflow an int64. */
+#define BOOK_PRICE_MAX	(INT64_MAX / 4)
 
 typedef enum {
 	BOOK_BUY = 0,
@@ -123,6 +136,7 @@ typedef enum {
 	BOOK_R_DUPLICATE_ID,
 	BOOK_R_UNKNOWN_ID,
 	BOOK_R_BAD_QTY,
+	/* a price <= 0, not a whole number of ticks, or > BOOK_PRICE_MAX */
 	BOOK_R_BAD_PRICE,
 	BOOK_R_POST_ONLY_CROSS,
 	BOOK_R_FOK_UNFILLABLE,
@@ -185,22 +199,29 @@ typedef struct {
 	uint32_t	head, tail;	/* FIFO of pool indices */
 	int64_t		qty;		/* displayed total at this price */
 	uint32_t	count;
-	uint32_t	_pad;
+	uint32_t	xnext;		/* overflow slot: free-list link */
 } book_level_t;
 
+/* The window: level i is the price base + i * tick. */
 typedef struct {
 	book_level_t	lv[BOOK_LADDER];
 	uint64_t	bits[BOOK_WORDS];	/* level i non-empty */
 	uint64_t	summary;		/* word w non-empty */
-	uint32_t	nlevels;
+	uint32_t	nlevels;		/* non-empty levels in the window */
 	uint32_t	_pad;
 } book_ladder_t;
+
+/* An overflow level: a level outside the window, with its price. */
+typedef struct {
+	book_level_t	lv;
+	int64_t		price;
+} book_xlevel_t;
 
 /* Configuration, fixed at init. */
 typedef struct {
 	uint32_t	max_orders;	/* pool size (resting + stops) */
 	int64_t		tick;		/* price step in ticks (usually 1) */
-	int64_t		ref_price;	/* initial band centre and LULD reference */
+	int64_t		ref_price;	/* initial window centre and LULD reference */
 	int64_t		band_pct_bp;	/* circuit breaker: +- this many basis
 					 * points of the reference; 0 = off */
 	int		pro_rata;	/* 0 FIFO, 1 pro-rata at each level */
@@ -208,8 +229,17 @@ typedef struct {
 
 typedef struct {
 	book_config_t	cfg;
-	int64_t		base;		/* price of lv[0] */
+	int64_t		base;		/* price of lv[0]; a multiple of tick */
 	book_ladder_t	side[2];
+	/* overflow: max_orders level slots shared by both sides (a level
+	 * holds >= 1 order, so they never run out), and per side the slots
+	 * in use, sorted worst price first (best last). */
+	book_xlevel_t	*xlv;
+	uint32_t	*xord[2];
+	uint32_t	nx[2];
+	uint32_t	xfree;		/* free-slot list */
+	uint32_t	_xpad;
+	uint64_t	rebases;	/* times the window moved */
 	/* pool */
 	book_slot_t	*pool;
 	uint32_t	free_head;
@@ -224,7 +254,8 @@ typedef struct {
 	uint32_t	n_stops[2];
 	/* state */
 	uint8_t		phase;
-	uint8_t		_pad[7];
+	uint8_t		moved;		/* a level appeared or emptied */
+	uint8_t		_pad[6];
 	uint64_t	seq;
 	int64_t		last_price;	/* last trade, BOOK_NO_PRICE if none */
 	int64_t		ref;		/* circuit-breaker reference */
@@ -235,8 +266,11 @@ typedef struct {
 /*
  * Memory: book_bytes(cfg) bytes, 64-byte aligned, owned by the caller
  * (an Isolate's working memory, a slab, or a wasm static).  book_init
- * lays the book out inside it.  Returns 0, or -1 for a bad cfg / short
- * buffer.
+ * lays the book out inside it: the order pool, the id map, the stops,
+ * and the overflow store (max_orders level slots and two sorted index
+ * arrays, 40 bytes per order), so nothing is allocated afterwards.
+ * Returns 0, or -1 for a bad cfg (tick or ref_price <= 0 or too large)
+ * or a short buffer.
  */
 size_t	book_bytes(const book_config_t *cfg);
 int	book_init(book_t **out, void *mem, size_t len, const book_config_t *cfg);

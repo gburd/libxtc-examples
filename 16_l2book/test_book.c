@@ -38,11 +38,13 @@ reset_out(void)
 	out.overflow = 0;
 }
 
+/* A book in one of two buffers (slot 0 or 1), so a test can hold two. */
 static book_t *
-mkbook(uint32_t max_orders, int pro_rata, int64_t band_bp)
+mkbook_in(int slot, uint32_t max_orders, int64_t ref, int pro_rata,
+    int64_t band_bp)
 {
-	static unsigned char *mem;
-	static size_t memlen;
+	static unsigned char *mem[2];
+	static size_t memlen[2];
 	book_config_t cfg;
 	book_t *b;
 	size_t n;
@@ -50,20 +52,33 @@ mkbook(uint32_t max_orders, int pro_rata, int64_t band_bp)
 	memset(&cfg, 0, sizeof cfg);
 	cfg.max_orders = max_orders;
 	cfg.tick = 1;
-	cfg.ref_price = 10000;		/* $100.00 in cents */
+	cfg.ref_price = ref;
 	cfg.band_pct_bp = band_bp;
 	cfg.pro_rata = pro_rata;
 	n = book_bytes(&cfg);
-	if (n > memlen) {
-		free(mem);
-		if (posix_memalign((void **)&mem, 64, n) != 0)
+	if (n > memlen[slot]) {
+		free(mem[slot]);
+		if (posix_memalign((void **)&mem[slot], 64, n) != 0)
 			abort();
-		memlen = n;
+		memlen[slot] = n;
 	}
-	if (book_init(&b, mem, memlen, &cfg) != 0)
+	if (book_init(&b, mem[slot], memlen[slot], &cfg) != 0)
 		abort();
 	reset_out();
 	return b;
+}
+
+static book_t *
+mkbook(uint32_t max_orders, int pro_rata, int64_t band_bp)
+{
+	return mkbook_in(0, max_orders, 10000, pro_rata, band_bp); /* $100 */
+}
+
+/* Times the book's price window has moved. */
+static uint64_t
+rebases(const book_t *b)
+{
+	return b->rebases;
 }
 
 static book_order_t
@@ -569,9 +584,16 @@ t_rejects(void)
 	book_submit(b, &o, 0, &out);
 	CHECK(nth(BOOK_EV_REJECTED, 0)->reason == BOOK_R_DUPLICATE_ID);
 	reset_out();
-	o = lim(2, BOOK_BUY, 1, 1);		/* far outside the band */
+	o = lim(2, BOOK_BUY, 0, 1); /* not a price */
 	book_submit(b, &o, 0, &out);
+	o = lim(2, BOOK_BUY, -5, 1);
+	book_submit(b, &o, 0, &out);
+	o = lim(2, BOOK_BUY, BOOK_PRICE_MAX + 1, 1);
+	book_submit(b, &o, 0, &out);
+	CHECK(count(BOOK_EV_REJECTED) == 3);
 	CHECK(nth(BOOK_EV_REJECTED, 0)->reason == BOOK_R_BAD_PRICE);
+	CHECK(nth(BOOK_EV_REJECTED, 1)->reason == BOOK_R_BAD_PRICE);
+	CHECK(nth(BOOK_EV_REJECTED, 2)->reason == BOOK_R_BAD_PRICE);
 	reset_out();
 	o = lim(3, BOOK_BUY, 9991, 1);
 	book_submit(b, &o, 0, &out);
@@ -583,6 +605,224 @@ t_rejects(void)
 	book_submit(b, &o, 0, &out);
 	CHECK(nth(BOOK_EV_REJECTED, 0)->reason == BOOK_R_FULL);
 	CHECK(book_check(b) == 0);
+}
+
+/* ---- any price: the window moves, the overflow holds the rest ------ */
+
+/*
+ * The book's dense window is 4096 ticks around the reference (7952 ..
+ * 12047 here); before it moved, every price outside it was refused
+ * BOOK_R_BAD_PRICE for the life of the book.  A limit far above and far
+ * below rest and fill, and a stop-limit priced far away is held,
+ * triggers, and rests at its far price.
+ */
+static void
+t_far_price(void)
+{
+	book_t *b = mkbook(64, 0, 0);
+	book_order_t o;
+
+	o = lim(1, BOOK_SELL, 110000, 5); /* $1,100.00 */
+	book_submit(b, &o, 0, &out);
+	o = lim(2, BOOK_BUY, 1, 7); /* one cent */
+	book_submit(b, &o, 0, &out);
+	o = lim(3, BOOK_BUY, 9990, 4); /* and one near the touch */
+	book_submit(b, &o, 0, &out);
+	CHECK(count(BOOK_EV_REJECTED) == 0 && count(BOOK_EV_ACCEPTED) == 3);
+	CHECK(book_best(b, BOOK_SELL) == 110000);
+	CHECK(book_best(b, BOOK_BUY) == 9990);
+	CHECK(book_level_qty(b, BOOK_SELL, 110000) == 5);
+	CHECK(book_level_qty(b, BOOK_BUY, 1) == 7);
+	CHECK(book_check(b) == 0);
+	reset_out();
+	o = lim(4, BOOK_BUY, 110000, 2);
+	book_submit(b, &o, 0, &out);
+	CHECK(count(BOOK_EV_TRADE) == 1);
+	CHECK(nth(BOOK_EV_TRADE, 0)->other == 1 &&
+	    nth(BOOK_EV_TRADE, 0)->price == 110000);
+	reset_out();
+	/* A market sell walks the bids from the touch down to one cent. */
+	memset(&o, 0, sizeof o);
+	o.id = 5;
+	o.side = BOOK_SELL;
+	o.type = BOOK_MARKET;
+	o.qty = 11;
+	book_submit(b, &o, 0, &out);
+	CHECK(count(BOOK_EV_TRADE) == 2);
+	CHECK(nth(BOOK_EV_TRADE, 0)->other == 3 &&
+	    nth(BOOK_EV_TRADE, 0)->price == 9990);
+	CHECK(nth(BOOK_EV_TRADE, 1)->other == 2 &&
+	    nth(BOOK_EV_TRADE, 1)->price == 1);
+	CHECK(book_best(b, BOOK_BUY) == BOOK_NO_PRICE);
+	CHECK(book_check(b) == 0);
+	/* A stop-limit sell, stop 9900, limit $500: held, then triggered by
+	 * a print at 9900, it rests at its far limit. */
+	b = mkbook(64, 0, 0);
+	o = lim(10, BOOK_BUY, 9900, 3);
+	book_submit(b, &o, 0, &out);
+	memset(&o, 0, sizeof o);
+	o.id = 11;
+	o.side = BOOK_SELL;
+	o.type = BOOK_STOP_LIMIT;
+	o.stop = 9900;
+	o.price = 50000;
+	o.qty = 5;
+	book_submit(b, &o, 0, &out);
+	CHECK(count(BOOK_EV_REJECTED) == 0 && count(BOOK_EV_ACCEPTED) == 2);
+	o = lim(12, BOOK_SELL, 9900, 1);
+	book_submit(b, &o, 0, &out);
+	CHECK(count(BOOK_EV_TRIGGERED) == 1);
+	CHECK(book_find(b, 11) != NULL && book_find(b, 11)->price == 50000);
+	CHECK(book_level_qty(b, BOOK_SELL, 50000) == 5);
+	CHECK(book_check(b) == 0);
+}
+
+/*
+ * The opening auction over a pre-open book wider than the window: a bid
+ * at $300.00 rests in the overflow.  Bids 5 @30000, 10 @9000; asks
+ * 8 @5000, 4 @9500.  8 shares cross anywhere in 5000 .. 9000 (bids
+ * >= p 15, asks <= p 8, imbalance 7), more than at any other price, so
+ * the tie goes to the price nearest the reference 10000: 9000.  The
+ * $300 bid trades first.
+ */
+static void
+t_auction_wide(void)
+{
+	book_t *b = mkbook(64, 0, 0);
+	book_order_t o;
+	book_set_phase(b, BOOK_PREOPEN, &out);
+	o = lim(1, BOOK_BUY, 30000, 5);
+	book_submit(b, &o, 0, &out);
+	o = lim(2, BOOK_BUY, 9000, 10);
+	book_submit(b, &o, 0, &out);
+	o = lim(3, BOOK_SELL, 5000, 8);
+	book_submit(b, &o, 0, &out);
+	o = lim(4, BOOK_SELL, 9500, 4);
+	book_submit(b, &o, 0, &out);
+	CHECK(count(BOOK_EV_REJECTED) == 0 && count(BOOK_EV_TRADE) == 0);
+	CHECK(book_check(b) == 0);
+	reset_out();
+	book_set_phase(b, BOOK_CONTINUOUS, &out);
+	CHECK(count(BOOK_EV_TRADE) == 2);
+	CHECK(nth(BOOK_EV_TRADE, 0)->id == 1 &&
+	    nth(BOOK_EV_TRADE, 0)->other == 3 &&
+	    nth(BOOK_EV_TRADE, 0)->qty == 5 &&
+	    nth(BOOK_EV_TRADE, 0)->price == 9000);
+	CHECK(nth(BOOK_EV_TRADE, 1)->id == 2 &&
+	    nth(BOOK_EV_TRADE, 1)->other == 3 &&
+	    nth(BOOK_EV_TRADE, 1)->qty == 3 &&
+	    nth(BOOK_EV_TRADE, 1)->price == 9000);
+	CHECK(book_best(b, BOOK_BUY) == 9000);
+	CHECK(book_best(b, BOOK_SELL) == 9500);
+	CHECK(book_level_qty(b, BOOK_BUY, 9000) == 7);
+	CHECK(book_check(b) == 0);
+}
+
+/*
+ * A trend: the touch walks 20,000 ticks up and back in steps of 50.  On
+ * the way up a one-lot bid rests 5 below every step, so the bids span
+ * five windows; on the way down each of those bids is hit at its own
+ * price as the touch passes it (the overflow levels come back into the
+ * window), and a one-lot ask rests 5 above every step.  At the end one
+ * buy sweeps the 401 asks, window and overflow, in price order.
+ */
+static void
+t_trend(void)
+{
+	book_t *b = mkbook(4096, 0, 0);
+	book_order_t o;
+	uint64_t id = 1, bid_id[401], ask_id[401];
+	int64_t p;
+	int k;
+
+	for (k = 0; k <= 400; k++) {
+		p = 10000 + 50 * (int64_t)k;
+		reset_out();
+		o = lim(id++, BOOK_SELL, p, 10); /* the touch */
+		book_submit(b, &o, 0, &out);
+		o = lim(id++, BOOK_BUY, p, 3);
+		book_submit(b, &o, 0, &out);
+		book_cancel(b, id - 2, 0, &out);
+		o = lim(id, BOOK_BUY, p - 5, 1);
+		bid_id[k] = id++;
+		book_submit(b, &o, 0, &out);
+		if (count(BOOK_EV_REJECTED) != 0)
+			printf("  trend: up step %d (price %" PRId64
+			       ") refused\n",
+			    k, p);
+		CHECK(count(BOOK_EV_REJECTED) == 0);
+		CHECK(count(BOOK_EV_TRADE) == 1 &&
+		    nth(BOOK_EV_TRADE, 0)->price == p);
+		CHECK(book_best(b, BOOK_BUY) == p - 5);
+		CHECK(book_check(b) == 0);
+	}
+	CHECK(book_level_qty(b, BOOK_BUY, 9995) == 1);
+	for (k = 400; k >= 0; k--) {
+		p = 10000 + 50 * (int64_t)k;
+		reset_out();
+		o = lim(id++, BOOK_SELL, p - 5, 1);
+		book_submit(b, &o, 0, &out);
+		CHECK(count(BOOK_EV_TRADE) == 1);
+		CHECK(nth(BOOK_EV_TRADE, 0)->other == bid_id[k] &&
+		    nth(BOOK_EV_TRADE, 0)->price == p - 5);
+		o = lim(id, BOOK_SELL, p + 5, 1);
+		ask_id[k] = id++;
+		book_submit(b, &o, 0, &out);
+		CHECK(count(BOOK_EV_REJECTED) == 0);
+		CHECK(book_best(b, BOOK_SELL) == p + 5);
+		CHECK(book_check(b) == 0);
+	}
+	reset_out();
+	o = lim(id++, BOOK_BUY, 40000, 401);
+	book_submit(b, &o, 0, &out);
+	CHECK(count(BOOK_EV_TRADE) == 401);
+	for (k = 0; k <= 400; k++)
+		CHECK(nth(BOOK_EV_TRADE, k)->price == 10005 + 50 * (int64_t)k &&
+		    nth(BOOK_EV_TRADE, k)->other == ask_id[k]);
+	CHECK(b->n_live == 0 && book_best(b, BOOK_SELL) == BOOK_NO_PRICE);
+	CHECK(book_check(b) == 0);
+	CHECK(rebases(b) > 0);
+	printf("  trend: 20000 ticks up and back, %" PRIu64 " re-bases\n",
+	    rebases(b));
+}
+
+/*
+ * intrepidkarthi's ThinBook scenario (bench_scenarios.c): 5,000 one-lot
+ * asks at consecutive ticks 3000 .. 7999, the book centred on 5048.
+ * Before the window moved, the top 904 were refused.  All rest, and
+ * 10-lot buys walk them, 10 levels each, in price-time order, out of
+ * the window and into the overflow.
+ */
+static void
+t_thin_book(void)
+{
+	book_t *b = mkbook_in(0, 5100, 3000 + BOOK_LADDER / 2, 0, 0);
+	book_order_t o;
+	int64_t n = 0;
+	int i, refused = 0, k;
+
+	for (i = 0; i < 5000; i++) {
+		reset_out();
+		o = lim((uint64_t)i + 1, BOOK_SELL, 3000 + i, 1);
+		book_submit(b, &o, 0, &out);
+		refused += count(BOOK_EV_REJECTED);
+	}
+	if (refused)
+		printf("  thin_book: %d of 5000 refused\n", refused);
+	CHECK(refused == 0 && b->n_live == 5000);
+	CHECK(book_check(b) == 0);
+	for (i = 0; i < 500; i++) {
+		reset_out();
+		o = lim(10000 + (uint64_t)i, BOOK_BUY, i == 0 ? 3020 : 8000,
+		    10);
+		book_submit(b, &o, 0, &out);
+		CHECK(count(BOOK_EV_TRADE) == 10);
+		for (k = 0; k < 10; k++, n++)
+			CHECK(nth(BOOK_EV_TRADE, k)->price == 3000 + n &&
+			    nth(BOOK_EV_TRADE, k)->other == (uint64_t)n + 1);
+		CHECK(book_check(b) == 0);
+	}
+	CHECK(b->n_live == 0);
 }
 
 /* ---- differential: the engine against the naive reference ---------- */
@@ -598,14 +838,61 @@ rnd(void)
 	return rng;
 }
 
+/* The engine's resting orders, in priority order, against the
+ * reference's: the same ids, prices and leaves in the same order. */
+typedef struct {
+	const ref_book_t *ref;
+	int side, i, bad;
+} walk_t;
+
 static void
-t_differential(void)
+walk_one(const book_slot_t *o, void *arg)
+{
+	walk_t *w = arg;
+	const ref_ord_t *r;
+	while (w->side < 2 && w->i >= w->ref->n[w->side]) {
+		w->side++;
+		w->i = 0;
+	}
+	if (w->side >= 2 || o->side != w->side) {
+		w->bad++;
+		return;
+	}
+	r = &w->ref->o[w->side][w->i++];
+	if (r->id != o->id || r->price != o->price || r->leaves != o->leaves)
+		w->bad++;
+}
+
+static int
+same_book(const book_t *b, const ref_book_t *ref)
+{
+	walk_t w;
+	memset(&w, 0, sizeof w);
+	w.ref = ref;
+	book_foreach_resting(b, walk_one, &w);
+	return w.bad == 0 && (uint32_t)(ref->n[0] + ref->n[1]) == b->n_live;
+}
+
+/*
+ * 200,000 random commands (limit, market, IOC, FOK, post-only, cancel,
+ * reduce, replace) through the engine and refbook.h.  Every command
+ * must trade the same quantity; every 1024 commands the two books must
+ * hold the same orders in the same priority order.  Limit prices are
+ * mid +- half (the book's window starts centred on mid): 20 keeps every
+ * price inside the
+ * engine's 4096-tick window, 20,000 spreads the book over ten windows
+ * (refbook.h has no window, so this is the check that the overflow and
+ * the re-bases change nothing).
+ */
+static void
+differential(int64_t mid, int64_t half)
 {
 	static ref_book_t ref;
-	book_t *b = mkbook(4096, 0, 0);
+	book_t *b = mkbook_in(0, 4096, mid, 0, 0);
 	uint64_t next_id = 1, ids[4096];
 	int nids = 0, step;
 	int64_t eng_vol = 0;
+	uint32_t max_x = 0;
 
 	memset(&ref, 0, sizeof ref);
 	for (step = 0; step < 200000; step++) {
@@ -616,7 +903,9 @@ t_differential(void)
 			/* limit, near the touch; 1 in 8 IOC, 1 in 16 FOK, 1 in
 			 * 16 post-only, 1 in 20 market */
 			int side = (int)((r >> 8) & 1);
-			int64_t px = 10000 + (int64_t)((r >> 9) % 41) - 20;
+			int64_t px = mid +
+			    (int64_t)((r >> 9) % (uint64_t)(2 * half + 1)) -
+			    half;
 			int64_t qty = 1 + (int64_t)((r >> 20) % 200);
 			int tif = ((r >> 30) % 8) == 0 ? 1 :
 			    ((r >> 33) % 16) == 0 ? 2 : 0;
@@ -624,7 +913,7 @@ t_differential(void)
 			int market = ((r >> 41) % 20) == 0;
 			book_order_t o = lim(next_id, side, px, qty);
 			uint32_t i;
-			int64_t got = 0;
+			int64_t got = 0, want;
 			if (market) {
 				o.type = BOOK_MARKET;
 				o.price = 0;
@@ -641,26 +930,24 @@ t_differential(void)
 					got += out.ev[i].qty;
 			/* A market order on an empty side is rejected by the
 			 * engine and is a no-op in the reference too. */
-			{
-				int64_t want = ref_submit(&ref, next_id, side,
-				    market, px, qty, tif, post);
-				if (got != want) {
-					printf("  step %d: id %" PRIu64 " side %d %s "
-					    "px %" PRId64 " qty %" PRId64 " tif %d "
-					    "post %d: engine %" PRId64 " ref %" PRId64
-					    "\n", step, next_id, side,
-					    market ? "MKT" : "LMT", px, qty, tif,
-					    post, got, want);
-					for (i = 0; i < out.n; i++)
-						printf("    ev %u kind %u id %" PRIu64
-						    " other %" PRIu64 " px %" PRId64
-						    " q %" PRId64 " r %u\n", i,
-						    out.ev[i].kind, out.ev[i].id,
-						    out.ev[i].other, out.ev[i].price,
-						    out.ev[i].qty, out.ev[i].reason);
-				}
-				CHECK(got == want);
+			want = ref_submit(&ref, next_id, side, market, px, qty,
+			    tif, post);
+			if (got != want) {
+				printf("  step %d: id %" PRIu64 " side %d %s "
+				       "px %" PRId64 " qty %" PRId64 " tif %d "
+				       "post %d: engine %" PRId64
+				       " ref %" PRId64 "\n",
+				    step, next_id, side, market ? "MKT" : "LMT",
+				    px, qty, tif, post, got, want);
+				for (i = 0; i < out.n; i++)
+					printf("    ev %u kind %u id %" PRIu64
+					       " other %" PRIu64 " px %" PRId64
+					       " q %" PRId64 " r %u\n",
+					    i, out.ev[i].kind, out.ev[i].id,
+					    out.ev[i].other, out.ev[i].price,
+					    out.ev[i].qty, out.ev[i].reason);
 			}
+			CHECK(got == want);
 			eng_vol += got;
 			if (book_find(b, next_id) != NULL && nids < 4096)
 				ids[nids++] = next_id;
@@ -686,7 +973,9 @@ t_differential(void)
 			int k = (int)((r >> 8) % (uint64_t)nids);
 			int s;
 			int i = ref_find(&ref, ids[k], &s);
-			int64_t px = 10000 + (int64_t)((r >> 9) % 41) - 20;
+			int64_t px = mid +
+			    (int64_t)((r >> 9) % (uint64_t)(2 * half + 1)) -
+			    half;
 			int64_t qty = 1 + (int64_t)((r >> 20) % 200);
 			uint32_t e;
 			int64_t got = 0;
@@ -708,20 +997,250 @@ t_differential(void)
 				ids[k] = ids[--nids];
 		}
 		CHECK(out.overflow == 0);
+		if (b->nx[0] + b->nx[1] > max_x)
+			max_x = b->nx[0] + b->nx[1];
 		if ((step & 1023) == 0) {
 			int64_t p;
-			int side;
+			int side, j;
 			CHECK(book_check(b) == 0);
-			for (side = 0; side < 2; side++)
-				for (p = 9970; p <= 10030; p++)
+			CHECK(same_book(b, &ref));
+			for (side = 0; side < 2; side++) {
+				for (p = mid - 30; p <= mid + 30; p++)
 					CHECK(book_level_qty(b, side, p) ==
 					    ref_level(&ref, side, p));
+				/* and the levels the reference holds, best
+				 * and worst, wherever the window is */
+				for (j = 0; j < ref.n[side]; j += j < 16 ?
+				         1 :
+				         ref.n[side] - 16 > j + 1 ?
+				         ref.n[side] - 16 - j :
+				         1)
+					CHECK(book_level_qty(b, side,
+					          ref.o[side][j].price) ==
+					    ref_level(&ref, side,
+					        ref.o[side][j].price));
+			}
 		}
 	}
 	CHECK(eng_vol == ref.volume);
 	CHECK(book_check(b) == 0);
-	printf("  differential: 200000 commands, %" PRIu64 " trades, "
-	    "volume %" PRId64 ", engine == reference\n", b->trades, eng_vol);
+	CHECK(same_book(b, &ref));
+	printf("  differential +-%" PRId64 ": 200000 commands, %" PRIu64
+	       " trades, volume %" PRId64 ", %" PRIu64 " re-bases, up to %u "
+	       "overflow levels, engine == reference\n",
+	    half, b->trades, eng_vol, rebases(b), max_x);
+}
+
+static void
+t_differential(void)
+{
+	differential(10000, 20);
+}
+
+static void
+t_differential_wide(void)
+{
+	differential(30000, 20000);
+}
+
+/* ---- the window is invisible ---------------------------------------- */
+
+/* One random command of every kind the engine takes, over centre +-
+ * half ticks; the centre trends.  Same rng state, same command. */
+static void
+any_command(book_t *b, uint64_t *next_id, int64_t *centre, int64_t now,
+    int64_t half)
+{
+	uint64_t r = rnd(), r2 = rnd();
+	int op = (int)(r % 1000);
+	int side = (int)((r >> 10) & 1);
+	int64_t px =
+	    *centre + (int64_t)((r >> 11) % (uint64_t)(2 * half + 1)) - half;
+	int64_t qty = 1 + (int64_t)((r >> 26) % 300);
+	uint64_t victim = 1 + (r2 >> 8) % *next_id;
+	book_order_t o;
+
+	*centre += (int64_t)((r2 >> 40) % 21) - 10;
+	if (*centre < 7000)
+		*centre = 7000;
+	if (px < 1)
+		px = 1;
+	o = lim(*next_id, side, px, qty);
+	o.account = 1 + (uint32_t)((r2 >> 2) % 4);
+	if ((r2 >> 5) % 10 == 0)
+		o.stp = (uint8_t)(1 + (r2 >> 12) % 4);
+	if (op < 400) {
+		int k = (int)((r2 >> 16) % 20);
+		o.tif = (uint8_t)(k < 2 ? BOOK_IOC :
+		        k < 3           ? BOOK_FOK :
+		        k < 4           ? BOOK_DAY :
+		        k < 5           ? BOOK_GTD :
+		                          BOOK_GTC);
+		o.expire_ns = now + 1 + (int64_t)((r2 >> 24) % 500);
+		if (k == 5)
+			o.flags = BOOK_F_POST_ONLY;
+		if ((r2 >> 30) % 8 == 0)
+			o.display = 1 + qty / 4;
+	} else if (op < 450) {
+		o.type = BOOK_MARKET;
+		o.tif = (uint8_t)((r2 >> 16) % 4 == 0 ? BOOK_FOK : BOOK_IOC);
+	} else if (op < 500) {
+		int k = (int)((r2 >> 16) % 3);
+		o.type = (uint8_t)(k == 0 ? BOOK_STOP :
+		        k == 1            ? BOOK_STOP_LIMIT :
+		                            BOOK_TRAILING_STOP);
+		o.stop = k == 2 ? 1 + (int64_t)((r2 >> 20) % 300) : px;
+		o.price = *centre +
+		    (int64_t)((r2 >> 32) % (uint64_t)(2 * half + 1)) - half;
+		if (o.price < 1)
+			o.price = 1;
+		/* a bracket: a same-side limit with this stop as its OCO
+		 * partner (the stop gets the next id) */
+		if (k == 1 && (r2 >> 50) % 2 == 0) {
+			book_order_t tp = lim(*next_id, side, px, qty);
+			tp.oco = *next_id + 1;
+			o.oco = *next_id;
+			o.id = ++*next_id;
+			book_submit(b, &tp, now, &out);
+		}
+	} else if (op < 530) {
+		o.type = BOOK_PEGGED;
+		o.peg = (uint8_t)((r2 >> 16) % 3);
+		o.peg_offset = (int64_t)((r2 >> 20) % 21) - 10;
+	} else if (op < 750) {
+		book_cancel(b, victim, 0, &out);
+		return;
+	} else if (op < 830) {
+		book_reduce(b, victim, 0, (int64_t)((r2 >> 30) % 200), &out);
+		return;
+	} else if (op < 910) {
+		book_replace(b, victim, 0, (*next_id)++, px, qty, now, &out);
+		return;
+	} else if (op < 915) {
+		book_cancel_all(b, o.account, &out);
+		return;
+	} else if (op < 925) {
+		book_expire(b, now, &out);
+		return;
+	} else if (op < 927) {
+		/* a pre-open spell; the opening auction uncrosses it */
+		book_set_phase(b,
+		    b->phase == BOOK_PREOPEN ? BOOK_CONTINUOUS : BOOK_PREOPEN,
+		    &out);
+		return;
+	}
+	book_submit(b, &o, now, &out);
+	(*next_id)++;
+}
+
+static uint64_t
+events_hash(uint64_t h)
+{
+	uint32_t e;
+	int i;
+	for (e = 0; e < out.n; e++) {
+		const unsigned char *p = (const void *)&out.ev[e];
+		for (i = 0; i < (int)sizeof out.ev[e]; i++) {
+			h ^= p[i];
+			h *= 0x100000001b3ull;
+		}
+	}
+	return h;
+}
+
+/*
+ * Push book c's window: a one-lot sell just above the window (and above
+ * the bid), cancelled at once.  It rests in the overflow, so the window
+ * re-centres to take it (or onto the touch); after the cancel the
+ * overflow may be empty again and then the window stays where it went.
+ * The pool and the id map come back exactly as they were.  Book a gets
+ * four cancels of an unknown id instead: four events, no change.  Both
+ * sequences advance by four.
+ */
+static void
+nudge(book_t *a, book_t *c, uint64_t far_id)
+{
+	int64_t bid = book_best(c, BOOK_BUY),
+	        top = c->base + (int64_t)BOOK_LADDER;
+	book_order_t o;
+	int i;
+
+	for (i = 0; i < 4; i++)
+		book_cancel(a, far_id, 0, &out);
+	o = lim(far_id, BOOK_SELL,
+	    (bid != BOOK_NO_PRICE && bid >= top ? bid + 1 : top) +
+	        (int64_t)(rnd() % 800),
+	    1);
+	book_submit(c, &o, 0, &out);
+	book_cancel(c, far_id, 0, &out);
+}
+
+/*
+ * The window is internal.  Two books get the same 30,000 random
+ * commands (every order type and pre-open spells, over a trending
+ * centre +- `half` ticks); every 64 commands book c's window is pushed
+ * away (nudge), so the two windows spend much of the run in different
+ * places.  Every event of every command must agree byte for byte and
+ * the digests stay equal, wherever each window is.
+ */
+static void
+window_invisible(int64_t half)
+{
+	book_t *a = mkbook_in(0, 8192, 10000, 0, 0);
+	book_t *c = mkbook_in(1, 8192, 10000, 0, 0);
+	uint64_t ha = 0xcbf29ce484222325ull, hc = ha, id[2] = { 1, 1 }, ra, rc;
+	int64_t cen[2] = { 10000, 10000 };
+	int apart = 0, apart_x = 0, step;
+
+	for (step = 0; step < 30000; step++) {
+		if ((step & 63) == 0) {
+			reset_out();
+			nudge(a, c, (1ull << 40) + (uint64_t)step);
+			CHECK(a->seq == c->seq && a->n_live == c->n_live);
+		}
+		ra = 0x5eed0002ull + (uint64_t)step * 0x9e3779b97f4a7c15ull;
+		rng = ra;
+		reset_out();
+		any_command(a, &id[0], &cen[0], step, half);
+		ha = events_hash(ha);
+		CHECK(out.overflow == 0);
+		rng = ra;
+		reset_out();
+		any_command(c, &id[1], &cen[1], step, half);
+		hc = events_hash(hc);
+		CHECK(out.overflow == 0);
+		if (ha != hc)
+			printf("  window_invisible: events differ at command "
+			       "%d\n",
+			    step);
+		CHECK(ha == hc);
+		if (a->base != c->base) {
+			apart++;
+			apart_x +=
+			    a->nx[0] + a->nx[1] + c->nx[0] + c->nx[1] > 0;
+		}
+		if ((step & 255) == 0) {
+			CHECK(book_check(a) == 0 && book_check(c) == 0);
+			CHECK(book_digest(a) == book_digest(c));
+		}
+	}
+	CHECK(book_check(a) == 0 && book_check(c) == 0);
+	CHECK(book_digest(a) == book_digest(c));
+	ra = rebases(a);
+	rc = rebases(c);
+	printf("  window_invisible +-%" PRId64 ": %" PRIu64 " trades, windows "
+	       "apart for %d of 30000 commands (%d with overflow levels), "
+	       "re-bases %" PRIu64 " vs %" PRIu64 ", digest %016" PRIx64
+	       " both\n",
+	    half, a->trades, apart, apart_x, ra, rc, book_digest(a));
+	CHECK(a->trades > 1000 && apart > 0 && rc != ra);
+}
+
+static void
+t_window_invisible(void)
+{
+	window_invisible(1500);
+	window_invisible(6000);
 }
 
 /* ---- determinism: same commands, same events, same digest --------- */
@@ -862,9 +1381,15 @@ main(int argc, char **argv)
 		{ "circuit_breaker", t_circuit_breaker },
 		{ "pro_rata", t_pro_rata },
 		{ "rejects", t_rejects },
+		{ "far_price", t_far_price },
+		{ "auction_wide", t_auction_wide },
+		{ "trend", t_trend },
+		{ "thin_book", t_thin_book },
 		{ "id_churn", t_id_churn },
 		{ "id_churn_random", t_id_churn_random },
 		{ "differential", t_differential },
+		{ "differential_wide", t_differential_wide },
+		{ "window_invisible", t_window_invisible },
 		{ "determinism", t_determinism },
 	};
 	size_t i;
