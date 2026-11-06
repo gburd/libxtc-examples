@@ -152,7 +152,7 @@ throughput: ... orders/s (... M TPS)
 latency ns: mean=...  p50=...  p99=...  p999=...  max=...
 ```
 
-Measured: ~1.8-2.0 M orders/s on a 32-vCPU host (Xeon Platinum 8488C;
+Measured: ~1.8-2.0 M orders/s on a 32-vCPU host (Sapphire Rapids;
 `./lorb 2000000`, gcc -O2, default `configure` build of libxtc, idle
 host); the 1.55.0 engine measured the same in interleaved runs, so the
 matching-rule fixes above cost nothing measurable.  A shared, busy host
