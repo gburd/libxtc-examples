@@ -61,7 +61,7 @@
       <div><b>17.4&nbsp;&micro;s</b><span>TCP round trip p50, 1 client</span></div>
       <div><b>0</b><span>allocations after book_init</span></div>
     </div>
-    <p class="hint">One bare-metal 48-core x86-64 host, one core per engine; the round trip is loopback TCP, order + ack. These are measurements of this venue and engine, not of a production exchange. <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">Read the method &rarr;</a></p>
+    <p class="hint">Measured on a one-socket 48-core bare-metal x86-64 host (Sapphire Rapids), one core per engine; the round trip is loopback TCP, order + ack. A two-socket re-run gives the same ranking (COMPARISON.md has both). These are measurements of this venue and engine, not of a production exchange. <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">Read the method &rarr;</a></p>
   </header>
 
   <main>
@@ -229,7 +229,9 @@
           replay: <b>l2book 2.76&nbsp;ms</b>, CppTrader 4.26, geseq 5.93, intrepidkarthi 9.60,
           OrderBook-rs 54.9. On their latency scenarios, ported operation for operation, l2book&rsquo;s
           medians are <b>1.9&ndash;4.4&times;</b> lower and its p99.99 stays below <b>0.75&nbsp;&micro;s</b>;
-          theirs reaches 28&ndash;114&nbsp;&micro;s wherever an operation allocates.
+          theirs reaches 28&ndash;114&nbsp;&micro;s wherever an operation allocates. (One-socket 48-core
+          host. On a two-socket 64-core host the replay is 3.85 ms against their 13.67 ms and the medians are
+          2.1&ndash;4.7&times; lower.)
           <a href="https://github.com/gburd/libxtc-examples/blob/main/16_l2book/COMPARISON.md">COMPARISON.md</a></p>
         </div>
         <div class="prod">
@@ -239,7 +241,8 @@
           shipped is 2.1&nbsp;ms, because it polls each session&rsquo;s outbound stream every 2&nbsp;ms; with that
           poll set to 20&nbsp;&micro;s it is 74&nbsp;&micro;s. With sessions on an <code>xtc_exec</code>
           (<code>--fiber-loops</code>), 8 shards and 16 clients: 1/2/4/8 loops give
-          <b>54k/149k/313k/383k</b> round trips/s on the 48-core development host.</p>
+          <b>54k/149k/313k/383k</b> round trips/s on the 48-core host, <b>86k/169k/324k/482k</b> on the
+          two-socket host with the client on the other socket.</p>
         </div>
         <div class="prod">
           <h3>Tested hard</h3>
