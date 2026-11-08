@@ -19,7 +19,6 @@
  *	transactions concurrently with the big one.
  */
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,8 +32,8 @@
 
 static int g_fail;
 static char g_path[256];
-static _Atomic int g_stop;
-static _Atomic long g_small;
+static int g_stop;
+static long g_small;
 
 #ifdef CK
 #undef CK
@@ -79,9 +78,12 @@ small_writer(void *arg)
 	char sql[96];
 	long id = (long)arg, n = 0;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
-	while (!atomic_load(&g_stop)) {
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
 		snprintf(sql, sizeof sql, "INSERT INTO small VALUES(%ld, %ld)", id * 1000000 + n, n);
-		if (sx_exec(h, sql, NULL) == SX_OK) { atomic_fetch_add(&g_small, 1); n++; }
+		if (sx_exec(h, sql, NULL) == SX_OK) {
+			xtc_atomic_fetch_add_long(&g_small, 1, xtc_mo_seq_cst);
+			n++;
+		}
 	}
 	sx_close(h);
 	return NULL;
@@ -121,13 +123,13 @@ main(void)
 	CK(one(h, "SELECT count(*) FROM small WHERE k = -1") == 1);
 
 	/* (2) a big transaction with small commits racing it, then crash */
-	atomic_store(&g_stop, 0);
+	xtc_atomic_store_i32(&g_stop, 0, xtc_mo_seq_cst);
 	for (i = 0; i < 3; i++) pthread_create(&th[i], NULL, small_writer, (void *)(long)(i + 1));
 	CK(big_txn(h, NBIG) == 0);
 	usleep(100 * 1000);
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	for (i = 0; i < 3; i++) pthread_join(th[i], NULL);
-	small_before = atomic_load(&g_small);
+	small_before = xtc_atomic_load_long(&g_small, xtc_mo_seq_cst);
 	sx_close(h);
 	sx_storage_abandon();
 	CK(sx_storage_open(g_path, 4096) == SX_OK);

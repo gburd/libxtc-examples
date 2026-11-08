@@ -45,7 +45,6 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,7 +92,7 @@ send_msg(int tag, int kind, int64_t id, int64_t tgt)
 
 struct seg { int64_t a, b, round_start; };
 static struct seg g_seg;
-static _Atomic int g_left;
+static int g_left;
 
 static int
 op_of(int64_t s, int64_t round_start, int64_t *tseq)
@@ -164,7 +163,7 @@ lane(void *arg)
 		}
 		sx_close(h);
 	}
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		sx_storage_quiesce();
 }
 
@@ -206,7 +205,7 @@ worker(int64_t round_start, const int64_t *cuts, int ncut, int create)
 			send_msg('Y', n, (int64_t)miss, (int64_t)stale);
 			send_msg('O', 0, 0, 0);          /* an in-process reopen */
 		}
-		atomic_store(&g_left, NLANE);
+		xtc_atomic_store_i32(&g_left, NLANE, xtc_mo_seq_cst);
 		if (xtc_loop_init(&loop) != XTC_OK) return 1;
 		if (sx_storage_run(loop) != SX_OK) return 1;
 		for (l = 0; l < NLANE; l++)

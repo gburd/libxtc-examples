@@ -16,7 +16,6 @@
  *	Reports ops/s and the buffer-manager flush/evict counters.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,8 +31,8 @@
 static bm_t       *g_bm;
 static int         g_n_pages;
 static int64_t     g_deadline_ns;
-static _Atomic long g_ops;
-static _Atomic long g_syncs;
+static long g_ops;
+static long g_syncs;
 static int         g_sync_every;     /* fdatasync every N ops (0 = never) */
 static int         g_locality;       /* 0=random 1=sequential 2=clustered */
 #define BM_CLUSTER 64                /* run length for clustered locality */
@@ -94,14 +93,15 @@ worker_proc(void *arg)
 				continue;
 			((uint64_t *)bm_page(f))[1] += 1;   /* mutate */
 			bm_unfix(g_bm, f, 1);               /* dirty */
-			n = atomic_fetch_add_explicit(&g_ops, 1,
-			    memory_order_relaxed) + 1;
+			n = xtc_atomic_fetch_add_long(&g_ops, 1,
+			        xtc_mo_relaxed) +
+			    1;
 			/* Durability barrier: force data to the device so the
 			 * buffered mode cannot "lie" by deferring writeback. */
 			if (g_sync_every > 0 && (n % g_sync_every) == 0) {
 				(void)bm_sync(g_bm);
-				atomic_fetch_add_explicit(&g_syncs, 1,
-				    memory_order_relaxed);
+				xtc_atomic_fetch_add_long(&g_syncs, 1,
+				    xtc_mo_relaxed);
 			}
 		}
 	}
@@ -150,8 +150,8 @@ main(int argc, char **argv)
 	bo.adaptive_writeback = adaptive ? 1 : 0;
 	if (bm_create(&bo, &g_bm) != XTC_OK) { fprintf(stderr, "bm_create\n"); return 1; }
 
-	atomic_store(&g_ops, 0);
-	atomic_store(&g_syncs, 0);
+	xtc_atomic_store_long(&g_ops, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_long(&g_syncs, 0, xtc_mo_seq_cst);
 	g_deadline_ns = now_ns() + (int64_t)secs * 1000000000LL;
 	t0 = now_ns();
 
@@ -164,7 +164,7 @@ main(int argc, char **argv)
 	(void)xtc_loop_fini(loop);
 
 	elapsed = (double)(now_ns() - t0) / 1e9;
-	ops = atomic_load(&g_ops);
+	ops = xtc_atomic_load_long(&g_ops, xtc_mo_seq_cst);
 	bm_get_stats(g_bm, &st);
 	bm_destroy(g_bm);
 	unlink(path);
@@ -176,7 +176,7 @@ main(int argc, char **argv)
 	    g_locality == 1 ? "seq" : (g_locality == 2 ? "clustered" : "random"));
 	printf("  ops=%ld  ops_per_sec=%.0f  fdatasyncs=%ld\n", ops,
 	    elapsed > 0 ? (double)ops / elapsed : 0.0,
-	    atomic_load(&g_syncs));
+	    xtc_atomic_load_long(&g_syncs, xtc_mo_seq_cst));
 	printf("  flushed=%llu trickled=%llu evicted=%llu loads=%llu\n",
 	    (unsigned long long)st.flushed, (unsigned long long)st.trickled,
 	    (unsigned long long)st.evicted, (unsigned long long)st.loads);

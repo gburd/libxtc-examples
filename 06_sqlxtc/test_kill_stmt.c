@@ -27,7 +27,6 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,9 +49,9 @@ static char             g_path[256];
 static xtc_exec_t      *g_exec;
 static xtc_pid_t        g_pid[NC];
 static int              g_live[NC];
-static _Atomic int      g_stop, g_done, g_final_ok;
-static _Atomic uint64_t g_stmts, g_kills;
-static _Atomic int64_t  g_next = NROW + 1;
+static int g_stop, g_done, g_final_ok;
+static uint64_t g_stmts, g_kills;
+static int64_t g_next = NROW + 1;
 static uint64_t         g_seed;
 static int64_t          g_ms;
 
@@ -93,15 +92,16 @@ conn(void *arg)
 	if (sx_open(":memory:", &h) != SX_OK)
 		return;
 	(void)xtc_proc_at_exit(close_db, h);
-	while (!atomic_load(&g_stop)) {
-		int64_t k = atomic_fetch_add(&g_next, 1);
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
+		int64_t k =
+		    xtc_atomic_fetch_add_i64(&g_next, 1, xtc_mo_seq_cst);
 		if (one(h, "SELECT count(*) FROM t WHERE v >= 0") >= 0)
-			atomic_fetch_add(&g_stmts, 1);
+			xtc_atomic_fetch_add_u64(&g_stmts, 1, xtc_mo_seq_cst);
 		snprintf(sql, sizeof sql, "INSERT INTO t VALUES(%lld, %lld, "
 		    "'pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad')",
 		    (long long)k, (long long)k);
 		if (sx_exec(h, sql, NULL) == SX_OK)
-			atomic_fetch_add(&g_stmts, 1);
+			xtc_atomic_fetch_add_u64(&g_stmts, 1, xtc_mo_seq_cst);
 	}
 }
 
@@ -111,17 +111,20 @@ watchdog(void *arg)
 	uint64_t last = 0;
 	int64_t since = xtc_clock_mono();
 	(void)arg;
-	while (!atomic_load(&g_done)) {
-		uint64_t c = atomic_load(&g_stmts);
+	while (!xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst)) {
+		uint64_t c = xtc_atomic_load_u64(&g_stmts, xtc_mo_seq_cst);
 		int64_t now = xtc_clock_mono();
 		if (c != last) {
 			last = c;
 			since = now;
 		} else if (now - since > (int64_t)HANG_S * 1000000000LL) {
-			fprintf(stderr, "HANG (seed %llu): no statement for %d s; "
-			    "statements %llu kills %llu\n", (unsigned long long)g_seed,
-			    HANG_S, (unsigned long long)c,
-			    (unsigned long long)atomic_load(&g_kills));
+			fprintf(stderr,
+			    "HANG (seed %llu): no statement for %d s; "
+			    "statements %llu kills %llu\n",
+			    (unsigned long long)g_seed, HANG_S,
+			    (unsigned long long)c,
+			    (unsigned long long)xtc_atomic_load_u64(&g_kills,
+			        xtc_mo_seq_cst));
 			fprintf(stderr, "FAIL: test_kill_stmt: hang\n");
 			_exit(3);
 		}
@@ -180,19 +183,20 @@ boss(void *arg)
 		(void)xtc_proc_sleep((int64_t)(200 + rng(&r) % 800) * 1000);
 		(void)reap(1);
 		if (g_live[k] && xtc_exit_pid(g_pid[k], 7) == XTC_OK)
-			atomic_fetch_add(&g_kills, 1);
+			xtc_atomic_fetch_add_u64(&g_kills, 1, xtc_mo_seq_cst);
 	}
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	while (reap(0) > 0)
 		(void)xtc_proc_sleep(1000LL * 1000);
 	/* Every page must still be latchable: a full scan and an insert. */
 	if (sx_open(":memory:", &h) == SX_OK) {
 		int64_t n = one(h, "SELECT count(*) FROM t WHERE v >= 0");
 		int ins = sx_exec(h, "INSERT INTO t VALUES(-1, -1, 'z')", NULL);
-		atomic_store(&g_final_ok, n >= NROW && ins == SX_OK);
+		xtc_atomic_store_i32(&g_final_ok, n >= NROW && ins == SX_OK,
+		    xtc_mo_seq_cst);
 		sx_close(h);
 	}
-	atomic_fetch_add(&g_stmts, 1);
+	xtc_atomic_fetch_add_u64(&g_stmts, 1, xtc_mo_seq_cst);
 	sx_storage_quiesce();
 }
 
@@ -242,7 +246,7 @@ main(int argc, char **argv)
 		return 1;
 	(void)pthread_create(&wd, NULL, watchdog, NULL);
 	(void)xtc_exec_run(g_exec);
-	atomic_store(&g_done, 1);
+	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
 	(void)xtc_exec_fini(g_exec);
 	(void)sx_storage_close();
@@ -252,10 +256,11 @@ main(int argc, char **argv)
 		unlink(side);
 	}
 	printf("  kill_stmt: kills %llu statements %llu final %s\n",
-	    (unsigned long long)atomic_load(&g_kills),
-	    (unsigned long long)atomic_load(&g_stmts),
-	    atomic_load(&g_final_ok) ? "ok" : "FAILED");
-	if (!atomic_load(&g_final_ok) || atomic_load(&g_kills) == 0) {
+	    (unsigned long long)xtc_atomic_load_u64(&g_kills, xtc_mo_seq_cst),
+	    (unsigned long long)xtc_atomic_load_u64(&g_stmts, xtc_mo_seq_cst),
+	    xtc_atomic_load_i32(&g_final_ok, xtc_mo_seq_cst) ? "ok" : "FAILED");
+	if (!xtc_atomic_load_i32(&g_final_ok, xtc_mo_seq_cst) ||
+	    xtc_atomic_load_u64(&g_kills, xtc_mo_seq_cst) == 0) {
 		fprintf(stderr, "FAIL: test_kill_stmt\n");
 		return 1;
 	}

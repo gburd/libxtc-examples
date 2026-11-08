@@ -24,7 +24,6 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,8 +39,8 @@
 
 static int              g_fail;
 static wal_t           *g_wal;
-static _Atomic uint64_t g_sum, g_xor;
-static _Atomic long     g_ok;
+static uint64_t g_sum, g_xor;
+static long g_ok;
 static uint64_t         g_seen_last;
 static long             g_seen, g_bad_order, g_bad_body;
 
@@ -64,9 +63,9 @@ committer(void *arg)
 			g_fail = 1;
 			break;
 		}
-		atomic_fetch_add(&g_sum, lsn);
-		atomic_fetch_xor(&g_xor, lsn);
-		atomic_fetch_add(&g_ok, 1);
+		xtc_atomic_fetch_add_u64(&g_sum, lsn, xtc_mo_seq_cst);
+		xtc_atomic_fetch_xor_u64(&g_xor, lsn, xtc_mo_seq_cst);
+		xtc_atomic_fetch_add_long(&g_ok, 1, xtc_mo_seq_cst);
 	}
 	return NULL;
 }
@@ -158,9 +157,10 @@ main(void)
 	    (unsigned long long)st.commits, (unsigned long long)st.batches,
 	    st.batches ? (double)st.commits / (double)st.batches : 0.0,
 	    (unsigned long long)st.max_batch_seen);
-	CK(atomic_load(&g_ok) == (long)n);
+	CK(xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst) == (long)n);
 	CK(st.commits == n);
-	CK(atomic_load(&g_sum) == want_sum && atomic_load(&g_xor) == want_xor);
+	CK(xtc_atomic_load_u64(&g_sum, xtc_mo_seq_cst) == want_sum &&
+	    xtc_atomic_load_u64(&g_xor, xtc_mo_seq_cst) == want_xor);
 	CK(st.durable_lsn == n);
 	/* The serial path gives batches == commits. */
 	if (ser_ns >= 0 && ser_ns < 5000)

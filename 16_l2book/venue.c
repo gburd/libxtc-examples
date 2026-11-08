@@ -18,7 +18,7 @@
  *	round trip.  These are what /stats and the --bench report show.
  */
 #include <errno.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +31,7 @@
 struct sym {
 	char			name[VENUE_SYM_LEN];
 	int			shard;
-	_Atomic xtc_tnt_handle_t book;	/* set by the Isolate's init */
+	xtc_tnt_handle_t book; /* set by the Isolate's init */
 	struct venue_stats	stats;
 	/* Market-data subscribers: written by the book Isolate only (on a
 	 * VT_SUBSCRIBE), read by the same Isolate.  No lock. */
@@ -39,8 +39,8 @@ struct sym {
 	int			nsubs;
 	/* Snapshot of the top of book, published by the Isolate after each
 	 * command for readers on other threads (/stats, readyz). */
-	_Atomic int64_t		bid, ask, last;
-	_Atomic uint64_t	seq;
+	int64_t bid, ask, last;
+	uint64_t seq;
 };
 
 static struct sym syms[VENUE_MAX_SYMS];
@@ -52,7 +52,11 @@ static int64_t g_ref = 10000;
 
 int venue_nsyms(void) { return nsyms; }
 const char *venue_sym_name(int i) { return syms[i].name; }
-xtc_tnt_handle_t venue_sym_book(int i) { return atomic_load(&syms[i].book); }
+xtc_tnt_handle_t
+venue_sym_book(int i)
+{
+	return xtc_atomic_load_u64(&syms[i].book, xtc_mo_seq_cst);
+}
 struct venue_stats *venue_sym_stats(int i) { return &syms[i].stats; }
 int venue_sym_shard(int i) { return syms[i].shard; }
 
@@ -76,12 +80,17 @@ int64_t venue_sym_best(int i, int side);
 int64_t
 venue_sym_best(int i, int side)
 {
-	return side == BOOK_BUY ? atomic_load(&syms[i].bid) :
-	    atomic_load(&syms[i].ask);
+	return side == BOOK_BUY ?
+	    xtc_atomic_load_i64(&syms[i].bid, xtc_mo_seq_cst) :
+	    xtc_atomic_load_i64(&syms[i].ask, xtc_mo_seq_cst);
 }
 
 int64_t venue_sym_last(int i);
-int64_t venue_sym_last(int i) { return atomic_load(&syms[i].last); }
+int64_t
+venue_sym_last(int i)
+{
+	return xtc_atomic_load_i64(&syms[i].last, xtc_mo_seq_cst);
+}
 
 xtc_tnt_send_result_t
 venue_to_book(int sym, uint16_t tag, const struct venue_cmd *c)
@@ -91,12 +100,13 @@ venue_to_book(int sym, uint16_t tag, const struct venue_cmd *c)
 
 	if (sym < 0 || sym >= nsyms)
 		return XTC_TNT_SEND_STALE_HANDLE;
-	h = atomic_load(&syms[sym].book);
+	h = xtc_atomic_load_u64(&syms[sym].book, xtc_mo_seq_cst);
 	if (h == XTC_TNT_HANDLE_NONE)
 		return XTC_TNT_SEND_STALE_HANDLE;
 	r = xtc_tnt_send_from(XTC_TNT_HANDLE_NONE, h, tag, c, sizeof *c);
 	if (r != XTC_TNT_SEND_OK)
-		atomic_fetch_add(&syms[sym].stats.drops, 1);
+		xtc_atomic_fetch_add_u64(&syms[sym].stats.drops, 1,
+		    xtc_mo_seq_cst);
 	return r;
 }
 
@@ -148,7 +158,8 @@ md_publish(book_iso_t *bi, const struct venue_md *m)
 
 	for (i = 0; i < s->nsubs; i++)
 		if (xtc_send(s->subs[i], m, sizeof *m) != XTC_OK)
-			atomic_fetch_add(&s->stats.drops, 1);
+			xtc_atomic_fetch_add_u64(&s->stats.drops, 1,
+			    xtc_mo_seq_cst);
 }
 
 static void
@@ -193,8 +204,10 @@ dispatch_events(book_iso_t *bi, const book_out_t *out,
 		case BOOK_EV_TRADE:
 			report(bi, e, e->id, 'R', c, t_matched);
 			report(bi, e, e->other, 'A', c, t_matched);
-			atomic_fetch_add(&s->stats.trades, 1);
-			atomic_fetch_add(&s->stats.volume, (uint64_t)e->qty);
+			xtc_atomic_fetch_add_u64(&s->stats.trades, 1,
+			    xtc_mo_seq_cst);
+			xtc_atomic_fetch_add_u64(&s->stats.volume,
+			    (uint64_t)e->qty, xtc_mo_seq_cst);
 			memset(&m, 0, sizeof m);
 			m.kind = 'T';
 			m.side = e->side;
@@ -223,7 +236,8 @@ dispatch_events(book_iso_t *bi, const book_out_t *out,
 			md_publish(bi, &m);
 			break;
 		case BOOK_EV_REJECTED:
-			atomic_fetch_add(&s->stats.rejects, 1);
+			xtc_atomic_fetch_add_u64(&s->stats.rejects, 1,
+			    xtc_mo_seq_cst);
 			report(bi, e, e->id, 0, c, t_matched);
 			break;
 		default:
@@ -231,11 +245,14 @@ dispatch_events(book_iso_t *bi, const book_out_t *out,
 			break;
 		}
 	}
-	atomic_store(&s->bid, book_best(bi->b, BOOK_BUY));
-	atomic_store(&s->ask, book_best(bi->b, BOOK_SELL));
+	xtc_atomic_store_i64(&s->bid, book_best(bi->b, BOOK_BUY),
+	    xtc_mo_seq_cst);
+	xtc_atomic_store_i64(&s->ask, book_best(bi->b, BOOK_SELL),
+	    xtc_mo_seq_cst);
 	if (bi->b->last_price != BOOK_NO_PRICE)
-		atomic_store(&s->last, bi->b->last_price);
-	atomic_store(&s->seq, bi->b->seq);
+		xtc_atomic_store_i64(&s->last, bi->b->last_price,
+		    xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&s->seq, bi->b->seq, xtc_mo_seq_cst);
 }
 
 /* A new subscriber gets the whole book first (snapshot + every level),
@@ -288,10 +305,11 @@ book_init_fn(void *self, const void *args, size_t n)
 	    book_init(&bi->b, bi->mem, len, &cfg) != 0)
 		return xtc_tnt_transition_to_crash(XTC_TNT_FAULT_CONTRACT_VIOLATION);
 	book_mem[a->sym] = bi->mem;
-	atomic_store(&syms[a->sym].bid, BOOK_NO_PRICE);
-	atomic_store(&syms[a->sym].ask, BOOK_NO_PRICE);
-	atomic_store(&syms[a->sym].last, g_ref);
-	atomic_store(&syms[a->sym].book, xtc_tnt_self());
+	xtc_atomic_store_i64(&syms[a->sym].bid, BOOK_NO_PRICE, xtc_mo_seq_cst);
+	xtc_atomic_store_i64(&syms[a->sym].ask, BOOK_NO_PRICE, xtc_mo_seq_cst);
+	xtc_atomic_store_i64(&syms[a->sym].last, g_ref, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&syms[a->sym].book, xtc_tnt_self(),
+	    xtc_mo_seq_cst);
 	xtc_tnt_register_timer(100LL * 1000 * 1000, VT_TICK);
 	return XTC_TNT_TRANSITION_WAIT_MESSAGE;
 }
@@ -383,7 +401,7 @@ book_handler(void *self, xtc_tnt_message_t *msg)
 	}
 	t1 = venue_now_ns();
 	hist_record(&s->stats.match, t1 - t0);
-	atomic_fetch_add(&s->stats.commands, 1);
+	xtc_atomic_fetch_add_u64(&s->stats.commands, 1, xtc_mo_seq_cst);
 	bi->commands++;
 	dispatch_events(bi, &out, c, t1);
 	return XTC_TNT_TRANSITION_WAIT_MESSAGE;
@@ -452,7 +470,7 @@ parse_symbols(const char *list)
  * beside the shards: venue_fibers.c. */
 int venue_fibers_start(const venue_opts_t *opts);
 void venue_fibers_join(void);
-extern _Atomic int venue_stopping;
+extern int venue_stopping;
 
 int
 venue_main(const venue_opts_t *opts)
@@ -498,7 +516,7 @@ venue_main(const venue_opts_t *opts)
 	if (venue_fibers_start(opts) != 0)
 		return 1;
 	rc = xtc_tnt_start(&spec);	/* blocks until xtc_tnt_stop */
-	atomic_store(&venue_stopping, 1);
+	xtc_atomic_store_i32(&venue_stopping, 1, xtc_mo_seq_cst);
 	venue_fibers_join();
 	for (i = 0; i < nsyms; i++) {
 		free(book_mem[i]);

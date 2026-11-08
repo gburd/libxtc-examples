@@ -23,7 +23,6 @@
  *	forcing data pages -- and redo-only recovery.  No daemon.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,7 +47,7 @@
 static wal_t      *g_wal;
 static bt_t       *g_bt1;
 static sx_db *g_db1;
-static _Atomic int g_phase1;          /* 0 unset, 1 ok, -1 fail */
+static int g_phase1; /* 0 unset, 1 ok, -1 fail */
 
 static int
 sel_v(sx_db *db, const char *tbl, int64_t k, char *out, size_t cap)
@@ -99,7 +98,7 @@ worker(void *arg)
 		snprintf(sql, sizeof sql, "INSERT INTO t2(k,v) VALUES(%d,'t2-%d');", 1000 + k, k);
 		if (sx_exec(g_db1, sql, NULL) != SX_OK) { ok = 0; break; }
 	}
-	atomic_store(&g_phase1, ok ? 1 : -1);
+	xtc_atomic_store_i32(&g_phase1, ok ? 1 : -1, xtc_mo_seq_cst);
 	(void)wal_writer_stop(g_wal);
 }
 
@@ -144,7 +143,7 @@ main(void)
 	if (xtc_proc_spawn(loop, worker, NULL, &po, &w) != XTC_OK) return 1;
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
 	(void)xtc_loop_fini(loop);
-	if (atomic_load(&g_phase1) != 1) {
+	if (xtc_atomic_load_i32(&g_phase1, xtc_mo_seq_cst) != 1) {
 		fprintf(stderr, "FAIL: phase 1 commits failed\n");
 		return 1;
 	}

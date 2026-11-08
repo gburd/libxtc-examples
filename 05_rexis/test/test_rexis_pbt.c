@@ -20,7 +20,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -214,7 +214,7 @@ test_prop_del_idempotent(const MunitParameter p[], void *d)
 #define INCR_THREADS    10
 #define INCR_PER_THREAD 100
 
-static atomic_int g_incr_errors;
+static int g_incr_errors;
 
 static void *
 incr_thread(void *arg)
@@ -226,16 +226,18 @@ incr_thread(void *arg)
 	(void)arg;
 	fd = connect_server();
 	if (fd < 0) {
-		atomic_fetch_add(&g_incr_errors, 1);
+		xtc_atomic_fetch_add_i32(&g_incr_errors, 1, xtc_mo_seq_cst);
 		return NULL;
 	}
 
 	for (i = 0; i < INCR_PER_THREAD; i++) {
 		n = build_cmd(cmd, sizeof cmd, 2, "INCR", "atomic_counter");
 		if (send_cmd(fd, cmd, (size_t)n, resp, sizeof resp) < 0) {
-			atomic_fetch_add(&g_incr_errors, 1);
+			xtc_atomic_fetch_add_i32(&g_incr_errors, 1,
+			    xtc_mo_seq_cst);
 		} else if (resp[0] != ':') {
-			atomic_fetch_add(&g_incr_errors, 1);
+			xtc_atomic_fetch_add_i32(&g_incr_errors, 1,
+			    xtc_mo_seq_cst);
 		}
 	}
 
@@ -254,7 +256,7 @@ test_prop_incr_atomic(const MunitParameter p[], void *d)
 	int64_t expected = INCR_THREADS * INCR_PER_THREAD;
 	(void)p; (void)d;
 
-	atomic_store(&g_incr_errors, 0);
+	xtc_atomic_store_i32(&g_incr_errors, 0, xtc_mo_seq_cst);
 
 	munit_assert_int(start_server(), ==, 0);
 
@@ -291,11 +293,12 @@ test_prop_incr_atomic(const MunitParameter p[], void *d)
 
 	printf("\n  P3 INCR atomic: %d threads x %d = %lld expected, got %lld"
 	       " (errors: %d)\n",
-	       INCR_THREADS, INCR_PER_THREAD,
-	       (long long)expected, (long long)final_value,
-	       atomic_load(&g_incr_errors));
+	    INCR_THREADS, INCR_PER_THREAD, (long long)expected,
+	    (long long)final_value,
+	    xtc_atomic_load_i32(&g_incr_errors, xtc_mo_seq_cst));
 
-	munit_assert_int(atomic_load(&g_incr_errors), ==, 0);
+	munit_assert_int(xtc_atomic_load_i32(&g_incr_errors, xtc_mo_seq_cst),
+	    ==, 0);
 	munit_assert_llong(final_value, ==, expected);
 
 	close(fd);

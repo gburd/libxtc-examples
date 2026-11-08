@@ -24,7 +24,6 @@
 
 #include <assert.h>
 #include <fcntl.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,10 +42,10 @@
 #define N_COMMITS     (N_COMMITTERS * PER_COMMITTER)
 
 static wal_t       *g_wal;
-static _Atomic int  g_left;             /* committers still running */
-static _Atomic long g_done;             /* commits acknowledged */
-static _Atomic uint64_t g_lsn_xor;      /* xor of all LSNs (uniqueness check) */
-static _Atomic uint64_t g_lsn_sum;      /* sum of all LSNs (1..N triangular) */
+static int g_left;         /* committers still running */
+static long g_done;        /* commits acknowledged */
+static uint64_t g_lsn_xor; /* xor of all LSNs (uniqueness check) */
+static uint64_t g_lsn_sum; /* sum of all LSNs (1..N triangular) */
 
 static void
 committer_proc(void *arg)
@@ -59,14 +58,16 @@ committer_proc(void *arg)
 		uint64_t lsn = 0;
 		int n = snprintf(rec, sizeof rec, "txn-%03ld-%03d-payload", id, i);
 		if (wal_commit(g_wal, rec, (uint32_t)n, &lsn) == XTC_OK) {
-			atomic_fetch_add(&g_done, 1);
-			atomic_fetch_xor(&g_lsn_xor, lsn);
-			atomic_fetch_add(&g_lsn_sum, lsn);
+			xtc_atomic_fetch_add_long(&g_done, 1, xtc_mo_seq_cst);
+			xtc_atomic_fetch_xor_u64(&g_lsn_xor, lsn,
+			    xtc_mo_seq_cst);
+			xtc_atomic_fetch_add_u64(&g_lsn_sum, lsn,
+			    xtc_mo_seq_cst);
 		}
 	}
 	/* The last committer to finish tells the writer to drain + exit so
 	 * the loop/executor can return (mirrors bm_provider_stop). */
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		(void)wal_writer_stop(g_wal);
 }
 
@@ -109,10 +110,10 @@ run_one(int n_loops, const char *tag)
 	wo.max_batch = 256;
 	if (wal_open(&wo, &g_wal) != XTC_OK) { fprintf(stderr, "wal_open\n"); return 1; }
 
-	atomic_store(&g_left, N_COMMITTERS);
-	atomic_store(&g_done, 0);
-	atomic_store(&g_lsn_xor, 0);
-	atomic_store(&g_lsn_sum, 0);
+	xtc_atomic_store_i32(&g_left, N_COMMITTERS, xtc_mo_seq_cst);
+	xtc_atomic_store_long(&g_done, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&g_lsn_xor, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&g_lsn_sum, 0, xtc_mo_seq_cst);
 
 	if (n_loops <= 1) {
 		xtc_loop_t *loop = NULL;
@@ -143,16 +144,18 @@ run_one(int n_loops, const char *tag)
 
 	wal_get_stats(g_wal, &st);
 
-	if (atomic_load(&g_done) != N_COMMITS) {
+	if (xtc_atomic_load_long(&g_done, xtc_mo_seq_cst) != N_COMMITS) {
 		fprintf(stderr, "FAIL[%s]: %ld/%d commits acked\n", tag,
-		    atomic_load(&g_done), N_COMMITS);
+		    xtc_atomic_load_long(&g_done, xtc_mo_seq_cst), N_COMMITS);
 		return 1;
 	}
 	/* LSNs must be exactly 1..N: the sum is the triangular number and
 	 * (since each is unique) replay sees them in order. */
-	if (atomic_load(&g_lsn_sum) != expect_sum) {
-		fprintf(stderr, "FAIL[%s]: LSN sum %llu != %llu (dup/missing LSN)\n",
-		    tag, (unsigned long long)atomic_load(&g_lsn_sum),
+	if (xtc_atomic_load_u64(&g_lsn_sum, xtc_mo_seq_cst) != expect_sum) {
+		fprintf(stderr,
+		    "FAIL[%s]: LSN sum %llu != %llu (dup/missing LSN)\n", tag,
+		    (unsigned long long)xtc_atomic_load_u64(&g_lsn_sum,
+		        xtc_mo_seq_cst),
 		    (unsigned long long)expect_sum);
 		return 1;
 	}

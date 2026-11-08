@@ -29,13 +29,14 @@ race_hook(bm_t *bm, bm_frame_t *f, int phase)
 		bm_unfix(bm, f, 1);
 		/* Sampling already saw this incarnation COOL: emulate a
 		 * concurrent provider's harmless cooling after the write. */
-		atomic_store(&f->state, BM_COOL);
+		xtc_atomic_store_u8(&f->state, BM_COOL, xtc_mo_seq_cst);
 		staged = 1;
 		armed = 0;
 		return;
 	}
 	if (phase == 0 && bm->claim_threshold != 0 && !staged &&
-	    atomic_load(&bm->clock) == (uint32_t)(f - bm->frames) + 1)
+	    xtc_atomic_load_u32(&bm->clock, xtc_mo_seq_cst) ==
+	        (uint32_t)(f - bm->frames) + 1)
 		return;
 	if (phase == 0 && !staged) {
 		/* Evictor has already seen pin==0 and HOT. The writer pins
@@ -83,14 +84,15 @@ run(uint32_t theta)
 	if (bm_checkpoint(bm) != XTC_OK)
 		goto out;
 	target = f;
-	atomic_store(&f->ref, 0);
-	atomic_store(&bm->clock, (uint32_t)(f - bm->frames));
+	xtc_atomic_store_i32(&f->ref, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u32(&bm->clock, (uint32_t)(f - bm->frames),
+	    xtc_mo_seq_cst);
 	/* Claim arm spends its budget passing over HOT, then reaches this
 	 * same frame on the next cycle. Don't start the writer on that pass. */
 	armed = 1;
 	staged = 0;
 #ifdef BM_SAMPLED_EVICT
-	atomic_store(&f->state, BM_COOL);
+	xtc_atomic_store_u8(&f->state, BM_COOL, xtc_mo_seq_cst);
 	reclaimed = sample_evict_one(bm);
 	/* Flush/reclaim after the forced interleaving if correctly spared. */
 #endif

@@ -25,7 +25,6 @@
  *	4 loops only.
  */
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,16 +46,17 @@
 
 static bt_t        *g_bt;
 static wal_t       *g_wal;
-static _Atomic int  g_done, g_readers_left;
-static _Atomic long g_torn, g_nonrepeat, g_reads, g_badkeys;
+static int g_done, g_readers_left;
+static long g_torn, g_nonrepeat, g_reads, g_badkeys;
 
-static _Atomic int  g_printed;
+static int g_printed;
 
 static void
 show(const char *what, const int64_t *v, int n, const int64_t *w, int m)
 {
 	int k;
-	if (atomic_fetch_add(&g_printed, 1) >= 3) return;
+	if (xtc_atomic_fetch_add_i32(&g_printed, 1, xtc_mo_seq_cst) >= 3)
+		return;
 	fprintf(stderr, "  %s: n=%d [", what, n);
 	for (k = 0; k < n; k++) fprintf(stderr, "%s%lld", k ? "," : "", (long long)v[k]);
 	fprintf(stderr, "]");
@@ -81,7 +81,7 @@ scan(sx_db *db, int64_t *v)
 	int64_t kk[SCANCAP];
 	int n = 0, k;
 	if (sx_prepare(db, "SELECT k, v FROM t ORDER BY k", -1, &st, NULL) != SX_OK) {
-		atomic_fetch_add(&g_badkeys, 1);
+		xtc_atomic_fetch_add_long(&g_badkeys, 1, xtc_mo_seq_cst);
 		return -1;
 	}
 	while (sx_step(st) == SX_ROW && n < SCANCAP) {
@@ -92,8 +92,9 @@ scan(sx_db *db, int64_t *v)
 	for (k = 0; k < n; k++)
 		if (kk[k] != k) break;
 	if (k < n || n != ROWS) {
-		atomic_fetch_add(&g_badkeys, 1);
-		if (atomic_fetch_add(&g_printed, 1) < 3) {
+		xtc_atomic_fetch_add_long(&g_badkeys, 1, xtc_mo_seq_cst);
+		if (xtc_atomic_fetch_add_i32(&g_printed, 1, xtc_mo_seq_cst) <
+		    3) {
 			fprintf(stderr, "  bad key set: n=%d k=[", n);
 			for (k = 0; k < n; k++)
 				fprintf(stderr, "%s%lld", k ? "," : "", (long long)kk[k]);
@@ -114,7 +115,10 @@ writer(void *arg)
 	char sql[96];
 	int i, k;
 	(void)arg;
-	if (sx_open_bt(g_bt, &db) != SX_OK) { atomic_store(&g_done, 1); return; }
+	if (sx_open_bt(g_bt, &db) != SX_OK) {
+		xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
+		return;
+	}
 	for (i = 1; i <= TXNS; i++) {
 		CK(sx_exec(db, "BEGIN", NULL) == SX_OK);
 		for (k = 0; k < ROWS; k++) {
@@ -124,7 +128,7 @@ writer(void *arg)
 		}
 		CK(sx_exec(db, "COMMIT", NULL) == SX_OK);
 	}
-	atomic_store(&g_done, 1);
+	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	sx_close(db);
 }
 
@@ -136,13 +140,13 @@ reader(void *arg)
 	int na, nb, k;
 	(void)arg;
 	if (sx_open_bt(g_bt, &db) != SX_OK) goto out;
-	while (!atomic_load(&g_done)) {
+	while (!xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst)) {
 		/* autocommit scan: all rows from one txn */
 		na = scan(db, a);
 		for (k = 1; k < na; k++)
 			if (a[k] != a[0]) break;
 		if (na == ROWS && k < na) {
-			atomic_fetch_add(&g_torn, 1);
+			xtc_atomic_fetch_add_long(&g_torn, 1, xtc_mo_seq_cst);
 			show("torn autocommit scan", a, na, NULL, 0);
 		}
 		/* snapshot txn: two reads agree */
@@ -153,14 +157,15 @@ reader(void *arg)
 		(void)sx_exec(db, "COMMIT", NULL);
 		if (na == ROWS && nb == ROWS &&
 		    memcmp(a, b, (size_t)na * sizeof a[0]) != 0) {
-			atomic_fetch_add(&g_nonrepeat, 1);
+			xtc_atomic_fetch_add_long(&g_nonrepeat, 1,
+			    xtc_mo_seq_cst);
 			show("non-repeatable snapshot", a, na, b, nb);
 		}
-		atomic_fetch_add(&g_reads, 1);
+		xtc_atomic_fetch_add_long(&g_reads, 1, xtc_mo_seq_cst);
 	}
 	sx_close(db);
 out:
-	if (atomic_fetch_sub(&g_readers_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_readers_left, 1, xtc_mo_seq_cst) == 1)
 		(void)wal_writer_stop(g_wal);
 }
 
@@ -197,12 +202,12 @@ main(void)
 			snprintf(q, sizeof q, "INSERT INTO t(k,v) VALUES(%d,0)", i);
 			CK(sx_exec(ddl, q, NULL) == SX_OK);
 		}
-		atomic_store(&g_done, 0);
-		atomic_store(&g_readers_left, READERS);
-		atomic_store(&g_torn, 0);
-		atomic_store(&g_nonrepeat, 0);
-		atomic_store(&g_reads, 0);
-		atomic_store(&g_badkeys, 0);
+		xtc_atomic_store_i32(&g_done, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_i32(&g_readers_left, READERS, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_torn, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_nonrepeat, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_reads, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_badkeys, 0, xtc_mo_seq_cst);
 		if (xtc_exec_init(&ex, nloops) != XTC_OK) return 1;
 		if (wal_writer_spawn(g_wal, xtc_exec_loop(ex, 0), NULL) != XTC_OK) return 1;
 		for (i = 0; i < READERS; i++)
@@ -213,15 +218,18 @@ main(void)
 			return 1;
 		if (xtc_exec_run(ex) != XTC_OK) return 1;
 		(void)xtc_exec_fini(ex);
-		printf("  [%d loop%s] reads=%ld torn-scans=%ld non-repeatable-snapshots=%ld"
+		printf(
+		    "  [%d loop%s] reads=%ld torn-scans=%ld non-repeatable-snapshots=%ld"
 		    " bad-key-sets=%ld\n",
-		    nloops, nloops > 1 ? "s" : "", atomic_load(&g_reads),
-		    atomic_load(&g_torn), atomic_load(&g_nonrepeat),
-		    atomic_load(&g_badkeys));
-		CK(atomic_load(&g_badkeys) == 0);
-		CK(atomic_load(&g_reads) > 0);
-		CK(atomic_load(&g_torn) == 0);
-		CK(atomic_load(&g_nonrepeat) == 0);
+		    nloops, nloops > 1 ? "s" : "",
+		    xtc_atomic_load_long(&g_reads, xtc_mo_seq_cst),
+		    xtc_atomic_load_long(&g_torn, xtc_mo_seq_cst),
+		    xtc_atomic_load_long(&g_nonrepeat, xtc_mo_seq_cst),
+		    xtc_atomic_load_long(&g_badkeys, xtc_mo_seq_cst));
+		CK(xtc_atomic_load_long(&g_badkeys, xtc_mo_seq_cst) == 0);
+		CK(xtc_atomic_load_long(&g_reads, xtc_mo_seq_cst) > 0);
+		CK(xtc_atomic_load_long(&g_torn, xtc_mo_seq_cst) == 0);
+		CK(xtc_atomic_load_long(&g_nonrepeat, xtc_mo_seq_cst) == 0);
 		sx_close(ddl);
 		xstore_set_wal(NULL);
 		bt_close(g_bt);

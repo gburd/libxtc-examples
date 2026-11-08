@@ -16,7 +16,6 @@
  *	the others must fail with "UNIQUE constraint failed: d.a, d.b".
  */
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,17 +38,17 @@
 static bt_t        *g_bt;
 static wal_t       *g_wal;
 static sx_db       *g_c[NCLI];
-static _Atomic int  g_bar, g_left;
-static _Atomic long g_ok[KEYS];          /* acked INSERTs per key */
-static _Atomic long g_winner[KEYS];      /* client id of the last ack */
-static _Atomic long g_errs, g_other;
+static int g_bar, g_left;
+static long g_ok[KEYS];     /* acked INSERTs per key */
+static long g_winner[KEYS]; /* client id of the last ack */
+static long g_errs, g_other;
 
 static void
 barrier(int *k)
 {
 	int target = NCLI * ++(*k);
-	atomic_fetch_add(&g_bar, 1);
-	while (atomic_load(&g_bar) < target)
+	xtc_atomic_fetch_add_i32(&g_bar, 1, xtc_mo_seq_cst);
+	while (xtc_atomic_load_i32(&g_bar, xtc_mo_seq_cst) < target)
 		(void)xtc_proc_sleep(20LL * 1000);
 }
 
@@ -72,19 +71,22 @@ worker(void *arg)
 			rc = sx_exec(g_c[me], q, NULL);
 		}
 		if (rc == SX_OK) {
-			atomic_fetch_add(&g_ok[key], 1);
-			atomic_store(&g_winner[key], me);
+			xtc_atomic_fetch_add_long(&g_ok[key], 1,
+			    xtc_mo_seq_cst);
+			xtc_atomic_store_long(&g_winner[key], me,
+			    xtc_mo_seq_cst);
 		} else {
-			atomic_fetch_add(&g_errs, 1);
+			xtc_atomic_fetch_add_long(&g_errs, 1, xtc_mo_seq_cst);
 			err = sx_errmsg(g_c[me]);
 			if (err == NULL ||
 			    strstr(err, "UNIQUE constraint failed: d.a, d.b") == NULL) {
 				fprintf(stderr, "  unexpected error: %s\n", err ? err : "?");
-				atomic_fetch_add(&g_other, 1);
+				xtc_atomic_fetch_add_long(&g_other, 1,
+				    xtc_mo_seq_cst);
 			}
 		}
 	}
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		(void)wal_writer_stop(g_wal);
 }
 
@@ -120,13 +122,14 @@ main(void)
 		for (i = 0; i < NCLI; i++)
 			if (sx_open_bt(g_bt, &g_c[i]) != SX_OK) return 1;
 		CK(sx_exec(g_c[0], "CREATE TABLE d(a INT, b INT, w INTEGER, PRIMARY KEY(a, b))", NULL) == SX_OK);
-		atomic_store(&g_bar, 0);
-		atomic_store(&g_left, NCLI);
-		atomic_store(&g_errs, 0);
-		atomic_store(&g_other, 0);
+		xtc_atomic_store_i32(&g_bar, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_i32(&g_left, NCLI, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_errs, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_other, 0, xtc_mo_seq_cst);
 		for (key = 0; key < KEYS; key++) {
-			atomic_store(&g_ok[key], 0);
-			atomic_store(&g_winner[key], -1);
+			xtc_atomic_store_long(&g_ok[key], 0, xtc_mo_seq_cst);
+			xtc_atomic_store_long(&g_winner[key], -1,
+			    xtc_mo_seq_cst);
 		}
 		if (xtc_exec_init(&ex, nloops) != XTC_OK) return 1;
 		if (wal_writer_spawn(g_wal, xtc_exec_loop(ex, 0), NULL) != XTC_OK) return 1;
@@ -149,21 +152,31 @@ main(void)
 				}
 				sx_finalize(st);
 			}
-			if (atomic_load(&g_ok[key]) > 1) multi++;
-			if (atomic_load(&g_ok[key]) == 0) zero++;
-			if (got != atomic_load(&g_winner[key])) lost++;
+			if (xtc_atomic_load_long(&g_ok[key], xtc_mo_seq_cst) >
+			    1)
+				multi++;
+			if (xtc_atomic_load_long(&g_ok[key], xtc_mo_seq_cst) ==
+			    0)
+				zero++;
+			if (got !=
+			    xtc_atomic_load_long(&g_winner[key],
+			        xtc_mo_seq_cst))
+				lost++;
 		}
-		printf("  [%d loop%s] keys=%d clients=%d keys-with->1-ack=%ld "
+		printf(
+		    "  [%d loop%s] keys=%d clients=%d keys-with->1-ack=%ld "
 		    "keys-with-0-acks=%ld acked-value-not-stored=%ld rows=%ld "
-		    "errors=%ld (non-unique-msg %ld)\n", nloops,
-		    nloops > 1 ? "s" : "", KEYS, NCLI, multi, zero, lost, rows,
-		    atomic_load(&g_errs), atomic_load(&g_other));
+		    "errors=%ld (non-unique-msg %ld)\n",
+		    nloops, nloops > 1 ? "s" : "", KEYS, NCLI, multi, zero,
+		    lost, rows, xtc_atomic_load_long(&g_errs, xtc_mo_seq_cst),
+		    xtc_atomic_load_long(&g_other, xtc_mo_seq_cst));
 		CK(multi == 0);
 		CK(zero == 0);
 		CK(lost == 0);
 		CK(rows == KEYS);
-		CK(atomic_load(&g_errs) == (long)KEYS * (NCLI - 1));
-		CK(atomic_load(&g_other) == 0);
+		CK(xtc_atomic_load_long(&g_errs, xtc_mo_seq_cst) ==
+		    (long)KEYS * (NCLI - 1));
+		CK(xtc_atomic_load_long(&g_other, xtc_mo_seq_cst) == 0);
 		for (i = 0; i < NCLI; i++) sx_close(g_c[i]);
 		xstore_set_wal(NULL);
 		bt_close(g_bt);

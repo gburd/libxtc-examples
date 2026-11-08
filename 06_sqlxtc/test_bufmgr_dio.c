@@ -13,7 +13,6 @@
  *	where the filesystem cannot do direct I/O (e.g. Linux tmpfs).
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +32,7 @@
 
 static bm_t       *g_bm;
 static bm_pid_t    g_pid[N_PAGES];
-static _Atomic int g_result;
+static int g_result;
 
 static void
 fill_page(void *p, bm_pid_t pid, uint64_t k)
@@ -68,7 +67,7 @@ worker_proc(void *arg)
 		if (!check_page(bm_page(f), g_pid[k], (uint64_t)k)) ok = 0;
 		bm_unfix(g_bm, f, 0);
 	}
-	atomic_store(&g_result, ok ? 1 : -1);
+	xtc_atomic_store_i32(&g_result, ok ? 1 : -1, xtc_mo_seq_cst);
 	bm_provider_stop(g_bm);
 	bm_trickler_stop(g_bm);     /* both must stop for the loop to drain */
 }
@@ -117,7 +116,7 @@ main(void)
 	bo.adaptive_writeback = 1;
 	if (bm_create(&bo, &g_bm) != XTC_OK) { fprintf(stderr, "bm_create\n"); return 1; }
 
-	atomic_store(&g_result, 0);
+	xtc_atomic_store_i32(&g_result, 0, xtc_mo_seq_cst);
 	if (xtc_loop_init(&loop) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, &pp) != XTC_OK) return 1;
 	if (bm_trickler_spawn(g_bm, loop, 1LL * 1000 * 1000, &tr) != XTC_OK) return 1;
@@ -130,9 +129,9 @@ main(void)
 	bm_destroy(g_bm);
 	unlink(path);
 
-	if (atomic_load(&g_result) != 1) {
+	if (xtc_atomic_load_i32(&g_result, xtc_mo_seq_cst) != 1) {
 		fprintf(stderr, "FAIL: direct-I/O workload result=%d\n",
-		    atomic_load(&g_result));
+		    xtc_atomic_load_i32(&g_result, xtc_mo_seq_cst));
 		return 1;
 	}
 	if (st.flushed == 0) {

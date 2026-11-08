@@ -93,7 +93,7 @@ struct venue_md {
 struct venue_stats {
 	hist_t		match;		/* book_submit/cancel wall time */
 	hist_t		queue;		/* ingress -> book handler start */
-	_Atomic uint64_t commands, trades, volume, rejects, drops;
+	uint64_t commands, trades, volume, rejects, drops;
 };
 
 typedef struct {

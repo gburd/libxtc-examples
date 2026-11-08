@@ -22,7 +22,6 @@
  *	     multi-loop executor never crashes and stays ascending.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -333,8 +332,8 @@ t_skewed(void)
 /* 4. Sampling during concurrent splits and merges. */
 static bm_t *g_bm;
 static bt_t *g_bt;
-static atomic_int g_left;
-static atomic_int g_bad, g_samples;
+static int g_left;
+static int g_bad, g_samples;
 
 static void
 churner(void *arg)
@@ -353,7 +352,7 @@ churner(void *arg)
 			(void)bt_delete(g_bt, k, 8);
 		}
 	}
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		bm_provider_stop(g_bm);
 }
 
@@ -365,16 +364,17 @@ sampler(void *arg)
 	uint32_t n;
 
 	(void)arg;
-	while (atomic_load(&g_left) > 0) {
+	while (xtc_atomic_load_i32(&g_left, xtc_mo_seq_cst) > 0) {
 		int rc = bt_sample_keys(g_bt, NULL, 0, NULL, 0, 2, keys, KCAP,
 		    lens, MAXS, &n);
 
 		/* An error after the last churner stopped the page provider
 		 * is not the sampler's fault; any other is. */
 		if ((rc == XTC_OK && !ascending(keys, lens, n)) ||
-		    (rc != XTC_OK && atomic_load(&g_left) > 0))
-			atomic_fetch_add(&g_bad, 1);
-		atomic_fetch_add(&g_samples, 1);
+		    (rc != XTC_OK &&
+		        xtc_atomic_load_i32(&g_left, xtc_mo_seq_cst) > 0))
+			xtc_atomic_fetch_add_i32(&g_bad, 1, xtc_mo_seq_cst);
+		xtc_atomic_fetch_add_i32(&g_samples, 1, xtc_mo_seq_cst);
 		xtc_yield();
 	}
 }
@@ -389,7 +389,7 @@ t_concurrent(void)
 
 	g_bm = mk(p, 48);
 	CHECK(bt_open(g_bm, &g_bt) == XTC_OK, "open");
-	atomic_store(&g_left, 4);
+	xtc_atomic_store_i32(&g_left, 4, xtc_mo_seq_cst);
 	CHECK(xtc_exec_init(&exec, 4) == XTC_OK, "exec");
 	CHECK(bm_provider_spawn(g_bm, xtc_exec_loop(exec, 0), 1000000LL,
 	    NULL) == XTC_OK, "provider");
@@ -403,14 +403,16 @@ t_concurrent(void)
 	    NULL) == XTC_OK, "spawn sampler");
 	CHECK(xtc_exec_run(exec) == XTC_OK, "run");
 	(void)xtc_exec_fini(exec);
-	CHECK(atomic_load(&g_bad) == 0, "%d bad samples",
-	    atomic_load(&g_bad));
-	CHECK(atomic_load(&g_samples) > 0, "sampler ran");
+	CHECK(xtc_atomic_load_i32(&g_bad, xtc_mo_seq_cst) == 0,
+	    "%d bad samples", xtc_atomic_load_i32(&g_bad, xtc_mo_seq_cst));
+	CHECK(xtc_atomic_load_i32(&g_samples, xtc_mo_seq_cst) > 0,
+	    "sampler ran");
 	bt_close(g_bt);
 	bm_destroy(g_bm);
 	(void)unlink(p);
 	printf("  ok   %d samples during concurrent splits/merges, all "
-	    "ascending\n", atomic_load(&g_samples));
+	       "ascending\n",
+	    xtc_atomic_load_i32(&g_samples, xtc_mo_seq_cst));
 }
 
 int

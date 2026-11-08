@@ -37,7 +37,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,17 +57,25 @@
 
 /* conn.c's view of main.c's server: only the connection count. */
 struct server {
-	_Atomic int n;
+	int n;
 };
-void server_inc_conn(struct server *s) { atomic_fetch_add(&s->n, 1); }
-void server_dec_conn(struct server *s) { atomic_fetch_sub(&s->n, 1); }
+void
+server_inc_conn(struct server *s)
+{
+	xtc_atomic_fetch_add_i32(&s->n, 1, xtc_mo_seq_cst);
+}
+void
+server_dec_conn(struct server *s)
+{
+	xtc_atomic_fetch_sub_i32(&s->n, 1, xtc_mo_seq_cst);
+}
 
 static struct server g_srv;
 static char          g_path[256];
 static xtc_exec_t   *g_exec;
 static db_t         *g_db;
 static xtc_res_t     g_res;
-static _Atomic int   g_done;
+static int g_done;
 static const char   *g_which = "abc";   /* argv[1]: the cases to run */
 static int           g_slow = 1;        /* x20 under valgrind / emulation */
 
@@ -267,7 +274,7 @@ scenario(int kill, const char *name)
 		close(sv[1]);
 	}
 	CK(nfds() == fd0);
-	CK(atomic_load(&g_srv.n) == 0);
+	CK(xtc_atomic_load_i32(&g_srv.n, xtc_mo_seq_cst) == 0);
 	mem = xtc_res_used(&g_res, XTC_RES_MEM_BYTES);
 	CK(mem == 0);
 	post = xstore_gc_run((struct xsql *)h);
@@ -283,9 +290,10 @@ scenario(int kill, const char *name)
 	sx_close(h);
 	free(c);
 	printf("  %-12s down %d eof %d fds %d->%d conns %d mem %lld gc %d->%d "
-	    "row1 %lld intent wait %lld ms\n", name, down, eof, fd0, nfds(),
-	    atomic_load(&g_srv.n), (long long)mem, pre, post, (long long)v1,
-	    (long long)wait_ms);
+	       "row1 %lld intent wait %lld ms\n",
+	    name, down, eof, fd0, nfds(),
+	    xtc_atomic_load_i32(&g_srv.n, xtc_mo_seq_cst), (long long)mem, pre,
+	    post, (long long)v1, (long long)wait_ms);
 }
 
 /*
@@ -352,7 +360,7 @@ mid_statement(void)
 		eof = cli_line(c, line, sizeof line, 1000);
 	CK(eof == 0);
 	close(sv[1]);
-	CK(atomic_load(&g_srv.n) == 0);
+	CK(xtc_atomic_load_i32(&g_srv.n, xtc_mo_seq_cst) == 0);
 	v2 = one(h, "SELECT v FROM t WHERE k = 2");
 	CK(v2 == 5);                    /* the statement ran to its end */
 	CK(sx_exec(h, "UPDATE t SET v = 1 WHERE k = 2", NULL) == SX_OK);
@@ -381,7 +389,7 @@ watchdog(void *arg)
 {
 	int64_t t0 = xtc_clock_mono();
 	(void)arg;
-	while (!atomic_load(&g_done)) {
+	while (!xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst)) {
 		if (ms_since(t0) > 60000 * g_slow) {
 			fprintf(stderr, "FAIL: test_conn_sup: hang\n");
 			_exit(3);
@@ -439,7 +447,7 @@ main(int argc, char **argv)
 		return 1;
 	(void)pthread_create(&wd, NULL, watchdog, NULL);
 	(void)xtc_exec_run(g_exec);
-	atomic_store(&g_done, 1);
+	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
 	(void)xtc_exec_fini(g_exec);
 	(void)sx_storage_close();

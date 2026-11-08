@@ -15,11 +15,12 @@
  *	#includes xstore.c to count snap_horizon calls (XS_HORIZON_TEST_HOOK).
  */
 
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <unistd.h>
 
-static _Atomic long g_hz;
-#define XS_HORIZON_TEST_HOOK() ((void)atomic_fetch_add(&g_hz, 1))
+static long g_hz;
+#define XS_HORIZON_TEST_HOOK()                                                 \
+	((void)xtc_atomic_fetch_add_long(&g_hz, 1, xtc_mo_seq_cst))
 #include "xstore.c"
 
 #include "engine.h"
@@ -55,21 +56,21 @@ main(void)
 	if (h == NULL) return 1;
 	CK(ex(h, "CREATE TABLE t(k INTEGER PRIMARY KEY, v INTEGER)") == SX_OK);
 
-	a0 = atomic_load(&g_hz);
+	a0 = xtc_atomic_load_long(&g_hz, xtc_mo_seq_cst);
 	for (i = 1; i <= N; i++) {
 		snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, %d)", i, i);
 		CK(ex(h, q) == SX_OK);
 	}
-	a1 = atomic_load(&g_hz) - a0;
+	a1 = xtc_atomic_load_long(&g_hz, xtc_mo_seq_cst) - a0;
 
 	CK(ex(h, "BEGIN") == SX_OK);
 	for (i = N + 1; i <= 2 * N; i++) {
 		snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, %d)", i, i);
 		CK(ex(h, q) == SX_OK);
 	}
-	a0 = atomic_load(&g_hz);
+	a0 = xtc_atomic_load_long(&g_hz, xtc_mo_seq_cst);
 	CK(ex(h, "COMMIT") == SX_OK);
-	t1 = atomic_load(&g_hz) - a0;
+	t1 = xtc_atomic_load_long(&g_hz, xtc_mo_seq_cst) - a0;
 
 	printf("  %d autocommit inserts: %ld horizon computations; a %d-row "
 	    "commit: %ld\n", N, a1, N, t1);

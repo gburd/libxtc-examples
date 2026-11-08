@@ -145,8 +145,8 @@ typedef struct conn_state {
 	int64_t     iops_cap;
 
 	/* Server-wide state */
-	_Atomic int *conn_count;
-	_Atomic int *shutdown;
+	int *conn_count;
+	int *shutdown;
 	int          loop_idx;   /* census slot (g_loop_live) */
 
 	/* Pub/sub: this connection's own pid + the shared channel registry
@@ -165,27 +165,27 @@ typedef struct conn_state {
 } conn_state_t;
 
 /* Charged client buffer bytes held by all connections (INFO). */
-static _Atomic int64_t g_client_bytes;
+static int64_t g_client_bytes;
 
 int64_t
 conn_client_bytes(void)
 {
-	return atomic_load(&g_client_bytes);
+	return xtc_atomic_load_i64(&g_client_bytes, xtc_mo_seq_cst);
 }
 
 /* ----- per-loop census (conn.h) ----- */
 
 static int              g_n_loops = 1;
 static int              g_loop_cap = CONN_LOOP_MAX;
-static _Atomic int      g_loop_live[CONN_MAX_LOOPS];
-static _Atomic int64_t  g_rejected;
-static _Atomic int64_t  g_idle_wakes;     /* park timer was the only cause */
-static _Atomic int64_t  g_ref_bytes;      /* value bytes sent by reference */
+static int g_loop_live[CONN_MAX_LOOPS];
+static int64_t g_rejected;
+static int64_t g_idle_wakes; /* park timer was the only cause */
+static int64_t g_ref_bytes;  /* value bytes sent by reference */
 
 int64_t
 conn_ref_bytes(void)
 {
-	return atomic_load(&g_ref_bytes);
+	return xtc_atomic_load_i64(&g_ref_bytes, xtc_mo_seq_cst);
 }
 
 /*
@@ -221,7 +221,7 @@ conn_wake_all(void)
 int64_t
 conn_idle_wakeups(void)
 {
-	return atomic_load(&g_idle_wakes);
+	return xtc_atomic_load_i64(&g_idle_wakes, xtc_mo_seq_cst);
 }
 
 void
@@ -239,7 +239,7 @@ conn_pick_loop(void)
 	int i, best = -1, n, best_n = g_loop_cap;
 
 	for (i = 0; i < g_n_loops; i++) {
-		n = atomic_load(&g_loop_live[i]);
+		n = xtc_atomic_load_i32(&g_loop_live[i], xtc_mo_seq_cst);
 		if (n < best_n) {
 			best = i;
 			best_n = n;
@@ -258,7 +258,8 @@ int
 conn_census_live(int loop_idx)
 {
 	return loop_idx >= 0 && loop_idx < g_n_loops ?
-	    atomic_load(&g_loop_live[loop_idx]) : 0;
+	    xtc_atomic_load_i32(&g_loop_live[loop_idx], xtc_mo_seq_cst) :
+	    0;
 }
 
 int
@@ -267,20 +268,20 @@ conn_census_total(void)
 	int i, t = 0;
 
 	for (i = 0; i < g_n_loops; i++)
-		t += atomic_load(&g_loop_live[i]);
+		t += xtc_atomic_load_i32(&g_loop_live[i], xtc_mo_seq_cst);
 	return t;
 }
 
 void
 conn_census_reject(void)
 {
-	atomic_fetch_add(&g_rejected, 1);
+	xtc_atomic_fetch_add_i64(&g_rejected, 1, xtc_mo_seq_cst);
 }
 
 int64_t
 conn_census_rejected(void)
 {
-	return atomic_load(&g_rejected);
+	return xtc_atomic_load_i64(&g_rejected, xtc_mo_seq_cst);
 }
 
 void
@@ -303,7 +304,7 @@ conn_charge(conn_state_t *st, size_t n)
 	    xtc_res_acquire(st->client_res, XTC_RES_MEM_BYTES, (int64_t)n) !=
 	    XTC_OK)
 		return -1;
-	atomic_fetch_add(&g_client_bytes, (int64_t)n);
+	xtc_atomic_fetch_add_i64(&g_client_bytes, (int64_t)n, xtc_mo_seq_cst);
 	return 0;
 }
 
@@ -312,7 +313,7 @@ conn_refund(conn_state_t *st, size_t n)
 {
 	if (st->client_res != NULL)
 		xtc_res_release(st->client_res, XTC_RES_MEM_BYTES, (int64_t)n);
-	atomic_fetch_sub(&g_client_bytes, (int64_t)n);
+	xtc_atomic_fetch_sub_i64(&g_client_bytes, (int64_t)n, xtc_mo_seq_cst);
 }
 
 /* The charged part of a buffer of cap bytes: only bytes above
@@ -417,7 +418,7 @@ seg_done(conn_state_t *st)
 {
 	out_seg_t *g = &st->segs[st->seg_head];
 
-	atomic_fetch_add(&g_ref_bytes, (int64_t)g->len);
+	xtc_atomic_fetch_add_i64(&g_ref_bytes, (int64_t)g->len, xtc_mo_seq_cst);
 	seg_drop(st, g);
 	st->seg_head++;
 	if (--st->nseg == 0)
@@ -845,8 +846,9 @@ conn_teardown(void *arg)
 	if (st->fd >= 0)
 		xtc_net_close(st->fd);
 	if (st->conn_count != NULL)
-		atomic_fetch_sub(st->conn_count, 1);   /* frees a --max-clients slot */
-	atomic_fetch_sub(&g_loop_live[st->loop_idx], 1);
+		xtc_atomic_fetch_sub_i32(st->conn_count, 1,
+		    xtc_mo_seq_cst); /* frees a --max-clients slot */
+	xtc_atomic_fetch_sub_i32(&g_loop_live[st->loop_idx], 1, xtc_mo_seq_cst);
 	seg_truncate(st, 0);
 	xtc_free(st->segs);
 	conn_refund(st, conn_charged(st->rcap) + conn_charged(st->wcap));
@@ -893,7 +895,8 @@ conn_proc(void *arg)
 	 * nor runs more commands until the client drains its replies.
 	 */
 	while (!st->closed &&
-	    (st->shutdown == NULL || !atomic_load(st->shutdown))) {
+	    (st->shutdown == NULL ||
+	        !xtc_atomic_load_i32(st->shutdown, xtc_mo_seq_cst))) {
 		conn_flush(st);
 		if (st->closed)
 			break;
@@ -982,7 +985,8 @@ conn_proc(void *arg)
 		revents = 0;
 		if (xtc_proc_wait_fd(st->fd, interest | XTC_IO_HUP | XTC_IO_ERR,
 		    park_ns, &revents) == XTC_E_AGAIN)
-			atomic_fetch_add(&g_idle_wakes, 1);
+			xtc_atomic_fetch_add_i64(&g_idle_wakes, 1,
+			    xtc_mo_seq_cst);
 		if ((st->rcap > CONN_BASE_BUF || st->wcap > CONN_BASE_BUF) &&
 		    xtc_clock_mono() - st->last_io_ns >= CONN_TRIM_NS)
 			conn_trim(st, 1);     /* idle: back to the base */
@@ -1081,10 +1085,11 @@ conn_spawn(xtc_loop_t *loop, const conn_opts_t *opts, xtc_pid_t *out_pid)
 
 	/* Count BEFORE the spawn: the proc may run (and exit) on its own
 	 * loop's thread before xtc_proc_spawn returns. */
-	atomic_fetch_add(&g_loop_live[st->loop_idx], 1);
+	xtc_atomic_fetch_add_i32(&g_loop_live[st->loop_idx], 1, xtc_mo_seq_cst);
 	rc = xtc_proc_spawn(loop, conn_proc, st, &proc_opts, out_pid);
 	if (rc != XTC_OK) {
-		atomic_fetch_sub(&g_loop_live[st->loop_idx], 1);
+		xtc_atomic_fetch_sub_i32(&g_loop_live[st->loop_idx], 1,
+		    xtc_mo_seq_cst);
 		/* Never ran, so conn_teardown never will: free here.  The fd
 		 * stays the caller's (see conn.h). */
 		xtc_free(st->rbuf);

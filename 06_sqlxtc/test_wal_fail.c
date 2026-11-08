@@ -26,7 +26,6 @@
  */
 
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,9 +50,9 @@
 #define PAGE_SZ     4096
 
 static wal_t       *g_wal;
-static _Atomic int  g_left;
-static _Atomic long g_ok, g_err, g_err_then_ok;
-static _Atomic uint64_t g_max_ok_lsn;
+static int g_left;
+static long g_ok, g_err, g_err_then_ok;
+static uint64_t g_max_ok_lsn;
 static uint8_t      g_acked[N_CMT * PER_CMT];   /* 1 = acked XTC_OK */
 
 static void
@@ -81,20 +80,24 @@ committer(void *arg)
 		memcpy(rec, &k, sizeof k);
 		rc = wal_commit(g_wal, rec, sizeof rec, &lsn);
 		if (rc == XTC_OK) {
-			uint64_t m = atomic_load(&g_max_ok_lsn);
+			uint64_t m =
+			    xtc_atomic_load_u64(&g_max_ok_lsn, xtc_mo_seq_cst);
 			g_acked[k] = 1;
-			atomic_fetch_add(&g_ok, 1);
+			xtc_atomic_fetch_add_long(&g_ok, 1, xtc_mo_seq_cst);
 			if (seen_err)
-				atomic_fetch_add(&g_err_then_ok, 1);
-			while (lsn > m && !atomic_compare_exchange_weak(&g_max_ok_lsn, &m, lsn))
+				xtc_atomic_fetch_add_long(&g_err_then_ok, 1,
+				    xtc_mo_seq_cst);
+			while (lsn > m &&
+			    !xtc_atomic_cas_weak_u64(&g_max_ok_lsn, &m, lsn,
+			        xtc_mo_seq_cst, xtc_mo_seq_cst))
 				;
 		} else {
 			CK(rc == XTC_E_IO);
 			seen_err = 1;
-			atomic_fetch_add(&g_err, 1);
+			xtc_atomic_fetch_add_long(&g_err, 1, xtc_mo_seq_cst);
 		}
 	}
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		(void)wal_writer_stop(g_wal);
 }
 
@@ -130,7 +133,7 @@ test_wal_level(void)
 	close(fd);
 	wo.path = path; wo.max_batch = 32;
 	if (wal_open(&wo, &g_wal) != XTC_OK) return 1;
-	atomic_store(&g_left, N_CMT);
+	xtc_atomic_store_i32(&g_left, N_CMT, xtc_mo_seq_cst);
 
 	cap_fsize(CAP_BYTES);
 	if (xtc_loop_init(&loop) != XTC_OK) return 1;
@@ -153,7 +156,8 @@ test_wal_level(void)
 	(void)lsn;
 #endif
 	cap_fsize(RLIM_INFINITY);
-	CK(st.durable_lsn == atomic_load(&g_max_ok_lsn));
+	CK(st.durable_lsn ==
+	    xtc_atomic_load_u64(&g_max_ok_lsn, xtc_mo_seq_cst));
 	wal_close(g_wal);
 
 	rp = calloc(1, sizeof *rp);
@@ -162,12 +166,14 @@ test_wal_level(void)
 	for (k = 0; k < N_CMT * PER_CMT; k++)
 		if (g_acked[k] && !rp->seen[k]) lost++;
 	printf("  wal: acked=%ld failed=%ld acked-after-fail=%ld replayed=%d "
-	    "acked-but-lost=%d durable_lsn=%llu\n", atomic_load(&g_ok),
-	    atomic_load(&g_err), atomic_load(&g_err_then_ok), rp->n, lost,
+	       "acked-but-lost=%d durable_lsn=%llu\n",
+	    xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_err, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_err_then_ok, xtc_mo_seq_cst), rp->n, lost,
 	    (unsigned long long)st.durable_lsn);
-	CK(atomic_load(&g_ok) > 0);
-	CK(atomic_load(&g_err) > 0);
-	CK(atomic_load(&g_err_then_ok) == 0);
+	CK(xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst) > 0);
+	CK(xtc_atomic_load_long(&g_err, xtc_mo_seq_cst) > 0);
+	CK(xtc_atomic_load_long(&g_err_then_ok, xtc_mo_seq_cst) == 0);
 	CK(lost == 0);
 	free(rp);
 	unlink(path);
@@ -179,8 +185,8 @@ test_wal_level(void)
 #define E_ROWS 3000
 static sx_db       *g_db;
 static uint8_t      g_e_ok[E_ROWS + 1];
-static _Atomic long g_e_ok_n, g_e_err_n, g_e_ok_after;
-static _Atomic int  g_e_read_ok;
+static long g_e_ok_n, g_e_err_n, g_e_ok_after;
+static int g_e_read_ok;
 
 static int
 exec_ok(const char *sql)
@@ -213,11 +219,14 @@ engine_worker(void *arg)
 rec:
 		if (ok) {
 			g_e_ok[i] = 1;
-			atomic_fetch_add(&g_e_ok_n, 1);
-			if (failed) atomic_fetch_add(&g_e_ok_after, 1);
+			xtc_atomic_fetch_add_long(&g_e_ok_n, 1, xtc_mo_seq_cst);
+			if (failed)
+				xtc_atomic_fetch_add_long(&g_e_ok_after, 1,
+				    xtc_mo_seq_cst);
 		} else {
 			failed = 1;
-			atomic_fetch_add(&g_e_err_n, 1);
+			xtc_atomic_fetch_add_long(&g_e_err_n, 1,
+			    xtc_mo_seq_cst);
 #ifdef WAL_HAVE_FAILSTOP
 			CK(xstore_wal_failed() == 1);
 			CK(strstr(sx_errmsg(g_db), "I/O error") != NULL);
@@ -227,7 +236,7 @@ rec:
 	/* read-only after fail-stop: a read still answers */
 	if (sx_prepare(g_db, "SELECT count(*) FROM t", -1, &st, NULL) == SX_OK) {
 		if (sx_step(st) == SX_ROW && sx_column_int64(st, 0) >= 0)
-			atomic_store(&g_e_read_ok, 1);
+			xtc_atomic_store_i32(&g_e_read_ok, 1, xtc_mo_seq_cst);
 		sx_finalize(st);
 	}
 	(void)wal_writer_stop(g_wal);
@@ -302,14 +311,16 @@ test_engine_level(void)
 		if (g_e_ok[i] && !got) lost++;
 	}
 	printf("  engine: ok=%ld failed=%ld ok-after-fail=%ld present-after-"
-	    "recovery=%d acked-but-lost=%d read-after-fail=%d\n",
-	    atomic_load(&g_e_ok_n), atomic_load(&g_e_err_n),
-	    atomic_load(&g_e_ok_after), present, lost, atomic_load(&g_e_read_ok));
-	CK(atomic_load(&g_e_ok_n) > 0);
-	CK(atomic_load(&g_e_err_n) > 0);
-	CK(atomic_load(&g_e_ok_after) == 0);
+	       "recovery=%d acked-but-lost=%d read-after-fail=%d\n",
+	    xtc_atomic_load_long(&g_e_ok_n, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_e_err_n, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_e_ok_after, xtc_mo_seq_cst), present, lost,
+	    xtc_atomic_load_i32(&g_e_read_ok, xtc_mo_seq_cst));
+	CK(xtc_atomic_load_long(&g_e_ok_n, xtc_mo_seq_cst) > 0);
+	CK(xtc_atomic_load_long(&g_e_err_n, xtc_mo_seq_cst) > 0);
+	CK(xtc_atomic_load_long(&g_e_ok_after, xtc_mo_seq_cst) == 0);
 	CK(lost == 0);
-	CK(atomic_load(&g_e_read_ok) == 1);
+	CK(xtc_atomic_load_i32(&g_e_read_ok, xtc_mo_seq_cst) == 1);
 	sx_close(db2); bt_close(bt2); bm_destroy(bm2);
 	unlink(logp); unlink(pa); unlink(pb);
 	return 0;

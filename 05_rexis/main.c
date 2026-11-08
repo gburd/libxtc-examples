@@ -46,7 +46,6 @@
 #include <getopt.h>
 #include <sched.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,11 +75,9 @@
 #include "proto.h"
 
 /* Forward declarations */
-int expire_spawn(xtc_loop_t *loop, db_t *db, _Atomic int *stop,
-                 xtc_pid_t *out_pid);
-int metrics_spawn(xtc_loop_t *loop, db_t *db, xtc_res_t *res,
-                  _Atomic int *conn_count, _Atomic int *stop,
-                  xtc_pid_t *out_pid);
+int expire_spawn(xtc_loop_t *loop, db_t *db, int *stop, xtc_pid_t *out_pid);
+int metrics_spawn(xtc_loop_t *loop, db_t *db, xtc_res_t *res, int *conn_count,
+    int *stop, xtc_pid_t *out_pid);
 
 /* ----- Server configuration ----- */
 
@@ -134,15 +131,15 @@ typedef struct server {
 	int              listen_fd;
 
 	/* Connection tracking */
-	_Atomic int      conn_count;
+	int conn_count;
 
 	/* Rate limiting state (token bucket) */
-	_Atomic int64_t  iops_tokens;
+	int64_t iops_tokens;
 	int64_t          iops_refill_ns;
 	int64_t          iops_last_refill;
 
 	/* Shutdown */
-	_Atomic int      shutdown_requested;
+	int shutdown_requested;
 	xtc_tcp_opts_t   conn_tcp_opts;  /* applied to each accepted socket */
 	xtc_pid_t        expire_pid;     /* woken by the listener on shutdown */
 	xtc_pid_t        metrics_pid;
@@ -156,7 +153,8 @@ static void
 rate_limit_init(server_t *srv)
 {
 	if (srv->cfg.max_iops > 0) {
-		atomic_store(&srv->iops_tokens, srv->cfg.max_iops);
+		xtc_atomic_store_i64(&srv->iops_tokens, srv->cfg.max_iops,
+		    xtc_mo_seq_cst);
 		srv->iops_refill_ns = 1000000000LL;  /* 1 second */
 		srv->iops_last_refill = xtc_clock_mono();
 	}
@@ -172,7 +170,8 @@ rate_limit_refill(server_t *srv)
 	now = xtc_clock_mono();
 	if (now - srv->iops_last_refill >= srv->iops_refill_ns) {
 		/* Refill tokens */
-		atomic_store(&srv->iops_tokens, srv->cfg.max_iops);
+		xtc_atomic_store_i64(&srv->iops_tokens, srv->cfg.max_iops,
+		    xtc_mo_seq_cst);
 		srv->iops_last_refill = now;
 	}
 }
@@ -222,7 +221,7 @@ listener_proc(void *arg)
 	void *msg;
 	size_t msg_len;
 
-	while (!atomic_load(&srv->shutdown_requested)) {
+	while (!xtc_atomic_load_i32(&srv->shutdown_requested, xtc_mo_seq_cst)) {
 		/* Refill rate limit tokens */
 		rate_limit_refill(srv);
 
@@ -257,7 +256,8 @@ listener_proc(void *arg)
 			 * LIVE connections: the conn proc decrements it on exit,
 			 * so this is a concurrency cap, not a lifetime one. */
 			if (srv->cfg.max_clients > 0 &&
-			    atomic_load(&srv->conn_count) >= srv->cfg.max_clients) {
+			    xtc_atomic_load_i32(&srv->conn_count,
+			        xtc_mo_seq_cst) >= srv->cfg.max_clients) {
 				conn_refuse(fd, "max number of clients reached");
 				XTC_LOG_WARN_F("max_clients reached, rejecting");
 				continue;
@@ -299,9 +299,11 @@ listener_proc(void *arg)
 			 * and it may run (and exit) before conn_spawn returns. */
 			cl = srv->exec != NULL ?
 			    xtc_exec_loop(srv->exec, loop_idx) : srv->loop;
-			atomic_fetch_add(&srv->conn_count, 1);
+			xtc_atomic_fetch_add_i32(&srv->conn_count, 1,
+			    xtc_mo_seq_cst);
 			if ((rc = conn_spawn(cl, &opts, &conn_pid)) != XTC_OK) {
-				atomic_fetch_sub(&srv->conn_count, 1);
+				xtc_atomic_fetch_sub_i32(&srv->conn_count, 1,
+				    xtc_mo_seq_cst);
 				/* Out of procs or memory: say so, as Redis does
 				 * at its limit, instead of a silent close. */
 				conn_refuse(fd, "max number of clients reached");
@@ -348,7 +350,9 @@ listener_proc(void *arg)
 	 * executor stops when the supervisor does, freezing whatever is
 	 * still running (LSan caught the background procs' state leaking). */
 	for (waited = 0; waited < 200 &&
-	    (atomic_load(&srv->conn_count) > 0 || n_bg > 0); waited++) {
+	     (xtc_atomic_load_i32(&srv->conn_count, xtc_mo_seq_cst) > 0 ||
+	         n_bg > 0);
+	     waited++) {
 		conn_wake_all();
 		if (xtc_recv(&msg, &msg_len, SHUTDOWN_POLL_NS) == XTC_OK) {
 			if (msg != NULL && xtc_down_decode_ex(msg, msg_len,
@@ -366,7 +370,7 @@ static void
 signal_handler(int sig)
 {
 	(void)sig;
-	atomic_store(&g_server.shutdown_requested, 1);
+	xtc_atomic_store_i32(&g_server.shutdown_requested, 1, xtc_mo_seq_cst);
 }
 
 static void
@@ -668,9 +672,10 @@ main(int argc, char **argv)
 		return rc > 0 ? 0 : 2;
 
 	srv->cfg = cfg;
-	atomic_init(&srv->conn_count, 0);
-	atomic_init(&srv->iops_tokens, cfg.max_iops > 0 ? cfg.max_iops : 0);
-	atomic_init(&srv->shutdown_requested, 0);
+	xtc_atomic_store_i32(&srv->conn_count, 0, xtc_mo_relaxed);
+	xtc_atomic_store_i64(&srv->iops_tokens,
+	    cfg.max_iops > 0 ? cfg.max_iops : 0, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&srv->shutdown_requested, 0, xtc_mo_relaxed);
 
 	/* Setup logging */
 	log_opts.floor = cfg.verbose ? XTC_LOG_DEBUG : XTC_LOG_INFO;

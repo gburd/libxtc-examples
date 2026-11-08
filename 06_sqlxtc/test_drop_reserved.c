@@ -64,10 +64,11 @@ main(int argc, char **argv)
 	if (bm_alloc_pid(bm, &f, &pid) != XTC_OK) return 2;
 	bm_unfix(bm, f, 0);
 	if (bm_checkpoint(bm) != XTC_OK) return 2;
-	atomic_store(&f->state, BM_COOL);
-	atomic_store(&f->ref, 0);
-	atomic_store(&bm->clock, (uint32_t)(f - bm->frames));
-	resident_before = atomic_load(&bm->resident);
+	xtc_atomic_store_u8(&f->state, BM_COOL, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&f->ref, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u32(&bm->clock, (uint32_t)(f - bm->frames),
+	    xtc_mo_seq_cst);
+	resident_before = xtc_atomic_load_u64(&bm->resident, xtc_mo_seq_cst);
 	target = f;
 	if (pthread_create(&thread, NULL, drop_thread, bm) != 0) return 2;
 	pthread_mutex_lock(&gate);
@@ -75,8 +76,10 @@ main(int argc, char **argv)
 		pthread_cond_wait(&changed, &gate);
 	pthread_mutex_unlock(&gate);
 	/* Drop owns active + deferred counts, but its pin is now zero. */
-	if (atomic_load(&f->pin) != 0 || !atomic_load(&f->doomed) ||
-	    atomic_load(&bm->pending_pid_drops) != 2) return 2;
+	if (xtc_atomic_load_i32(&f->pin, xtc_mo_seq_cst) != 0 ||
+	    !xtc_atomic_load_i32(&f->doomed, xtc_mo_seq_cst) ||
+	    xtc_atomic_load_u64(&bm->pending_pid_drops, xtc_mo_seq_cst) != 2)
+		return 2;
 	evicted = argc == 1 ? evict_one(bm) : 0;
 	pthread_mutex_lock(&gate);
 	resume_drop = 1;
@@ -84,8 +87,8 @@ main(int argc, char **argv)
 	pthread_mutex_unlock(&gate);
 	pthread_join(thread, NULL);
 	target = NULL;
-	resident_after = atomic_load(&bm->resident);
-	pending = atomic_load(&bm->pending_pid_drops);
+	resident_after = xtc_atomic_load_u64(&bm->resident, xtc_mo_seq_cst);
+	pending = xtc_atomic_load_u64(&bm->pending_pid_drops, xtc_mo_seq_cst);
 	bm_reclaim_quarantine(bm);
 	failed = drop_rc != XTC_OK || resident_after != resident_before - 1 ||
 	    pending != 0 || bm->quar_pids_n != 0 || bm->free_pids_n != 1;

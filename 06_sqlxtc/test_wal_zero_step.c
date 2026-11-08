@@ -18,17 +18,19 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdint.h>
 #include <sys/stat.h>
 
-static _Atomic uint64_t g_zmax, g_zcalls;  /* largest zero-fill, count */
+static uint64_t g_zmax, g_zcalls; /* largest zero-fill, count */
 static void
 zero_seen(uint64_t n)
 {
-	uint64_t cur = atomic_load(&g_zmax);
-	atomic_fetch_add(&g_zcalls, 1);
-	while (n > cur && !atomic_compare_exchange_weak(&g_zmax, &cur, n))
+	uint64_t cur = xtc_atomic_load_u64(&g_zmax, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_u64(&g_zcalls, 1, xtc_mo_seq_cst);
+	while (n > cur &&
+	    !xtc_atomic_cas_weak_u64(&g_zmax, &cur, n, xtc_mo_seq_cst,
+	        xtc_mo_seq_cst))
 		;
 }
 #define WAL_ZERO_TEST_HOOK(n) zero_seen((uint64_t)(n))
@@ -42,7 +44,7 @@ zero_seen(uint64_t n)
 #define BIGN  (3u << 20)
 
 static wal_t *g_w;
-static _Atomic long g_ok, g_bad, g_bigs;
+static long g_ok, g_bad, g_bigs;
 
 struct sc { uint64_t prev, n, big; int ordered; };
 
@@ -80,15 +82,17 @@ committer(void *arg)
 		len = 100 + (uint32_t)(seed % (sizeof rec[0] - 100));
 		if (i % 50 == 25) {
 			if (wal_commit_sync(g_w, big, BIGN, &lsn) == XTC_OK)
-				atomic_fetch_add(&g_bigs, 1);
+				xtc_atomic_fetch_add_long(&g_bigs, 1,
+				    xtc_mo_seq_cst);
 			else
-				atomic_fetch_add(&g_bad, 1);
+				xtc_atomic_fetch_add_long(&g_bad, 1,
+				    xtc_mo_seq_cst);
 			continue;
 		}
 		if (wal_commit_sync(g_w, r, len, &lsn) == XTC_OK)
-			atomic_fetch_add(&g_ok, 1);
+			xtc_atomic_fetch_add_long(&g_ok, 1, xtc_mo_seq_cst);
 		else
-			atomic_fetch_add(&g_bad, 1);
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 	}
 	return NULL;
 }
@@ -117,11 +121,14 @@ main(void)
 	if (g_w == NULL) return 1;
 	for (n = 0; wal_size(g_w) < (48u << 20); n++)
 		CK(wal_commit_sync(g_w, rec, sizeof rec, &lsn) == XTC_OK);
-	printf("  (a) %ld commits, log %llu MiB, file %ld MiB: %llu zero-fills, "
-	    "the largest %llu KiB\n", n, (unsigned long long)(wal_size(g_w) >> 20),
-	    file_size(path) >> 20, (unsigned long long)atomic_load(&g_zcalls),
-	    (unsigned long long)(atomic_load(&g_zmax) >> 10));
-	CK(atomic_load(&g_zmax) <= (1u << 20));
+	printf(
+	    "  (a) %ld commits, log %llu MiB, file %ld MiB: %llu zero-fills, "
+	    "the largest %llu KiB\n",
+	    n, (unsigned long long)(wal_size(g_w) >> 20), file_size(path) >> 20,
+	    (unsigned long long)xtc_atomic_load_u64(&g_zcalls, xtc_mo_seq_cst),
+	    (unsigned long long)(xtc_atomic_load_u64(&g_zmax, xtc_mo_seq_cst) >>
+	        10));
+	CK(xtc_atomic_load_u64(&g_zmax, xtc_mo_seq_cst) <= (1u << 20));
 	CK(file_size(path) > (long)wal_size(g_w));
 	wal_close(g_w);
 
@@ -136,17 +143,23 @@ main(void)
 	wal_close(g_w);                   /* a crash: no truncation */
 	memset(&s, 0, sizeof s); s.ordered = 1;
 	CK(wal_scan(path, scan_cb, &s) == XTC_OK);
-	printf("  (b) %d threads: %ld + %ld big committed, %ld failed; scan %llu "
-	    "records (%llu big), ordered %d; largest zero-fill %llu KiB\n", NT,
-	    atomic_load(&g_ok), atomic_load(&g_bigs), atomic_load(&g_bad),
+	printf(
+	    "  (b) %d threads: %ld + %ld big committed, %ld failed; scan %llu "
+	    "records (%llu big), ordered %d; largest zero-fill %llu KiB\n",
+	    NT, xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_bigs, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst),
 	    (unsigned long long)s.n, (unsigned long long)s.big, s.ordered,
-	    (unsigned long long)(atomic_load(&g_zmax) >> 10));
-	CK(atomic_load(&g_bad) == 0);
-	CK(s.n == (uint64_t)n + (uint64_t)atomic_load(&g_ok) +
-	    (uint64_t)atomic_load(&g_bigs));
-	CK(s.big == (uint64_t)atomic_load(&g_bigs));
+	    (unsigned long long)(xtc_atomic_load_u64(&g_zmax, xtc_mo_seq_cst) >>
+	        10));
+	CK(xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst) == 0);
+	CK(s.n ==
+	    (uint64_t)n +
+	        (uint64_t)xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst) +
+	        (uint64_t)xtc_atomic_load_long(&g_bigs, xtc_mo_seq_cst));
+	CK(s.big == (uint64_t)xtc_atomic_load_long(&g_bigs, xtc_mo_seq_cst));
 	CK(s.ordered);
-	CK(atomic_load(&g_zmax) <= (1u << 20));
+	CK(xtc_atomic_load_u64(&g_zmax, xtc_mo_seq_cst) <= (1u << 20));
 
 	unlink(path);
 	if (g_fail) { fprintf(stderr, "FAIL: test_wal_zero_step\n"); return 1; }

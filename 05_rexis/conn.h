@@ -10,7 +10,7 @@
 #ifndef REXIS_CONN_H
 #define REXIS_CONN_H
 
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdint.h>
 
 #include "xtc.h"
@@ -50,8 +50,8 @@ typedef struct conn_opts {
 	xtc_res_t      *client_res;
 
 	/* Server-wide state the connection proc updates / watches. */
-	_Atomic int    *conn_count;    /* live connections; decremented on exit */
-	_Atomic int    *shutdown;      /* set by the signal handler */
+	int *conn_count; /* live connections; decremented on exit */
+	int *shutdown;   /* set by the signal handler */
 	int             loop_idx;      /* the loop it runs on (census) */
 } conn_opts_t;
 

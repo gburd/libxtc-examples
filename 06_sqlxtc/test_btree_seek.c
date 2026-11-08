@@ -33,7 +33,6 @@
  *	cursor fallback).
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -246,9 +245,9 @@ t_oracle(uint32_t ps)
 
 static bm_t        *g_bm;
 static bt_t        *g_bt;
-static _Atomic int  g_active;
-static _Atomic long g_reads, g_bad_range, g_bad_val, g_bad_rc;
-static _Atomic long g_lt_reads, g_lt_bad;
+static int g_active;
+static long g_reads, g_bad_range, g_bad_val, g_bad_rc;
+static long g_lt_reads, g_lt_bad;
 
 static void
 s2_key(int i, char *k)
@@ -290,7 +289,7 @@ churner(void *arg)
 			(void)bt_delete(g_bt, k, 8);
 		}
 	}
-	if (atomic_fetch_sub(&g_active, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_active, 1, xtc_mo_seq_cst) == 1)
 		bm_provider_stop(g_bm);
 }
 
@@ -305,11 +304,11 @@ reader(void *arg)
 	long n = 0;
 
 	if (out == NULL || want == NULL) {
-		atomic_fetch_add(&g_bad_rc, 1);
+		xtc_atomic_fetch_add_long(&g_bad_rc, 1, xtc_mo_seq_cst);
 		free(out); free(want);
 		return;
 	}
-	while (atomic_load(&g_active) > 0 || n < 2000) {
+	while (xtc_atomic_load_i32(&g_active, xtc_mo_seq_cst) > 0 || n < 2000) {
 		int i = (int)(rnd(&s) % S2_N), j, gi, rc;
 		uint16_t ql = 8, gl = 0, vl = 0;
 
@@ -321,36 +320,40 @@ reader(void *arg)
 		    &vl);
 		n++;
 		if (j >= S2_N) {
-			if (rc != XTC_E_NOTFOUND) atomic_fetch_add(&g_bad_rc, 1);
+			if (rc != XTC_E_NOTFOUND)
+				xtc_atomic_fetch_add_long(&g_bad_rc, 1,
+				    xtc_mo_seq_cst);
 			goto next;
 		}
 		if (rc != XTC_OK || gl != 8) {
-			atomic_fetch_add(&g_bad_rc, 1);
+			xtc_atomic_fetch_add_long(&g_bad_rc, 1, xtc_mo_seq_cst);
 			goto next;
 		}
 		s2_key(j, hi);
 		if (memcmp(got, q, ql < gl ? ql : gl) < 0 ||
 		    (memcmp(got, q, 8) == 0 && ql == 9) ||
 		    memcmp(got, hi, 8) > 0) {
-			atomic_fetch_add(&g_bad_range, 1);   /* skipped a live key */
+			xtc_atomic_fetch_add_long(&g_bad_range, 1,
+			    xtc_mo_seq_cst); /* skipped a live key */
 			goto next;
 		}
 		gi = atoi(got + 1);
 		s2_val(gi, want);
 		if (vl != s2_vlen(gi) || memcmp(out, want, vl) != 0)
-			atomic_fetch_add(&g_bad_val, 1);
+			xtc_atomic_fetch_add_long(&g_bad_val, 1,
+			    xtc_mo_seq_cst);
 next:
 		if ((n & 31) == 0)
 			xtc_yield();
-	}
-	atomic_fetch_add(&g_reads, n);
-	free(out);
-	free(want);
+}
+xtc_atomic_fetch_add_long(&g_reads, n, xtc_mo_seq_cst);
+free(out);
+free(want);
 }
 
 /* S4: batches of probes through bt_seek_ge_n in the churn.  Each
  * settled answer obeys S2's bound check; unsettled ones are counted. */
-static _Atomic long g_n_reads, g_n_settled, g_n_bad;
+static long g_n_reads, g_n_settled, g_n_bad;
 
 static void
 reader_n(void *arg)
@@ -363,11 +366,11 @@ reader_n(void *arg)
 	long n = 0, settled = 0, bad = 0;
 
 	if (nb == NULL || want == NULL) {
-		atomic_fetch_add(&g_n_bad, 1);
+		xtc_atomic_fetch_add_long(&g_n_bad, 1, xtc_mo_seq_cst);
 		free(nb); free(want);
 		return;
 	}
-	while (atomic_load(&g_active) > 0 || n < 2000) {
+	while (xtc_atomic_load_i32(&g_active, xtc_mo_seq_cst) > 0 || n < 2000) {
 		int nq = 1 + (int)(rnd(&s) % BT_SEEKN_MAX), k, j, gi;
 		for (k = 0; k < nq; k++) {
 			s2_key((int)(rnd(&s) % S2_N), q[k]);
@@ -409,12 +412,12 @@ reader_n(void *arg)
 next:
 		if ((n & 63) < nq)
 			xtc_yield();
-	}
-	atomic_fetch_add(&g_n_reads, n);
-	atomic_fetch_add(&g_n_settled, settled);
-	atomic_fetch_add(&g_n_bad, bad);
-	free(nb);
-	free(want);
+}
+xtc_atomic_fetch_add_long(&g_n_reads, n, xtc_mo_seq_cst);
+xtc_atomic_fetch_add_long(&g_n_settled, settled, xtc_mo_seq_cst);
+xtc_atomic_fetch_add_long(&g_n_bad, bad, xtc_mo_seq_cst);
+free(nb);
+free(want);
 }
 
 /* S3: a reverse batch below a random bound.  The answer must be the
@@ -432,16 +435,17 @@ reader_lt(void *arg)
 	long n = 0;
 
 	if (buf == NULL) {
-		atomic_fetch_add(&g_lt_bad, 1);
+		xtc_atomic_fetch_add_long(&g_lt_bad, 1, xtc_mo_seq_cst);
 		return;
 	}
-	while (atomic_load(&g_active) > 0 || n < 2000) {
+	while (xtc_atomic_load_i32(&g_active, xtc_mo_seq_cst) > 0 || n < 2000) {
 		int i = 1 + (int)(rnd(&s) % (S2_N - 1)), got = 0, j, lo, bad = 0;
 		int want = 1 + (int)(rnd(&s) % 40);
 		s2_key(i, q);
 		if (bt_seek_lt_n(g_bt, q, 8, buf, 4096, off, lens, want,
 		    &got) != XTC_OK || got < 1 || got > want) {
-			atomic_fetch_add(&g_lt_bad, 1);    /* key 0 is stable: >= 1 */
+			xtc_atomic_fetch_add_long(&g_lt_bad, 1,
+			    xtc_mo_seq_cst); /* key 0 is stable: >= 1 */
 			goto next;
 		}
 		for (j = 0; j < got; j++) {
@@ -464,14 +468,14 @@ reader_lt(void *arg)
 			}
 		}
 		if (bad)
-			atomic_fetch_add(&g_lt_bad, 1);
+			xtc_atomic_fetch_add_long(&g_lt_bad, 1, xtc_mo_seq_cst);
 next:
 		n++;
 		if ((n & 15) == 0)
 			xtc_yield();
-	}
-	atomic_fetch_add(&g_lt_reads, n);
-	free(buf);
+}
+xtc_atomic_fetch_add_long(&g_lt_reads, n, xtc_mo_seq_cst);
+free(buf);
 }
 
 static void
@@ -492,7 +496,7 @@ t_concurrent(void)
 		s2_key(i, k); s2_val(i, v);
 		CK(bt_insert(g_bt, k, 8, v, s2_vlen(i)) == XTC_OK);
 	}
-	atomic_store(&g_active, N_CHURNERS);
+	xtc_atomic_store_i32(&g_active, N_CHURNERS, xtc_mo_seq_cst);
 	CK(xtc_exec_init(&ex, N_LOOPS) == XTC_OK);
 	CK(bm_provider_spawn(g_bm, xtc_exec_loop(ex, 0), 1LL * 1000 * 1000,
 	    NULL) == XTC_OK);
@@ -514,26 +518,36 @@ t_concurrent(void)
 
 	bt_get_stats(g_bt, &ts);
 	bm_get_stats(g_bm, &bs);
-	CK(atomic_load(&g_bad_range) == 0);
-	CK(atomic_load(&g_bad_val) == 0);
-	CK(atomic_load(&g_bad_rc) == 0);
-	CK(atomic_load(&g_lt_bad) == 0);
-	CK(atomic_load(&g_n_bad) == 0);
+	CK(xtc_atomic_load_long(&g_bad_range, xtc_mo_seq_cst) == 0);
+	CK(xtc_atomic_load_long(&g_bad_val, xtc_mo_seq_cst) == 0);
+	CK(xtc_atomic_load_long(&g_bad_rc, xtc_mo_seq_cst) == 0);
+	CK(xtc_atomic_load_long(&g_lt_bad, xtc_mo_seq_cst) == 0);
+	CK(xtc_atomic_load_long(&g_n_bad, xtc_mo_seq_cst) == 0);
 	CK(ts.splits > 0 && ts.merges > 0);           /* both SMOs raced */
-	printf("  %s   S2: %ld concurrent seeks vs %d churners on %d threads "
+	printf(
+	    "  %s   S2: %ld concurrent seeks vs %d churners on %d threads "
 	    "(splits=%llu merges=%llu evicted=%llu): %ld out of range, %ld bad "
-	    "values, %ld bad rc\n", g_fail ? "FAIL" : "ok",
-	    atomic_load(&g_reads), N_CHURNERS, N_LOOPS,
+	    "values, %ld bad rc\n",
+	    g_fail ? "FAIL" : "ok",
+	    xtc_atomic_load_long(&g_reads, xtc_mo_seq_cst), N_CHURNERS, N_LOOPS,
 	    (unsigned long long)ts.splits, (unsigned long long)ts.merges,
-	    (unsigned long long)bs.evicted, atomic_load(&g_bad_range),
-	    atomic_load(&g_bad_val), atomic_load(&g_bad_rc));
-	printf("  %s   S3: %ld concurrent reverse batches (bt_seek_lt_n) in the "
-	    "same churn: %ld wrong\n", atomic_load(&g_lt_bad) ? "FAIL" : "ok",
-	    atomic_load(&g_lt_reads), atomic_load(&g_lt_bad));
-	printf("  %s   S4: %ld batched probes (bt_seek_ge_n) in the same churn, "
+	    (unsigned long long)bs.evicted,
+	    xtc_atomic_load_long(&g_bad_range, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_bad_val, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_bad_rc, xtc_mo_seq_cst));
+	printf(
+	    "  %s   S3: %ld concurrent reverse batches (bt_seek_lt_n) in the "
+	    "same churn: %ld wrong\n",
+	    xtc_atomic_load_long(&g_lt_bad, xtc_mo_seq_cst) ? "FAIL" : "ok",
+	    xtc_atomic_load_long(&g_lt_reads, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_lt_bad, xtc_mo_seq_cst));
+	printf(
+	    "  %s   S4: %ld batched probes (bt_seek_ge_n) in the same churn, "
 	    "%ld settled by the batch: %ld wrong\n",
-	    atomic_load(&g_n_bad) ? "FAIL" : "ok", atomic_load(&g_n_reads),
-	    atomic_load(&g_n_settled), atomic_load(&g_n_bad));
+	    xtc_atomic_load_long(&g_n_bad, xtc_mo_seq_cst) ? "FAIL" : "ok",
+	    xtc_atomic_load_long(&g_n_reads, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_n_settled, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_n_bad, xtc_mo_seq_cst));
 	done(g_bt, g_bm, p);
 }
 

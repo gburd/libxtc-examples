@@ -15,9 +15,10 @@
  *
  * Includes the implementation for the pass counters.
  */
-#define BM_PP_TICK_TEST_HOOK(bm) ((void)atomic_fetch_add(&g_pp_ticks, 1))
-#include <stdatomic.h>
-static _Atomic unsigned g_pp_ticks;
+#define BM_PP_TICK_TEST_HOOK(bm)                                               \
+	((void)xtc_atomic_fetch_add_u32(&g_pp_ticks, 1, xtc_mo_seq_cst))
+static unsigned g_pp_ticks;
+#include "xtc_atomic.h"
 #include "bufmgr.h"
 #include "bufmgr.c"
 #include "xtc_loop.h"
@@ -53,11 +54,11 @@ driver(void *arg)
 	int64_t a;
 	(void)arg;
 	(void)xtc_proc_sleep(50LL * 1000 * 1000);      /* let both start */
-	p0 = atomic_load(&g_pp_ticks);
+	p0 = xtc_atomic_load_u32(&g_pp_ticks, xtc_mo_seq_cst);
 	bm_get_stats(g_bm, &st);
 	t0 = st.tr_passes;
 	(void)xtc_proc_sleep((int64_t)IDLE_MS * 1000 * 1000);
-	g_pp_idle = atomic_load(&g_pp_ticks) - p0;
+	g_pp_idle = xtc_atomic_load_u32(&g_pp_ticks, xtc_mo_seq_cst) - p0;
 	bm_get_stats(g_bm, &st);
 	g_tr_idle = (unsigned)(st.tr_passes - t0);
 
@@ -67,9 +68,10 @@ driver(void *arg)
 		memset(bm_page(f), 0x5a, g_bm->page_size);
 		bm_unfix(g_bm, f, 1);
 		a = ms();
-		while (atomic_load(&f->dirty) && ms() - a < 2000)
+		while (xtc_atomic_load_i32(&f->dirty, xtc_mo_seq_cst) &&
+		    ms() - a < 2000)
 			(void)xtc_proc_sleep(1LL * 1000 * 1000);
-		if (!atomic_load(&f->dirty))
+		if (!xtc_atomic_load_i32(&f->dirty, xtc_mo_seq_cst))
 			g_wb_ms = ms() - a;
 	}
 	/* Let both back off again, then stop them. */

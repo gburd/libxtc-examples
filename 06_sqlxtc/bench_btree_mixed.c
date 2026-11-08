@@ -26,7 +26,6 @@
  *	                         [writers/loop]
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,10 +44,10 @@ static bm_t *g_bm;
 static bt_t *g_bt;
 static long g_keys;
 static int64_t g_stop_at;
-static atomic_int g_go, g_left;
-static atomic_llong g_reads, g_writes, g_miss, g_wfail;
-static atomic_llong g_hist[NB];
-static atomic_llong g_max;
+static int g_go, g_left;
+static long long g_reads, g_writes, g_miss, g_wfail;
+static long long g_hist[NB];
+static long long g_max;
 
 static void
 mkkey(long i, char *k)
@@ -75,7 +74,7 @@ reader(void *arg)
 	int i;
 
 	memset(h, 0, sizeof h);
-	while (!atomic_load(&g_go))
+	while (!xtc_atomic_load_i32(&g_go, xtc_mo_seq_cst))
 		xtc_yield();
 	while (xtc_clock_mono() < g_stop_at) {
 		int64_t t0, d;
@@ -93,15 +92,19 @@ reader(void *arg)
 		xtc_yield();
 	}
 	for (i = 0; i < NB; i++)
-		if (h[i]) atomic_fetch_add(&g_hist[i], h[i]);
-	atomic_fetch_add(&g_reads, n);
-	atomic_fetch_add(&g_miss, miss);
+		if (h[i])
+			xtc_atomic_fetch_add_llong(&g_hist[i], h[i],
+			    xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_llong(&g_reads, n, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_llong(&g_miss, miss, xtc_mo_seq_cst);
 	for (;;) {
-		long long cur = atomic_load(&g_max);
-		if (mx <= cur || atomic_compare_exchange_weak(&g_max, &cur, mx))
+		long long cur = xtc_atomic_load_llong(&g_max, xtc_mo_seq_cst);
+		if (mx <= cur ||
+		    xtc_atomic_cas_weak_llong(&g_max, &cur, mx, xtc_mo_seq_cst,
+		        xtc_mo_seq_cst))
 			break;
 	}
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		bm_provider_stop(g_bm);
 }
 
@@ -113,7 +116,7 @@ writer(void *arg)
 	long long n = 0, fail = 0;
 	int i;
 
-	while (!atomic_load(&g_go))
+	while (!xtc_atomic_load_i32(&g_go, xtc_mo_seq_cst))
 		xtc_yield();
 	while (xtc_clock_mono() < g_stop_at) {
 		for (i = 0; i < 8; i++) {
@@ -130,9 +133,9 @@ writer(void *arg)
 		}
 		xtc_yield();
 	}
-	atomic_fetch_add(&g_writes, n);
-	atomic_fetch_add(&g_wfail, fail);
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	xtc_atomic_fetch_add_llong(&g_writes, n, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_llong(&g_wfail, fail, xtc_mo_seq_cst);
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		bm_provider_stop(g_bm);
 }
 
@@ -142,7 +145,7 @@ pct(double q, long long total)
 	long long acc = 0, want = (long long)(q * (double)total);
 	int i;
 	for (i = 0; i < NB; i++) {
-		acc += atomic_load(&g_hist[i]);
+		acc += xtc_atomic_load_llong(&g_hist[i], xtc_mo_seq_cst);
 		if (acc >= want && acc > 0)
 			return (int64_t)1 << i;   /* bucket upper bound (2^i ns) */
 	}
@@ -181,7 +184,7 @@ main(int argc, char **argv)
 	if (xtc_exec_init(&e, L) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, xtc_exec_loop(e, 0), 1000000LL, NULL) != XTC_OK)
 		return 1;
-	atomic_store(&g_left, L * (R + W));
+	xtc_atomic_store_i32(&g_left, L * (R + W), xtc_mo_seq_cst);
 	for (j = 0; j < L; j++) {
 		int q;
 		for (q = 0; q < R; q++)
@@ -192,18 +195,21 @@ main(int argc, char **argv)
 			    (void *)(intptr_t)(j * 100 + q + 50), NULL, NULL);
 	}
 	g_stop_at = xtc_clock_mono() + (int64_t)secs * 1000000000LL;
-	atomic_store(&g_go, 1);
+	xtc_atomic_store_i32(&g_go, 1, xtc_mo_seq_cst);
 	(void)xtc_exec_run(e);
 	xtc_exec_fini(e);
-	reads = atomic_load(&g_reads);
-	writes = atomic_load(&g_writes);
+	reads = xtc_atomic_load_llong(&g_reads, xtc_mo_seq_cst);
+	writes = xtc_atomic_load_llong(&g_writes, xtc_mo_seq_cst);
 	dt = (double)secs;
-	printf("btmix keys=%ld L=%d R=%d W=%d: reads/s=%.0f writes(del+ins)/s=%.0f "
+	printf(
+	    "btmix keys=%ld L=%d R=%d W=%d: reads/s=%.0f writes(del+ins)/s=%.0f "
 	    "read p50=%lldns p99=%lldns p99.9=%lldns max=%lldns misses=%lld wfail=%lld\n",
 	    keys, L, R, W, (double)reads / dt, (double)writes / dt,
 	    (long long)pct(0.50, reads), (long long)pct(0.99, reads),
-	    (long long)pct(0.999, reads), (long long)atomic_load(&g_max),
-	    (long long)atomic_load(&g_miss), (long long)atomic_load(&g_wfail));
+	    (long long)pct(0.999, reads),
+	    (long long)xtc_atomic_load_llong(&g_max, xtc_mo_seq_cst),
+	    (long long)xtc_atomic_load_llong(&g_miss, xtc_mo_seq_cst),
+	    (long long)xtc_atomic_load_llong(&g_wfail, xtc_mo_seq_cst));
 	bt_close(g_bt);
 	bm_destroy(g_bm);
 	unlink(path);

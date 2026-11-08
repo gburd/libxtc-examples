@@ -22,7 +22,6 @@
  */
 
 #include <assert.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,16 +35,21 @@
 
 #define N_SHARDS   4
 
-static _Atomic int g_fail;
-static _Atomic int g_commits;     /* successful commits (conflict test) */
-static _Atomic int g_aborts;
-static _Atomic int g_clients_left;
+static int g_fail;
+static int g_commits; /* successful commits (conflict test) */
+static int g_aborts;
+static int g_clients_left;
 static uint64_t    g_conflict_snap;
 static uint32_t    g_conflict_key = 4242;
 
-#define CK(cond) do { if (!(cond)) { \
-	fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-	atomic_store(&g_fail, 1); } } while (0)
+#define CK(cond)                                                               \
+	do {                                                                   \
+		if (!(cond)) {                                                 \
+			fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__,          \
+			    __LINE__, #cond);                                  \
+			xtc_atomic_store_i32(&g_fail, 1, xtc_mo_seq_cst);      \
+		}                                                              \
+	} while (0)
 
 /* Scenario 1 + 2: a single driver runs sequential correctness checks. */
 static void
@@ -99,13 +103,13 @@ conflict_client(void *arg)
 	w.value = (uint32_t)(id + 1);
 	rc = mvcc_commit(g_conflict_snap, &w, 1, NULL);
 	if (rc == XTC_OK)
-		atomic_fetch_add(&g_commits, 1);
+		xtc_atomic_fetch_add_i32(&g_commits, 1, xtc_mo_seq_cst);
 	else if (rc == XTC_E_AGAIN)
-		atomic_fetch_add(&g_aborts, 1);
+		xtc_atomic_fetch_add_i32(&g_aborts, 1, xtc_mo_seq_cst);
 	else
-		atomic_store(&g_fail, 1);
+		xtc_atomic_store_i32(&g_fail, 1, xtc_mo_seq_cst);
 
-	if (atomic_fetch_sub(&g_clients_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_clients_left, 1, xtc_mo_seq_cst) == 1)
 		mvcc_stop();
 }
 
@@ -122,14 +126,15 @@ conflict_starter(void *a)
 	long c;
 	(void)a;
 	g_conflict_snap = mvcc_begin();
-	atomic_store(&g_clients_left, g_conflict_nclients);
+	xtc_atomic_store_i32(&g_clients_left, g_conflict_nclients,
+	    xtc_mo_seq_cst);
 	for (c = 0; c < g_conflict_nclients; c++) {
 		xtc_loop_t *lp = g_conflict_loops[c % g_conflict_nloops];
 		xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "cli" };
 		xtc_pid_t pid;
 		if (xtc_proc_spawn(lp, conflict_client, (void *)c, &po, &pid)
 		    != XTC_OK)
-			atomic_store(&g_fail, 1);
+			xtc_atomic_store_i32(&g_fail, 1, xtc_mo_seq_cst);
 	}
 }
 
@@ -142,7 +147,7 @@ run_correctness(void)
 	xtc_pid_t pid;
 	int i;
 
-	atomic_store(&g_fail, 0);
+	xtc_atomic_store_i32(&g_fail, 0, xtc_mo_seq_cst);
 	assert(xtc_loop_init(&loop) == XTC_OK);
 	for (i = 0; i < N_SHARDS; i++) sl[i] = loop;
 	if (mvcc_start(sl, N_SHARDS, loop) != XTC_OK) return 1;
@@ -150,7 +155,8 @@ run_correctness(void)
 	assert(xtc_loop_run(loop) == XTC_OK);
 	mvcc_fini();
 	assert(xtc_loop_fini(loop) == XTC_OK);
-	if (atomic_load(&g_fail)) return 1;
+	if (xtc_atomic_load_i32(&g_fail, xtc_mo_seq_cst))
+		return 1;
 	printf("  ok   snapshot isolation + cross-shard atomic commit "
 	    "(2PC via deferred-reply coordinator, per-shard HLC)\n");
 	return 0;
@@ -162,9 +168,9 @@ run_conflict(int n_loops, int n_clients, const char *tag)
 	xtc_loop_t *sl[N_SHARDS];
 	int i;
 
-	atomic_store(&g_fail, 0);
-	atomic_store(&g_commits, 0);
-	atomic_store(&g_aborts, 0);
+	xtc_atomic_store_i32(&g_fail, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_commits, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_aborts, 0, xtc_mo_seq_cst);
 	g_conflict_nclients = n_clients;
 
 	if (n_loops <= 1) {
@@ -197,18 +203,21 @@ run_conflict(int n_loops, int n_clients, const char *tag)
 		(void)xtc_exec_fini(exec);
 	}
 
-	if (atomic_load(&g_fail)) {
+	if (xtc_atomic_load_i32(&g_fail, xtc_mo_seq_cst)) {
 		fprintf(stderr, "FAIL[%s]: unexpected commit error\n", tag);
 		return 1;
 	}
-	if (atomic_load(&g_commits) != 1) {
-		fprintf(stderr, "FAIL[%s]: %d commits (want exactly 1), %d aborts\n",
-		    tag, atomic_load(&g_commits), atomic_load(&g_aborts));
+	if (xtc_atomic_load_i32(&g_commits, xtc_mo_seq_cst) != 1) {
+		fprintf(stderr,
+		    "FAIL[%s]: %d commits (want exactly 1), %d aborts\n", tag,
+		    xtc_atomic_load_i32(&g_commits, xtc_mo_seq_cst),
+		    xtc_atomic_load_i32(&g_aborts, xtc_mo_seq_cst));
 		return 1;
 	}
-	printf("  ok   [%s] %d clients raced one key at one snapshot: exactly 1 "
+	printf(
+	    "  ok   [%s] %d clients raced one key at one snapshot: exactly 1 "
 	    "committed, %d aborted (write-write conflict detected)\n",
-	    tag, n_clients, atomic_load(&g_aborts));
+	    tag, n_clients, xtc_atomic_load_i32(&g_aborts, xtc_mo_seq_cst));
 	return 0;
 }
 
@@ -273,7 +282,7 @@ run_gc(void)
 	xtc_pid_t pid;
 	int i;
 
-	atomic_store(&g_fail, 0);
+	xtc_atomic_store_i32(&g_fail, 0, xtc_mo_seq_cst);
 	assert(xtc_loop_init(&loop) == XTC_OK);
 	for (i = 0; i < N_SHARDS; i++) sl[i] = loop;
 	if (mvcc_start(sl, N_SHARDS, loop) != XTC_OK) return 1;
@@ -281,7 +290,8 @@ run_gc(void)
 	assert(xtc_loop_run(loop) == XTC_OK);
 	mvcc_fini();
 	assert(xtc_loop_fini(loop) == XTC_OK);
-	if (atomic_load(&g_fail)) return 1;
+	if (xtc_atomic_load_i32(&g_fail, xtc_mo_seq_cst))
+		return 1;
 	printf("  ok   version GC against the oldest live snapshot: a hot key's "
 	    "chain stays short; a live snapshot pins its version\n");
 	return 0;

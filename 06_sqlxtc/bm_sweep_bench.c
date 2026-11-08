@@ -11,7 +11,6 @@
  */
 #include <errno.h>
 #include <math.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +29,7 @@ static uint32_t g_n_pages;
 static int64_t g_deadline_ns;
 static double *g_cdf;
 static uint32_t *g_rank_pid;
-static _Atomic uint64_t g_ops, g_errs;
+static uint64_t g_ops, g_errs;
 static xtc_hist_t *g_lat;
 static uint64_t *g_rng;
 
@@ -69,17 +68,17 @@ worker(void *arg)
 		uint32_t pid = g_rank_pid[zipf_rank(rng)];
 		int64_t t0 = xtc_clock_mono();
 		if (bm_fix_pid(g_bm, (bm_pid_t)pid, &f) != XTC_OK) {
-			atomic_fetch_add(&g_errs, 1);
+			xtc_atomic_fetch_add_u64(&g_errs, 1, xtc_mo_seq_cst);
 			return;
 		}
 		if (((const uint32_t *)bm_page(f))[0] != pid)
-			atomic_fetch_add(&g_errs, 1);
+			xtc_atomic_fetch_add_u64(&g_errs, 1, xtc_mo_seq_cst);
 		bm_unfix(g_bm, f, 0);
 		xtc_hist_record(g_lat, xtc_clock_mono() - t0);
 		if ((++n & 63) == 0)
 			xtc_yield();
 	}
-	atomic_fetch_add(&g_ops, n);
+	xtc_atomic_fetch_add_u64(&g_ops, n, xtc_mo_seq_cst);
 }
 
 static int
@@ -91,7 +90,8 @@ window(xtc_exec_t *e, uint32_t loops, uint32_t fibers, uint32_t secs)
 		if (xtc_proc_spawn(xtc_exec_loop(e, (int)(i % loops)), worker,
 		    &g_rng[i], NULL, NULL) != XTC_OK)
 			return -1;
-	if (xtc_exec_run(e) != XTC_OK || atomic_load(&g_errs) != 0)
+	if (xtc_exec_run(e) != XTC_OK ||
+	    xtc_atomic_load_u64(&g_errs, xtc_mo_seq_cst) != 0)
 		return -1;
 	return 0;
 }
@@ -229,13 +229,13 @@ main(int argc, char **argv)
 	xtc_hist_destroy(g_lat);
 	if (xtc_hist_create("bm_sweep_fix_ns", &g_lat) != XTC_OK)
 		return 1;
-	atomic_store(&g_ops, 0);
+	xtc_atomic_store_u64(&g_ops, 0, xtc_mo_seq_cst);
 	start = xtc_clock_mono();
 	if (window(e, loops, fibers, secs) != 0)
 		return 1;
 	elapsed = xtc_clock_mono() - start;
 	bm_get_stats(g_bm, &s1);
-	ops = atomic_load(&g_ops);
+	ops = xtc_atomic_load_u64(&g_ops, xtc_mo_seq_cst);
 	allocs = s1.allocs - s0.allocs;
 	adv = s1.advances - s0.advances;
 	hits = s1.hits - s0.hits;

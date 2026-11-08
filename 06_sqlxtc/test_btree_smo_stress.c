@@ -31,7 +31,7 @@
  *	SMO_STRESS_SECS (default 2, per phase) and SMO_STRESS_THREADS
  *	(default 8) scale it for a soak.
  */
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +41,7 @@
 
 #include "xtc_loop.h"
 
-static _Atomic long g_restarts_max;   /* longest run of stale restarts */
+static long g_restarts_max; /* longest run of stale restarts */
 static _Thread_local long t_restarts;
 #define BT_STALE_TEST_HOOK() (0)
 #define BT_STALE_TEST_HOOK_PEEK() (0)
@@ -60,11 +60,11 @@ static void smo_restart_hook(void);
 
 static bm_t *g_bm;
 static bt_t *g_bt;
-static _Atomic int g_stop;
-static _Atomic long g_ops, g_bad;
-static _Atomic uint64_t g_ver[HOT_ROWS];   /* newest version stamp per row */
-static _Atomic int g_rowlock[HOT_ROWS];
-static _Atomic uint64_t g_qhead, g_qtail;  /* queue: keys [head, tail) live */
+static int g_stop;
+static long g_ops, g_bad;
+static uint64_t g_ver[HOT_ROWS]; /* newest version stamp per row */
+static int g_rowlock[HOT_ROWS];
+static uint64_t g_qhead, g_qtail; /* queue: keys [head, tail) live */
 static pthread_mutex_t g_qmu = PTHREAD_MUTEX_INITIALIZER;
 
 static void
@@ -117,19 +117,20 @@ do_update(uint64_t *s)
 	int e = 0;
 	uint16_t vl = (uint16_t)(8 + rnd(s) % 40);
 
-	while (!atomic_compare_exchange_weak(&g_rowlock[row], &e, 1))
+	while (!xtc_atomic_cas_weak_i32(&g_rowlock[row], &e, 1, xtc_mo_seq_cst,
+	    xtc_mo_seq_cst))
 		e = 0;
-	old = atomic_load(&g_ver[row]);
+	old = xtc_atomic_load_u64(&g_ver[row], xtc_mo_seq_cst);
 	memset(v, (int)(row & 0xff), sizeof v);
 	if (bt_insert(g_bt, k, vkey(k, row, old + 1), v, vl) != XTC_OK)
-		atomic_fetch_add(&g_bad, 1);
+		xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 	if (bt_delete(g_bt, k, vkey(k, row, old)) != XTC_OK) {
 		fprintf(stderr, "lost version row %u ver %llu\n", row,
 		    (unsigned long long)old);
-		atomic_fetch_add(&g_bad, 1);
+		xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 	}
-	atomic_store(&g_ver[row], old + 1);
-	atomic_store(&g_rowlock[row], 0);
+	xtc_atomic_store_u64(&g_ver[row], old + 1, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_rowlock[row], 0, xtc_mo_seq_cst);
 }
 
 /* Queue: append at the tail or trim at the head (empties leaves on the
@@ -143,19 +144,21 @@ do_queue(uint64_t *s)
 
 	memset(v, 'q', sizeof v);
 	(void)pthread_mutex_lock(&g_qmu);
-	if (!push && atomic_load(&g_qhead) == atomic_load(&g_qtail))
+	if (!push &&
+	    xtc_atomic_load_u64(&g_qhead, xtc_mo_seq_cst) ==
+	        xtc_atomic_load_u64(&g_qtail, xtc_mo_seq_cst))
 		push = 1;
 	if (push) {
-		seq = atomic_fetch_add(&g_qtail, 1);
+		seq = xtc_atomic_fetch_add_u64(&g_qtail, 1, xtc_mo_seq_cst);
 		if (bt_insert(g_bt, k, qkey(k, seq), v,
 		    (uint16_t)(8 + rnd(s) % 24)) != XTC_OK)
-			atomic_fetch_add(&g_bad, 1);
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 	} else {
-		seq = atomic_fetch_add(&g_qhead, 1);
+		seq = xtc_atomic_fetch_add_u64(&g_qhead, 1, xtc_mo_seq_cst);
 		if (bt_delete(g_bt, k, qkey(k, seq)) != XTC_OK) {
 			fprintf(stderr, "lost queue key %llu\n",
 			    (unsigned long long)seq);
-			atomic_fetch_add(&g_bad, 1);
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 		}
 	}
 	(void)pthread_mutex_unlock(&g_qmu);
@@ -186,8 +189,8 @@ do_read(uint64_t *s)
 /* Phase 2: delete a random cold row and insert it again (the cold
  * region's leaves underflow, merge, and are refilled by splits; their
  * pages come from disk). */
-static _Atomic int g_cold;
-static _Atomic int g_coldlock[COLD_ROWS];
+static int g_cold;
+static int g_coldlock[COLD_ROWS];
 
 static void
 do_cold(uint64_t *s)
@@ -197,19 +200,20 @@ do_cold(uint64_t *s)
 	uint16_t kl = vkey(k, row, 0), vl;
 	int e = 0;
 
-	while (!atomic_compare_exchange_weak(&g_coldlock[row - HOT_ROWS], &e, 1))
+	while (!xtc_atomic_cas_weak_i32(&g_coldlock[row - HOT_ROWS], &e, 1,
+	    xtc_mo_seq_cst, xtc_mo_seq_cst))
 		e = 0;
 	if (bt_lookup(g_bt, k, kl, buf, sizeof buf, &vl) != XTC_OK) {
 		fprintf(stderr, "lost cold row %u\n", row);
-		atomic_fetch_add(&g_bad, 1);
+		xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 	} else if (bt_delete(g_bt, k, kl) != XTC_OK) {
-		atomic_fetch_add(&g_bad, 1);
+		xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 	} else {
 		memset(v, 'c', sizeof v);
 		if (bt_insert(g_bt, k, kl, v, (uint16_t)(8 + rnd(s) % 40)) != XTC_OK)
-			atomic_fetch_add(&g_bad, 1);
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 	}
-	atomic_store(&g_coldlock[row - HOT_ROWS], 0);
+	xtc_atomic_store_i32(&g_coldlock[row - HOT_ROWS], 0, xtc_mo_seq_cst);
 }
 
 /* A checkpoint-like full scan: every key once, in order, parking and
@@ -236,7 +240,7 @@ do_scan(void)
 			for (j = 0; j < ckl; j++) fprintf(stderr, "%02x", ((const uint8_t *)ck)[j]);
 			fprintf(stderr, " leaf %llu slot %d\n",
 			    (unsigned long long)bm_frame_pid(c->leaf), c->slot);
-			atomic_fetch_add(&g_bad, 1);
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 			break;
 		}
 		memcpy(prev, ck, ckl);
@@ -255,12 +259,13 @@ worker(void *arg)
 {
 	uint64_t s = 0x9E3779B97F4A7C15ull * ((uint64_t)(uintptr_t)arg + 1);
 
-	while (!atomic_load(&g_stop)) {
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
 		uint64_t r = rnd(&s) % 10;
 		t_restarts = 0;
-		if (atomic_load(&g_cold) && (uintptr_t)arg == 0)
+		if (xtc_atomic_load_i32(&g_cold, xtc_mo_seq_cst) &&
+		    (uintptr_t)arg == 0)
 			do_scan();
-		else if (atomic_load(&g_cold) && r < 3)
+		else if (xtc_atomic_load_i32(&g_cold, xtc_mo_seq_cst) && r < 3)
 			do_cold(&s);
 		else if (r < 5)
 			do_update(&s);
@@ -268,9 +273,11 @@ worker(void *arg)
 			do_queue(&s);
 		else
 			do_read(&s);
-		if (t_restarts > atomic_load(&g_restarts_max))
-			atomic_store(&g_restarts_max, t_restarts);
-		atomic_fetch_add(&g_ops, 1);
+		if (t_restarts >
+		    xtc_atomic_load_long(&g_restarts_max, xtc_mo_seq_cst))
+			xtc_atomic_store_long(&g_restarts_max, t_restarts,
+			    xtc_mo_seq_cst);
+		xtc_atomic_fetch_add_long(&g_ops, 1, xtc_mo_seq_cst);
 	}
 	return NULL;
 }
@@ -402,10 +409,11 @@ check_tree(char *why, size_t wl)
 	g_seen_cap = (uint32_t)g_bm->next_pid;
 	(void)pthread_mutex_unlock(&g_bm->pid_mu);
 	g_seen = calloc(g_seen_cap + 1u, 1);
-	height = (int)atomic_load(&g_bt->st_height);
+	height = (int)xtc_atomic_load_u64(&g_bt->st_height, xtc_mo_seq_cst);
 	if (g_seen != NULL)
-		chk_node(&c, atomic_load(&g_bt->root_pid), NULL, 0, NULL, 0,
-		    BM_PID_NONE, height);
+		chk_node(&c,
+		    xtc_atomic_load_u64(&g_bt->root_pid, xtc_mo_seq_cst), NULL,
+		    0, NULL, 0, BM_PID_NONE, height);
 	(void)xtc_arwlock_unlock(g_bt->smo);
 	free(g_seen);
 	g_seen = NULL;
@@ -423,7 +431,7 @@ run_phase(int nth, int secs, char *why, size_t wl, int *checks)
 	int i, bad = 0;
 	int64_t t0;
 
-	atomic_store(&g_stop, 0);
+	xtc_atomic_store_i32(&g_stop, 0, xtc_mo_seq_cst);
 	for (i = 0; i < nth; i++)
 		if (pthread_create(&th[i], NULL, worker, (void *)(uintptr_t)i) != 0)
 			return snprintf(why, wl, "pthread_create"), 1;
@@ -433,7 +441,7 @@ run_phase(int nth, int secs, char *why, size_t wl, int *checks)
 		bad = check_tree(why, wl);
 		(*checks)++;
 	}
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	for (i = 0; i < nth; i++)
 		(void)pthread_join(th[i], NULL);
 	if (!bad)
@@ -450,13 +458,14 @@ report(const char *phase, int nth, int secs, int checks)
 	bt_get_stats(g_bt, &ts);
 	bm_get_stats(g_bm, &bs);
 	printf("  %s: %d threads %d s: %ld ops, %d checks, height %llu splits "
-	    "%llu merges %llu freed %llu reissued %llu loads %llu evicted "
-	    "%llu, longest restart run %ld\n", phase, nth, secs,
-	    atomic_load(&g_ops), checks, (unsigned long long)ts.height,
+	       "%llu merges %llu freed %llu reissued %llu loads %llu evicted "
+	       "%llu, longest restart run %ld\n",
+	    phase, nth, secs, xtc_atomic_load_long(&g_ops, xtc_mo_seq_cst),
+	    checks, (unsigned long long)ts.height,
 	    (unsigned long long)ts.splits, (unsigned long long)ts.merges,
 	    (unsigned long long)bs.freed, (unsigned long long)bs.reissued,
 	    (unsigned long long)bs.loads, (unsigned long long)bs.evicted,
-	    atomic_load(&g_restarts_max));
+	    xtc_atomic_load_long(&g_restarts_max, xtc_mo_seq_cst));
 }
 
 static void *
@@ -518,8 +527,8 @@ main(void)
 		    bm_trickler_spawn(g_bm, loop, 1LL * 1000 * 1000, NULL) != XTC_OK ||
 		    pthread_create(&lt, NULL, loop_thread, loop) != 0)
 			return 1;
-		atomic_store(&g_cold, 1);
-		atomic_store(&g_ops, 0);
+		xtc_atomic_store_i32(&g_cold, 1, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_ops, 0, xtc_mo_seq_cst);
 		checks = 0;
 		bad = run_phase(nth, secs, why, sizeof why, &checks);
 		report("cold+evicting", nth, secs, checks);
@@ -531,9 +540,10 @@ main(void)
 	bt_close(g_bt);
 	bm_destroy(g_bm);
 	unlink(path);
-	if (bad || atomic_load(&g_bad) != 0) {
-		fprintf(stderr, "FAIL: %s; %ld bad ops\n", bad ? why : "tree ok",
-		    atomic_load(&g_bad));
+	if (bad || xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst) != 0) {
+		fprintf(stderr, "FAIL: %s; %ld bad ops\n",
+		    bad ? why : "tree ok",
+		    xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst));
 		return 1;
 	}
 	printf("test_btree_smo_stress: OK\n");

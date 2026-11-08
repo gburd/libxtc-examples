@@ -195,7 +195,8 @@ main(void)
 	    (unsigned long long)misorder);
 
 	/* 2-5. the shape. */
-	walk(bt, atomic_load(&bt->root_pid), NULL, 0, NULL, 0, 0);
+	walk(bt, xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst), NULL, 0,
+	    NULL, 0, 0);
 	TCK(g_bad_fence == 0, "2. %d nodes malformed or with fences that are "
 	    "not their parent's routing range", g_bad_fence);
 	for (lvl = 0; lvl + 1 < g_height; lvl++) {

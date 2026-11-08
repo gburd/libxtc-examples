@@ -15,7 +15,6 @@
  *	across a parked write without wedging the loop.  No daemon.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +34,7 @@
 
 static bm_t       *g_bm;
 static bt_t       *g_bt;
-static _Atomic int g_result;
+static int g_result;
 
 static void
 worker_proc(void *arg)
@@ -85,7 +84,7 @@ worker_proc(void *arg)
 		if (n != N_KEYS) ok = 0;
 	}
 
-	atomic_store(&g_result, ok ? 1 : -1);
+	xtc_atomic_store_i32(&g_result, ok ? 1 : -1, xtc_mo_seq_cst);
 	bm_provider_stop(g_bm);
 	bm_trickler_stop(g_bm);
 }
@@ -108,7 +107,7 @@ main(void)
 	if (bm_create(&bo, &g_bm) != XTC_OK) { fprintf(stderr, "bm_create\n"); return 1; }
 	if (bt_open(g_bm, &g_bt) != XTC_OK) { fprintf(stderr, "bt_open\n"); return 1; }
 
-	atomic_store(&g_result, 0);
+	xtc_atomic_store_i32(&g_result, 0, xtc_mo_seq_cst);
 	if (xtc_loop_init(&loop) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, &pp) != XTC_OK) return 1;
 	if (bm_trickler_spawn(g_bm, loop, 1LL * 1000 * 1000, NULL) != XTC_OK) return 1;
@@ -124,8 +123,9 @@ main(void)
 	unlink(path);
 	{ char wal[288]; snprintf(wal, sizeof wal, "%s-wal", path); unlink(wal); }
 
-	if (atomic_load(&g_result) != 1) {
-		fprintf(stderr, "FAIL: workload result=%d\n", atomic_load(&g_result));
+	if (xtc_atomic_load_i32(&g_result, xtc_mo_seq_cst) != 1) {
+		fprintf(stderr, "FAIL: workload result=%d\n",
+		    xtc_atomic_load_i32(&g_result, xtc_mo_seq_cst));
 		return 1;
 	}
 	if (bs.loads == 0 || bs.evicted == 0) {

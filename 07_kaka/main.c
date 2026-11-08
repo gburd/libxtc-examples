@@ -15,7 +15,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,8 +62,8 @@ typedef struct broker {
 	xtc_app_t        *app;
 	xtc_loop_t       *loop;
 	int               listen_fd;
-	_Atomic int       conn_count;
-	_Atomic int       shutdown_requested;
+	int conn_count;
+	int shutdown_requested;
 } broker_t;
 
 #define MAX_SYNC_WORKERS 64     /* concurrent partition fdatasyncs */
@@ -77,7 +76,8 @@ on_signal(int sig)
 	(void)sig;
 	if (g_broker == NULL)
 		return;
-	if (atomic_exchange(&g_broker->shutdown_requested, 1) != 0)
+	if (xtc_atomic_exchange_i32(&g_broker->shutdown_requested, 1,
+	        xtc_mo_seq_cst) != 0)
 		_exit(1);                 /* second signal: give up now */
 	(void)alarm(30);                  /* backstop: exit even if wedged */
 }
@@ -96,11 +96,12 @@ listener_proc(void *arg)
 	broker_t *b = arg;
 	int64_t last_warn = 0;
 
-	while (!atomic_load(&b->shutdown_requested)) {
+	while (!xtc_atomic_load_i32(&b->shutdown_requested, xtc_mo_seq_cst)) {
 		int fd = -1;
 		int rc = xtc_net_accept(b->listen_fd, &fd);
 		if (rc == XTC_OK) {
-			atomic_fetch_add(&b->conn_count, 1);
+			xtc_atomic_fetch_add_i32(&b->conn_count, 1,
+			    xtc_mo_seq_cst);
 			if (broker_spawn_conn(b->loop, fd) != 0)
 				xtc_net_close(fd);    /* table full */
 			continue;
@@ -297,7 +298,7 @@ main(int argc, char **argv)
 	xtc_app_run(b->app);
 
 	XTC_LOG_INFO_F("kaka shutting down (accepted %d connections)",
-	    atomic_load(&b->conn_count));
+	    xtc_atomic_load_i32(&b->conn_count, xtc_mo_seq_cst));
 	if (log != NULL)
 		xtc_log_drain(log);
 

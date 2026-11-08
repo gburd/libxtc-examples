@@ -25,7 +25,6 @@
 
 #include <ctype.h>
 #include <math.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,20 +149,20 @@ vxf_now_ms(void)
 	 * so 'now' never runs backward -- and inside a deterministic run the
 	 * virtual milliseconds alone, so 'now' replays (the offset was
 	 * sampled from real time before the run). */
-	static _Atomic int64_t epoch_off_ms;
-	static _Atomic int     epoch_set;
+	static int64_t epoch_off_ms;
+	static int epoch_set;
 	int64_t mono_ns = xtc_clock_mono();
 	int64_t mono_ms = (mono_ns < 0 ? 0 : mono_ns) / 1000000LL;
 	if (xtc_sim_clock_active())
 		return mono_ms;               /* virtual: no real-time offset */
-	if (!atomic_load_explicit(&epoch_set, memory_order_acquire)) {
+	if (!xtc_atomic_load_i32(&epoch_set, xtc_mo_acquire)) {
 		int64_t wall_ns = xtc_clock_real();
 		int64_t wall_ms = (wall_ns < 0 ? 0 : wall_ns) / 1000000LL;
-		atomic_store_explicit(&epoch_off_ms, wall_ms - mono_ms,
-		    memory_order_relaxed);
-		atomic_store_explicit(&epoch_set, 1, memory_order_release);
+		xtc_atomic_store_i64(&epoch_off_ms, wall_ms - mono_ms,
+		    xtc_mo_relaxed);
+		xtc_atomic_store_i32(&epoch_set, 1, xtc_mo_release);
 	}
-	return mono_ms + atomic_load_explicit(&epoch_off_ms, memory_order_relaxed);
+	return mono_ms + xtc_atomic_load_i64(&epoch_off_ms, xtc_mo_relaxed);
 }
 
 /* ---- small text helpers ------------------------------------------- */

@@ -51,7 +51,6 @@
 
 #include <sched.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,7 +118,7 @@ static inline uint64_t bp_hash64(uint64_t x);   /* fwd decl */
 
 /* Global generation tick: bumped by a background thread every GEN_MS.
  * Read-mostly (design 7.1): every access reads it, one writer bumps it. */
-static _Atomic uint64_t g_gen_tick;
+static uint64_t g_gen_tick;
 #define GEN_MS  50
 
 /* ---- GROUND TRUTH (probe-only, NOT part of the design) ----
@@ -131,8 +130,8 @@ static _Atomic uint64_t g_gen_tick;
  * cheap here and keeps the premise test honest. */
 #define GT_MAX_PIDS 262144
 typedef struct {
-	_Atomic uint64_t pid;                 /* 0 = empty */
-	_Atomic uint64_t count[N_SYNTH_DOMAINS];
+	uint64_t pid; /* 0 = empty */
+	uint64_t count[N_SYNTH_DOMAINS];
 } gt_slot_t;
 static gt_slot_t g_gt[GT_MAX_PIDS];       /* open-addressed, pid-keyed */
 
@@ -141,19 +140,19 @@ gt_record(uint64_t pid, int domain)
 {
 	uint64_t i = bp_hash64(pid) & (GT_MAX_PIDS - 1);
 	for (;;) {
-		uint64_t k = atomic_load_explicit(&g_gt[i].pid, memory_order_acquire);
+		uint64_t k = xtc_atomic_load_u64(&g_gt[i].pid, xtc_mo_acquire);
 		if (k == pid)
 			break;
 		if (k == 0) {
 			uint64_t exp = 0;
-			if (atomic_compare_exchange_strong(&g_gt[i].pid, &exp, pid))
+			if (xtc_atomic_cas_u64(&g_gt[i].pid, &exp, pid,
+			        xtc_mo_seq_cst, xtc_mo_seq_cst))
 				break;
 			continue;   /* lost race; re-read */
 		}
 		i = (i + 1) & (GT_MAX_PIDS - 1);
 	}
-	atomic_fetch_add_explicit(&g_gt[i].count[domain], 1,
-	    memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_gt[i].count[domain], 1, xtc_mo_relaxed);
 }
 
 /* ---- splitmix64 (design section 4.2) ---- */
@@ -229,7 +228,7 @@ bm_access_probe(bm_pid_t pid)
 
 	gt_record((uint64_t)pid, dom);     /* ground truth (probe-only) */
 
-	sk_maybe_seal(s, atomic_load_explicit(&g_gen_tick, memory_order_relaxed));
+	sk_maybe_seal(s, xtc_atomic_load_u64(&g_gen_tick, xtc_mo_relaxed));
 
 	h = bp_hash64((uint64_t)pid);
 	if (!dk_test_and_set(s, h))
@@ -339,8 +338,8 @@ static bm_t   *g_bm;
 static bt_t   *g_bt;
 static long    g_n_keys;
 static long    g_iters_per_reader;
-static atomic_int   g_go;
-static atomic_int   g_readers_left;
+static int g_go;
+static int g_readers_left;
 
 static void
 mkkey(long i, char *k)
@@ -393,7 +392,7 @@ reader_proc(void *arg)
 		lo = (long)dom * span;
 	}
 
-	while (!atomic_load_explicit(&g_go, memory_order_acquire))
+	while (!xtc_atomic_load_i32(&g_go, xtc_mo_acquire))
 		xtc_yield();
 
 	for (i = 0; i < g_iters_per_reader; i++) {
@@ -405,20 +404,19 @@ reader_proc(void *arg)
 		if ((i & 63) == 63)
 			xtc_yield();
 	}
-	if (atomic_fetch_sub_explicit(&g_readers_left, 1,
-	    memory_order_acq_rel) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_readers_left, 1, xtc_mo_acq_rel) == 1)
 		bm_provider_stop(g_bm);
 }
 
-static _Atomic int g_tick_stop;
+static int g_tick_stop;
 
 static void *
 gen_tick_thread(void *arg)
 {
 	(void)arg;
-	while (!atomic_load_explicit(&g_tick_stop, memory_order_relaxed)) {
+	while (!xtc_atomic_load_i32(&g_tick_stop, xtc_mo_relaxed)) {
 		usleep(GEN_MS * 1000);
-		atomic_fetch_add_explicit(&g_gen_tick, 1, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&g_gen_tick, 1, xtc_mo_relaxed);
 	}
 	return NULL;
 }
@@ -431,9 +429,9 @@ run_workload(int nloops)
 	int i;
 	pthread_t tick;
 
-	atomic_store(&g_go, 0);
-	atomic_store(&g_readers_left, readers);
-	atomic_store(&g_tick_stop, 0);
+	xtc_atomic_store_i32(&g_go, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_readers_left, readers, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_tick_stop, 0, xtc_mo_seq_cst);
 	if (xtc_exec_init(&e, nloops) != XTC_OK) { fprintf(stderr, "exec_init\n"); exit(1); }
 	if (bm_provider_spawn(g_bm, xtc_exec_loop(e, 0), 1LL * 1000 * 1000,
 	    NULL) != XTC_OK) { fprintf(stderr, "provider\n"); exit(1); }
@@ -441,9 +439,9 @@ run_workload(int nloops)
 		(void)xtc_proc_spawn(xtc_exec_loop(e, i % nloops), reader_proc,
 		    (void *)(intptr_t)(i + 1), NULL, NULL);
 	pthread_create(&tick, NULL, gen_tick_thread, NULL);
-	atomic_store_explicit(&g_go, 1, memory_order_release);
+	xtc_atomic_store_i32(&g_go, 1, xtc_mo_release);
 	(void)xtc_exec_run(e);
-	atomic_store_explicit(&g_tick_stop, 1, memory_order_relaxed);
+	xtc_atomic_store_i32(&g_tick_stop, 1, xtc_mo_relaxed);
 	pthread_join(tick, NULL);
 	xtc_exec_fini(e);
 }
@@ -475,19 +473,22 @@ report(void)
 		}
 	}
 	for (i = 0; i < GT_MAX_PIDS; i++)
-		if (atomic_load(&g_gt[i].pid) != 0) observed++;
+		if (xtc_atomic_load_u64(&g_gt[i].pid, xtc_mo_seq_cst) != 0)
+			observed++;
 
 	rows = calloc((size_t)(observed > 0 ? observed : 1), sizeof(*rows));
 	if (rows == NULL) { fprintf(stderr, "oom\n"); return; }
 
 	for (i = 0; i < GT_MAX_PIDS; i++) {
-		uint64_t pid = atomic_load(&g_gt[i].pid);
+		uint64_t pid =
+		    xtc_atomic_load_u64(&g_gt[i].pid, xtc_mo_seq_cst);
 		uint64_t tot = 0;
 		int tdeg = 0;
 		uint16_t mask; uint32_t freq;
 		if (pid == 0) continue;
 		for (d = 0; d < N_SYNTH_DOMAINS; d++) {
-			uint64_t c = atomic_load(&g_gt[i].count[d]);
+			uint64_t c = xtc_atomic_load_u64(&g_gt[i].count[d],
+			    xtc_mo_seq_cst);
 			tot += c;
 			if (c > 0) tdeg++;
 		}

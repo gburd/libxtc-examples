@@ -23,7 +23,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -430,12 +430,12 @@ sql_parse_run(const char *sql, size_t len, sql_parse_state_t *st)
 	return st->error ? -1 : 0;
 }
 
-static _Atomic unsigned long long g_parse_count;   /* parses run (metric) */
+static unsigned long long g_parse_count; /* parses run (metric) */
 
 unsigned long long
 sql_parse_count(void)
 {
-	return atomic_load_explicit(&g_parse_count, memory_order_relaxed);
+	return xtc_atomic_load_ullong(&g_parse_count, xtc_mo_relaxed);
 }
 
 int
@@ -456,7 +456,7 @@ sql_parse_ast(const char *sql, size_t len, sql_arena_t **arena_out,
 	st.kind = SQL_KIND_UNKNOWN;
 	st.arena = arena;
 
-	atomic_fetch_add_explicit(&g_parse_count, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_ullong(&g_parse_count, 1, xtc_mo_relaxed);
 	if (sql_parse_run(sql, len, &st) < 0) {
 		if (err_out) *err_out = st.err_msg ? st.err_msg : "parse error";
 		sql_arena_destroy(arena);
@@ -482,7 +482,7 @@ sql_parse_lime(const char *sql, size_t len, sql_info_t *info)
 	st.kind = SQL_KIND_UNKNOWN;
 	st.arena = arena;
 
-	atomic_fetch_add_explicit(&g_parse_count, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_ullong(&g_parse_count, 1, xtc_mo_relaxed);
 	if (sql_parse_run(sql, len, &st) < 0) {
 		info->err = st.err_msg ? st.err_msg : "lime: parse failure";
 		sql_arena_destroy(arena);

@@ -27,7 +27,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,12 +41,12 @@
 #include "xtc_orc.h"
 
 
-_Atomic int venue_stopping;
+int venue_stopping;
 
 static xtc_exec_t *g_exec;
 static xtc_loop_t *g_loop;		/* loop 0: listeners, boot, stopper */
 static pthread_t g_loop_thread;
-static _Atomic unsigned g_next_loop;	/* round-robin for connections */
+static unsigned g_next_loop; /* round-robin for connections */
 
 /* The loop the next connection runs on. */
 static xtc_loop_t *
@@ -54,10 +54,11 @@ conn_loop(void)
 {
 	int n = xtc_exec_n_loops(g_exec);
 	return xtc_exec_loop(g_exec,
-	    (int)(atomic_fetch_add(&g_next_loop, 1) % (unsigned)n));
+	    (int)(xtc_atomic_fetch_add_u32(&g_next_loop, 1, xtc_mo_seq_cst) %
+	        (unsigned)n));
 }
 static const venue_opts_t *g_opts;
-static _Atomic uint32_t g_next_account = 100;
+static uint32_t g_next_account = 100;
 static int g_ready_fd = -1;
 
 int64_t venue_sym_best(int i, int side);
@@ -78,7 +79,8 @@ write_full(int fd, const void *buf, size_t n)
 		}
 		if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 			uint32_t rev = 0;
-			if (atomic_load(&venue_stopping))
+			if (xtc_atomic_load_i32(&venue_stopping,
+			        xtc_mo_seq_cst))
 				return -1;
 			(void)xtc_proc_wait_fd(fd, XTC_IO_WRITABLE,
 			    200LL * 1000 * 1000, &rev);
@@ -318,7 +320,8 @@ session_record(int fd, const unsigned char *rec, uint32_t len,
 	if (rec[0] == 'L' && len >= 5) {
 		*account = le32(rec + 1);
 		if (*account == 0)
-			*account = atomic_fetch_add(&g_next_account, 1);
+			*account = xtc_atomic_fetch_add_u32(&g_next_account, 1,
+			    xtc_mo_seq_cst);
 		return 0;
 	}
 	if (*account == 0)
@@ -358,7 +361,7 @@ session_fiber(void *arg)
 	size_t have = 0;
 
 	xtc_free(ca);
-	while (!atomic_load(&venue_stopping)) {
+	while (!xtc_atomic_load_i32(&venue_stopping, xtc_mo_seq_cst)) {
 		uint32_t rev = 0;
 		ssize_t r;
 		size_t off;
@@ -458,7 +461,7 @@ md_fiber(void *arg)
 
 	xtc_free(ca);
 	subscribe_all(1);
-	while (!atomic_load(&venue_stopping)) {
+	while (!xtc_atomic_load_i32(&venue_stopping, xtc_mo_seq_cst)) {
 		void *m;
 		size_t sz;
 		int rc = xtc_recv(&m, &sz, 500LL * 1000 * 1000);
@@ -552,11 +555,16 @@ stats_json(char *b, size_t cap)
 		    (long long)venue_sym_best(i, BOOK_BUY),
 		    (long long)venue_sym_best(i, BOOK_SELL),
 		    (long long)venue_sym_last(i),
-		    (unsigned long long)atomic_load(&s->commands),
-		    (unsigned long long)atomic_load(&s->trades),
-		    (unsigned long long)atomic_load(&s->volume),
-		    (unsigned long long)atomic_load(&s->rejects),
-		    (unsigned long long)atomic_load(&s->drops),
+		    (unsigned long long)xtc_atomic_load_u64(&s->commands,
+		        xtc_mo_seq_cst),
+		    (unsigned long long)xtc_atomic_load_u64(&s->trades,
+		        xtc_mo_seq_cst),
+		    (unsigned long long)xtc_atomic_load_u64(&s->volume,
+		        xtc_mo_seq_cst),
+		    (unsigned long long)xtc_atomic_load_u64(&s->rejects,
+		        xtc_mo_seq_cst),
+		    (unsigned long long)xtc_atomic_load_u64(&s->drops,
+		        xtc_mo_seq_cst),
 		    (unsigned long long)hist_q(&s->match, 0.50),
 		    (unsigned long long)hist_q(&s->match, 0.99),
 		    (unsigned long long)hist_q(&s->match, 0.999),
@@ -606,7 +614,7 @@ sse_stream(int fd, int sym)
 	memset(&c, 0, sizeof c);
 	c.reply = xtc_self();
 	(void)venue_to_book(sym, VT_SUBSCRIBE, &c);
-	while (!atomic_load(&venue_stopping)) {
+	while (!xtc_atomic_load_i32(&venue_stopping, xtc_mo_seq_cst)) {
 		void *m;
 		size_t sz;
 		int n = 0, rc = xtc_recv(&m, &sz, 250LL * 1000 * 1000);
@@ -661,7 +669,7 @@ web_order(int fd, const char *q)
 	char v[32];
 	struct venue_cmd c;
 	int sym;
-	static _Atomic uint64_t next_cid = 1;
+	static uint64_t next_cid = 1;
 	char body[128];
 	int n;
 
@@ -676,7 +684,7 @@ web_order(int fd, const char *q)
 	    BOOK_IOC : BOOK_GTC);
 	c.price = query_get(q, "price", v, sizeof v) ? atoll(v) : 0;
 	c.qty = query_get(q, "qty", v, sizeof v) ? atoll(v) : 100;
-	c.client_id = atomic_fetch_add(&next_cid, 1);
+	c.client_id = xtc_atomic_fetch_add_u64(&next_cid, 1, xtc_mo_seq_cst);
 	c.t_ingress = venue_now_ns();
 	n = snprintf(body, sizeof body, "{\"ok\":%d,\"id\":%llu}\n",
 	    sym >= 0 && venue_to_book(sym, VT_ORDER, &c) == XTC_TNT_SEND_OK,
@@ -710,8 +718,9 @@ web_fiber(void *arg)
 		{
 			uint32_t rev = 0;
 			if (xtc_proc_wait_fd(fd, XTC_IO_READABLE,
-			    5LL * 1000 * 1000 * 1000, &rev) != XTC_OK ||
-			    atomic_load(&venue_stopping))
+			        5LL * 1000 * 1000 * 1000, &rev) != XTC_OK ||
+			    xtc_atomic_load_i32(&venue_stopping,
+			        xtc_mo_seq_cst))
 				goto out;
 		}
 	}
@@ -775,7 +784,7 @@ static void
 listener_fiber(void *arg)
 {
 	struct listener *l = arg;
-	while (!atomic_load(&venue_stopping)) {
+	while (!xtc_atomic_load_i32(&venue_stopping, xtc_mo_seq_cst)) {
 		int cfd;
 		int rc = xtc_net_accept(l->fd, &cfd);
 		if (rc == XTC_OK) {
@@ -832,7 +841,9 @@ flow_fiber(void *arg)
 {
 	struct flow_args fa = *(struct flow_args *)arg;
 	uint64_t rng = 0x9e3779b97f4a7c15ull * (uint64_t)(fa.sym + 1);
-	uint32_t mm = atomic_fetch_add(&g_next_account, 2), noise = mm + 1;
+	uint32_t mm = xtc_atomic_fetch_add_u32(&g_next_account, 2,
+	             xtc_mo_seq_cst),
+	         noise = mm + 1;
 	int64_t mid = g_opts->ref_price > 0 ? g_opts->ref_price : 10000;
 	int64_t inventory = 0;
 	uint64_t cid = 1, quote_ids[10] = { 0 };
@@ -841,7 +852,7 @@ flow_fiber(void *arg)
 	int64_t next_quote = 0;
 
 	xtc_free(arg);
-	while (!atomic_load(&venue_stopping)) {
+	while (!xtc_atomic_load_i32(&venue_stopping, xtc_mo_seq_cst)) {
 		struct venue_cmd c;
 		int64_t now = xtc_clock_mono();
 		void *m;
@@ -949,7 +960,7 @@ boot_fiber(void *arg)
 		for (up = 1, i = 0; i < venue_nsyms(); i++)
 			if (venue_sym_book(i) == XTC_TNT_HANDLE_NONE)
 				up = 0;
-	} while (!up && !atomic_load(&venue_stopping));
+	} while (!up && !xtc_atomic_load_i32(&venue_stopping, xtc_mo_seq_cst));
 	for (i = 0; i < g_nlisteners; i++) {
 		xtc_proc_opts_t po = XTC_PROC_OPTS_INIT;
 		po.name = "listener";
@@ -982,7 +993,7 @@ static void
 stopper_fiber(void *arg)
 {
 	(void)arg;
-	while (!atomic_load(&venue_stopping))
+	while (!xtc_atomic_load_i32(&venue_stopping, xtc_mo_seq_cst))
 		(void)xtc_proc_sleep(50LL * 1000 * 1000);
 	(void)xtc_exec_stop(g_exec);
 }

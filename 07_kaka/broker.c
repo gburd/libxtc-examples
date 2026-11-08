@@ -28,7 +28,6 @@
 
 #include <errno.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,7 +101,7 @@ struct part_entry {
 	uint32_t   partition;
 	xtc_pid_t  pid;
 	int        in_use;
-	_Atomic int done;          /* partition proc returned */
+	int done; /* partition proc returned */
 };
 
 struct part_arg {
@@ -121,13 +120,13 @@ static uint64_t            g_retention;
 static int64_t             g_req_timeout = 30LL * 1000 * 1000 * 1000;
 static xtc_pid_t           g_coord;
 static int                 g_have_coord;
-static _Atomic int         g_stopping;       /* no new requests */
+static int g_stopping; /* no new requests */
 
 /* Connection table (for shutdown). */
 static xtc_pid_t          *g_conns;
 static int                *g_conn_fds;
 static int                 g_max_conns;
-static _Atomic int         g_n_conns;
+static int g_n_conns;
 static pthread_mutex_t     g_conns_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void broker_set_loop(xtc_loop_t *loop) { g_loop = loop; }
@@ -320,7 +319,7 @@ __do_fetch(struct pstate *ps, struct part_req *req)
 			req->n += n;
 		}
 		if (n > 0 && req->offset < end && req->used < cap &&
-		    !atomic_load(&g_stopping)) {
+		    !xtc_atomic_load_i32(&g_stopping, xtc_mo_seq_cst)) {
 			req->op = REQ_FETCH_CONT;
 			if (xtc_send(xtc_self(), req, sizeof *req) == XTC_OK) {
 				xtc_yield();     /* let the loop run others */
@@ -518,7 +517,7 @@ partition_proc(void *arg)
 		(void)xtc_send(shut_to, &reps[0], sizeof reps[0]);
 	}
 	if (ps.pa->ent != NULL)
-		atomic_store(&ps.pa->ent->done, 1);
+		xtc_atomic_store_i32(&ps.pa->ent->done, 1, xtc_mo_seq_cst);
 	free(ps.pa);
 }
 
@@ -558,13 +557,13 @@ partition_for(const char *topic, uint16_t topic_len, uint32_t partition,
 			free_slot = i;
 		}
 	}
-	if (free_slot < 0 || atomic_load(&g_stopping) ||
+	if (free_slot < 0 || xtc_atomic_load_i32(&g_stopping, xtc_mo_seq_cst) ||
 	    (pa = calloc(1, sizeof *pa)) == NULL)
 		goto out;
 	memcpy(pa->topic, tkey, (size_t)topic_len + 1);
 	pa->partition = partition;
 	pa->ent = &g_parts[free_slot];
-	atomic_store(&pa->ent->done, 0);
+	xtc_atomic_store_i32(&pa->ent->done, 0, xtc_mo_seq_cst);
 	opts.name = "kaka-partition";
 	opts.mailbox_cap = 1u << 16;
 	if (xtc_proc_spawn(g_loop, partition_proc, pa, &opts, &pid) != XTC_OK) {
@@ -601,7 +600,8 @@ conn_read_frame(int fd, uint8_t **buf, size_t *cap, size_t *have)
 		long n = kaka_frame_parse(*buf, *have, &type, &body, &body_len);
 		if (n > 0) return n;
 		if (n < 0) return -1;
-		if (atomic_load(&g_stopping)) return 0;
+		if (xtc_atomic_load_i32(&g_stopping, xtc_mo_seq_cst))
+			return 0;
 		if (*have == *cap) {
 			size_t ncap = *cap ? *cap * 2 : 4096;
 			uint8_t *nb = realloc(*buf, ncap);
@@ -758,10 +758,13 @@ conn_partition_req(int fd, uint8_t type, const uint8_t *body,
 	}
 	if (partition_for(topic, topic_len, partition, &ppid) != 0) {
 		if (msg != (uint8_t *)&req) xtc_free(msg);
-		return conn_send_error(fd, atomic_load(&g_stopping) ?
-		    KAKA_ERR_SHUTDOWN : KAKA_ERR_BAD_REQUEST,
-		    atomic_load(&g_stopping) ? "broker shutting down" :
-		    "bad topic or too many partitions");
+		return conn_send_error(fd,
+		    xtc_atomic_load_i32(&g_stopping, xtc_mo_seq_cst) ?
+		        KAKA_ERR_SHUTDOWN :
+		        KAKA_ERR_BAD_REQUEST,
+		    xtc_atomic_load_i32(&g_stopping, xtc_mo_seq_cst) ?
+		        "broker shutting down" :
+		        "bad topic or too many partitions");
 	}
 	if (msg != (uint8_t *)&req) {
 		memcpy(msg, &req, sizeof req);
@@ -864,7 +867,7 @@ conn_proc(void *arg)
 	g_conn_fds[slot] = -1;
 	(void)pthread_mutex_unlock(&g_conns_lock);
 	xtc_net_close(fd);
-	atomic_fetch_sub(&g_n_conns, 1);
+	xtc_atomic_fetch_sub_i32(&g_n_conns, 1, xtc_mo_seq_cst);
 }
 
 /* ---- startup / shutdown ---- */
@@ -905,7 +908,8 @@ broker_spawn_conn(xtc_loop_t *loop, int fd)
 	xtc_pid_t pid;
 	int i, slot = -1;
 
-	if (atomic_load(&g_stopping)) return -1;
+	if (xtc_atomic_load_i32(&g_stopping, xtc_mo_seq_cst))
+		return -1;
 	(void)pthread_mutex_lock(&g_conns_lock);
 	for (i = 0; i < g_max_conns; i++)
 		if (g_conn_fds[i] < 0) { slot = i; break; }
@@ -916,11 +920,11 @@ broker_spawn_conn(xtc_loop_t *loop, int fd)
 	ca->fd = fd;
 	ca->slot = slot;
 	opts.name = "kaka-conn";
-	atomic_fetch_add(&g_n_conns, 1);
+	xtc_atomic_fetch_add_i32(&g_n_conns, 1, xtc_mo_seq_cst);
 	(void)pthread_mutex_lock(&g_conns_lock);
 	if (xtc_proc_spawn(loop, conn_proc, ca, &opts, &pid) != XTC_OK) {
 		(void)pthread_mutex_unlock(&g_conns_lock);
-		atomic_fetch_sub(&g_n_conns, 1);
+		xtc_atomic_fetch_sub_i32(&g_n_conns, 1, xtc_mo_seq_cst);
 		free(ca);
 		goto fail;
 	}
@@ -945,18 +949,19 @@ broker_shutdown(int64_t grace_ns)
 
 	/* 1. Connections stop reading new requests, finish the one in
 	 *    flight and close.  Wake the idle ones so they see the flag. */
-	atomic_store(&g_stopping, 1);
+	xtc_atomic_store_i32(&g_stopping, 1, xtc_mo_seq_cst);
 	(void)pthread_mutex_lock(&g_conns_lock);
 	for (i = 0; i < g_max_conns; i++)
 		if (!xtc_pid_is_none(g_conns[i]))
 			(void)xtc_proc_wake(g_conns[i]);
 	(void)pthread_mutex_unlock(&g_conns_lock);
-	while (atomic_load(&g_n_conns) > 0 && xtc_clock_mono() < deadline)
+	while (xtc_atomic_load_i32(&g_n_conns, xtc_mo_seq_cst) > 0 &&
+	    xtc_clock_mono() < deadline)
 		(void)xtc_proc_sleep(10LL * 1000 * 1000);
 	/* 2. Cut the stragglers (a client that never reads its reply). */
-	if (atomic_load(&g_n_conns) > 0) {
+	if (xtc_atomic_load_i32(&g_n_conns, xtc_mo_seq_cst) > 0) {
 		XTC_LOG_WARN_F("kaka: cutting %d connection(s)",
-		    atomic_load(&g_n_conns));
+		    xtc_atomic_load_i32(&g_n_conns, xtc_mo_seq_cst));
 		(void)pthread_mutex_lock(&g_conns_lock);
 		for (i = 0; i < g_max_conns; i++)
 			if (g_conn_fds[i] >= 0)
@@ -978,9 +983,12 @@ broker_shutdown(int64_t grace_ns)
 		size_t ml;
 		pending = 0;
 		for (i = 0; i < MAX_PARTITIONS; i++)
-			if (g_parts[i].in_use && !atomic_load(&g_parts[i].done))
+			if (g_parts[i].in_use &&
+			    !xtc_atomic_load_i32(&g_parts[i].done,
+			        xtc_mo_seq_cst))
 				pending++;
-		if ((pending == 0 && atomic_load(&g_n_conns) == 0) ||
+		if ((pending == 0 &&
+		        xtc_atomic_load_i32(&g_n_conns, xtc_mo_seq_cst) == 0) ||
 		    xtc_clock_mono() >= deadline)
 			break;
 		if (xtc_recv(&m, &ml, 10LL * 1000 * 1000) == XTC_OK)
@@ -1312,18 +1320,18 @@ broker_metrics_selftest(void)
 
 /* ---- durability (E-M5) ---- */
 
-static _Atomic int g_syncs;
-static _Atomic int g_sync_fail;
-static _Atomic int64_t g_sync_sleep;
+static int g_syncs;
+static int g_sync_fail;
+static int64_t g_sync_sleep;
 
 static int
 st_sync_hook(int fd)
 {
-	int64_t ns = atomic_load(&g_sync_sleep);
-	atomic_fetch_add(&g_syncs, 1);
+	int64_t ns = xtc_atomic_load_i64(&g_sync_sleep, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_i32(&g_syncs, 1, xtc_mo_seq_cst);
 	if (ns > 0)
 		(void)xtc_proc_sleep(ns);
-	if (atomic_load(&g_sync_fail))
+	if (xtc_atomic_load_i32(&g_sync_fail, xtc_mo_seq_cst))
 		return -5;               /* -EIO */
 	return xtc_aio_fdatasync(fd);
 }
@@ -1337,15 +1345,18 @@ durable_client(void *arg)
 	int i, s0;
 
 	/* (a) the ack of a produce comes after a sync. */
-	s0 = atomic_load(&g_syncs);
+	s0 = xtc_atomic_load_i32(&g_syncs, xtc_mo_seq_cst);
 	kaka_put_u32(v, 0);
 	if (st_produce(st->part, 1, v, 4, &rep) != 0 || !rep.ok) {
 		st->result = 1; goto done;
 	}
-	if (atomic_load(&g_syncs) == s0) { st->result = 2; goto done; }
+	if (xtc_atomic_load_i32(&g_syncs, xtc_mo_seq_cst) == s0) {
+		st->result = 2;
+		goto done;
+	}
 
 	/* (b) group commit: 64 produces queued together share syncs. */
-	s0 = atomic_load(&g_syncs);
+	s0 = xtc_atomic_load_i32(&g_syncs, xtc_mo_seq_cst);
 	for (i = 1; i <= 64; i++) {
 		uint8_t rec[16];
 		kaka_put_u32(v, (uint32_t)i);
@@ -1357,15 +1368,15 @@ durable_client(void *arg)
 	for (i = 1; i <= 64; i++)
 		if (await_reply((uint32_t)i + 1, &rep, sizeof rep) != 0 ||
 		    !rep.ok) { st->result = 4; goto done; }
-	st->a = atomic_load(&g_syncs) - s0;
+	st->a = xtc_atomic_load_i32(&g_syncs, xtc_mo_seq_cst) - s0;
 	if (st->a < 1 || st->a >= 64) { st->result = 5; goto done; }
 
 	/* (c) a failed sync fails the produce and every later one. */
-	atomic_store(&g_sync_fail, 1);
+	xtc_atomic_store_i32(&g_sync_fail, 1, xtc_mo_seq_cst);
 	kaka_put_u32(v, 99);
 	if (st_produce(st->part, 100, v, 4, &rep) != 0 || rep.ok ||
 	    rep.err != KAKA_ERR_STORAGE) { st->result = 6; goto done; }
-	atomic_store(&g_sync_fail, 0);
+	xtc_atomic_store_i32(&g_sync_fail, 0, xtc_mo_seq_cst);
 	if (st_produce(st->part, 101, v, 4, &rep) != 0 || rep.ok ||
 	    rep.err != KAKA_ERR_STORAGE) { st->result = 7; goto done; }
 	/* Records synced before the failure are still served; the
@@ -1486,7 +1497,8 @@ timeout_client(void *arg)
 		p += st_rec(p, "k", 1, v, sizeof v);
 		blen = (size_t)(p - body[i]);
 	}
-	atomic_store(&g_sync_sleep, 300LL * 1000 * 1000);
+	xtc_atomic_store_i64(&g_sync_sleep, 300LL * 1000 * 1000,
+	    xtc_mo_seq_cst);
 	broker_set_request_timeout(50LL * 1000 * 1000);
 	for (i = 0; i < 2; i++) {
 		(void)conn_partition_req(sv[0], KAKA_PRODUCE, body[i], blen,
@@ -1494,7 +1506,7 @@ timeout_client(void *arg)
 		memset(body[i], 0xee, 512);
 		free(body[i]);
 	}
-	atomic_store(&g_sync_sleep, 0);
+	xtc_atomic_store_i64(&g_sync_sleep, 0, xtc_mo_seq_cst);
 	broker_set_request_timeout(30LL * 1000 * 1000 * 1000);
 	if (partition_for("u", 1, 0, &part) != 0) { st->result = 3; goto out; }
 	(void)xtc_proc_sleep(700LL * 1000 * 1000);
@@ -1555,7 +1567,7 @@ broker_timeout_selftest(const char *dir)
 	(void)xtc_loop_fini(loop);
 	plog_set_sync_hook(NULL);
 	broker_set_log_dir(NULL);
-	atomic_store(&g_stopping, 0);
+	xtc_atomic_store_i32(&g_stopping, 0, xtc_mo_seq_cst);
 	for (i = 0; i < MAX_PARTITIONS; i++)
 		g_parts[i].in_use = 0;
 	return st.result;

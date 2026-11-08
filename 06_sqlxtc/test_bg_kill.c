@@ -19,7 +19,6 @@
  * procs (sx_storage_run), kills the checkpoint proc,
  * and times sx_storage_quiesce (which stops the checkpoint proc first).
  */
-#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -33,9 +32,8 @@
 #include "xtc_res.h"
 #include "t_tmp.h"
 
-extern int  metrics_spawn(xtc_loop_t *loop, xtc_res_t *res,
-                          _Atomic int *conn_count,
-                          _Atomic int64_t *queries_total, xtc_pid_t *out_pid);
+extern int metrics_spawn(xtc_loop_t *loop, xtc_res_t *res, int *conn_count,
+    int64_t *queries_total, xtc_pid_t *out_pid);
 extern void metrics_stop(void);
 
 static bm_t *g_bm;
@@ -101,7 +99,7 @@ main(void)
 	char path[256];
 	xtc_loop_t *loop = NULL;
 	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "drv" };
-	_Atomic int conns = 0;
+	int conns = 0;
 	xtc_pid_t pid;
 	int fd;
 

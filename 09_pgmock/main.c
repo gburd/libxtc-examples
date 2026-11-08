@@ -23,7 +23,6 @@
 #endif
 #include <getopt.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,13 +38,13 @@
 
 static pgmock_listener_t g_listener;
 static xtc_app_t        *g_app;
-static _Atomic int       g_shutdown;
+static int g_shutdown;
 
 static void
 sig_handler(int sig)
 {
 	(void)sig;
-	atomic_store(&g_shutdown, 1);
+	xtc_atomic_store_i32(&g_shutdown, 1, xtc_mo_seq_cst);
 	if (g_app != NULL)
 		(void)xtc_app_stop(g_app);
 }
@@ -116,8 +115,8 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	atomic_init(&g_shutdown, 0);
-	atomic_init(&g_listener.accepted, 0);
+	xtc_atomic_store_i32(&g_shutdown, 0, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&g_listener.accepted, 0, xtc_mo_relaxed);
 	g_listener.listen_fd = listen_fd;
 	g_listener.loop = xtc_app_loop(g_app);
 	g_listener.shutdown = &g_shutdown;
@@ -141,6 +140,6 @@ main(int argc, char **argv)
 	if (unix_path != NULL)
 		unlink(unix_path);
 	fprintf(stderr, "pgmock exiting (accepted %d connections)\n",
-	    atomic_load(&g_listener.accepted));
+	    xtc_atomic_load_i32(&g_listener.accepted, xtc_mo_seq_cst));
 	return 0;
 }

@@ -46,8 +46,8 @@
 struct rec_id { uint32_t th, i; };
 
 static wal_t           *g_w;
-static _Atomic long     g_ok, g_bad;
-static _Atomic uint64_t g_bytes;
+static long g_ok, g_bad;
+static uint64_t g_bytes;
 
 static uint32_t
 r_len(uint32_t th, uint32_t i)
@@ -90,11 +90,12 @@ committer(void *arg)
 	for (i = 0; i < PER; i++) {
 		int l = fill(buf, th, i);
 		if (wal_commit_sync(g_w, buf, (uint32_t)l, NULL) == XTC_OK) {
-			atomic_fetch_add(&g_ok, 1);
-			atomic_fetch_add(&g_bytes, (uint64_t)l + WAL_REC_HDR +
-			    WAL_REC_CRC);
+			xtc_atomic_fetch_add_long(&g_ok, 1, xtc_mo_seq_cst);
+			xtc_atomic_fetch_add_u64(&g_bytes,
+			    (uint64_t)l + WAL_REC_HDR + WAL_REC_CRC,
+			    xtc_mo_seq_cst);
 		} else {
-			atomic_fetch_add(&g_bad, 1);
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 		}
 	}
 	free(buf);
@@ -178,7 +179,8 @@ more(uint32_t from, uint32_t to)
 	for (i = from; i < to; i++) {
 		int l = fill(buf, NTH, PER + i);
 		CK(wal_commit_sync(g_w, buf, (uint32_t)l, NULL) == XTC_OK);
-		atomic_fetch_add(&g_bytes, (uint64_t)l + WAL_REC_HDR + WAL_REC_CRC);
+		xtc_atomic_fetch_add_u64(&g_bytes,
+		    (uint64_t)l + WAL_REC_HDR + WAL_REC_CRC, xtc_mo_seq_cst);
 	}
 	free(buf);
 }
@@ -309,12 +311,15 @@ main(void)
 		CK(pthread_create(&t[k], NULL, committer, (void *)(uintptr_t)k) == 0);
 	for (k = 0; k < NTH; k++)
 		(void)pthread_join(t[k], NULL);
-	CK(atomic_load(&g_ok) == (long)NTH * PER && atomic_load(&g_bad) == 0);
+	CK(xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst) == (long)NTH * PER &&
+	    xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst) == 0);
 	end = wal_size(g_w);
-	CK(end == atomic_load(&g_bytes));   /* 5. no padding in the log */
+	CK(end ==
+	    xtc_atomic_load_u64(&g_bytes,
+	        xtc_mo_seq_cst)); /* 5. no padding in the log */
 	printf("  %ld commits, log %llu bytes (%.1f ring wraps)\n",
-	    atomic_load(&g_ok), (unsigned long long)end,
-	    (double)end / WAL_RING);
+	    xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst),
+	    (unsigned long long)end, (double)end / WAL_RING);
 	printf("  end %% 4096 = %llu (the reopen below starts mid-block)\n",
 	    (unsigned long long)(end % WAL_BLK));
 	wal_close(g_w);
@@ -330,7 +335,7 @@ main(void)
 	end = wal_size(g_w);
 	wal_close(g_w);
 	CK(scan_all(path, NTH, PER, 40, 0));
-	CK(end == atomic_load(&g_bytes));
+	CK(end == xtc_atomic_load_u64(&g_bytes, xtc_mo_seq_cst));
 
 	/* 4. after a checkpoint rebind (the compacted file) */
 	memset(&wo, 0, sizeof wo);

@@ -72,9 +72,10 @@ test_group: test_group.c group.c group.h partition.c frame.c
 kaka_load: kaka_load.c
 	$(CC) -O2 -g -std=c11 -Wall -Wextra -o $@ kaka_load.c
 
-# Concurrent produce + consume soak (a plain socket client, no libxtc).
+# Concurrent produce + consume soak (a plain socket client, no libxtc;
+# only the header-only xtc_atomic.h).
 kaka_soak: kaka_soak.c
-	$(CC) -O2 -g -std=c11 -Wall -Wextra -o $@ kaka_soak.c -lpthread
+	$(CC) -O2 -g -std=c11 -Wall -Wextra -I$(XTC_INC) -o $@ kaka_soak.c -lpthread
 
 # A real broker on a durable data dir, network and storage at once.
 soak: $(TARGET) kaka_soak

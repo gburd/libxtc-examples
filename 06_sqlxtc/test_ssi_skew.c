@@ -16,7 +16,6 @@
  *	both committed -> x + y == 0.
  */
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,8 +37,8 @@
 static bt_t        *g_bt;
 static wal_t       *g_wal;
 static sx_db       *g_c[2];
-static _Atomic int  g_bar, g_left;
-static _Atomic long g_both, g_violations, g_commits;
+static int g_bar, g_left;
+static long g_both, g_violations, g_commits;
 
 static int64_t
 sum_xy(sx_db *db)
@@ -59,8 +58,8 @@ static void
 barrier(int *k)
 {
 	int target = 2 * ++(*k);
-	atomic_fetch_add(&g_bar, 1);
-	while (atomic_load(&g_bar) < target)
+	xtc_atomic_fetch_add_i32(&g_bar, 1, xtc_mo_seq_cst);
+	while (xtc_atomic_load_i32(&g_bar, xtc_mo_seq_cst) < target)
 		(void)xtc_proc_sleep(20LL * 1000);
 }
 
@@ -81,17 +80,22 @@ worker(void *arg)
 			CK(sx_exec(db, q, NULL) == SX_OK);
 		}
 		if (sx_exec(db, "COMMIT", NULL) == SX_OK && ok)
-			atomic_fetch_add(&g_commits, 1);
+			xtc_atomic_fetch_add_long(&g_commits, 1,
+			    xtc_mo_seq_cst);
 		barrier(&k);                     /* both commits resolved */
 		if (me == 0) {
 			int64_t s = sum_xy(db);
-			if (s < 1) atomic_fetch_add(&g_violations, 1);
-			if (s == 0) atomic_fetch_add(&g_both, 1);
+			if (s < 1)
+				xtc_atomic_fetch_add_long(&g_violations, 1,
+				    xtc_mo_seq_cst);
+			if (s == 0)
+				xtc_atomic_fetch_add_long(&g_both, 1,
+				    xtc_mo_seq_cst);
 			CK(sx_exec(db, "UPDATE t SET v=1", NULL) == SX_OK);
 		}
 		barrier(&k);                     /* reset done */
 	}
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		(void)wal_writer_stop(g_wal);
 }
 
@@ -129,11 +133,11 @@ main(void)
 		CK(sx_exec(g_c[0], "CREATE TABLE t(k INTEGER PRIMARY KEY, v INTEGER)", NULL) == SX_OK);
 		CK(sx_exec(g_c[0], "INSERT INTO t(k,v) VALUES(0,1)", NULL) == SX_OK);
 		CK(sx_exec(g_c[0], "INSERT INTO t(k,v) VALUES(1,1)", NULL) == SX_OK);
-		atomic_store(&g_bar, 0);
-		atomic_store(&g_left, 2);
-		atomic_store(&g_both, 0);
-		atomic_store(&g_violations, 0);
-		atomic_store(&g_commits, 0);
+		xtc_atomic_store_i32(&g_bar, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_i32(&g_left, 2, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_both, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_violations, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_long(&g_commits, 0, xtc_mo_seq_cst);
 		if (xtc_exec_init(&ex, nloops) != XTC_OK) return 1;
 		if (wal_writer_spawn(g_wal, xtc_exec_loop(ex, 0), NULL) != XTC_OK) return 1;
 		for (i = 0; i < 2; i++)
@@ -143,10 +147,13 @@ main(void)
 		if (xtc_exec_run(ex) != XTC_OK) return 1;
 		(void)xtc_exec_fini(ex);
 		printf("  [%d loop%s] rounds=%d writer-commits=%ld write-skew "
-		    "(x+y==0)=%ld\n", nloops, nloops > 1 ? "s" : "", ROUNDS,
-		    atomic_load(&g_commits), atomic_load(&g_both));
-		CK(atomic_load(&g_violations) == 0);
-		CK(atomic_load(&g_commits) >= ROUNDS);   /* one of each pair commits */
+		       "(x+y==0)=%ld\n",
+		    nloops, nloops > 1 ? "s" : "", ROUNDS,
+		    xtc_atomic_load_long(&g_commits, xtc_mo_seq_cst),
+		    xtc_atomic_load_long(&g_both, xtc_mo_seq_cst));
+		CK(xtc_atomic_load_long(&g_violations, xtc_mo_seq_cst) == 0);
+		CK(xtc_atomic_load_long(&g_commits, xtc_mo_seq_cst) >=
+		    ROUNDS); /* one of each pair commits */
 		for (i = 0; i < 2; i++) sx_close(g_c[i]);
 		xstore_set_wal(NULL);
 		bt_close(g_bt);

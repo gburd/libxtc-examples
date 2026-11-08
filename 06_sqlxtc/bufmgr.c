@@ -34,7 +34,7 @@
 
 #include <pthread.h>
 #include <stddef.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -115,17 +115,17 @@ struct bm_frame {
 	 * can safely dereference a frame that was just unlinked; it can only
 	 * ever observe a STALE pid there (caught by the recheck), never
 	 * invalid memory. */
-	_Atomic bm_pid_t  pid;
-	_Atomic(struct bm_frame *) hnext;   /* page-table hash chain */
+	bm_pid_t pid;
+	struct bm_frame *hnext;       /* page-table hash chain */
 	void             *page;       /* page_size bytes (into the pool) */
 	xtc_arwlock_t    *latch;      /* content latch (fiber-yielding) */
-	_Atomic uint64_t  version;    /* OLC seqlock: EVEN when stable, ODD while
-	                               * an exclusive holder is mutating the page.
-	                               * An optimistic reader samples it before and
-	                               * after reading the page and retries if it
-	                               * changed or is odd -- so a lockless read
-	                               * never observes a torn mid-write page and
-	                               * takes no shared-latch write of its own. */
+	uint64_t version; /* OLC seqlock: EVEN when stable, ODD while
+	                   * an exclusive holder is mutating the page.
+	                   * An optimistic reader samples it before and
+	                   * after reading the page and retries if it
+	                   * changed or is odd -- so a lockless read
+	                   * never observes a torn mid-write page and
+	                   * takes no shared-latch write of its own. */
 	struct bm_frame  *next_free;  /* free-list link; touched only when FREE */
 
 	/* ---- LINE 1: WRITE-MOSTLY (evictor / writers) ----
@@ -133,36 +133,36 @@ struct bm_frame {
 	 * so the compiler pads line 0 automatically -- no fragile manual
 	 * pad arithmetic, and the write-mostly group can never share a line
 	 * with the read-mostly group regardless of field sizes. */
-	_Alignas(BM_CACHELINE) _Atomic uint8_t   state;
-	_Atomic int       pin;        /* >0: a worker holds it; do not evict */
-	_Atomic int       io_busy;    /* a write is in flight */
-	_Atomic int       dirty;      /* page modified since last write */
-	_Atomic int       doomed;     /* reclaimed (bm_free_pid) while pinned: the
-	                               * page is unlinked and removed from the
-	                               * table, but a worker still holds a pin from
-	                               * a read it began before the unlink.  The
-	                               * frame cannot be reclaimed under the pin
-	                               * (the worker reads valid pre-merge bytes);
-	                               * the LAST unpin completes the drop, freeing
-	                               * the frame to the pool.  This deferred,
-	                               * pin-safe drop is the reclamation interlock:
-	                               * a frame is never torn out from under a
-	                               * live pin, and no bucket lock is held across
-	                               * a blocking wait for the pin to drain. */
-	_Atomic int       ref;        /* CLOCK second-chance: set on access,
-	                               * cleared by the eviction sweep -- a
-	                               * recently used COOL page survives one
-	                               * sweep, so a hot page is not evicted
-	                               * out from under a fixer about to
-	                               * re-pin it (anti-thrash). */
-	_Atomic uint64_t  dirty_seq;  /* order it was dirtied (recLSN proxy) */
-	_Atomic uint64_t  rec_lsn;    /* WAL LSN that first dirtied it since clean
-	                               * (the ARIES recLSN; log truncation horizon) */
-	_Atomic uint8_t   cls_cache;  /* stage 5: cached sharing-degree class
-	                               * (BM_CLS_*), refreshed on the classify
-	                               * tick; advisory input to sample_score.
-	                               * On the write-mostly line (rare write,
-	                               * batched) -- Invariant 2 safe. */
+	_Alignas(BM_CACHELINE) uint8_t state;
+	int pin;            /* >0: a worker holds it; do not evict */
+	int io_busy;        /* a write is in flight */
+	int dirty;          /* page modified since last write */
+	int doomed;         /* reclaimed (bm_free_pid) while pinned: the
+	                     * page is unlinked and removed from the
+	                     * table, but a worker still holds a pin from
+	                     * a read it began before the unlink.  The
+	                     * frame cannot be reclaimed under the pin
+	                     * (the worker reads valid pre-merge bytes);
+	                     * the LAST unpin completes the drop, freeing
+	                     * the frame to the pool.  This deferred,
+	                     * pin-safe drop is the reclamation interlock:
+	                     * a frame is never torn out from under a
+	                     * live pin, and no bucket lock is held across
+	                     * a blocking wait for the pin to drain. */
+	int ref;            /* CLOCK second-chance: set on access,
+	                     * cleared by the eviction sweep -- a
+	                     * recently used COOL page survives one
+	                     * sweep, so a hot page is not evicted
+	                     * out from under a fixer about to
+	                     * re-pin it (anti-thrash). */
+	uint64_t dirty_seq; /* order it was dirtied (recLSN proxy) */
+	uint64_t rec_lsn;   /* WAL LSN that first dirtied it since clean
+	                     * (the ARIES recLSN; log truncation horizon) */
+	uint8_t cls_cache;  /* stage 5: cached sharing-degree class
+	                     * (BM_CLS_*), refreshed on the classify
+	                     * tick; advisory input to sample_score.
+	                     * On the write-mostly line (rare write,
+	                     * batched) -- Invariant 2 safe. */
 	char              _pad1[1];   /* keep the write-mostly group padded out;
 	                               * the _Alignas on `state` gives the struct
 	                               * BM_CACHELINE alignment, so sizeof rounds up
@@ -227,14 +227,14 @@ struct bm {
 	int               cls_ncores;
 	int               cls_ndom;
 	uint8_t           cls_core_dom[BM_CLS_MAXCORES];
-	_Atomic uint64_t  cls_gen_tick;
+	uint64_t cls_gen_tick;
 #endif
 	bm_frame_t       *frames;
 	unsigned char    *pool;        /* n_frames * page_size, aligned */
 
 	pthread_mutex_t   free_mu;
 	bm_frame_t       *free_head;
-	_Atomic uint32_t  free_n;
+	uint32_t free_n;
 
 	pthread_mutex_t   pid_mu;
 	bm_pid_t          next_pid;
@@ -268,22 +268,22 @@ struct bm {
 	bm_pid_t         *quar_set;      /* open-addressing slots; 0 == empty */
 	uint32_t          quar_set_cap;  /* power of two */
 	uint32_t          quar_set_n;    /* live members */
-	_Atomic uint64_t  s_freed;       /* total pages put on the freelist */
-	_Atomic uint64_t  s_reissued;    /* allocations served from the freelist */
+	uint64_t s_freed;                /* total pages put on the freelist */
+	uint64_t s_reissued; /* allocations served from the freelist */
 
-	_Atomic uint64_t  pending_pid_drops; /* active drop + deferred frame owners */
-	_Atomic uint32_t  clock;       /* round-robin victim cursor */
-	_Atomic uint64_t  evict_rng;   /* sampled-eviction PRNG state (stage 2) */
+	uint64_t pending_pid_drops; /* active drop + deferred frame owners */
+	uint32_t clock;             /* round-robin victim cursor */
+	uint64_t evict_rng;         /* sampled-eviction PRNG state (stage 2) */
 
 	/* Sweep bound (bm_opts_t.claim_threshold; 0 = unbounded) and the
 	 * eviction-cost instruments.  The per-call advance count is a LOCAL
 	 * in evict_one, so the common path adds no shared write beyond these
 	 * end-of-call stat updates. */
 	uint32_t          claim_threshold;
-	_Atomic uint64_t  s_allocs;      /* evict_one calls that reclaimed */
-	_Atomic uint64_t  s_advances;    /* frames visited by those calls */
-	_Atomic uint64_t  s_adv_max;     /* worst single call */
-	_Atomic uint64_t  s_forced;      /* reclaims taken by the bound */
+	uint64_t s_allocs;   /* evict_one calls that reclaimed */
+	uint64_t s_advances; /* frames visited by those calls */
+	uint64_t s_adv_max;  /* worst single call */
+	uint64_t s_forced;   /* reclaims taken by the bound */
 
 	/* page table (pid mode): pid -> resident frame */
 	bm_htlock_t      *ht_locks;    /* BM_HT_STRIPES striped bucket locks;
@@ -291,48 +291,48 @@ struct bm {
 	                                * chain-structure mutation), but no
 	                                * longer for a HIT re-pin -- see
 	                                * ht_lookup_pin_fast. */
-	_Atomic(bm_frame_t *) *buckets;  /* bucket HEADS: atomic so a lock-free
-	                                  * reader's chain walk sees a
-	                                  * consistent, in-order-published
-	                                  * list (release-published by
-	                                  * insert, acquire-read by the
-	                                  * fast-path walk). */
+	bm_frame_t **buckets;          /* bucket HEADS: atomic so a lock-free
+	                                * reader's chain walk sees a
+	                                * consistent, in-order-published
+	                                * list (release-published by
+	                                * insert, acquire-read by the
+	                                * fast-path walk). */
 	uint32_t          nbucket;
 
 	/* page-provider */
-	_Atomic int       pp_running;
-	_Atomic int       pp_alive;      /* proc is live; cleared on its exit */
+	int pp_running;
+	int pp_alive; /* proc is live; cleared on its exit */
 	xtc_pid_t         pp_pid;
 
 	/* trickler: paced, ordered dirty-page writeback */
-	_Atomic int       tr_running;
-	_Atomic int       tr_alive;      /* proc is live; cleared on its exit */
+	int tr_running;
+	int tr_alive; /* proc is live; cleared on its exit */
 	xtc_pid_t         tr_pid;
-	_Atomic uint64_t  dirty_clock;   /* stamps dirty_seq on clean->dirty */
-	_Atomic uint64_t  s_trickled;    /* pages written by the trickler */
-	_Atomic uint64_t  s_tr_writes;   /* trickler pwrite calls (coalescing) */
-	_Atomic uint64_t  s_evict_flush; /* dirty pages flushed on the foreground
-	                                  * eviction path (no clean victim) */
-	_Atomic uint32_t  s_dirty_backlog; /* dirty frames seen by the last
-	                                    * trickler pass (backlog gauge) */
-	_Atomic uint64_t  s_tr_passes;   /* trickler passes (total) */
-	_Atomic uint64_t  s_tr_visited;  /* frames the trickler visited (total) */
-	_Atomic uint64_t  s_tr_adaptive; /* trickler passes that ran the tuner */
+	uint64_t dirty_clock;     /* stamps dirty_seq on clean->dirty */
+	uint64_t s_trickled;      /* pages written by the trickler */
+	uint64_t s_tr_writes;     /* trickler pwrite calls (coalescing) */
+	uint64_t s_evict_flush;   /* dirty pages flushed on the foreground
+	                           * eviction path (no clean victim) */
+	uint32_t s_dirty_backlog; /* dirty frames seen by the last
+	                           * trickler pass (backlog gauge) */
+	uint64_t s_tr_passes;     /* trickler passes (total) */
+	uint64_t s_tr_visited;    /* frames the trickler visited (total) */
+	uint64_t s_tr_adaptive;   /* trickler passes that ran the tuner */
 
 	/* prefetch ring: read-ahead requests, drained by the provider so a
 	 * scanning fiber never blocks on a prefetch (best-effort). */
 	pthread_mutex_t   pf_mu;
 	bm_pid_t          pf_ring[256];
 	uint32_t          pf_head, pf_tail;
-	_Atomic uint64_t  s_prefetched;
+	uint64_t s_prefetched;
 
 	/* stats.  s_hits is bumped by every fix of a resident page (every
 	 * level of every descent, every thread): one shared atomic there was
 	 * 20-28% of all samples at 8 readers, so it is striped (xs_ctr.h).
 	 * The others count misses / evictions / flushes: rare, plain. */
 	xs_ctr_t          s_hits;
-	_Atomic uint64_t  s_rescues, s_loads, s_cooled, s_flushed, s_evicted;
-	_Atomic uint64_t  resident;
+	uint64_t s_rescues, s_loads, s_cooled, s_flushed, s_evicted;
+	uint64_t resident;
 
 	/* double-write buffer (torn-page protection); dw_fd < 0 == disabled */
 	int               dw_fd;
@@ -340,14 +340,14 @@ struct bm {
 	pthread_mutex_t   dw_mu;
 	uint32_t          dw_slots;      /* ring size in slots */
 	uint32_t          dw_next;       /* next slot to claim (round-robin) */
-	_Atomic uint64_t  dw_seq;        /* monotonic write sequence */
-	_Atomic uint64_t  s_dw_repaired; /* pages restored from the DW on reopen */
-	_Atomic uint64_t  s_dw_writes;   /* page images written to the DW ring */
-	_Atomic uint64_t  s_io_errors;   /* failed page / double-write writes */
+	uint64_t dw_seq;                 /* monotonic write sequence */
+	uint64_t s_dw_repaired; /* pages restored from the DW on reopen */
+	uint64_t s_dw_writes;   /* page images written to the DW ring */
+	uint64_t s_io_errors;   /* failed page / double-write writes */
 
 	/* ARIES page LSN (active when lsn_off >= 0). */
 	int               lsn_off;       /* byte offset of the page LSN, or -1 */
-	_Atomic uint64_t  cur_lsn;       /* LSN stamped on the next clean->dirty edge */
+	uint64_t cur_lsn; /* LSN stamped on the next clean->dirty edge */
 	int             (*wal_flush)(void *ctx, uint64_t lsn);  /* write-ahead hook */
 	void             *wal_ctx;
 
@@ -365,14 +365,14 @@ struct bm {
 	uint32_t        (*cksum)(uint32_t crc, const void *p, size_t n);
 	void            (*cksum_hook)(void *ctx, bm_pid_t pid);
 	void             *cksum_ctx;
-	_Atomic uint64_t  s_cksum_bad;   /* loads refused by the checksum */
-	_Atomic uint64_t  cksum_bad_pid; /* the last page refused */
+	uint64_t s_cksum_bad;   /* loads refused by the checksum */
+	uint64_t cksum_bad_pid; /* the last page refused */
 
 	/* Cold: page-file preallocation (pf_extend).  Bytes. */
-	_Atomic uint64_t  wr_end;        /* end of the highest page written */
-	_Atomic uint64_t  pre_end;       /* the file covers [0, pre_end) */
-	_Atomic int       pre_busy;      /* a fiber is growing the file */
-	_Atomic int       pre_on;        /* 0: growth failed once, stop trying */
+	uint64_t wr_end;  /* end of the highest page written */
+	uint64_t pre_end; /* the file covers [0, pre_end) */
+	int pre_busy;     /* a fiber is growing the file */
+	int pre_on;       /* 0: growth failed once, stop trying */
 };
 
 /* ---- page-file preallocation ----
@@ -440,10 +440,11 @@ pf_grow(bm_t *bm, uint64_t end)
 	uint64_t pre, step;
 	int expect = 0, res = -1;
 
-	if (!atomic_load_explicit(&bm->pre_on, memory_order_relaxed) ||
-	    !atomic_compare_exchange_strong(&bm->pre_busy, &expect, 1))
+	if (!xtc_atomic_load_i32(&bm->pre_on, xtc_mo_relaxed) ||
+	    !xtc_atomic_cas_i32(&bm->pre_busy, &expect, 1, xtc_mo_seq_cst,
+	        xtc_mo_seq_cst))
 		return;
-	pre = atomic_load_explicit(&bm->pre_end, memory_order_acquire);
+	pre = xtc_atomic_load_u64(&bm->pre_end, xtc_mo_acquire);
 	if (end > pre) {
 		j.fd = bm->fd;
 		j.off = pre;
@@ -451,25 +452,26 @@ pf_grow(bm_t *bm, uint64_t end)
 		j.len = (end / step + 1u) * step - pre;
 		if (xtc_blocking_run(pf_fallocate, &j, &res) == XTC_OK) {
 			if (res == 0)
-				atomic_store_explicit(&bm->pre_end, pre + j.len,
-				    memory_order_release);
+				xtc_atomic_store_u64(&bm->pre_end, pre + j.len,
+				    xtc_mo_release);
 			else      /* unsupported, or no space: grow as written */
-				atomic_store_explicit(&bm->pre_on, 0,
-				    memory_order_relaxed);
+				xtc_atomic_store_i32(&bm->pre_on, 0,
+				    xtc_mo_relaxed);
 		}
 	}
-	atomic_store_explicit(&bm->pre_busy, 0, memory_order_release);
+	xtc_atomic_store_i32(&bm->pre_busy, 0, xtc_mo_release);
 }
 
 /* Before a write of the page file ending at byte `end`. */
 static void
 pf_extend(bm_t *bm, uint64_t end)
 {
-	uint64_t w = atomic_load_explicit(&bm->wr_end, memory_order_relaxed);
-	while (end > w && !atomic_compare_exchange_weak_explicit(&bm->wr_end,
-	    &w, end, memory_order_relaxed, memory_order_relaxed))
+	uint64_t w = xtc_atomic_load_u64(&bm->wr_end, xtc_mo_relaxed);
+	while (end > w &&
+	    !xtc_atomic_cas_weak_u64(&bm->wr_end, &w, end, xtc_mo_relaxed,
+	        xtc_mo_relaxed))
 		;
-	if (end > atomic_load_explicit(&bm->pre_end, memory_order_acquire))
+	if (end > xtc_atomic_load_u64(&bm->pre_end, xtc_mo_acquire))
 		pf_grow(bm, end);
 }
 
@@ -477,9 +479,9 @@ pf_extend(bm_t *bm, uint64_t end)
 static void
 pf_trim(bm_t *bm)
 {
-	uint64_t keep = atomic_load_explicit(&bm->wr_end, memory_order_relaxed);
+	uint64_t keep = xtc_atomic_load_u64(&bm->wr_end, xtc_mo_relaxed);
 	off_t end;
-	if (atomic_load_explicit(&bm->pre_end, memory_order_relaxed) <= keep)
+	if (xtc_atomic_load_u64(&bm->pre_end, xtc_mo_relaxed) <= keep)
 		return;                   /* nothing preallocated past the pages */
 	end = lseek(bm->fd, 0, SEEK_END);
 	if (end > 0 && (uint64_t)end > keep)
@@ -570,8 +572,8 @@ ck_ok(const bm_t *bm, const uint8_t *pg, bm_pid_t pid, uint32_t off)
 static void
 ck_fail(bm_t *bm, bm_pid_t pid)
 {
-	atomic_fetch_add_explicit(&bm->s_cksum_bad, 1, memory_order_relaxed);
-	atomic_store_explicit(&bm->cksum_bad_pid, pid, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&bm->s_cksum_bad, 1, xtc_mo_relaxed);
+	xtc_atomic_store_u64(&bm->cksum_bad_pid, pid, xtc_mo_relaxed);
 	if (bm->cksum_hook != NULL)
 		bm->cksum_hook(bm->cksum_ctx, pid);
 }
@@ -591,9 +593,9 @@ bm_cksum_failures(bm_t *bm, bm_pid_t *bad_pid)
 	if (bm == NULL)
 		return 0;
 	if (bad_pid != NULL)
-		*bad_pid = atomic_load_explicit(&bm->cksum_bad_pid,
-		    memory_order_relaxed);
-	return atomic_load_explicit(&bm->s_cksum_bad, memory_order_relaxed);
+		*bad_pid =
+		    xtc_atomic_load_u64(&bm->cksum_bad_pid, xtc_mo_relaxed);
+	return xtc_atomic_load_u64(&bm->s_cksum_bad, xtc_mo_relaxed);
 }
 
 /* ---- pin protocol ----
@@ -608,12 +610,12 @@ bm_cksum_failures(bm_t *bm, bm_pid_t *bad_pid)
 static int
 try_pin(bm_frame_t *f)
 {
-	int p = atomic_load_explicit(&f->pin, memory_order_acquire);
+	int p = xtc_atomic_load_i32(&f->pin, xtc_mo_acquire);
 	for (;;) {
 		if (p < 0)
 			return 0;                 /* reserved for eviction */
-		if (atomic_compare_exchange_weak_explicit(&f->pin, &p, p + 1,
-		    memory_order_acquire, memory_order_acquire))
+		if (xtc_atomic_cas_weak_i32(&f->pin, &p, p + 1, xtc_mo_acquire,
+		        xtc_mo_acquire))
 			return 1;
 	}
 }
@@ -623,8 +625,8 @@ static int
 try_reserve(bm_frame_t *f)
 {
 	int e = 0;
-	return atomic_compare_exchange_strong_explicit(&f->pin, &e, -1,
-	    memory_order_acquire, memory_order_relaxed);
+	return xtc_atomic_cas_i32(&f->pin, &e, -1, xtc_mo_acquire,
+	    xtc_mo_relaxed);
 }
 
 /* Release an eviction reservation made by try_reserve: -1 -> 0, but
@@ -640,8 +642,8 @@ static void
 release_reservation(bm_frame_t *f)
 {
 	int e = -1;
-	(void)atomic_compare_exchange_strong_explicit(&f->pin, &e, 0,
-	    memory_order_release, memory_order_relaxed);
+	(void)xtc_atomic_cas_i32(&f->pin, &e, 0, xtc_mo_release,
+	    xtc_mo_relaxed);
 }
 
 static void unpin_frame(bm_t *, bm_frame_t *);
@@ -655,7 +657,7 @@ free_push(bm_t *bm, bm_frame_t *f)
 	/* Mark FREE before clearing the reservation, so an eviction sweep
 	 * that is mid-scan sees a non-COOL state and never reserves a frame
 	 * that is on its way to the free list. */
-	atomic_store_explicit(&f->state, BM_FREE, memory_order_release);
+	xtc_atomic_store_u8(&f->state, BM_FREE, xtc_mo_release);
 	/* Terminate the hash link so a lock-free fast-path walker that
 	 * loaded a stale pointer to this frame (from a chain it was unlinked
 	 * from) cannot wander into an unrelated bucket chain: a freed frame
@@ -663,7 +665,7 @@ free_push(bm_t *bm, bm_frame_t *f)
 	 * walker rechecks pid after pinning -- but this keeps a wandering
 	 * walk bounded rather than relying on chains never forming a cycle
 	 * across recycling.) */
-	atomic_store_explicit(&f->hnext, NULL, memory_order_release);
+	xtc_atomic_store_ptr(&f->hnext, NULL, xtc_mo_release);
 	/* Leave the frame UNPINNABLE (pin = -1, the eviction-reservation
 	 * sentinel) while it sits on the free list, NOT pin = 0.  A lock-free
 	 * fast-path reader (ht_lookup_pin_fast / bm_fix_pid_nopin) that loaded
@@ -677,12 +679,12 @@ free_push(bm_t *bm, bm_frame_t *f)
 	 * racing reader cleanly takes it as a miss.  The loader clears the
 	 * sentinel by storing pin = 1 when it reuses the frame (get_free_frame
 	 * caller). */
-	atomic_store_explicit(&f->pin, -1, memory_order_release);
+	xtc_atomic_store_i32(&f->pin, -1, xtc_mo_release);
 	(void)pthread_mutex_lock(&bm->free_mu);
 	f->next_free = bm->free_head;
 	bm->free_head = f;
 	(void)pthread_mutex_unlock(&bm->free_mu);
-	atomic_fetch_add_explicit(&bm->free_n, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u32(&bm->free_n, 1, xtc_mo_relaxed);
 }
 static bm_frame_t *
 free_pop(bm_t *bm)
@@ -692,7 +694,8 @@ free_pop(bm_t *bm)
 	f = bm->free_head;
 	if (f != NULL) bm->free_head = f->next_free;
 	(void)pthread_mutex_unlock(&bm->free_mu);
-	if (f != NULL) atomic_fetch_sub_explicit(&bm->free_n, 1, memory_order_relaxed);
+	if (f != NULL)
+		xtc_atomic_fetch_sub_u32(&bm->free_n, 1, xtc_mo_relaxed);
 	return f;
 }
 
@@ -728,12 +731,12 @@ dw_protect(bm_t *bm, bm_pid_t pid, const void *page)
 
 	if (bm->dw_fd < 0 || bm->dw_off)
 		return 0;                     /* double-write disabled */
-	atomic_fetch_add_explicit(&bm->s_dw_writes, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&bm->s_dw_writes, 1, xtc_mo_relaxed);
 	pthread_mutex_lock(&bm->dw_mu);
 	slot = bm->dw_next;
 	bm->dw_next = (slot + 1u) % bm->dw_slots;
 	pthread_mutex_unlock(&bm->dw_mu);   /* mutex NOT held across the I/O */
-	seq = atomic_fetch_add_explicit(&bm->dw_seq, 1, memory_order_relaxed) + 1;
+	seq = xtc_atomic_fetch_add_u64(&bm->dw_seq, 1, xtc_mo_relaxed) + 1;
 	memcpy(hdr, &pid, 8);
 	memcpy(hdr + 8, &seq, 8);
 	off = (off_t)slot * (off_t)(BM_DW_HDR + bm->page_size);
@@ -788,8 +791,8 @@ dw_recover(bm_t *bm)
 		if (pwrite(bm->fd, pg, bm->page_size,
 		    (off_t)ent[i].pid * (off_t)bm->page_size)
 		    == (ssize_t)bm->page_size)
-			atomic_fetch_add_explicit(&bm->s_dw_repaired, 1,
-			    memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&bm->s_dw_repaired, 1,
+			    xtc_mo_relaxed);
 	}
 	if (n > 0)
 		(void)fdatasync(bm->fd);
@@ -835,13 +838,14 @@ flush_frame_claimed(bm_t *bm, bm_frame_t *f)
 	int expect = 0, clean = 0;
 	void *snap;
 
-	if (!atomic_load_explicit(&f->dirty, memory_order_acquire))
+	if (!xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire))
 		return 1;
 	/* Pin BEFORE claiming I/O: eviction and deferred page deletion use
 	 * this same ownership gate. io_busy alone cannot prevent reuse. */
 	if (!try_pin(f))
 		return 0;
-	if (!atomic_compare_exchange_strong(&f->io_busy, &expect, 1)) {
+	if (!xtc_atomic_cas_i32(&f->io_busy, &expect, 1, xtc_mo_seq_cst,
+	        xtc_mo_seq_cst)) {
 		unpin_frame(bm, f);
 		return 0;                       /* another writer owns it */
 	}
@@ -850,7 +854,7 @@ flush_frame_claimed(bm_t *bm, bm_frame_t *f)
 	 * the page -> skip; it is flushed on a later pass. */
 	if (xtc_arwlock_rdlock(f->latch, 0) != XTC_OK)
 		goto release;
-	if (!atomic_load_explicit(&f->dirty, memory_order_acquire)) {
+	if (!xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire)) {
 		xtc_arwlock_unlock(f->latch);
 		clean = 1;                      /* raced with another flush */
 		goto release;
@@ -861,12 +865,14 @@ flush_frame_claimed(bm_t *bm, bm_frame_t *f)
 	}
 	memcpy(snap, f->page, bm->page_size);
 	if (bm->cksum_off >= 0)
-		ck_seal(bm, snap, f->pid, (uint32_t)bm->cksum_off);
+		ck_seal(bm, snap, xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst),
+		    (uint32_t)bm->cksum_off);
 	/* Write-ahead rule: never write a dirty page to disk until the log
 	 * is durable through that page's LSN.  If it is not yet, abort this
 	 * flush (the page stays dirty) and let a later pass retry once the
 	 * log has caught up. */
-	if (bm->lsn_off >= 0 && bm->wal_flush != NULL && f->pid != 0) {
+	if (bm->lsn_off >= 0 && bm->wal_flush != NULL &&
+	    xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) != 0) {
 		uint64_t plsn;
 		memcpy(&plsn, (uint8_t *)snap + bm->lsn_off, sizeof plsn);
 		if (bm->wal_flush(bm->wal_ctx, plsn) != XTC_OK) {
@@ -879,23 +885,25 @@ flush_frame_claimed(bm_t *bm, bm_frame_t *f)
 	 * exclusive latch and re-dirties on bm_unfix, so its change is not
 	 * lost -- the next flush captures it.  The snapshot we write is a
 	 * consistent image as of this point. */
-	atomic_store_explicit(&f->dirty, 0, memory_order_release);
+	xtc_atomic_store_i32(&f->dirty, 0, xtc_mo_release);
 	xtc_arwlock_unlock(f->latch);
 	BM_FLUSH_TEST_HOOK(bm, f);
 	/* Full-page log, durable, BEFORE the final write.  If the slot
 	 * cannot be made durable the home write is skipped (it would be
 	 * unprotected) and the page stays dirty. */
-	clean = dw_protect(bm, f->pid, snap) == 0 &&
-	    do_io(bm, snap, f->pid, 1) == 0;
+	clean = dw_protect(bm, xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst),
+	            snap) == 0 &&
+	    do_io(bm, snap, xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst), 1) ==
+	        0;
 	xtc_aligned_free(snap);
 	if (!clean) {
-		atomic_store_explicit(&f->dirty, 1, memory_order_release);
-		atomic_fetch_add_explicit(&bm->s_io_errors, 1, memory_order_relaxed);
+		xtc_atomic_store_i32(&f->dirty, 1, xtc_mo_release);
+		xtc_atomic_fetch_add_u64(&bm->s_io_errors, 1, xtc_mo_relaxed);
 	}
 	else
-		atomic_fetch_add_explicit(&bm->s_flushed, 1, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&bm->s_flushed, 1, xtc_mo_relaxed);
 release:
-	atomic_store_explicit(&f->io_busy, 0, memory_order_release);
+	xtc_atomic_store_i32(&f->io_busy, 0, xtc_mo_release);
 	unpin_frame(bm, f);
 	return clean;
 }
@@ -927,19 +935,21 @@ ht_lock(bm_t *bm, uint32_t b)
 static bm_frame_t *
 ht_insert_alloc(bm_t *bm, bm_frame_t *f)
 {
-	uint32_t b = (uint32_t)(f->pid % bm->nbucket);
+	uint32_t b = (uint32_t)(xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) %
+	    bm->nbucket);
 	pthread_mutex_t *lk = ht_lock(bm, b);
 	bm_frame_t *e;
 
 	(void)pthread_mutex_lock(lk);
-	for (e = bm->buckets[b]; e != NULL; e = e->hnext) {
-		if (e->pid != f->pid)
+	for (e = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_seq_cst);
+	     e != NULL; e = xtc_atomic_load_ptr(&e->hnext, xtc_mo_seq_cst)) {
+		if (xtc_atomic_load_u64(&e->pid, xtc_mo_seq_cst) !=
+		    xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst))
 			continue;
 		if (!try_pin(e))
 			break;            /* reserved for eviction: treat as none */
-		if (atomic_load_explicit(&e->state, memory_order_acquire) == BM_COOL)
-			atomic_store_explicit(&e->state, BM_HOT,
-			    memory_order_release);
+		if (xtc_atomic_load_u8(&e->state, xtc_mo_acquire) == BM_COOL)
+			xtc_atomic_store_u8(&e->state, BM_HOT, xtc_mo_release);
 		(void)pthread_mutex_unlock(lk);
 		return e;                 /* dup found: reuse, do not publish f */
 	}
@@ -947,14 +957,16 @@ ht_insert_alloc(bm_t *bm, bm_frame_t *f)
 	 * lock-free reader can observe f via the bucket head -- the release
 	 * store on the head is what provides that ordering (paired with the
 	 * fast path's acquire load in ht_lookup_pin_fast). */
-	f->hnext = atomic_load_explicit(&bm->buckets[b], memory_order_relaxed);
-	atomic_store_explicit(&bm->buckets[b], f, memory_order_release);
+	xtc_atomic_store_ptr(&f->hnext,
+	    xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_relaxed),
+	    xtc_mo_seq_cst);
+	xtc_atomic_store_ptr(&bm->buckets[b], f, xtc_mo_release);
 	BM_PUBLISH_TEST_HOOK(bm, f);
 	bm->ht_locks[b & (BM_HT_STRIPES - 1)].generation++;
 	/* A reusable pid remains retired until its new initialized frame
 	 * is visible. Never admit a load of its obsolete disk image. */
 	(void)pthread_mutex_lock(&bm->pid_mu);
-	quar_set_remove(bm, f->pid);
+	quar_set_remove(bm, xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst));
 	(void)pthread_mutex_unlock(&bm->pid_mu);
 	(void)pthread_mutex_unlock(lk);
 	return NULL;
@@ -962,7 +974,8 @@ ht_insert_alloc(bm_t *bm, bm_frame_t *f)
 static void
 ht_remove(bm_t *bm, bm_frame_t *f)
 {
-	uint32_t b = (uint32_t)(f->pid % bm->nbucket);
+	uint32_t b = (uint32_t)(xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) %
+	    bm->nbucket);
 	pthread_mutex_t *lk = ht_lock(bm, b);
 	bm_frame_t *cur, *prev = NULL;
 	(void)pthread_mutex_lock(lk);
@@ -975,17 +988,17 @@ ht_remove(bm_t *bm, bm_frame_t *f)
 	 * observes it (an in-flight walk that already loaded f is still
 	 * safe -- f is never freed, and the pid recheck after pinning
 	 * catches a since-reissued frame; see ht_lookup_pin_fast). */
-	cur = atomic_load_explicit(&bm->buckets[b], memory_order_relaxed);
+	cur = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_relaxed);
 	while (cur != NULL) {
-		bm_frame_t *next = atomic_load_explicit(&cur->hnext,
-		    memory_order_relaxed);
+		bm_frame_t *next =
+		    xtc_atomic_load_ptr(&cur->hnext, xtc_mo_relaxed);
 		if (cur == f) {
 			if (prev == NULL)
-				atomic_store_explicit(&bm->buckets[b], next,
-				    memory_order_release);
+				xtc_atomic_store_ptr(&bm->buckets[b], next,
+				    xtc_mo_release);
 			else
-				atomic_store_explicit(&prev->hnext, next,
-				    memory_order_release);
+				xtc_atomic_store_ptr(&prev->hnext, next,
+				    xtc_mo_release);
 			break;
 		}
 		prev = cur;
@@ -1006,12 +1019,15 @@ ht_lookup_pin(bm_t *bm, bm_pid_t pid, uint64_t *generation)
 	(void)pthread_mutex_lock(lk);
 	if (generation != NULL)
 		*generation = bm->ht_locks[b & (BM_HT_STRIPES - 1)].generation;
-	for (f = bm->buckets[b]; f != NULL; f = f->hnext) {
-		if (f->pid == pid) {
+	for (f = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_seq_cst);
+	     f != NULL; f = xtc_atomic_load_ptr(&f->hnext, xtc_mo_seq_cst)) {
+		if (xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) == pid) {
 			if (!try_pin(f))
 				break;            /* reserved for eviction: treat as a miss */
-			if (atomic_load_explicit(&f->state, memory_order_acquire) == BM_COOL)
-				atomic_store_explicit(&f->state, BM_HOT, memory_order_release);
+			if (xtc_atomic_load_u8(&f->state, xtc_mo_acquire) ==
+			    BM_COOL)
+				xtc_atomic_store_u8(&f->state, BM_HOT,
+				    xtc_mo_release);
 			(void)pthread_mutex_unlock(lk);
 			return f;
 		}
@@ -1049,10 +1065,10 @@ static bm_frame_t *
 ht_lookup_pin_fast(bm_t *bm, bm_pid_t pid)
 {
 	uint32_t b = (uint32_t)(pid % bm->nbucket);
-	bm_frame_t *f = atomic_load_explicit(&bm->buckets[b], memory_order_acquire);
+	bm_frame_t *f = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_acquire);
 
 	while (f != NULL) {
-		if (atomic_load_explicit(&f->pid, memory_order_acquire) == pid) {
+		if (xtc_atomic_load_u64(&f->pid, xtc_mo_acquire) == pid) {
 			if (!try_pin(f)) {
 				/* Reserved for eviction right now: fall back to the
 				 * mutex path rather than treat this as a hard miss --
@@ -1062,15 +1078,18 @@ ht_lookup_pin_fast(bm_t *bm, bm_pid_t pid)
 			}
 			/* Re-validate: did this frame get reissued to a DIFFERENT
 			 * pid between our compare and our pin winning? */
-			if (atomic_load_explicit(&f->pid, memory_order_acquire) != pid) {
+			if (xtc_atomic_load_u64(&f->pid, xtc_mo_acquire) !=
+			    pid) {
 				unpin_frame(bm, f);
 				return NULL;    /* raced a reissue; caller retries slow */
 			}
-			if (atomic_load_explicit(&f->state, memory_order_acquire) == BM_COOL)
-				atomic_store_explicit(&f->state, BM_HOT, memory_order_release);
+			if (xtc_atomic_load_u8(&f->state, xtc_mo_acquire) ==
+			    BM_COOL)
+				xtc_atomic_store_u8(&f->state, BM_HOT,
+				    xtc_mo_release);
 			return f;
 		}
-		f = atomic_load_explicit(&f->hnext, memory_order_acquire);
+		f = xtc_atomic_load_ptr(&f->hnext, xtc_mo_acquire);
 	}
 	return NULL;   /* not resident (or a lock-free walk that lost a race) */
 }
@@ -1094,9 +1113,9 @@ bm_fix_pid_nopin(bm_t *bm, bm_pid_t pid)
 	if (bm == NULL || pid == BM_PID_NONE)
 		return NULL;
 	b = (uint32_t)(pid % bm->nbucket);
-	f = atomic_load_explicit(&bm->buckets[b], memory_order_acquire);
+	f = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_acquire);
 	while (f != NULL) {
-		if (atomic_load_explicit(&f->pid, memory_order_acquire) == pid) {
+		if (xtc_atomic_load_u64(&f->pid, xtc_mo_acquire) == pid) {
 			/* Do NOT touch state (no COOL->HOT flip): that would be a
 			 * shared write on the hit path, defeating the purpose.  A
 			 * pin-free reader does not rescue a COOL page; the pinned
@@ -1105,7 +1124,7 @@ bm_fix_pid_nopin(bm_t *bm, bm_pid_t pid)
 			 * by keeping the page HOT. */
 			return f;
 		}
-		f = atomic_load_explicit(&f->hnext, memory_order_acquire);
+		f = xtc_atomic_load_ptr(&f->hnext, xtc_mo_acquire);
 	}
 	return NULL;
 }
@@ -1146,7 +1165,7 @@ bm_cls_record(bm_t *bm, bm_pid_t pid)
 	s = bm->cls_sketch[cpu];
 	if (s == NULL) return;
 
-	tick = atomic_load_explicit(&bm->cls_gen_tick, memory_order_relaxed);
+	tick = xtc_atomic_load_u64(&bm->cls_gen_tick, xtc_mo_relaxed);
 	if (tick != s->last_tick) {
 		s->last_tick = tick;
 		s->cur_gen = (s->cur_gen + 1) & (BM_CLS_GENS - 1);
@@ -1238,13 +1257,14 @@ bm_cls_tick(bm_t *bm)
 	bm_cls_aggregate(bm);
 	for (i = 0; i < bm->n_frames; i++) {
 		bm_frame_t *f = &bm->frames[i];
-		uint8_t st = atomic_load_explicit(&f->state, memory_order_acquire);
+		uint8_t st = xtc_atomic_load_u8(&f->state, xtc_mo_acquire);
 		if (st != BM_HOT && st != BM_COOL) continue;
-		atomic_store_explicit(&f->cls_cache,
-		    bm_cls_classify(bm, atomic_load_explicit(&f->pid, memory_order_relaxed)),
-		    memory_order_relaxed);
+		xtc_atomic_store_u8(&f->cls_cache,
+		    bm_cls_classify(bm,
+		        xtc_atomic_load_u64(&f->pid, xtc_mo_relaxed)),
+		    xtc_mo_relaxed);
 	}
-	atomic_fetch_add_explicit(&bm->cls_gen_tick, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&bm->cls_gen_tick, 1, xtc_mo_relaxed);
 }
 
 static void
@@ -1290,12 +1310,12 @@ static int64_t
 sample_score(bm_t *bm, bm_frame_t *f)
 {
 	int64_t s = 0;
-	uint8_t st = atomic_load_explicit(&f->state, memory_order_relaxed);
+	uint8_t st = xtc_atomic_load_u8(&f->state, xtc_mo_relaxed);
 	(void)bm;
 	if (st == BM_HOT)   s += 1000;   /* HOT: keep over COOL (W_LOCAL-ish) */
-	if (atomic_load_explicit(&f->ref, memory_order_relaxed))
+	if (xtc_atomic_load_i32(&f->ref, xtc_mo_relaxed))
 		s += 1000;                   /* recently used: strongly prefer to keep */
-	if (atomic_load_explicit(&f->dirty, memory_order_relaxed))
+	if (xtc_atomic_load_i32(&f->dirty, xtc_mo_relaxed))
 		s += 200;                    /* prefer clean victims (W_DIRTY) */
 #ifdef BM_CLASSIFY
 	/* Stage 5: sharing-degree class dominates the score (design 8.2 /
@@ -1303,7 +1323,7 @@ sample_score(bm_t *bm, bm_frame_t *f)
 	 * every domain) is effectively pinned; LOCAL_HOT is protected; a
 	 * TRANSIENT (scan) page is evicted first.  cls_cache is refreshed on
 	 * the classify tick; 0 (BM_CLS_TRANSIENT) until first classified. */
-	switch (atomic_load_explicit(&f->cls_cache, memory_order_relaxed)) {
+	switch (xtc_atomic_load_u8(&f->cls_cache, xtc_mo_relaxed)) {
 	case BM_CLS_SHARED_HOT: s += 1000000; break;
 	case BM_CLS_LOCAL_HOT:  s += 1000;    break;
 	case BM_CLS_TRANSIENT:  s -= 500;     break;
@@ -1316,7 +1336,7 @@ sample_score(bm_t *bm, bm_frame_t *f)
 static int
 sample_evict_one(bm_t *bm)
 {
-	uint64_t rng = atomic_load_explicit(&bm->evict_rng, memory_order_relaxed);
+	uint64_t rng = xtc_atomic_load_u64(&bm->evict_rng, xtc_mo_relaxed);
 	int tries;
 
 	/*
@@ -1343,30 +1363,33 @@ sample_evict_one(bm_t *bm)
 			rng = rng * 6364136223846793005ull + 1442695040888963407ull;
 			i = (uint32_t)((rng >> 33) % bm->n_frames);
 			f = &bm->frames[i];
-			if (atomic_load_explicit(&f->state, memory_order_acquire) != BM_COOL)
+			if (xtc_atomic_load_u8(&f->state, xtc_mo_acquire) !=
+			    BM_COOL)
 				continue;            /* COOL only: never sample HOT here */
-			if (atomic_load_explicit(&f->pin, memory_order_acquire) != 0)
+			if (xtc_atomic_load_i32(&f->pin, xtc_mo_acquire) != 0)
 				continue;
-			if (atomic_load_explicit(&f->io_busy, memory_order_acquire))
+			if (xtc_atomic_load_i32(&f->io_busy, xtc_mo_acquire))
 				continue;
-			if (atomic_load_explicit(&f->dirty, memory_order_acquire))
+			if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire))
 				continue;            /* prefer clean; trickler handles dirty */
 			{
 				int64_t sc = sample_score(bm, f);
 				if (sc < best_score) {
 					best_score = sc; best = f;
-					best_pid = atomic_load_explicit(&f->pid,
-					    memory_order_acquire);
+					best_pid = xtc_atomic_load_u64(&f->pid,
+					    xtc_mo_acquire);
 				}
 			}
 		}
 		if (best != NULL) {
-			if (atomic_exchange_explicit(&best->ref, 0, memory_order_relaxed))
+			if (xtc_atomic_exchange_i32(&best->ref, 0,
+			        xtc_mo_relaxed))
 				continue;    /* recently used COOL page: spare one round */
 			BM_EVICT_TEST_HOOK(bm, best, 2);
 			if (!try_reserve(best))
 				continue;
-			if (atomic_load_explicit(&best->doomed, memory_order_acquire)) {
+			if (xtc_atomic_load_i32(&best->doomed,
+			        xtc_mo_acquire)) {
 				release_reservation(best);
 				finish_doomed_drop(bm, best);
 				continue;
@@ -1377,18 +1400,24 @@ sample_evict_one(bm_t *bm)
 			 * state AND the pid are unchanged -- else we would evict a
 			 * freshly-loaded, valid, different page out from under its
 			 * reader (the 1-in-N content mismatch this closes). */
-			if (atomic_load_explicit(&best->state, memory_order_acquire) != BM_COOL ||
-			    atomic_load_explicit(&best->pid, memory_order_acquire) != best_pid ||
-			    atomic_load_explicit(&best->dirty, memory_order_acquire) ||
-			    atomic_load_explicit(&best->io_busy, memory_order_acquire)) {
+			if (xtc_atomic_load_u8(&best->state, xtc_mo_acquire) !=
+			        BM_COOL ||
+			    xtc_atomic_load_u64(&best->pid, xtc_mo_acquire) !=
+			        best_pid ||
+			    xtc_atomic_load_i32(&best->dirty, xtc_mo_acquire) ||
+			    xtc_atomic_load_i32(&best->io_busy,
+			        xtc_mo_acquire)) {
 				release_reservation(best);
 				continue;
 			}
 			ht_remove(bm, best);
-			atomic_fetch_sub_explicit(&bm->resident, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&bm->s_evicted, 1, memory_order_relaxed);
+			xtc_atomic_fetch_sub_u64(&bm->resident, 1,
+			    xtc_mo_relaxed);
+			xtc_atomic_fetch_add_u64(&bm->s_evicted, 1,
+			    xtc_mo_relaxed);
 			free_push(bm, best);
-			atomic_store_explicit(&bm->evict_rng, rng, memory_order_relaxed);
+			xtc_atomic_store_u64(&bm->evict_rng, rng,
+			    xtc_mo_relaxed);
 			return 1;
 		}
 
@@ -1409,14 +1438,19 @@ sample_evict_one(bm_t *bm)
 			 * scan's probationary COOL pages are always preferred above. */
 			for (j = 0; j < bm->n_frames; j++) {
 				bm_frame_t *f = &bm->frames[j];
-				if (atomic_load_explicit(&f->state, memory_order_acquire) != BM_HOT)
+				if (xtc_atomic_load_u8(&f->state,
+				        xtc_mo_acquire) != BM_HOT)
 					continue;
-				if (atomic_load_explicit(&f->pin, memory_order_acquire) != 0)
+				if (xtc_atomic_load_i32(&f->pin,
+				        xtc_mo_acquire) != 0)
 					continue;
-				if (atomic_exchange_explicit(&f->ref, 0, memory_order_relaxed))
+				if (xtc_atomic_exchange_i32(&f->ref, 0,
+				        xtc_mo_relaxed))
 					continue;   /* recently used: second chance */
-				atomic_store_explicit(&f->state, BM_COOL, memory_order_release);
-				atomic_fetch_add_explicit(&bm->s_cooled, 1, memory_order_relaxed);
+				xtc_atomic_store_u8(&f->state, BM_COOL,
+				    xtc_mo_release);
+				xtc_atomic_fetch_add_u64(&bm->s_cooled, 1,
+				    xtc_mo_relaxed);
 				made_progress = 1;
 				break;
 			}
@@ -1429,27 +1463,32 @@ sample_evict_one(bm_t *bm)
 			if (!made_progress) {
 				for (j = 0; j < bm->n_frames; j++) {
 					bm_frame_t *f = &bm->frames[j];
-					if (atomic_load_explicit(&f->state, memory_order_acquire) != BM_COOL)
+					if (xtc_atomic_load_u8(&f->state,
+					        xtc_mo_acquire) != BM_COOL)
 						continue;
-					if (atomic_load_explicit(&f->pin, memory_order_acquire) != 0)
+					if (xtc_atomic_load_i32(&f->pin,
+					        xtc_mo_acquire) != 0)
 						continue;
-					if (!atomic_load_explicit(&f->dirty, memory_order_acquire))
+					if (!xtc_atomic_load_i32(&f->dirty,
+					        xtc_mo_acquire))
 						continue;
 					if (flush_frame(bm, f)) {
-						atomic_fetch_add_explicit(&bm->s_evict_flush, 1,
-						    memory_order_relaxed);
+						xtc_atomic_fetch_add_u64(
+						    &bm->s_evict_flush, 1,
+						    xtc_mo_relaxed);
 						made_progress = 1;
 						break;
 					}
 				}
 			}
 			if (!made_progress) {
-				atomic_store_explicit(&bm->evict_rng, rng, memory_order_relaxed);
+				xtc_atomic_store_u64(&bm->evict_rng, rng,
+				    xtc_mo_relaxed);
 				return 0;   /* nothing reclaimable (all pinned / in flight) */
 			}
 		}
 	}
-	atomic_store_explicit(&bm->evict_rng, rng, memory_order_relaxed);
+	xtc_atomic_store_u64(&bm->evict_rng, rng, xtc_mo_relaxed);
 	return 0;
 }
 #endif /* BM_SAMPLED_EVICT */
@@ -1462,14 +1501,14 @@ static void
 evict_note(bm_t *bm, uint64_t adv, int forced)
 {
 	uint64_t cur;
-	atomic_fetch_add_explicit(&bm->s_allocs, 1, memory_order_relaxed);
-	atomic_fetch_add_explicit(&bm->s_advances, adv, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&bm->s_allocs, 1, xtc_mo_relaxed);
+	xtc_atomic_fetch_add_u64(&bm->s_advances, adv, xtc_mo_relaxed);
 	if (forced)
-		atomic_fetch_add_explicit(&bm->s_forced, 1, memory_order_relaxed);
-	cur = atomic_load_explicit(&bm->s_adv_max, memory_order_relaxed);
-	while (adv > cur && !atomic_compare_exchange_weak_explicit(
-	    &bm->s_adv_max, &cur, adv, memory_order_relaxed,
-	    memory_order_relaxed))
+		xtc_atomic_fetch_add_u64(&bm->s_forced, 1, xtc_mo_relaxed);
+	cur = xtc_atomic_load_u64(&bm->s_adv_max, xtc_mo_relaxed);
+	while (adv > cur &&
+	    !xtc_atomic_cas_weak_u64(&bm->s_adv_max, &cur, adv, xtc_mo_relaxed,
+	        xtc_mo_relaxed))
 		;
 }
 
@@ -1504,59 +1543,64 @@ evict_one(bm_t *bm)
 
 	for (;;) {
 	  for (scanned = 0; scanned < bm->n_frames * 2u; scanned++) {
-		i = atomic_fetch_add_explicit(&bm->clock, 1, memory_order_relaxed)
-		    % bm->n_frames;
-		bm_frame_t *f = &bm->frames[i];
-		uint8_t st = atomic_load_explicit(&f->state, memory_order_acquire);
+		  i = xtc_atomic_fetch_add_u32(&bm->clock, 1, xtc_mo_relaxed) %
+		      bm->n_frames;
+		  bm_frame_t *f = &bm->frames[i];
+		  uint8_t st = xtc_atomic_load_u8(&f->state, xtc_mo_acquire);
 
-		adv++;
-		/*
-		 * The sweep bound (PostgreSQL bounded clock sweep).  Demoting a
-		 * HOT frame and sparing a referenced COOL one both count as
-		 * progress, so in a hot pool -- every page re-touched faster
-		 * than the hand comes round -- this call could otherwise
-		 * circle the pool several times.  Having made claim_threshold
-		 * non-productive advances, it has established by observation
-		 * that the pool is hotter than the hand can grind down: from
-		 * here it claims the next unpinned, idle frame whatever its
-		 * HOT/ref state, writing it out first if it is dirty.  Pinned
-		 * and in-I/O frames are still skipped and the reservation +
-		 * re-validate below is unchanged, so the reclaim protocol is
-		 * the same one every other eviction uses.
-		 */
-		if (!claim && bm->claim_threshold != 0 &&
-		    wasted >= bm->claim_threshold)
-			claim = 1;
+		  adv++;
+		  /*
+		   * The sweep bound (PostgreSQL bounded clock sweep).  Demoting
+		   * a HOT frame and sparing a referenced COOL one both count as
+		   * progress, so in a hot pool -- every page re-touched faster
+		   * than the hand comes round -- this call could otherwise
+		   * circle the pool several times.  Having made claim_threshold
+		   * non-productive advances, it has established by observation
+		   * that the pool is hotter than the hand can grind down: from
+		   * here it claims the next unpinned, idle frame whatever its
+		   * HOT/ref state, writing it out first if it is dirty.  Pinned
+		   * and in-I/O frames are still skipped and the reservation +
+		   * re-validate below is unchanged, so the reclaim protocol is
+		   * the same one every other eviction uses.
+		   */
+		  if (!claim && bm->claim_threshold != 0 &&
+		      wasted >= bm->claim_threshold)
+			  claim = 1;
 
-		if (atomic_load_explicit(&f->pin, memory_order_acquire) != 0)
-			continue;
+		  if (xtc_atomic_load_i32(&f->pin, xtc_mo_acquire) != 0)
+			  continue;
 
-		BM_EVICT_TEST_HOOK(bm, f, 0);
-		/* Cooling is a state flip; the page table keeps naming the
-		 * page until it is reclaimed. */
-		if (st == BM_HOT) {
-			if (!force_cool && !claim) {
-				wasted++;            /* passed over: not a victim */
-				continue;            /* prefer COOL victims */
-			}
-			atomic_store_explicit(&f->state, BM_COOL, memory_order_release);
-			atomic_fetch_add_explicit(&bm->s_cooled, 1, memory_order_relaxed);
-			st = BM_COOL;
-			wasted++;   /* a demotion: counted whether or not the
-			             * checks below then reclaim this frame */
-		}
+		  BM_EVICT_TEST_HOOK(bm, f, 0);
+		  /* Cooling is a state flip; the page table keeps naming the
+		   * page until it is reclaimed. */
+		  if (st == BM_HOT) {
+			  if (!force_cool && !claim) {
+				  wasted++; /* passed over: not a victim */
+				  continue; /* prefer COOL victims */
+			  }
+			  xtc_atomic_store_u8(&f->state, BM_COOL,
+			      xtc_mo_release);
+			  xtc_atomic_fetch_add_u64(&bm->s_cooled, 1,
+			      xtc_mo_relaxed);
+			  st = BM_COOL;
+			  wasted++; /* a demotion: counted whether or not the
+				     * checks below then reclaim this frame */
+		  }
 		if (st != BM_COOL) continue;
 #if XTC_DST_BUG(XTC_DST_BUG_EVICTNOWB)
 		/* planted: every 4th dirty victim is dropped unwritten */
-		if (atomic_load_explicit(&f->dirty, memory_order_acquire) &&
-		    atomic_load_explicit(&f->io_busy, memory_order_acquire) == 0) {
-			static _Atomic unsigned bug_n;
-			if (atomic_fetch_add(&bug_n, 1) % 4 == 3)
-				atomic_store_explicit(&f->dirty, 0, memory_order_release);
+		if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire) &&
+		    xtc_atomic_load_i32(&f->io_busy, xtc_mo_acquire) == 0) {
+			static unsigned bug_n;
+			if (xtc_atomic_fetch_add_u32(&bug_n, 1,
+				xtc_mo_seq_cst) %
+				4 ==
+			    3)
+				xtc_atomic_store_i32(&f->dirty, 0,
+				    xtc_mo_release);
 		}
 #endif
-		if (atomic_load_explicit(&f->dirty, memory_order_acquire) &&
-		    claim) {
+		if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire) && claim) {
 			/*
 			 * Bound reached and the claimed frame is dirty: write
 			 * THIS one out and take it, as PostgreSQL's bound does
@@ -1568,20 +1612,20 @@ evict_one(bm_t *bm)
 			 */
 			if (!flush_frame(bm, f))
 				continue;
-			atomic_fetch_add_explicit(&bm->s_evict_flush, 1,
-			    memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&bm->s_evict_flush, 1,
+			    xtc_mo_relaxed);
 		}
-		if (atomic_load_explicit(&f->dirty, memory_order_acquire)) {
+		if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire)) {
 			if (!prefer_clean) {
 				(void)flush_frame(bm, f);  /* fallback write-out */
-				atomic_fetch_add_explicit(&bm->s_evict_flush,
-				    1, memory_order_relaxed);
+				xtc_atomic_fetch_add_u64(&bm->s_evict_flush, 1,
+				    xtc_mo_relaxed);
 			}
 			continue;          /* else leave it for the trickler */
 		}
-		if (atomic_load_explicit(&f->io_busy, memory_order_acquire))
+		if (xtc_atomic_load_i32(&f->io_busy, xtc_mo_acquire))
 			continue;
-		if (atomic_exchange_explicit(&f->ref, 0, memory_order_relaxed) &&
+		if (xtc_atomic_exchange_i32(&f->ref, 0, xtc_mo_relaxed) &&
 		    !claim) {
 			wasted++;
 			continue;            /* recently used: spare one sweep */
@@ -1591,7 +1635,7 @@ evict_one(bm_t *bm)
 			continue;            /* pinned: a fixer holds it */
 		/* A drop already unlinked this frame. Its last-unpin finalizer
 		 * may have lost the reservation to us; hand completion back. */
-		if (atomic_load_explicit(&f->doomed, memory_order_acquire)) {
+		if (xtc_atomic_load_i32(&f->doomed, xtc_mo_acquire)) {
 			release_reservation(f);
 			finish_doomed_drop(bm, f);
 			continue;
@@ -1605,16 +1649,15 @@ evict_one(bm_t *bm)
 		 * while a stale HOT observation is being demoted to COOL.
 		 * Reservation acquires that unpin: recheck dirty/busy here,
 		 * before removing the only resident copy of the update. */
-		if (atomic_load_explicit(&f->state, memory_order_acquire)
-		    != BM_COOL ||
-		    atomic_load_explicit(&f->dirty, memory_order_acquire) ||
-		    atomic_load_explicit(&f->io_busy, memory_order_acquire)) {
+		if (xtc_atomic_load_u8(&f->state, xtc_mo_acquire) != BM_COOL ||
+		    xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire) ||
+		    xtc_atomic_load_i32(&f->io_busy, xtc_mo_acquire)) {
 			release_reservation(f);
 			continue;
 		}
 		ht_remove(bm, f);
-		atomic_fetch_sub_explicit(&bm->resident, 1, memory_order_relaxed);
-		atomic_fetch_add_explicit(&bm->s_evicted, 1, memory_order_relaxed);
+		xtc_atomic_fetch_sub_u64(&bm->resident, 1, xtc_mo_relaxed);
+		xtc_atomic_fetch_add_u64(&bm->s_evicted, 1, xtc_mo_relaxed);
 		free_push(bm, f);            /* free-list sentinel stays -1 */
 		evict_note(bm, adv, claim);
 		return 1;
@@ -1707,8 +1750,8 @@ pf_drain(bm_t *bm, int max)
 		(void)pthread_mutex_unlock(&bm->pf_mu);
 		if (bm_fix_pid(bm, pid, &f) == XTC_OK) {
 			bm_unfix(bm, f, 0);     /* resident, ready for the real fix */
-			atomic_fetch_add_explicit(&bm->s_prefetched, 1,
-			    memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&bm->s_prefetched, 1,
+			    xtc_mo_relaxed);
 		}
 	}
 }
@@ -1735,9 +1778,9 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 	if (bm->cool_target < 1) bm->cool_target = 1;
 	bm->scan_resist = opts->scan_resist ? 1 : 0;
 	bm->claim_threshold = opts->claim_threshold;   /* 0 = unbounded */
-	atomic_store_explicit(&bm->evict_rng,
+	xtc_atomic_store_u64(&bm->evict_rng,
 	    0x9E3779B97F4A7C15ull ^ ((uint64_t)(uintptr_t)bm),
-	    memory_order_relaxed);   /* sampled-eviction PRNG seed (stage 2) */
+	    xtc_mo_relaxed); /* sampled-eviction PRNG seed (stage 2) */
 #ifdef BM_CLASSIFY
 	{
 		int nc = xtc_ncpus();
@@ -1765,7 +1808,7 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 		bm->cksum_off = opts->cksum_off;
 		bm->cksum = opts->cksum;
 	}
-	atomic_store_explicit(&bm->cur_lsn, 0, memory_order_relaxed);
+	xtc_atomic_store_u64(&bm->cur_lsn, 0, xtc_mo_relaxed);
 	bm->wal_flush = NULL;
 	bm->wal_ctx = NULL;
 	(void)pthread_mutex_init(&bm->free_mu, NULL);
@@ -1797,8 +1840,8 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 	bm->dw_fd = -1;
 	bm->dw_slots = BM_DW_SLOTS;
 	bm->dw_next = 0;
-	atomic_store(&bm->dw_seq, 0);
-	atomic_store(&bm->s_dw_repaired, 0);
+	xtc_atomic_store_u64(&bm->dw_seq, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&bm->s_dw_repaired, 0, xtc_mo_seq_cst);
 	(void)pthread_mutex_init(&bm->dw_mu, NULL);
 	if (opts->double_write) {
 		char dwpath[1024];
@@ -1856,13 +1899,13 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 	bm->free_pids = NULL;      /* page-id reclaim freelist (grown on demand) */
 	bm->free_pids_n = 0;
 	bm->free_pids_cap = 0;
-	atomic_store_explicit(&bm->s_freed, 0, memory_order_relaxed);
-	atomic_store_explicit(&bm->s_reissued, 0, memory_order_relaxed);
-	atomic_store_explicit(&bm->pre_busy, 0, memory_order_relaxed);
+	xtc_atomic_store_u64(&bm->s_freed, 0, xtc_mo_relaxed);
+	xtc_atomic_store_u64(&bm->s_reissued, 0, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&bm->pre_busy, 0, xtc_mo_relaxed);
 #if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
-	atomic_store_explicit(&bm->pre_on, 1, memory_order_relaxed);
+	xtc_atomic_store_i32(&bm->pre_on, 1, xtc_mo_relaxed);
 #else
-	atomic_store_explicit(&bm->pre_on, 0, memory_order_relaxed);
+	xtc_atomic_store_i32(&bm->pre_on, 0, xtc_mo_relaxed);
 #endif
 	if (opts->reopen) {
 		/* Resume page-id allocation past the file's existing pages
@@ -1871,10 +1914,10 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 		off_t end = lseek(bm->fd, 0, SEEK_END);
 		if (end > 0) {
 			bm_pid_t n = (bm_pid_t)(end / (off_t)bm->page_size);
-			atomic_store_explicit(&bm->wr_end, (uint64_t)end,
-			    memory_order_relaxed);
-			atomic_store_explicit(&bm->pre_end, (uint64_t)end,
-			    memory_order_relaxed);
+			xtc_atomic_store_u64(&bm->wr_end, (uint64_t)end,
+			    xtc_mo_relaxed);
+			xtc_atomic_store_u64(&bm->pre_end, (uint64_t)end,
+			    xtc_mo_relaxed);
 			if (n > bm->next_pid) bm->next_pid = n;
 			/* The page ids a clean close left free (fl_save). */
 			freelist_load(bm, n);
@@ -2050,7 +2093,7 @@ next_pid(bm_t *bm)
 	if (bm->free_pids_n > 0) {
 		/* Reissue a reclaimed page id before growing the file. */
 		p = bm->free_pids[--bm->free_pids_n];
-		atomic_fetch_add_explicit(&bm->s_reissued, 1, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&bm->s_reissued, 1, xtc_mo_relaxed);
 	} else {
 		p = bm->next_pid++;
 	}
@@ -2073,14 +2116,14 @@ finish_doomed_drop(bm_t *bm, bm_frame_t *f)
 		return;               /* still pinned, or another path took it */
 	/* A competing finalizer may have completed and recycled f while
 	 * this caller was delayed. Never free that new incarnation. */
-	if (!atomic_load_explicit(&f->doomed, memory_order_acquire)) {
+	if (!xtc_atomic_load_i32(&f->doomed, xtc_mo_acquire)) {
 		release_reservation(f);
 		return;
 	}
-	atomic_store_explicit(&f->doomed, 0, memory_order_release);
-	atomic_store_explicit(&f->dirty, 0, memory_order_release);
+	xtc_atomic_store_i32(&f->doomed, 0, xtc_mo_release);
+	xtc_atomic_store_i32(&f->dirty, 0, xtc_mo_release);
 	free_push(bm, f);             /* free-list sentinel stays -1 */
-	atomic_fetch_sub_explicit(&bm->pending_pid_drops, 1, memory_order_release);
+	xtc_atomic_fetch_sub_u64(&bm->pending_pid_drops, 1, xtc_mo_release);
 }
 
 /*
@@ -2114,8 +2157,9 @@ retry:
 	/* Also invalidate an in-flight load when the freed pid has no
 	 * resident frame. Quarantine may drain before that load returns. */
 	bm->ht_locks[b & (BM_HT_STRIPES - 1)].generation++;
-	for (f = bm->buckets[b]; f != NULL; f = f->hnext)
-		if (f->pid == pid)
+	for (f = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_seq_cst);
+	     f != NULL; f = xtc_atomic_load_ptr(&f->hnext, xtc_mo_seq_cst))
+		if (xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) == pid)
 			break;
 	if (f == NULL) {
 		(void)pthread_mutex_unlock(lk);
@@ -2131,35 +2175,35 @@ retry:
 	}
 	/* Dead page: never flush it (a flush under a reissued id would
 	 * resurrect stale bytes). */
-	atomic_store_explicit(&f->dirty, 0, memory_order_release);
+	xtc_atomic_store_i32(&f->dirty, 0, xtc_mo_release);
 	/* Remove from the table under the bucket lock so no NEW fixer (which
 	 * looks up under the same lock) can reach this frame again; release
 	 * store so the lock-free fast path stops seeing it too (an in-flight
 	 * fast-path walk that already reached f is caught by its post-pin
 	 * pid recheck; see ht_lookup_pin_fast). */
 	prev = NULL;
-	cur = atomic_load_explicit(&bm->buckets[b], memory_order_relaxed);
+	cur = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_relaxed);
 	while (cur != NULL) {
-		bm_frame_t *next = atomic_load_explicit(&cur->hnext,
-		    memory_order_relaxed);
+		bm_frame_t *next =
+		    xtc_atomic_load_ptr(&cur->hnext, xtc_mo_relaxed);
 		if (cur == f) {
 			if (prev == NULL)
-				atomic_store_explicit(&bm->buckets[b], next,
-				    memory_order_release);
+				xtc_atomic_store_ptr(&bm->buckets[b], next,
+				    xtc_mo_release);
 			else
-				atomic_store_explicit(&prev->hnext, next,
-				    memory_order_release);
+				xtc_atomic_store_ptr(&prev->hnext, next,
+				    xtc_mo_release);
 			break;
 		}
 		prev = cur;
 		cur = next;
 	}
-	atomic_fetch_sub_explicit(&bm->resident, 1, memory_order_relaxed);
+	xtc_atomic_fetch_sub_u64(&bm->resident, 1, xtc_mo_relaxed);
 	/* Our pin closes the last-unpin window while installing doomed.
 	 * Only the final unpin owns completion, never a delayed drop-side
 	 * finalizer acting on a recycled incarnation. */
-	atomic_fetch_add_explicit(&bm->pending_pid_drops, 1, memory_order_relaxed);
-	atomic_store_explicit(&f->doomed, 1, memory_order_release);
+	xtc_atomic_fetch_add_u64(&bm->pending_pid_drops, 1, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&f->doomed, 1, xtc_mo_release);
 	(void)pthread_mutex_unlock(lk);
 	unpin_frame(bm, f);
 	return 1;
@@ -2175,21 +2219,24 @@ mark_dirty_edge(bm_t *bm, bm_frame_t *frame)
 {
 	/* Stamp the dirtying order on the clean -> dirty edge, so the
 	 * trickler can write oldest dirt first (a recLSN proxy). */
-	if (atomic_exchange_explicit(&frame->dirty, 1, memory_order_acq_rel) == 0) {
-		frame->dirty_seq = atomic_fetch_add_explicit(&bm->dirty_clock,
-		    1, memory_order_relaxed);
+	if (xtc_atomic_exchange_i32(&frame->dirty, 1, xtc_mo_acq_rel) == 0) {
+		xtc_atomic_store_u64(&frame->dirty_seq,
+		    xtc_atomic_fetch_add_u64(&bm->dirty_clock, 1,
+		        xtc_mo_relaxed),
+		    xtc_mo_seq_cst);
 		/* ARIES page LSN: stamp the change's log LSN onto the page.
 		 * The engine supplies it via bm_set_lsn before the mutation.
 		 * Skip page 0 (the superblock is not a btnode). */
-		if (bm->lsn_off >= 0 && frame->pid != 0) {
-			uint64_t lsn = atomic_load_explicit(&bm->cur_lsn,
-			    memory_order_relaxed);
+		if (bm->lsn_off >= 0 &&
+		    xtc_atomic_load_u64(&frame->pid, xtc_mo_seq_cst) != 0) {
+			uint64_t lsn =
+			    xtc_atomic_load_u64(&bm->cur_lsn, xtc_mo_relaxed);
 			memcpy((uint8_t *)frame->page + bm->lsn_off,
 			    &lsn, sizeof lsn);
 			/* recLSN: the LSN of the change that first dirtied
 			 * this page; the log is durable-needed up to here. */
-			atomic_store_explicit(&frame->rec_lsn, lsn,
-			    memory_order_relaxed);
+			xtc_atomic_store_u64(&frame->rec_lsn, lsn,
+			    xtc_mo_relaxed);
 		}
 	}
 }
@@ -2203,7 +2250,7 @@ unpin_frame(bm_t *bm, bm_frame_t *frame)
 {
 	int prev;
 
-	prev = atomic_fetch_sub_explicit(&frame->pin, 1, memory_order_acq_rel);
+	prev = xtc_atomic_fetch_sub_i32(&frame->pin, 1, xtc_mo_acq_rel);
 	BM_UNPIN_TEST_HOOK(frame);
 	/* Deferred reclamation: if this was the LAST pin (prev == 1, so the
 	 * count is now 0) and the frame was doomed by a concurrent
@@ -2212,8 +2259,7 @@ unpin_frame(bm_t *bm, bm_frame_t *frame)
 	 * so this just returns it to the pool. finish_doomed_drop's
 	 * reservation arbitrates against an evictor handing off a doomed
 	 * frame; drop_resident releases its own pin through this path. */
-	if (prev == 1 &&
-	    atomic_load_explicit(&frame->doomed, memory_order_acquire))
+	if (prev == 1 && xtc_atomic_load_i32(&frame->doomed, xtc_mo_acquire))
 		finish_doomed_drop(bm, frame);
 }
 
@@ -2223,7 +2269,7 @@ bm_unfix(bm_t *bm, bm_frame_t *frame, int mark_dirty)
 	if (frame == NULL) return;
 	if (mark_dirty)
 		mark_dirty_edge(bm, frame);
-	atomic_store_explicit(&frame->ref, 1, memory_order_relaxed);
+	xtc_atomic_store_i32(&frame->ref, 1, xtc_mo_relaxed);
 	unpin_frame(bm, frame);
 }
 
@@ -2243,9 +2289,10 @@ bm_predirty(bm_t *bm, bm_frame_t *frame)
 	 * gate would refuse a newer image.  Then take the normal dirty edge
 	 * so recLSN/dirty bookkeeping is set if this is the first touch.
 	 */
-	if (bm->lsn_off >= 0 && frame->pid != 0) {
-		uint64_t lsn = atomic_load_explicit(&bm->cur_lsn,
-		    memory_order_relaxed);
+	if (bm->lsn_off >= 0 &&
+	    xtc_atomic_load_u64(&frame->pid, xtc_mo_seq_cst) != 0) {
+		uint64_t lsn =
+		    xtc_atomic_load_u64(&bm->cur_lsn, xtc_mo_relaxed);
 		memcpy((uint8_t *)frame->page + bm->lsn_off, &lsn, sizeof lsn);
 	}
 	mark_dirty_edge(bm, frame);
@@ -2254,14 +2301,14 @@ bm_predirty(bm_t *bm, bm_frame_t *frame)
 void
 bm_set_lsn(bm_t *bm, uint64_t lsn)
 {
-	atomic_store_explicit(&bm->cur_lsn, lsn, memory_order_relaxed);
+	xtc_atomic_store_u64(&bm->cur_lsn, lsn, xtc_mo_relaxed);
 }
 
 uint64_t
 bm_get_lsn(bm_t *bm)
 {
-	return bm == NULL ? 0
-	    : atomic_load_explicit(&bm->cur_lsn, memory_order_relaxed);
+	return bm == NULL ? 0 :
+	                    xtc_atomic_load_u64(&bm->cur_lsn, xtc_mo_relaxed);
 }
 
 void
@@ -2297,7 +2344,7 @@ bm_apply_page_image(bm_t *bm, bm_pid_t pid, const void *image, uint32_t image_le
 		memcpy(bm_page(f), image, bm->page_size);   /* redo this page */
 		/* bm_unfix stamps page_lsn = cur_lsn on the clean->dirty edge;
 		 * point it at the image's own LSN so the stamp preserves it. */
-		atomic_store_explicit(&bm->cur_lsn, in_image, memory_order_relaxed);
+		xtc_atomic_store_u64(&bm->cur_lsn, in_image, xtc_mo_relaxed);
 		bm_unlatch(f);
 		bm_unfix(bm, f, 1);                          /* dirty: write it back */
 		return 1;
@@ -2330,7 +2377,7 @@ bm_apply_page_image_at(bm_t *bm, bm_pid_t pid, const void *image,
 		 * clean->dirty edge preserves it. */
 		memcpy((uint8_t *)bm_page(f) + bm->lsn_off, &apply_lsn,
 		    sizeof apply_lsn);
-		atomic_store_explicit(&bm->cur_lsn, apply_lsn, memory_order_relaxed);
+		xtc_atomic_store_u64(&bm->cur_lsn, apply_lsn, xtc_mo_relaxed);
 		bm_unlatch(f);
 		bm_unfix(bm, f, 1);                          /* dirty: write it back */
 		return 1;
@@ -2362,9 +2409,9 @@ bm_min_rec_lsn(bm_t *bm)
 	 * 0 means no page is dirty (no constraint from the pool). */
 	for (i = 0; i < bm->n_frames; i++) {
 		bm_frame_t *f = &bm->frames[i];
-		if (atomic_load_explicit(&f->dirty, memory_order_acquire)) {
-			uint64_t r = atomic_load_explicit(&f->rec_lsn,
-			    memory_order_relaxed);
+		if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire)) {
+			uint64_t r =
+			    xtc_atomic_load_u64(&f->rec_lsn, xtc_mo_relaxed);
 			if (!seen || r < m) { m = r; seen = 1; }
 		}
 	}
@@ -2383,15 +2430,15 @@ bm_alloc_pid(bm_t *bm, bm_frame_t **out_frame, bm_pid_t *out_pid)
 	 * the reuse fails validation.  The pid can be the SAME one (the
 	 * freelist reissues it into the same frame), so the pid recheck
 	 * alone does not catch it (test_bm_reuse_version). */
-	atomic_fetch_add_explicit(&f->version, 2, memory_order_release);
-	atomic_store_explicit(&f->pid, next_pid(bm), memory_order_release);
-	atomic_store_explicit(&f->dirty, 1, memory_order_relaxed);
-	atomic_store_explicit(&f->io_busy, 0, memory_order_relaxed);
-	atomic_store_explicit(&f->doomed, 0, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&f->version, 2, xtc_mo_release);
+	xtc_atomic_store_u64(&f->pid, next_pid(bm), xtc_mo_release);
+	xtc_atomic_store_i32(&f->dirty, 1, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&f->io_busy, 0, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&f->doomed, 0, xtc_mo_relaxed);
 	memset(f->page, 0, bm->page_size);
-	atomic_store_explicit(&f->state, BM_HOT, memory_order_release);
+	xtc_atomic_store_u8(&f->state, BM_HOT, xtc_mo_release);
 	/* Keep the free-list sentinel until initialization is complete. */
-	atomic_store_explicit(&f->pin, 1, memory_order_release);
+	xtc_atomic_store_i32(&f->pin, 1, xtc_mo_release);
 	/*
 	 * Publish with dedup under the bucket lock.  Under the quarantine
 	 * invariant the reissued pid has no resident frame, so the common
@@ -2405,18 +2452,21 @@ bm_alloc_pid(bm_t *bm, bm_frame_t **out_frame, bm_pid_t *out_pid)
 		/* Reinitialised in place: a new version for a pin-free reader
 		 * (it is pinned, so +2 keeps it even and never looks like a
 		 * writer's odd hold). */
-		atomic_fetch_add_explicit(&dup->version, 2, memory_order_release);
-		atomic_store_explicit(&dup->dirty, 1, memory_order_relaxed);
-		atomic_store_explicit(&dup->doomed, 0, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&dup->version, 2, xtc_mo_release);
+		xtc_atomic_store_i32(&dup->dirty, 1, xtc_mo_relaxed);
+		xtc_atomic_store_i32(&dup->doomed, 0, xtc_mo_relaxed);
 		memset(dup->page, 0, bm->page_size);
-		atomic_store_explicit(&dup->state, BM_HOT, memory_order_release);
+		xtc_atomic_store_u8(&dup->state, BM_HOT, xtc_mo_release);
 		free_push(bm, f);          /* spare frame back to the pool */
-		if (out_pid) *out_pid = dup->pid;
+		if (out_pid)
+			*out_pid =
+			    xtc_atomic_load_u64(&dup->pid, xtc_mo_seq_cst);
 		*out_frame = dup;
 		return XTC_OK;
 	}
-	atomic_fetch_add_explicit(&bm->resident, 1, memory_order_relaxed);
-	if (out_pid) *out_pid = f->pid;
+	xtc_atomic_fetch_add_u64(&bm->resident, 1, xtc_mo_relaxed);
+	if (out_pid)
+		*out_pid = xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst);
 	*out_frame = f;
 	return XTC_OK;
 }
@@ -2440,11 +2490,12 @@ bm_free_pid(bm_t *bm, bm_pid_t pid)
 	 * quar_pids list too, so the next epoch drains it to the reusable
 	 * freelist.
 	 */
-	atomic_fetch_add_explicit(&bm->pending_pid_drops, 1, memory_order_acq_rel);
+	xtc_atomic_fetch_add_u64(&bm->pending_pid_drops, 1, xtc_mo_acq_rel);
 	(void)pthread_mutex_lock(&bm->pid_mu);
 	if ((rc = quar_set_add(bm, pid)) != XTC_OK) {
 		(void)pthread_mutex_unlock(&bm->pid_mu);
-		atomic_fetch_sub_explicit(&bm->pending_pid_drops, 1, memory_order_release);
+		xtc_atomic_fetch_sub_u64(&bm->pending_pid_drops, 1,
+		    xtc_mo_release);
 		return rc;            /* page leaked, never double-allocated */
 	}
 	if (bm->quar_pids_n == bm->quar_pids_cap) {
@@ -2453,7 +2504,8 @@ bm_free_pid(bm_t *bm, bm_pid_t pid)
 		    (size_t)cap * sizeof *bm->quar_pids);
 		if (nb == NULL) {
 			(void)pthread_mutex_unlock(&bm->pid_mu);
-			atomic_fetch_sub_explicit(&bm->pending_pid_drops, 1, memory_order_release);
+			xtc_atomic_fetch_sub_u64(&bm->pending_pid_drops, 1,
+			    xtc_mo_release);
 			return XTC_E_NOMEM;   /* page leaked, never double-allocated */
 		}
 		bm->quar_pids = nb;
@@ -2471,9 +2523,9 @@ bm_free_pid(bm_t *bm, bm_pid_t pid)
 	 * unpin completes the pin-safe deferred drop.
 	 */
 	(void)drop_resident(bm, pid);
-	atomic_fetch_sub_explicit(&bm->pending_pid_drops, 1, memory_order_release);
+	xtc_atomic_fetch_sub_u64(&bm->pending_pid_drops, 1, xtc_mo_release);
 
-	atomic_fetch_add_explicit(&bm->s_freed, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&bm->s_freed, 1, xtc_mo_relaxed);
 	return XTC_OK;
 }
 
@@ -2497,7 +2549,7 @@ bm_reclaim_quarantine(bm_t *bm)
 	 * Pins include writeback: reusing its pid early lets an old disk
 	 * write overwrite the new incarnation even with distinct frames. */
 	if (bm->quar_pids_n == 0 ||
-	    atomic_load_explicit(&bm->pending_pid_drops, memory_order_acquire) != 0) {
+	    xtc_atomic_load_u64(&bm->pending_pid_drops, xtc_mo_acquire) != 0) {
 		(void)pthread_mutex_unlock(&bm->pid_mu);
 		return;
 	}
@@ -2581,7 +2633,7 @@ bm_fix_pid(bm_t *bm, bm_pid_t pid, bm_frame_t **out_frame)
 		/* Keep free_push's pin=-1 sentinel throughout private I/O.
 		 * A stale fast-path walker may still hold this frame pointer;
 		 * it must not pin a same-pid reload before it is published. */
-		atomic_store_explicit(&f->state, BM_LOADED, memory_order_relaxed);
+		xtc_atomic_store_u8(&f->state, BM_LOADED, xtc_mo_relaxed);
 		/* Bump the frame version across a (re)load so the OLC seqlock
 		 * ALSO detects a content reissue, not just an in-place write.
 		 * This is what lets a PIN-FREE epoch reader
@@ -2591,11 +2643,11 @@ bm_fix_pid(bm_t *bm, bm_pid_t pid, bm_frame_t **out_frame)
 		 * the reader retries.  +2 keeps it even (stable) for the next
 		 * reader.  Rare path (a miss), so this write to the read-mostly
 		 * line is not on the hot hit path. */
-		atomic_fetch_add_explicit(&f->version, 2, memory_order_release);
-		atomic_store_explicit(&f->pid, pid, memory_order_release);
-		atomic_store_explicit(&f->dirty, 0, memory_order_relaxed);
-		atomic_store_explicit(&f->doomed, 0, memory_order_relaxed);
-		atomic_store_explicit(&f->io_busy, 0, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&f->version, 2, xtc_mo_release);
+		xtc_atomic_store_u64(&f->pid, pid, xtc_mo_release);
+		xtc_atomic_store_i32(&f->dirty, 0, xtc_mo_relaxed);
+		xtc_atomic_store_i32(&f->doomed, 0, xtc_mo_relaxed);
+		xtc_atomic_store_i32(&f->io_busy, 0, xtc_mo_relaxed);
 		/* A page that cannot be read is damage, as a bad checksum is:
 		 * the owner must stop trusting the base (ck_fail). */
 		if (do_io(bm, f->page, pid, 0) != 0) {
@@ -2614,16 +2666,23 @@ bm_fix_pid(bm_t *bm, bm_pid_t pid, bm_frame_t **out_frame)
 			pthread_mutex_t *lk = ht_lock(bm, b);
 			bm_frame_t *e;
 			(void)pthread_mutex_lock(lk);
-			for (e = bm->buckets[b]; e != NULL; e = e->hnext)
-				if (e->pid == pid) break;
+			for (e = xtc_atomic_load_ptr(&bm->buckets[b],
+			         xtc_mo_seq_cst);
+			     e != NULL;
+			     e = xtc_atomic_load_ptr(&e->hnext, xtc_mo_seq_cst))
+				if (xtc_atomic_load_u64(&e->pid,
+				        xtc_mo_seq_cst) == pid)
+					break;
 			if (e != NULL) {
 				/* Lost the race; use the resident frame if we can pin it
 				 * (it may be reserved for eviction -- then retry as a
 				 * miss). */
 				int pinned = try_pin(e);
 				if (pinned &&
-				    atomic_load_explicit(&e->state, memory_order_acquire) == BM_COOL)
-					atomic_store_explicit(&e->state, BM_HOT, memory_order_release);
+				    xtc_atomic_load_u8(&e->state,
+				        xtc_mo_acquire) == BM_COOL)
+					xtc_atomic_store_u8(&e->state, BM_HOT,
+					    xtc_mo_release);
 				(void)pthread_mutex_unlock(lk);
 				free_push(bm, f);
 				if (!pinned)
@@ -2666,23 +2725,26 @@ bm_fix_pid(bm_t *bm, bm_pid_t pid, bm_frame_t **out_frame)
 				return XTC_E_IO;
 			}
 			/* Establish ownership/state before bucket publication. */
-			atomic_store_explicit(&f->state,
-			    bm->scan_resist ? BM_COOL : BM_HOT, memory_order_relaxed);
-			atomic_store_explicit(&f->pin, 1, memory_order_release);
+			xtc_atomic_store_u8(&f->state,
+			    bm->scan_resist ? BM_COOL : BM_HOT, xtc_mo_relaxed);
+			xtc_atomic_store_i32(&f->pin, 1, xtc_mo_release);
 			/* Publish: f->pid was stored before this (see above), and
 			 * the release store on the bucket head orders it before any
 			 * lock-free reader can observe f (ht_lookup_pin_fast). */
-			f->hnext = atomic_load_explicit(&bm->buckets[b],
-			    memory_order_relaxed);
-			atomic_store_explicit(&bm->buckets[b], f, memory_order_release);
+			xtc_atomic_store_ptr(&f->hnext,
+			    xtc_atomic_load_ptr(&bm->buckets[b],
+			        xtc_mo_relaxed),
+			    xtc_mo_seq_cst);
+			xtc_atomic_store_ptr(&bm->buckets[b], f,
+			    xtc_mo_release);
 			BM_PUBLISH_TEST_HOOK(bm, f);
 			bm->ht_locks[b & (BM_HT_STRIPES - 1)].generation++;
 			/* Do not overwrite pin after publication: a lock-free fixer
 			 * may already have incremented it. */
 			(void)pthread_mutex_unlock(lk);
 		}
-		atomic_fetch_add_explicit(&bm->resident, 1, memory_order_relaxed);
-		atomic_fetch_add_explicit(&bm->s_loads, 1, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&bm->resident, 1, xtc_mo_relaxed);
+		xtc_atomic_fetch_add_u64(&bm->s_loads, 1, xtc_mo_relaxed);
 		*out_frame = f;
 		return XTC_OK;
 	}
@@ -2692,7 +2754,11 @@ void *
 bm_page(bm_frame_t *frame) { return frame ? frame->page : NULL; }
 
 bm_pid_t
-bm_frame_pid(const bm_frame_t *frame) { return frame ? frame->pid : BM_PID_NONE; }
+bm_frame_pid(const bm_frame_t *frame)
+{
+	return frame ? xtc_atomic_load_u64(&frame->pid, xtc_mo_seq_cst) :
+	               BM_PID_NONE;
+}
 
 /*
  * Debug probe (the reclamation-race oracle).  Scans every page-table
@@ -2718,15 +2784,34 @@ bm_dbg_dup_pid(bm_t *bm)
 		bm_frame_t *f, *g;
 
 		(void)pthread_mutex_lock(lk);
-		for (f = bm->buckets[b]; f != NULL; f = f->hnext) {
+		for (f = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_seq_cst);
+		     f != NULL;
+		     f = xtc_atomic_load_ptr(&f->hnext, xtc_mo_seq_cst)) {
 			int seen = 0;
-			for (g = bm->buckets[b]; g != f; g = g->hnext)
-				if (g->pid == f->pid) { seen = 1; break; }
+			for (g = xtc_atomic_load_ptr(&bm->buckets[b],
+			         xtc_mo_seq_cst);
+			     g != f;
+			     g = xtc_atomic_load_ptr(&g->hnext, xtc_mo_seq_cst))
+				if (xtc_atomic_load_u64(&g->pid,
+				        xtc_mo_seq_cst) ==
+				    xtc_atomic_load_u64(&f->pid,
+				        xtc_mo_seq_cst)) {
+					seen = 1;
+					break;
+				}
 			if (!seen) {
 				/* count occurrences of f->pid in this bucket */
 				int n = 0;
-				for (g = bm->buckets[b]; g != NULL; g = g->hnext)
-					if (g->pid == f->pid) n++;
+				for (g = xtc_atomic_load_ptr(&bm->buckets[b],
+				         xtc_mo_seq_cst);
+				     g != NULL;
+				     g = xtc_atomic_load_ptr(&g->hnext,
+				         xtc_mo_seq_cst))
+					if (xtc_atomic_load_u64(&g->pid,
+					        xtc_mo_seq_cst) ==
+					    xtc_atomic_load_u64(&f->pid,
+					        xtc_mo_seq_cst))
+						n++;
 				if (n > 1)
 					dups++;
 			}
@@ -2743,7 +2828,7 @@ void bm_latch_exclusive(bm_frame_t *f)
 		(void)xtc_arwlock_wrlock(f->latch, -1);
 		/* Enter the write section: make the version ODD so a
 		 * concurrent optimistic reader that samples it now retries. */
-		atomic_fetch_add_explicit(&f->version, 1, memory_order_release);
+		xtc_atomic_fetch_add_u64(&f->version, 1, xtc_mo_release);
 	}
 }
 void bm_unlatch(bm_frame_t *f)
@@ -2755,8 +2840,8 @@ void bm_unlatch(bm_frame_t *f)
 	 * to see all the page writes.  A shared-latch release finds it even
 	 * already -- no-op.  (Only the holder unlatches, so this read of
 	 * version is not racing another writer on this frame.) */
-	if ((atomic_load_explicit(&f->version, memory_order_relaxed) & 1u) != 0)
-		atomic_fetch_add_explicit(&f->version, 1, memory_order_release);
+	if ((xtc_atomic_load_u64(&f->version, xtc_mo_relaxed) & 1u) != 0)
+		xtc_atomic_fetch_add_u64(&f->version, 1, xtc_mo_release);
 	(void)xtc_arwlock_unlock(f->latch);
 }
 
@@ -2786,8 +2871,7 @@ bm_read_begin(const bm_frame_t *f, uint64_t *out_v)
 {
 	uint64_t v;
 	if (f == NULL) return 0;
-	v = atomic_load_explicit(&((bm_frame_t *)f)->version,
-	    memory_order_acquire);
+	v = xtc_atomic_load_u64(&((bm_frame_t *)f)->version, xtc_mo_acquire);
 	if ((v & 1u) != 0)
 		return 0;               /* a writer holds it: caller latches */
 	*out_v = v;
@@ -2799,8 +2883,8 @@ bm_read_valid(const bm_frame_t *f, uint64_t v)
 {
 	if (f == NULL) return 0;
 	/* acquire so the version re-read is ordered after the page reads. */
-	return atomic_load_explicit(&((bm_frame_t *)f)->version,
-	    memory_order_acquire) == v;
+	return xtc_atomic_load_u64(&((bm_frame_t *)f)->version,
+	           xtc_mo_acquire) == v;
 }
 
 /* ---- page-provider process ---- */
@@ -2832,8 +2916,7 @@ pp_tick(bm_t *bm, uint32_t *cursor)
 	 * buffered write -> re-dirty, 7k-42k writes a second that the
 	 * kernel's 30 s dirty expiry flushed in one ~550 MB burst the log's
 	 * O_DSYNC commits queued behind (test_pp_idle_writes). */
-	if (atomic_load_explicit(&bm->free_n, memory_order_relaxed) >=
-	    bm->cool_target)
+	if (xtc_atomic_load_u32(&bm->free_n, xtc_mo_relaxed) >= bm->cool_target)
 		goto classify;
 	/* Pass 1: flush dirty COOL frames (so reclaiming them later is a
 	 * cheap state flip) and count the clean cool supply. */
@@ -2844,12 +2927,12 @@ pp_tick(bm_t *bm, uint32_t *cursor)
 		*cursor = *cursor + 1 < bm->n_frames ? *cursor + 1 : 0;
 		f = &bm->frames[i];
 		visited++;
-		st = atomic_load_explicit(&f->state, memory_order_acquire);
-		if (atomic_load_explicit(&f->pin, memory_order_acquire) != 0)
+		st = xtc_atomic_load_u8(&f->state, xtc_mo_acquire);
+		if (xtc_atomic_load_i32(&f->pin, xtc_mo_acquire) != 0)
 			continue;
 		if (st != BM_COOL)
 			continue;
-		if (atomic_load_explicit(&f->dirty, memory_order_acquire))
+		if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire))
 			(void)flush_frame(bm, f);   /* proactive write-out */
 		else
 			cool_clean++;
@@ -2870,20 +2953,20 @@ pp_tick(bm_t *bm, uint32_t *cursor)
 		*cursor = *cursor + 1 < bm->n_frames ? *cursor + 1 : 0;
 		f = &bm->frames[i];
 		visited++;
-		st = atomic_load_explicit(&f->state, memory_order_acquire);
-		if (atomic_load_explicit(&f->pin, memory_order_acquire) != 0)
+		st = xtc_atomic_load_u8(&f->state, xtc_mo_acquire);
+		if (xtc_atomic_load_i32(&f->pin, xtc_mo_acquire) != 0)
 			continue;
 		if (st != BM_HOT)
 			continue;
 		/* Cooling is a state flip; the page table keeps naming the
 		 * page until it is reclaimed. */
-		atomic_store_explicit(&f->state, BM_COOL, memory_order_release);
-		atomic_fetch_add_explicit(&bm->s_cooled, 1, memory_order_relaxed);
+		xtc_atomic_store_u8(&f->state, BM_COOL, xtc_mo_release);
+		xtc_atomic_fetch_add_u64(&bm->s_cooled, 1, xtc_mo_relaxed);
 		need--;
 	}
 	/* Pass 3: keep the free list above the cool target. */
-	while (atomic_load_explicit(&bm->free_n, memory_order_relaxed)
-	    < bm->cool_target) {
+	while (xtc_atomic_load_u32(&bm->free_n, xtc_mo_relaxed) <
+	    bm->cool_target) {
 #ifdef BM_SAMPLED_EVICT
 		if (!(bm->scan_resist ? sample_evict_one(bm) : evict_one(bm))) break;
 #else
@@ -2943,16 +3026,16 @@ bg_park(int64_t ns)
 static void
 bg_dead(void *alive)
 {
-	atomic_store_explicit((_Atomic int *)alive, 0, memory_order_release);
+	xtc_atomic_store_i32((int *)alive, 0, xtc_mo_release);
 }
 
 /* Wake a backed-off proc so it sees its stop flag now.  From a proc only:
  * off a loop the proc's loop is not running and the caller does not wait. */
 static void
-bg_wake(_Atomic int *alive, xtc_pid_t pid)
+bg_wake(int *alive, xtc_pid_t pid)
 {
 	if (!xtc_pid_is_none(xtc_self()) &&
-	    atomic_load_explicit(alive, memory_order_acquire))
+	    xtc_atomic_load_i32(alive, xtc_mo_acquire))
 		(void)xtc_send(pid, "s", 1);
 }
 
@@ -2970,13 +3053,13 @@ static void
 bg_activity(bm_t *bm, struct bg_act *a)
 {
 	a->v[0] = xs_ctr_sum(&bm->s_hits);     /* striped: summed once per pass */
-	a->v[1] = atomic_load_explicit(&bm->s_cooled, memory_order_relaxed);
-	a->v[2] = atomic_load_explicit(&bm->s_flushed, memory_order_relaxed);
-	a->v[3] = atomic_load_explicit(&bm->s_evicted, memory_order_relaxed);
-	a->v[4] = atomic_load_explicit(&bm->s_prefetched, memory_order_relaxed);
-	a->v[5] = atomic_load_explicit(&bm->s_loads, memory_order_relaxed);
-	a->v[6] = atomic_load_explicit(&bm->dirty_clock, memory_order_relaxed);
-	a->v[7] = atomic_load_explicit(&bm->free_n, memory_order_relaxed);
+	a->v[1] = xtc_atomic_load_u64(&bm->s_cooled, xtc_mo_relaxed);
+	a->v[2] = xtc_atomic_load_u64(&bm->s_flushed, xtc_mo_relaxed);
+	a->v[3] = xtc_atomic_load_u64(&bm->s_evicted, xtc_mo_relaxed);
+	a->v[4] = xtc_atomic_load_u64(&bm->s_prefetched, xtc_mo_relaxed);
+	a->v[5] = xtc_atomic_load_u64(&bm->s_loads, xtc_mo_relaxed);
+	a->v[6] = xtc_atomic_load_u64(&bm->dirty_clock, xtc_mo_relaxed);
+	a->v[7] = xtc_atomic_load_u32(&bm->free_n, xtc_mo_relaxed);
 }
 
 /* Refresh *a; 1 if it changed. */
@@ -3004,7 +3087,7 @@ pp_proc(void *arg)
 	(void)xtc_proc_at_exit(bg_dead, &bm->pp_alive);
 
 	bg_activity(bm, &act);
-	while (atomic_load_explicit(&bm->pp_running, memory_order_acquire)) {
+	while (xtc_atomic_load_i32(&bm->pp_running, xtc_mo_acquire)) {
 		(void)pp_tick(bm, &cursor);
 		BM_PP_TICK_TEST_HOOK(bm);
 		idle = bg_moved(bm, &act) ? 0 : idle + 1;
@@ -3026,11 +3109,16 @@ bm_provider_spawn(bm_t *bm, xtc_loop_t *loop, int64_t interval_ns,
 	if ((pa = xtc_calloc(1, sizeof *pa)) == NULL) return XTC_E_NOMEM;
 	pa->bm = bm;
 	pa->interval = interval_ns > 0 ? interval_ns : 5LL * 1000 * 1000;
-	atomic_store_explicit(&bm->pp_running, 1, memory_order_release);
-	atomic_store_explicit(&bm->pp_alive, 1, memory_order_release);
+	xtc_atomic_store_i32(&bm->pp_running, 1, xtc_mo_release);
+	xtc_atomic_store_i32(&bm->pp_alive, 1, xtc_mo_release);
 	opts.name = "bm-provider";
 	rc = xtc_proc_spawn(loop, pp_proc, pa, &opts, &bm->pp_pid);
-	if (rc != XTC_OK) { atomic_store_explicit(&bm->pp_running, 0, memory_order_release); atomic_store_explicit(&bm->pp_alive, 0, memory_order_release); xtc_free(pa); return rc; }
+	if (rc != XTC_OK) {
+		xtc_atomic_store_i32(&bm->pp_running, 0, xtc_mo_release);
+		xtc_atomic_store_i32(&bm->pp_alive, 0, xtc_mo_release);
+		xtc_free(pa);
+		return rc;
+	}
 	if (out_pid) *out_pid = bm->pp_pid;
 	return XTC_OK;
 }
@@ -3135,8 +3223,12 @@ static int
 tr_cmp_pid(const void *a, const void *b)
 {
 	const struct tr_cand *x = a, *y = b;
-	if (x->f->pid < y->f->pid) return -1;
-	if (x->f->pid > y->f->pid) return 1;
+	if (xtc_atomic_load_u64(&x->f->pid, xtc_mo_seq_cst) <
+	    xtc_atomic_load_u64(&y->f->pid, xtc_mo_seq_cst))
+		return -1;
+	if (xtc_atomic_load_u64(&x->f->pid, xtc_mo_seq_cst) >
+	    xtc_atomic_load_u64(&y->f->pid, xtc_mo_seq_cst))
+		return 1;
 	return 0;
 }
 
@@ -3153,24 +3245,27 @@ tr_prepare(bm_t *bm, bm_frame_t *f, void *dst)
 {
 	int expect = 0;
 
-	if (!atomic_load_explicit(&f->dirty, memory_order_acquire))
+	if (!xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire))
 		return 0;
 	if (!try_pin(f))
 		return 0;
-	if (!atomic_compare_exchange_strong(&f->io_busy, &expect, 1)) {
+	if (!xtc_atomic_cas_i32(&f->io_busy, &expect, 1, xtc_mo_seq_cst,
+	        xtc_mo_seq_cst)) {
 		unpin_frame(bm, f);
 		return 0;
 	}
 	if (xtc_arwlock_rdlock(f->latch, 0) != XTC_OK)
 		goto release;
-	if (!atomic_load_explicit(&f->dirty, memory_order_acquire)) {
+	if (!xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire)) {
 		xtc_arwlock_unlock(f->latch);
 		goto release;
 	}
 	memcpy(dst, f->page, bm->page_size);
 	if (bm->cksum_off >= 0)
-		ck_seal(bm, dst, f->pid, (uint32_t)bm->cksum_off);
-	if (bm->lsn_off >= 0 && bm->wal_flush != NULL && f->pid != 0) {
+		ck_seal(bm, dst, xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst),
+		    (uint32_t)bm->cksum_off);
+	if (bm->lsn_off >= 0 && bm->wal_flush != NULL &&
+	    xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) != 0) {
 		uint64_t plsn;
 		memcpy(&plsn, (uint8_t *)dst + bm->lsn_off, sizeof plsn);
 		if (bm->wal_flush(bm->wal_ctx, plsn) != XTC_OK) {
@@ -3178,18 +3273,19 @@ tr_prepare(bm_t *bm, bm_frame_t *f, void *dst)
 			goto release;
 		}
 	}
-	atomic_store_explicit(&f->dirty, 0, memory_order_release);
+	xtc_atomic_store_i32(&f->dirty, 0, xtc_mo_release);
 	xtc_arwlock_unlock(f->latch);
 	/* Double-write log (no-op if disabled).  If the slot is not durable
 	 * the page must not be written home: re-dirty it and give it back. */
-	if (dw_protect(bm, f->pid, dst) != 0) {
-		atomic_store_explicit(&f->dirty, 1, memory_order_release);
-		atomic_fetch_add_explicit(&bm->s_io_errors, 1, memory_order_relaxed);
+	if (dw_protect(bm, xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst), dst) !=
+	    0) {
+		xtc_atomic_store_i32(&f->dirty, 1, xtc_mo_release);
+		xtc_atomic_fetch_add_u64(&bm->s_io_errors, 1, xtc_mo_relaxed);
 		goto release;
 	}
 	return 1;
 release:
-	atomic_store_explicit(&f->io_busy, 0, memory_order_release);
+	xtc_atomic_store_i32(&f->io_busy, 0, xtc_mo_release);
 	unpin_frame(bm, f);
 	return 0;
 }
@@ -3200,8 +3296,8 @@ static void
 tr_release(bm_t *bm, bm_frame_t *f, int wrote_ok)
 {
 	if (!wrote_ok)
-		atomic_store_explicit(&f->dirty, 1, memory_order_release);
-	atomic_store_explicit(&f->io_busy, 0, memory_order_release);
+		xtc_atomic_store_i32(&f->dirty, 1, xtc_mo_release);
+	xtc_atomic_store_i32(&f->io_busy, 0, xtc_mo_release);
 	unpin_frame(bm, f);
 }
 
@@ -3216,13 +3312,13 @@ tr_emit_run(bm_t *bm, uint8_t *base, int run_len, bm_pid_t pid0,
 	int len = run_len * (int)bm->page_size, k, ok, written = 0;
 	pf_extend(bm, (uint64_t)off + (uint64_t)len);
 	ok = xtc_aio_pwrite(bm->fd, base, len, off) == len;
-	atomic_fetch_add_explicit(&bm->s_tr_writes, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&bm->s_tr_writes, 1, xtc_mo_relaxed);
 	for (k = 0; k < run_len; k++) {
 		tr_release(bm, run_f[k], ok);
 		if (ok) {
 			written++;
-			atomic_fetch_add_explicit(&bm->s_flushed, 1,
-			    memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&bm->s_flushed, 1,
+			    xtc_mo_relaxed);
 		}
 	}
 	return written;
@@ -3253,18 +3349,21 @@ tr_flush_batch(bm_t *bm, struct tr_cand *sel, int nsel, uint8_t *wbuf,
 		bm_frame_t *f = sel[j].f;
 		if (!tr_prepare(bm, f, wbuf + (size_t)slot * psz))
 			continue;
-		if (run_len > 0 && f->pid == prev_pid + 1) {
+		if (run_len > 0 &&
+		    xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) ==
+		        prev_pid + 1) {
 			run_f[run_len++] = f;        /* extend the contiguous run */
 		} else {
 			if (run_len > 0)             /* emit the finished run */
 				written += tr_emit_run(bm,
 				    wbuf + (size_t)(slot - run_len) * psz,
 				    run_len, run_pid0, run_f);
-			run_pid0 = f->pid;           /* start a new run at this slot */
+			run_pid0 = xtc_atomic_load_u64(&f->pid,
+			    xtc_mo_seq_cst); /* start a new run at this slot */
 			run_f[0] = f;
 			run_len = 1;
 		}
-		prev_pid = f->pid;
+		prev_pid = xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst);
 		slot++;
 	}
 	if (run_len > 0)                             /* emit the trailing run */
@@ -3337,7 +3436,7 @@ tr_proc(void *arg)
 		}
 	}
 	bg_activity(bm, &act);
-	while (atomic_load_explicit(&bm->tr_running, memory_order_acquire)) {
+	while (xtc_atomic_load_i32(&bm->tr_running, xtc_mo_acquire)) {
 		uint32_t i, j, slice;
 		int n = 0, w = 0, dirty_total = 0, k;
 		struct tr_cand c;
@@ -3349,33 +3448,34 @@ tr_proc(void *arg)
 			i = tr_cursor;
 			tr_cursor = tr_cursor + 1 < bm->n_frames ? tr_cursor + 1 : 0;
 			f = &bm->frames[i];
-			if (!atomic_load_explicit(&f->dirty, memory_order_acquire))
+			if (!xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire))
 				continue;
 			dirty_total++;          /* writeback backlog (all dirty) */
-			if (atomic_load_explicit(&f->pin, memory_order_acquire) != 0)
+			if (xtc_atomic_load_i32(&f->pin, xtc_mo_acquire) != 0)
 				continue;
-			if (atomic_load_explicit(&f->io_busy, memory_order_acquire))
+			if (xtc_atomic_load_i32(&f->io_busy, xtc_mo_acquire))
 				continue;
-			st = atomic_load_explicit(&f->state, memory_order_acquire);
+			st = xtc_atomic_load_u8(&f->state, xtc_mo_acquire);
 			if (st != BM_HOT && st != BM_COOL)
 				continue;
 			c.f = f;
 			c.cool = (st == BM_COOL);
-			c.seq = atomic_load_explicit(&f->dirty_seq,
-			    memory_order_relaxed);
+			c.seq =
+			    xtc_atomic_load_u64(&f->dirty_seq, xtc_mo_relaxed);
 			tr_topk_offer(cand, &n, k, &c);   /* priority select */
 		}
 		if (slice < bm->n_frames)          /* scale the slice up */
 			dirty_total = (int)((uint64_t)dirty_total * bm->n_frames / slice);
-		atomic_fetch_add_explicit(&bm->s_tr_visited, slice, memory_order_relaxed);
-		atomic_store_explicit(&bm->s_dirty_backlog, (uint32_t)dirty_total,
-		    memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&bm->s_tr_visited, slice,
+		    xtc_mo_relaxed);
+		xtc_atomic_store_u32(&bm->s_dirty_backlog,
+		    (uint32_t)dirty_total, xtc_mo_relaxed);
 		int64_t t0 = 0, t1 = 0;
 		int nsel = n;
 		t0 = xtc_clock_mono();
 		/* Elevator-ordered, write-coalesced flush of the selected batch. */
 		w = tr_flush_batch(bm, cand, nsel, wbuf, run_f);
-		atomic_fetch_add_explicit(&bm->s_trickled, w, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&bm->s_trickled, w, xtc_mo_relaxed);
 		t1 = xtc_clock_mono();
 		/* Adaptive pacing, GATED by backlog.  When the trickler is
 		 * comfortably keeping up (few dirty frames), the backlog-based
@@ -3392,10 +3492,10 @@ tr_proc(void *arg)
 		 * and evictions keep coming), so the GA is pure overhead: fall
 		 * back to fixed pacing. */
 		{
-			uint64_t twr = atomic_load_explicit(&bm->s_tr_writes,
-			    memory_order_relaxed);
-			uint64_t ev = atomic_load_explicit(&bm->s_evicted,
-			    memory_order_relaxed);
+			uint64_t twr = xtc_atomic_load_u64(&bm->s_tr_writes,
+			    xtc_mo_relaxed);
+			uint64_t ev =
+			    xtc_atomic_load_u64(&bm->s_evicted, xtc_mo_relaxed);
 			uint64_t calls = twr - prev_tr_writes;
 			uint64_t evd = ev - prev_evicted;
 			int use_adaptive, fits;
@@ -3416,14 +3516,14 @@ tr_proc(void *arg)
 			ev_ewma = 0.9 * ev_ewma + 0.1 * (double)evd;
 			fits = ev_ewma < 0.05;
 			use_adaptive = (pp_ewma >= 1.5) || fits;
-			atomic_fetch_add_explicit(&bm->s_tr_passes, 1,
-			    memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&bm->s_tr_passes, 1,
+			    xtc_mo_relaxed);
 			if (tuner != NULL && use_adaptive && w > 0) {
 				int g[XTC_DIO_SCHED_MAX_GENES];
 				double cycle = (double)((t1 - t0) + iv) / 1e9;
 				double rate, dfrac, f[2];
-				atomic_fetch_add_explicit(&bm->s_tr_adaptive, 1,
-				    memory_order_relaxed);
+				xtc_atomic_fetch_add_u64(&bm->s_tr_adaptive, 1,
+				    xtc_mo_relaxed);
 				if (cycle <= 0.0) cycle = 1e-9;
 				rate = (double)w / cycle;        /* sustained pages/s */
 				dfrac = bm->n_frames
@@ -3468,11 +3568,16 @@ bm_trickler_spawn(bm_t *bm, xtc_loop_t *loop, int64_t interval_ns,
 	if ((ta = xtc_calloc(1, sizeof *ta)) == NULL) return XTC_E_NOMEM;
 	ta->bm = bm;
 	ta->interval = interval_ns > 0 ? interval_ns : 2LL * 1000 * 1000;
-	atomic_store_explicit(&bm->tr_running, 1, memory_order_release);
-	atomic_store_explicit(&bm->tr_alive, 1, memory_order_release);
+	xtc_atomic_store_i32(&bm->tr_running, 1, xtc_mo_release);
+	xtc_atomic_store_i32(&bm->tr_alive, 1, xtc_mo_release);
 	opts.name = "bm-trickler";
 	rc = xtc_proc_spawn(loop, tr_proc, ta, &opts, &bm->tr_pid);
-	if (rc != XTC_OK) { atomic_store_explicit(&bm->tr_running, 0, memory_order_release); atomic_store_explicit(&bm->tr_alive, 0, memory_order_release); xtc_free(ta); return rc; }
+	if (rc != XTC_OK) {
+		xtc_atomic_store_i32(&bm->tr_running, 0, xtc_mo_release);
+		xtc_atomic_store_i32(&bm->tr_alive, 0, xtc_mo_release);
+		xtc_free(ta);
+		return rc;
+	}
 	if (out_pid) *out_pid = bm->tr_pid;
 	return XTC_OK;
 }
@@ -3482,10 +3587,11 @@ bm_trickler_stop(bm_t *bm)
 {
 	int i;
 	if (bm == NULL) return;
-	atomic_store_explicit(&bm->tr_running, 0, memory_order_release);
+	xtc_atomic_store_i32(&bm->tr_running, 0, xtc_mo_release);
 	bg_wake(&bm->tr_alive, bm->tr_pid);   /* it may be in a long idle sleep */
-	for (i = 0; i < 100000 &&
-	    atomic_load_explicit(&bm->tr_alive, memory_order_acquire); i++)
+	for (i = 0;
+	     i < 100000 && xtc_atomic_load_i32(&bm->tr_alive, xtc_mo_acquire);
+	     i++)
 		if (xtc_proc_sleep(200LL * 1000) != XTC_OK) break;
 }
 
@@ -3494,15 +3600,16 @@ bm_provider_stop(bm_t *bm)
 {
 	int i;
 	if (bm == NULL) return;
-	atomic_store_explicit(&bm->pp_running, 0, memory_order_release);
+	xtc_atomic_store_i32(&bm->pp_running, 0, xtc_mo_release);
 	bg_wake(&bm->pp_alive, bm->pp_pid);   /* it may be in a long idle sleep */
 	/* Wait for the proc to observe the flag and exit before a caller
 	 * (e.g. bm_destroy) frees the buffer manager out from under it.
 	 * On a loop, parking lets the proc wake from its interval sleep,
 	 * see the flag, and return.  Off a loop xtc_proc_sleep fails and
 	 * the proc has already drained, so we stop immediately. */
-	for (i = 0; i < 100000 &&
-	    atomic_load_explicit(&bm->pp_alive, memory_order_acquire); i++)
+	for (i = 0;
+	     i < 100000 && xtc_atomic_load_i32(&bm->pp_alive, xtc_mo_acquire);
+	     i++)
 		if (xtc_proc_sleep(200LL * 1000) != XTC_OK) break;
 }
 
@@ -3511,34 +3618,40 @@ bm_get_stats(bm_t *bm, bm_stats_t *out)
 {
 	if (bm == NULL || out == NULL) return;
 	out->hits = xs_ctr_sum(&bm->s_hits);
-	out->rescues = atomic_load_explicit(&bm->s_rescues, memory_order_relaxed);
-	out->loads = atomic_load_explicit(&bm->s_loads, memory_order_relaxed);
-	out->cooled = atomic_load_explicit(&bm->s_cooled, memory_order_relaxed);
-	out->flushed = atomic_load_explicit(&bm->s_flushed, memory_order_relaxed);
-	out->evicted = atomic_load_explicit(&bm->s_evicted, memory_order_relaxed);
-	out->resident = atomic_load_explicit(&bm->resident, memory_order_relaxed);
-	out->free_frames = atomic_load_explicit(&bm->free_n, memory_order_relaxed);
-	out->prefetched = atomic_load_explicit(&bm->s_prefetched, memory_order_relaxed);
-	out->trickled = atomic_load_explicit(&bm->s_trickled, memory_order_relaxed);
-	out->tr_writes = atomic_load_explicit(&bm->s_tr_writes, memory_order_relaxed);
-	out->evict_flushes = atomic_load_explicit(&bm->s_evict_flush, memory_order_relaxed);
-	out->dirty_backlog = atomic_load_explicit(&bm->s_dirty_backlog, memory_order_relaxed);
-	out->tr_passes = atomic_load_explicit(&bm->s_tr_passes, memory_order_relaxed);
-	out->tr_visited = atomic_load_explicit(&bm->s_tr_visited, memory_order_relaxed);
-	out->tr_adaptive = atomic_load_explicit(&bm->s_tr_adaptive, memory_order_relaxed);
-	out->dw_repaired = atomic_load_explicit(&bm->s_dw_repaired, memory_order_relaxed);
-	out->dw_writes = atomic_load_explicit(&bm->s_dw_writes, memory_order_relaxed);
-	out->freed = atomic_load_explicit(&bm->s_freed, memory_order_relaxed);
-	out->reissued = atomic_load_explicit(&bm->s_reissued, memory_order_relaxed);
+	out->rescues = xtc_atomic_load_u64(&bm->s_rescues, xtc_mo_relaxed);
+	out->loads = xtc_atomic_load_u64(&bm->s_loads, xtc_mo_relaxed);
+	out->cooled = xtc_atomic_load_u64(&bm->s_cooled, xtc_mo_relaxed);
+	out->flushed = xtc_atomic_load_u64(&bm->s_flushed, xtc_mo_relaxed);
+	out->evicted = xtc_atomic_load_u64(&bm->s_evicted, xtc_mo_relaxed);
+	out->resident = xtc_atomic_load_u64(&bm->resident, xtc_mo_relaxed);
+	out->free_frames = xtc_atomic_load_u32(&bm->free_n, xtc_mo_relaxed);
+	out->prefetched =
+	    xtc_atomic_load_u64(&bm->s_prefetched, xtc_mo_relaxed);
+	out->trickled = xtc_atomic_load_u64(&bm->s_trickled, xtc_mo_relaxed);
+	out->tr_writes = xtc_atomic_load_u64(&bm->s_tr_writes, xtc_mo_relaxed);
+	out->evict_flushes =
+	    xtc_atomic_load_u64(&bm->s_evict_flush, xtc_mo_relaxed);
+	out->dirty_backlog =
+	    xtc_atomic_load_u32(&bm->s_dirty_backlog, xtc_mo_relaxed);
+	out->tr_passes = xtc_atomic_load_u64(&bm->s_tr_passes, xtc_mo_relaxed);
+	out->tr_visited =
+	    xtc_atomic_load_u64(&bm->s_tr_visited, xtc_mo_relaxed);
+	out->tr_adaptive =
+	    xtc_atomic_load_u64(&bm->s_tr_adaptive, xtc_mo_relaxed);
+	out->dw_repaired =
+	    xtc_atomic_load_u64(&bm->s_dw_repaired, xtc_mo_relaxed);
+	out->dw_writes = xtc_atomic_load_u64(&bm->s_dw_writes, xtc_mo_relaxed);
+	out->freed = xtc_atomic_load_u64(&bm->s_freed, xtc_mo_relaxed);
+	out->reissued = xtc_atomic_load_u64(&bm->s_reissued, xtc_mo_relaxed);
 	out->free_pids = bm->free_pids_n;   /* approximate (read without the pid lock) */
 	out->fl_loaded = bm->s_fl_loaded;
 	out->fl_pages = bm->s_fl_pages;
-	out->allocs = atomic_load_explicit(&bm->s_allocs, memory_order_relaxed);
-	out->advances = atomic_load_explicit(&bm->s_advances, memory_order_relaxed);
-	out->adv_max = atomic_load_explicit(&bm->s_adv_max, memory_order_relaxed);
-	out->forced_claims = atomic_load_explicit(&bm->s_forced, memory_order_relaxed);
-	out->cksum_failures = atomic_load_explicit(&bm->s_cksum_bad,
-	    memory_order_relaxed);
+	out->allocs = xtc_atomic_load_u64(&bm->s_allocs, xtc_mo_relaxed);
+	out->advances = xtc_atomic_load_u64(&bm->s_advances, xtc_mo_relaxed);
+	out->adv_max = xtc_atomic_load_u64(&bm->s_adv_max, xtc_mo_relaxed);
+	out->forced_claims = xtc_atomic_load_u64(&bm->s_forced, xtc_mo_relaxed);
+	out->cksum_failures =
+	    xtc_atomic_load_u64(&bm->s_cksum_bad, xtc_mo_relaxed);
 }
 
 /* ---- persistence: superblock, sync, checkpoint ---- */
@@ -3688,10 +3801,9 @@ fl_save(bm_t *bm, uint8_t *tr)
 	 * them does not grow it.  The end is the last page written, not the
 	 * file's: a preallocated tail holds no page (pf_trim drops it). */
 	end = lseek(bm->fd, 0, SEEK_END);
-	if (end > 0 && (uint64_t)end > atomic_load_explicit(&bm->wr_end,
-	    memory_order_relaxed))
-		end = (off_t)atomic_load_explicit(&bm->wr_end,
-		    memory_order_relaxed);
+	if (end > 0 &&
+	    (uint64_t)end > xtc_atomic_load_u64(&bm->wr_end, xtc_mo_relaxed))
+		end = (off_t)xtc_atomic_load_u64(&bm->wr_end, xtc_mo_relaxed);
 	qsort(ids, (size_t)n, sizeof *ids, fl_cmp_asc);
 	while (n > 0 && (end <= 0 ||
 	    (off_t)ids[n - 1] >= end / (off_t)bm->page_size))
@@ -3904,7 +4016,7 @@ bm_checkpoint(bm_t *bm)
 	int rc;
 	for (i = 0; i < bm->n_frames; i++) {
 		bm_frame_t *f = &bm->frames[i];
-		if (atomic_load_explicit(&f->dirty, memory_order_acquire) &&
+		if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire) &&
 		    !flush_frame(bm, f))
 			left++;
 	}

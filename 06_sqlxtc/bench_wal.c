@@ -25,7 +25,6 @@
 #include <pthread.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,8 +43,8 @@
 static wal_t           *g_wal;
 static int              g_len;
 static int64_t          g_end;
-static _Atomic int      g_bfail;
-static _Atomic int      g_live;
+static int g_bfail;
+static int g_live;
 static uint32_t        *g_lat[MAXC];
 static long             g_n[MAXC];
 
@@ -55,7 +54,7 @@ commit_loop(int id)
 	uint8_t *rec = xtc_malloc((size_t)g_len > 0 ? (size_t)g_len : 1);
 	long n = 0;
 	if (rec == NULL) {
-		atomic_store(&g_bfail, 1);
+		xtc_atomic_store_i32(&g_bfail, 1, xtc_mo_seq_cst);
 		return;
 	}
 	memset(rec, id & 0xff, (size_t)g_len);
@@ -63,7 +62,7 @@ commit_loop(int id)
 		uint64_t lsn;
 		int64_t t0 = xtc_clock_mono();
 		if (wal_commit(g_wal, rec, (uint32_t)g_len, &lsn) != XTC_OK) {
-			atomic_store(&g_bfail, 1);
+			xtc_atomic_store_i32(&g_bfail, 1, xtc_mo_seq_cst);
 			break;
 		}
 		if (n < (long)NLAT)
@@ -85,7 +84,7 @@ static void
 proc_main(void *arg)
 {
 	commit_loop((int)(intptr_t)arg);
-	atomic_fetch_sub(&g_live, 1);
+	xtc_atomic_fetch_sub_i32(&g_live, 1, xtc_mo_seq_cst);
 }
 
 static int
@@ -187,7 +186,7 @@ main(int argc, char **argv)
 	if (fiber) {
 		if (xtc_exec_init(&ex, loops) != XTC_OK)
 			return 1;
-		atomic_store(&g_live, c);
+		xtc_atomic_store_i32(&g_live, c, xtc_mo_seq_cst);
 		for (i = 0; i < c; i++) {
 			xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "committer" };
 			xtc_pid_t p;
@@ -231,5 +230,5 @@ main(int argc, char **argv)
 		printf("replay,%ld,%.3f\n", nrec, el);
 	}
 	unlink(path);
-	return atomic_load(&g_bfail) ? 1 : 0;
+	return xtc_atomic_load_i32(&g_bfail, xtc_mo_seq_cst) ? 1 : 0;
 }

@@ -21,7 +21,6 @@
  *	and the test passes without exercising the window; it then says so.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 
 #include "xtc.h"
@@ -29,7 +28,7 @@
 #include "xtc_preempt_involuntary.h"
 
 static volatile unsigned long g_spin;
-static atomic_int g_in_init;
+static int g_in_init;
 static uint64_t   g_ticks_in_init;
 
 /* 20 ms of CPU inside the init, long enough for many 50 us ticks.  The
@@ -41,7 +40,7 @@ crc_init_spin(void)
 {
 	int64_t end = xtc_clock_mono() + 20000000;
 	uint64_t t0 = xtc_preempt_ticks();
-	atomic_store(&g_in_init, 1);
+	xtc_atomic_store_i32(&g_in_init, 1, xtc_mo_seq_cst);
 	while (xtc_clock_mono() < end)
 		g_spin++;
 	g_ticks_in_init = xtc_preempt_ticks() - t0;
@@ -52,7 +51,7 @@ crc_init_spin(void)
 
 #include "xtc_exec.h"
 
-static atomic_int g_done;
+static int g_done;
 static uint32_t   g_sum[2];
 
 static void
@@ -62,7 +61,7 @@ crc_fiber(void *arg)
 	int i = (int)(intptr_t)arg;
 
 	g_sum[i] = wal_c32c(~0u, buf, sizeof buf);
-	atomic_fetch_add(&g_done, 1);
+	xtc_atomic_fetch_add_i32(&g_done, 1, xtc_mo_seq_cst);
 }
 
 static void *
@@ -70,11 +69,14 @@ watchdog(void *arg)
 {
 	int i;
 	(void)arg;
-	for (i = 0; i < 1000 && atomic_load(&g_done) < 2; i++)
+	for (i = 0;
+	     i < 1000 && xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst) < 2; i++)
 		(void)xtc_sleep_ns(10 * 1000 * 1000);
-	if (atomic_load(&g_done) < 2) {
-		fprintf(stderr, "FAIL: the loop wedged in the CRC32C init "
-		    "(%d of 2 checksums done)\n", atomic_load(&g_done));
+	if (xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst) < 2) {
+		fprintf(stderr,
+		    "FAIL: the loop wedged in the CRC32C init "
+		    "(%d of 2 checksums done)\n",
+		    xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst));
 		abort();
 	}
 	return NULL;
@@ -113,9 +115,11 @@ main(void)
 	(void)xtc_preempt_set_involuntary(0);
 	(void)xtc_exec_fini(e);
 
-	if (!atomic_load(&g_in_init) || g_sum[0] != g_sum[1]) {
+	if (!xtc_atomic_load_i32(&g_in_init, xtc_mo_seq_cst) ||
+	    g_sum[0] != g_sum[1]) {
 		fprintf(stderr, "FAIL: init ran %d, sums %08x %08x\n",
-		    atomic_load(&g_in_init), g_sum[0], g_sum[1]);
+		    xtc_atomic_load_i32(&g_in_init, xtc_mo_seq_cst), g_sum[0],
+		    g_sum[1]);
 		return 1;
 	}
 	printf("ok   the CRC32C init defers preemption: 2 fibers, 1 loop, "

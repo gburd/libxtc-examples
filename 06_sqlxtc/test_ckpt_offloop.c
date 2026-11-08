@@ -32,7 +32,6 @@
 #define _GNU_SOURCE                  /* RTLD_NEXT */
 #endif
 #include <dlfcn.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,8 +51,8 @@
 #define PAD           200
 #define SLOW_FSYNC_MS 150
 
-static _Atomic int  g_done, g_fsyncs;
-static _Atomic long g_last[NROW];
+static int g_done, g_fsyncs;
+static long g_last[NROW];
 static int64_t      g_max_gap;
 static uint64_t     g_ck0;
 
@@ -66,7 +65,7 @@ fsync(int fd)
 	struct timespec ts = { 0, SLOW_FSYNC_MS * 1000000L };
 	if (real == NULL)
 		*(void **)&real = dlsym(RTLD_NEXT, "fsync");
-	atomic_fetch_add(&g_fsyncs, 1);
+	xtc_atomic_fetch_add_i32(&g_fsyncs, 1, xtc_mo_seq_cst);
 	(void)nanosleep(&ts, NULL);
 	return real(fd);
 }
@@ -86,11 +85,11 @@ committer(void *arg)
 		snprintf(sql, sizeof sql, "UPDATE t SET v=%d, pad='%s' WHERE k=%d",
 		    r, pad, row);
 		if (sx_exec(h, sql, NULL) != SX_OK) { g_fail = 1; break; }
-		atomic_store(&g_last[row], r);
+		xtc_atomic_store_long(&g_last[row], r, xtc_mo_seq_cst);
 	}
 	sx_close(h);
 out:
-	atomic_store(&g_done, 1);
+	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	sx_storage_quiesce();
 }
 
@@ -99,7 +98,7 @@ ticker(void *arg)
 {
 	int64_t prev = xtc_clock_mono(), now;
 	(void)arg;
-	while (!atomic_load(&g_done)) {
+	while (!xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst)) {
 		(void)xtc_proc_sleep(1LL * 1000 * 1000);
 		now = xtc_clock_mono();
 		if (now - prev > g_max_gap)
@@ -143,12 +142,12 @@ main(void)
 	for (i = 0; i < NROW; i++) {
 		snprintf(sql, sizeof sql, "INSERT INTO t(k,v,pad) VALUES(%d,-1,'')", i);
 		CK(sx_exec(h, sql, NULL) == SX_OK);
-		atomic_store(&g_last[i], -1);
+		xtc_atomic_store_long(&g_last[i], -1, xtc_mo_seq_cst);
 	}
 	sx_close(h);
 
 	ck = g_ck0 = sx_storage_checkpoints();
-	nf = atomic_load(&g_fsyncs);
+	nf = xtc_atomic_load_i32(&g_fsyncs, xtc_mo_seq_cst);
 	if (xtc_loop_init(&loop) != XTC_OK) return 1;
 	CK(sx_storage_run(loop) == SX_OK);
 	if (xtc_proc_spawn(loop, committer, NULL, &po, &pid) != XTC_OK) return 1;
@@ -157,14 +156,16 @@ main(void)
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
 	(void)xtc_loop_fini(loop);
 	ck = sx_storage_checkpoints() - ck;
-	nf = atomic_load(&g_fsyncs) - nf;
+	nf = xtc_atomic_load_i32(&g_fsyncs, xtc_mo_seq_cst) - nf;
 
 	sx_storage_abandon();                         /* crash */
 	CK(sx_storage_open(path, 256) == SX_OK);
 	CK(sx_open(":memory:", &h) == SX_OK);
 	for (i = 0; i < NROW; i++) {
 		snprintf(sql, sizeof sql, "SELECT v FROM t WHERE k=%d", i);
-		if (one(h, sql) != atomic_load(&g_last[i])) bad++;
+		if (one(h, sql) !=
+		    xtc_atomic_load_long(&g_last[i], xtc_mo_seq_cst))
+			bad++;
 	}
 	sx_close(h);
 	(void)sx_storage_close();

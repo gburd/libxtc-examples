@@ -37,11 +37,15 @@ pins_balanced(bm_t *bm)
 {
 	uint32_t i;
 	for (i = 0; i < bm->n_frames; i++) {
-		int p = atomic_load(&bm->frames[i].pin);
-		int st = atomic_load(&bm->frames[i].state);
+		int p = xtc_atomic_load_i32(&bm->frames[i].pin, xtc_mo_seq_cst);
+		int st =
+		    xtc_atomic_load_u8(&bm->frames[i].state, xtc_mo_seq_cst);
 		if (st != BM_FREE && p != 0) {
 			fprintf(stderr, "  frame %u pid %llu pin %d\n", i,
-			    (unsigned long long)bm->frames[i].pid, p);
+			    (unsigned long long)
+			        xtc_atomic_load_u64(&bm->frames[i].pid,
+			            xtc_mo_seq_cst),
+			    p);
 			return 0;
 		}
 	}
@@ -55,7 +59,7 @@ check_held(bt_t *bt, bm_frame_t *f, const char *key, uint16_t kl)
 {
 	void *pg = bm_page(f);
 	int found = 0;
-	TCK(atomic_load(&f->pin) == 1);
+	TCK(xtc_atomic_load_i32(&f->pin, xtc_mo_seq_cst) == 1);
 	TCK(btnode_is_leaf(pg));
 	TCK(!btnode_is_dead(pg));
 	(void)btnode_search(pg, key, kl, &found);
@@ -88,7 +92,7 @@ main(void)
 		vl = (uint16_t)snprintf(v, sizeof v, "v%d", i);
 		TCK(bt_insert(bt, k, kl, v, vl) == XTC_OK);
 	}
-	TCK(atomic_load(&bt->st_height) > 1);
+	TCK(xtc_atomic_load_u64(&bt->st_height, xtc_mo_seq_cst) > 1);
 	TCK(pins_balanced(bm));
 	mkkey(N_KEYS / 2, k, &kl);
 

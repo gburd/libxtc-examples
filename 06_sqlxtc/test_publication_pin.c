@@ -28,15 +28,18 @@ publish_hook(bm_t *bm, bm_frame_t *f)
 		return;
 	armed = 0;
 	hook_calls++;
-	published_pin = atomic_load(&f->pin);
+	published_pin = xtc_atomic_load_i32(&f->pin, xtc_mo_seq_cst);
 	CK(published_pin == 1);
-	CK(atomic_load(&bm->buckets[f->pid % bm->nbucket]) == f);
+	CK(xtc_atomic_load_ptr(&bm->buckets[xtc_atomic_load_u64(&f->pid,
+	                                        xtc_mo_seq_cst) %
+	                           bm->nbucket],
+	       xtc_mo_seq_cst) == f);
 	/* A slow-path lookup would deadlock on the publisher's stripe.
 	 * The real lock-free HIT must acquire a second, independent pin. */
 	reader_rc = bm_fix_pid(bm, bm_frame_pid(f), &reader);
 	CK(reader_rc == XTC_OK);
 	CK(reader == f);
-	reader_pin = atomic_load(&f->pin);
+	reader_pin = xtc_atomic_load_i32(&f->pin, xtc_mo_seq_cst);
 	CK(reader_pin == 2);
 }
 
@@ -89,11 +92,11 @@ run(int allocate, int scan_resist)
 	CK(hook_calls == 1);
 	if (rc != XTC_OK || reader_rc != XTC_OK || reader != original)
 		goto err;
-	after_publish = atomic_load(&original->pin);
+	after_publish = xtc_atomic_load_i32(&original->pin, xtc_mo_seq_cst);
 	CK(after_publish == 2);
 	CK(memcmp(bm_page(reader), expected, sizeof expected) == 0);
 	bm_unfix(bm, reader, 0);
-	after_unfix = atomic_load(&original->pin);
+	after_unfix = xtc_atomic_load_i32(&original->pin, xtc_mo_seq_cst);
 	CK(after_unfix == 1);
 	printf("%s scan_resist=%d: publication=%d reader=%d resumed=%d "
 	    "reader-unfix=%d\n", allocate ? "alloc" : "fix", scan_resist,
@@ -102,7 +105,7 @@ run(int allocate, int scan_resist)
 	/* Model a merge dropping the page while the original caller still
 	 * owns its pin. Reallocation must neither recycle nor overwrite it. */
 	CK(bm_free_pid(bm, pid) == XTC_OK);
-	CK(atomic_load(&original->state) != BM_FREE);
+	CK(xtc_atomic_load_u8(&original->state, xtc_mo_seq_cst) != BM_FREE);
 	if (bm_alloc_pid(bm, &replacement, &replacement_pid) != XTC_OK)
 		goto err;
 	CK(replacement != original);

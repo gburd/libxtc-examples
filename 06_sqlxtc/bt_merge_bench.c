@@ -28,7 +28,6 @@
  *	Reports ops/s, merges/s, reclaim rate, and final tree height.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,8 +45,8 @@ static bt_t        *g_bt;
 static bm_t        *g_bm;
 static int64_t      g_deadline_ns;
 static int           g_window;
-static _Atomic long g_ops;
-static _Atomic int  g_workers_left;
+static long g_ops;
+static int g_workers_left;
 
 static int64_t
 now_ns(void)
@@ -95,12 +94,11 @@ worker_proc(void *arg)
 			(void)bt_insert(g_bt, k, (uint16_t)strlen(k), v,
 			    (uint16_t)strlen(v));
 			next++;
-			atomic_fetch_add_explicit(&g_ops, 2,
-			    memory_order_relaxed);
+			xtc_atomic_fetch_add_long(&g_ops, 2, xtc_mo_relaxed);
 		}
 	}
 
-	if (atomic_fetch_sub(&g_workers_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_workers_left, 1, xtc_mo_seq_cst) == 1)
 		bm_provider_stop(g_bm);
 }
 
@@ -137,8 +135,8 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	atomic_store(&g_ops, 0);
-	atomic_store(&g_workers_left, workers);
+	xtc_atomic_store_long(&g_ops, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_workers_left, workers, xtc_mo_seq_cst);
 
 	if (xtc_exec_init(&exec, n_loops) != XTC_OK) {
 		fprintf(stderr, "exec_init\n");
@@ -169,7 +167,7 @@ main(int argc, char **argv)
 	(void)xtc_exec_fini(exec);
 
 	elapsed = (double)(now_ns() - t0) / 1e9;
-	ops = atomic_load(&g_ops);
+	ops = xtc_atomic_load_long(&g_ops, xtc_mo_seq_cst);
 	bt_get_stats(g_bt, &ts);
 	bm_get_stats(g_bm, &bs);
 	bt_close(g_bt);

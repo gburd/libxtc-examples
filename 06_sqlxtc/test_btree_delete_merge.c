@@ -25,7 +25,6 @@
  *	  make test_btree_delete_merge && ./test_btree_delete_merge
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -555,8 +554,8 @@ test_no_bloat_churn(void)
 
 static bm_t       *g_cm_bm;
 static bt_t       *g_cm_bt;
-static _Atomic int g_cm_left;
-static _Atomic int g_cm_dup;   /* max duplicate-pid count any probe ever saw */
+static int g_cm_left;
+static int g_cm_dup; /* max duplicate-pid count any probe ever saw */
 
 static void
 cm_anchor_kv(int i, char *k, char *v)
@@ -607,12 +606,14 @@ cm_churner(void *arg)
 			 * Sample periodically so the scan does not dominate. */
 			if ((i & 63) == 0) {
 				uint32_t d = bm_dbg_dup_pid(g_cm_bm);
-				if ((int)d > atomic_load(&g_cm_dup))
-					atomic_store(&g_cm_dup, (int)d);
+				if ((int)d > xtc_atomic_load_i32(&g_cm_dup,
+				                 xtc_mo_seq_cst))
+					xtc_atomic_store_i32(&g_cm_dup, (int)d,
+					    xtc_mo_seq_cst);
 			}
 		}
 	}
-	if (atomic_fetch_sub(&g_cm_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_cm_left, 1, xtc_mo_seq_cst) == 1)
 		bm_provider_stop(g_cm_bm);
 }
 
@@ -638,7 +639,7 @@ test_concurrent_merge(void)
 	bo.cool_pct = 25;
 	CHECK(bm_create(&bo, &g_cm_bm) == XTC_OK, "bm_create cmerge");
 	CHECK(bt_open(g_cm_bm, &g_cm_bt) == XTC_OK, "bt_open cmerge");
-	atomic_store(&g_cm_dup, 0);
+	xtc_atomic_store_i32(&g_cm_dup, 0, xtc_mo_seq_cst);
 
 	/* Lay down the anchor set that the churners never touch. */
 	for (i = 0; i < CM_ANCHORS; i++) {
@@ -648,7 +649,7 @@ test_concurrent_merge(void)
 		    (uint16_t)strlen(v)) == XTC_OK, "anchor insert %d", i);
 	}
 
-	atomic_store(&g_cm_left, CM_CHURNERS);
+	xtc_atomic_store_i32(&g_cm_left, CM_CHURNERS, xtc_mo_seq_cst);
 	CHECK(xtc_exec_init(&exec, CM_LOOPS) == XTC_OK, "exec_init cmerge");
 	l0 = xtc_exec_loop(exec, 0);
 	CHECK(bm_provider_spawn(g_cm_bm, l0, 1LL * 1000 * 1000, NULL) == XTC_OK,
@@ -684,9 +685,9 @@ test_concurrent_merge(void)
 	 * ever mapped two resident frames.  A duplicate is the exact bufmgr
 	 * aliasing bug the interlock closes (two frames -> divergent page
 	 * copies handed to different callers -> corruption). */
-	CHECK(atomic_load(&g_cm_dup) == 0,
+	CHECK(xtc_atomic_load_i32(&g_cm_dup, xtc_mo_seq_cst) == 0,
 	    "a pid mapped two frames during the storm (max dup=%d)",
-	    atomic_load(&g_cm_dup));
+	    xtc_atomic_load_i32(&g_cm_dup, xtc_mo_seq_cst));
 	CHECK(bm_dbg_dup_pid(g_cm_bm) == 0,
 	    "a pid maps two frames after the storm");
 

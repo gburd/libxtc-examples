@@ -42,7 +42,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,9 +57,9 @@
 static struct sockaddr_in g_sa;
 static int g_topics, g_prod, g_cons, g_vlen, g_batch;
 static double g_end;
-static _Atomic int g_prod_done, g_err;
-static _Atomic uint64_t g_produced, g_consumed;
-static _Atomic uint64_t g_acked[MAXT];     /* records acked per topic */
+static int g_prod_done, g_err;
+static uint64_t g_produced, g_consumed;
+static uint64_t g_acked[MAXT]; /* records acked per topic */
 
 static void
 put32(uint8_t *p, uint32_t v)
@@ -93,7 +93,7 @@ now_s(void)
 static void
 fail(const char *what, unsigned a, unsigned long long b)
 {
-	if (atomic_fetch_add(&g_err, 1) < 8)
+	if (xtc_atomic_fetch_add_i32(&g_err, 1, xtc_mo_seq_cst) < 8)
 		fprintf(stderr, "FAIL: %s (%u, %llu)\n", what, a, b);
 }
 
@@ -215,8 +215,10 @@ producer(void *arg)
 			fail("produce", (unsigned)id, seq);
 			break;
 		}
-		atomic_fetch_add(&g_acked[t], (uint64_t)g_batch);
-		atomic_fetch_add(&g_produced, (uint64_t)g_batch);
+		xtc_atomic_fetch_add_u64(&g_acked[t], (uint64_t)g_batch,
+		    xtc_mo_seq_cst);
+		xtc_atomic_fetch_add_u64(&g_produced, (uint64_t)g_batch,
+		    xtc_mo_seq_cst);
 	}
 	close(fd);
 	free(p);
@@ -244,8 +246,8 @@ consumer(void *arg)
 	for (;;) {
 		/* Done when the producers have stopped and this consumer has
 		 * read every record they had acknowledged for its topic. */
-		if (atomic_load(&g_prod_done) &&
-		    off >= atomic_load(&g_acked[t]))
+		if (xtc_atomic_load_i32(&g_prod_done, xtc_mo_seq_cst) &&
+		    off >= xtc_atomic_load_u64(&g_acked[t], xtc_mo_seq_cst))
 			break;
 		at = 5;
 		req[at++] = (uint8_t)(tl >> 8);
@@ -314,7 +316,7 @@ consumer(void *arg)
 		}
 	}
 out:
-	atomic_fetch_add(&g_consumed, got);
+	xtc_atomic_fetch_add_u64(&g_consumed, got, xtc_mo_seq_cst);
 	close(fd);
 	free(rbuf);
 	return NULL;
@@ -357,24 +359,31 @@ main(int argc, char **argv)
 	for (i = 0; i < g_prod; i++)
 		pthread_join(pt[i], NULL);
 	t1 = now_s();
-	atomic_store(&g_prod_done, 1);
+	xtc_atomic_store_i32(&g_prod_done, 1, xtc_mo_seq_cst);
 	for (i = 0; i < g_cons; i++)
 		pthread_join(ct[i], NULL);
 	t2 = now_s();
 	/* every consumer read its whole topic: sum over consumers */
 	want = 0;
 	for (i = 0; i < g_cons; i++)
-		want += atomic_load(&g_acked[i % g_topics]);
-	if (atomic_load(&g_err) == 0 && atomic_load(&g_consumed) != want)
+		want +=
+		    xtc_atomic_load_u64(&g_acked[i % g_topics], xtc_mo_seq_cst);
+	if (xtc_atomic_load_i32(&g_err, xtc_mo_seq_cst) == 0 &&
+	    xtc_atomic_load_u64(&g_consumed, xtc_mo_seq_cst) != want)
 		fail("consumers short of the acked total",
-		    (unsigned)atomic_load(&g_consumed), want);
+		    (unsigned)xtc_atomic_load_u64(&g_consumed, xtc_mo_seq_cst),
+		    want);
 	rec_mib = (double)(16 + 8 + g_vlen) / (1024.0 * 1024.0);
 	printf("produced=%llu acked_MiB_s=%.1f consumed=%llu "
-	    "consumed_MiB_s=%.1f drain_s=%.2f errors=%d\n",
-	    (unsigned long long)atomic_load(&g_produced),
-	    (double)atomic_load(&g_produced) * rec_mib / (t1 - t0),
-	    (unsigned long long)atomic_load(&g_consumed),
-	    (double)atomic_load(&g_consumed) * rec_mib / (t2 - t0),
-	    t2 - t1, atomic_load(&g_err));
-	return atomic_load(&g_err) ? 1 : 0;
+	       "consumed_MiB_s=%.1f drain_s=%.2f errors=%d\n",
+	    (unsigned long long)xtc_atomic_load_u64(&g_produced,
+	        xtc_mo_seq_cst),
+	    (double)xtc_atomic_load_u64(&g_produced, xtc_mo_seq_cst) * rec_mib /
+	        (t1 - t0),
+	    (unsigned long long)xtc_atomic_load_u64(&g_consumed,
+	        xtc_mo_seq_cst),
+	    (double)xtc_atomic_load_u64(&g_consumed, xtc_mo_seq_cst) * rec_mib /
+	        (t2 - t0),
+	    t2 - t1, xtc_atomic_load_i32(&g_err, xtc_mo_seq_cst));
+	return xtc_atomic_load_i32(&g_err, xtc_mo_seq_cst) ? 1 : 0;
 }

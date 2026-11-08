@@ -17,7 +17,6 @@
 #include <getopt.h>
 #include <sched.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,10 +41,8 @@
 #include "conn.h"
 #include "db.h"
 #include "engine.h"
-extern int metrics_spawn(xtc_loop_t *loop, xtc_res_t *res,
-                         _Atomic int *conn_count,
-                         _Atomic int64_t *queries_total,
-                         xtc_pid_t *out_pid);
+extern int metrics_spawn(xtc_loop_t *loop, xtc_res_t *res, int *conn_count,
+    int64_t *queries_total, xtc_pid_t *out_pid);
 extern void metrics_stop(void);
 
 typedef struct server_cfg {
@@ -90,17 +87,17 @@ typedef struct server {
 	xtc_loop_t   *loop;            /* loop 0: listener, metrics, storage */
 	xtc_exec_t   *exec;           /* N worker loops (NULL if single-loop) */
 	int           n_loops;
-	_Atomic unsigned next_loop;   /* round-robin cursor for conn placement */
+	unsigned next_loop; /* round-robin cursor for conn placement */
 	int           listen_fd;
 
-	_Atomic int      conn_count;
-	_Atomic int64_t  queries_total;
+	int conn_count;
+	int64_t queries_total;
 
-	_Atomic int64_t  iops_tokens;
+	int64_t iops_tokens;
 	int64_t          iops_refill_ns;
 	int64_t          iops_last_refill;
 
-	_Atomic int      shutdown_requested;
+	int shutdown_requested;
 } server_t;
 
 static server_t g_server;
@@ -109,13 +106,13 @@ static server_t g_server;
  * out of restarts (sx_storage_on_failure; runs on a proc on loop 0).
  * Stop the server through the SIGTERM path -- the drain_on_signal
  * handler only writes its self-pipe -- and exit non-zero. */
-static _Atomic int g_storage_failed;
+static int g_storage_failed;
 
 static void
 storage_failed(const char *what, void *arg)
 {
 	(void)arg;
-	if (atomic_exchange(&g_storage_failed, 1))
+	if (xtc_atomic_exchange_i32(&g_storage_failed, 1, xtc_mo_seq_cst))
 		return;
 	XTC_LOG_ERROR_F("sqlxtc: storage proc %s exited; stopping the server",
 	    what);
@@ -123,16 +120,23 @@ storage_failed(const char *what, void *arg)
 }
 
 void
-server_inc_conn(server_t *s) { atomic_fetch_add(&s->conn_count, 1); }
+server_inc_conn(server_t *s)
+{
+	xtc_atomic_fetch_add_i32(&s->conn_count, 1, xtc_mo_seq_cst);
+}
 
 void
-server_dec_conn(server_t *s) { atomic_fetch_sub(&s->conn_count, 1); }
+server_dec_conn(server_t *s)
+{
+	xtc_atomic_fetch_sub_i32(&s->conn_count, 1, xtc_mo_seq_cst);
+}
 
 static void
 rate_limit_init(server_t *s)
 {
 	if (s->cfg.max_iops > 0) {
-		atomic_store(&s->iops_tokens, s->cfg.max_iops);
+		xtc_atomic_store_i64(&s->iops_tokens, s->cfg.max_iops,
+		    xtc_mo_seq_cst);
 		s->iops_refill_ns = 1000000000LL;
 		s->iops_last_refill = xtc_clock_mono();
 	}
@@ -145,7 +149,8 @@ rate_limit_refill(server_t *s)
 	if (s->cfg.max_iops <= 0) return;
 	now = xtc_clock_mono();
 	if (now - s->iops_last_refill >= s->iops_refill_ns) {
-		atomic_store(&s->iops_tokens, s->cfg.max_iops);
+		xtc_atomic_store_i64(&s->iops_tokens, s->cfg.max_iops,
+		    xtc_mo_seq_cst);
 		s->iops_last_refill = now;
 	}
 }
@@ -218,7 +223,7 @@ listener_proc(void *arg)
 	void *msg; size_t msg_len;
 	xtc_tcp_opts_t nodelay = { .size = sizeof(xtc_tcp_opts_t), .nodelay = 1 };
 
-	while (!atomic_load(&srv->shutdown_requested)) {
+	while (!xtc_atomic_load_i32(&srv->shutdown_requested, xtc_mo_seq_cst)) {
 		rate_limit_refill(srv);
 		for (;;) {
 			int fd = -1, arc;
@@ -241,7 +246,8 @@ listener_proc(void *arg)
 				break;                    /* transient; wait for readiness */
 
 			if (srv->cfg.max_clients > 0 &&
-			    atomic_load(&srv->conn_count) >= srv->cfg.max_clients) {
+			    xtc_atomic_load_i32(&srv->conn_count,
+			        xtc_mo_seq_cst) >= srv->cfg.max_clients) {
 				const char *reject =
 				    "{\"err\":\"max_clients\"}\n";
 				(void)send(fd, reject, strlen(reject),
@@ -271,8 +277,10 @@ listener_proc(void *arg)
 			xtc_loop_t *cl = srv->loop;
 			if (srv->exec != NULL && srv->n_loops > 1)
 				cl = xtc_exec_loop(srv->exec,
-				    (int)(atomic_fetch_add(&srv->next_loop, 1) %
-				          (unsigned)srv->n_loops));
+				    (int)(xtc_atomic_fetch_add_u32(
+				              &srv->next_loop, 1,
+				              xtc_mo_seq_cst) %
+				        (unsigned)srv->n_loops));
 			/* Count it BEFORE the spawn (as rexis does): the proc
 			 * runs on another loop and can exit -- and decrement --
 			 * before conn_spawn returns, which drove the count
@@ -295,7 +303,9 @@ listener_proc(void *arg)
 			if (revents & XTC_WAIT_MAILBOX) {
 				while (xtc_recv(&msg, &msg_len, 0) == XTC_OK) {
 					if (xtc_app_is_shutdown_msg(msg, msg_len))
-						atomic_store(&srv->shutdown_requested, 1);
+						xtc_atomic_store_i32(
+						    &srv->shutdown_requested, 1,
+						    xtc_mo_seq_cst);
 					if (msg) xtc_free(msg);
 				}
 			}
@@ -441,10 +451,11 @@ main(int argc, char **argv)
 	/* 1 = --help (success), -1 = bad option (usage already printed). */
 	if ((rc = parse_args(argc, argv, &cfg)) != 0) return rc > 0 ? 0 : 1;
 	srv->cfg = cfg;
-	atomic_init(&srv->conn_count, 0);
-	atomic_init(&srv->queries_total, 0);
-	atomic_init(&srv->iops_tokens, cfg.max_iops > 0 ? cfg.max_iops : 0);
-	atomic_init(&srv->shutdown_requested, 0);
+	xtc_atomic_store_i32(&srv->conn_count, 0, xtc_mo_relaxed);
+	xtc_atomic_store_i64(&srv->queries_total, 0, xtc_mo_relaxed);
+	xtc_atomic_store_i64(&srv->iops_tokens,
+	    cfg.max_iops > 0 ? cfg.max_iops : 0, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&srv->shutdown_requested, 0, xtc_mo_relaxed);
 
 	/* Logging. */
 	log_opts.floor = cfg.verbose ? XTC_LOG_DEBUG : XTC_LOG_INFO;
@@ -567,7 +578,7 @@ main(int argc, char **argv)
 		srv->exec = xtc_app_exec(srv->app);   /* NULL when single-loop */
 		srv->n_loops = srv->exec ? xtc_exec_n_loops(srv->exec) : 1;
 		srv->loop = xtc_app_loop(srv->app);   /* loop 0 */
-		atomic_init(&srv->next_loop, 0);
+		xtc_atomic_store_u32(&srv->next_loop, 0, xtc_mo_relaxed);
 
 		/* L3 over-budget stall watchdog (inspired by Glommio -- Glauber
 		 * Costa / ScyllaDB -- its stall detector).  A single SQL query or
@@ -629,7 +640,7 @@ main(int argc, char **argv)
 		    "NOT marked clean (the next start replays the log)\n");
 		exit_rc = 1;
 	}
-	if (atomic_load(&g_storage_failed))
+	if (xtc_atomic_load_i32(&g_storage_failed, xtc_mo_seq_cst))
 		exit_rc = 1;
 	xtc_app_destroy(srv->app);   /* joins the supervisor + frees the exec */
 	free(srv->res);

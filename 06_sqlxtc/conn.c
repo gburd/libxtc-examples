@@ -14,7 +14,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

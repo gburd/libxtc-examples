@@ -12,7 +12,7 @@
 #ifndef PGMOCK_LISTENER_H
 #define PGMOCK_LISTENER_H
 
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 
 #include "xtc_loop.h"
 #include "xtc_proc.h"
@@ -23,13 +23,13 @@
 typedef struct pgmock_listener {
 	int              listen_fd;   /* non-blocking listen socket */
 	xtc_loop_t      *loop;        /* loop to place backends on */
-	_Atomic int     *shutdown;    /* set non-zero to stop the loop */
-	_Atomic int      accepted;    /* connections accepted (observability) */
+	int *shutdown;                /* set non-zero to stop the loop */
+	int accepted;                 /* connections accepted (observability) */
 	/* Optional: the last few backend pids spawned, so a test can assert
 	 * distinct procs serve concurrent connections.  NULL = not tracked. */
 	xtc_pid_t       *pids;        /* array of pids_cap slots */
 	int              pids_cap;
-	_Atomic int      pids_n;      /* number of slots filled */
+	int pids_n; /* number of slots filled */
 } pgmock_listener_t;
 
 /* xtc_proc_fn entry: arg is a pgmock_listener_t *. */

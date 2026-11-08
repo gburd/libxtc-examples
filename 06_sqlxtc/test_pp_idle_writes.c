@@ -62,34 +62,36 @@ main(void)
 		memset(bm_page(f), (int)(i & 0xff), bm->page_size);
 		bm_unfix(bm, f, 1);
 	}
-	CK(atomic_load(&bm->free_n) >= bm->cool_target);
+	CK(xtc_atomic_load_u32(&bm->free_n, xtc_mo_seq_cst) >= bm->cool_target);
 	bm_get_stats(bm, &s0);
 	(void)ticks(bm, &cursor, 4 * ((NF + PP_SLICE - 1) / PP_SLICE));
 	bm_get_stats(bm, &s1);
 	printf("  (a) free %u >= target %u: cooled %llu, flushed %llu\n",
-	    atomic_load(&bm->free_n), bm->cool_target,
+	    xtc_atomic_load_u32(&bm->free_n, xtc_mo_seq_cst), bm->cool_target,
 	    (unsigned long long)(s1.cooled - s0.cooled),
 	    (unsigned long long)(s1.flushed - s0.flushed));
 	CK(s1.cooled == s0.cooled);
 	CK(s1.flushed == s0.flushed);
 
 	/* (b) Drain the free list to half its target: the provider works. */
-	while (atomic_load(&bm->free_n) > bm->cool_target / 2) {
+	while (xtc_atomic_load_u32(&bm->free_n, xtc_mo_seq_cst) >
+	    bm->cool_target / 2) {
 		if (bm_alloc_pid(bm, &f, &pid) != XTC_OK) break;
 		memset(bm_page(f), 0x77, bm->page_size);
 		bm_unfix(bm, f, 1);
 	}
-	CK(atomic_load(&bm->free_n) < bm->cool_target);
+	CK(xtc_atomic_load_u32(&bm->free_n, xtc_mo_seq_cst) < bm->cool_target);
 	bm_get_stats(bm, &s0);
 	(void)ticks(bm, &cursor, 4 * ((NF + PP_SLICE - 1) / PP_SLICE));
 	bm_get_stats(bm, &s1);
 	printf("  (b) free below target: cooled %llu, flushed %llu, free %u\n",
 	    (unsigned long long)(s1.cooled - s0.cooled),
 	    (unsigned long long)(s1.flushed - s0.flushed),
-	    atomic_load(&bm->free_n));
+	    xtc_atomic_load_u32(&bm->free_n, xtc_mo_seq_cst));
 	CK(s1.cooled > s0.cooled);
 	CK(s1.flushed > s0.flushed);
-	CK(atomic_load(&bm->free_n) >= bm->cool_target);   /* refilled */
+	CK(xtc_atomic_load_u32(&bm->free_n, xtc_mo_seq_cst) >=
+	    bm->cool_target); /* refilled */
 
 	bm_destroy(bm);
 	unlink(path);

@@ -13,7 +13,7 @@
  */
 
 #include <stdio.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <unistd.h>
 
 #include "db.h"
@@ -47,8 +47,8 @@ metrics_register(void)
 typedef struct metrics_state {
 	db_t        *db;
 	xtc_res_t   *res;
-	_Atomic int *conn_count;
-	_Atomic int *stop;   /* server shutdown flag */
+	int *conn_count;
+	int *stop; /* server shutdown flag */
 } metrics_state_t;
 
 static void
@@ -62,7 +62,7 @@ metrics_proc(void *arg)
 		(void)xtc_recv(&msg, &msg_len, METRICS_INTERVAL_NS);
 		if (msg)
 			xtc_free(msg);
-		if (atomic_load(st->stop))
+		if (xtc_atomic_load_i32(st->stop, xtc_mo_seq_cst))
 			break;
 
 		/* Update gauges from authoritative state. */
@@ -74,7 +74,8 @@ metrics_proc(void *arg)
 			    (int64_t)db_mem_used(st->db));
 		if (rexis_stat_connections != NULL)
 			xtc_gauge_set(rexis_stat_connections,
-			    (int64_t)atomic_load(st->conn_count));
+			    (int64_t)xtc_atomic_load_i32(st->conn_count,
+			        xtc_mo_seq_cst));
 		if (st->res != NULL && rexis_stat_res_mem != NULL)
 			xtc_gauge_set(rexis_stat_res_mem,
 			    xtc_res_used(st->res, XTC_RES_MEM_BYTES));
@@ -89,12 +90,10 @@ metrics_proc(void *arg)
 				p50 = xtc_hist_quantile(rexis_stat_cmd_latency, 0.50);
 				p99 = xtc_hist_quantile(rexis_stat_cmd_latency, 0.99);
 			}
-			XTC_LOG_INFO_F(
-			    "metrics: keys=%zu db_mem=%zu conns=%d "
-			    "cmd_p50_ns=%lld cmd_p99_ns=%lld",
-			    db_key_count(st->db),
-			    db_mem_used(st->db),
-			    atomic_load(st->conn_count),
+			XTC_LOG_INFO_F("metrics: keys=%zu db_mem=%zu conns=%d "
+			               "cmd_p50_ns=%lld cmd_p99_ns=%lld",
+			    db_key_count(st->db), db_mem_used(st->db),
+			    xtc_atomic_load_i32(st->conn_count, xtc_mo_seq_cst),
 			    (long long)p50, (long long)p99);
 		}
 	}
@@ -102,9 +101,8 @@ metrics_proc(void *arg)
 }
 
 int
-metrics_spawn(xtc_loop_t *loop, db_t *db, xtc_res_t *res,
-              _Atomic int *conn_count, _Atomic int *stop,
-              xtc_pid_t *out_pid)
+metrics_spawn(xtc_loop_t *loop, db_t *db, xtc_res_t *res, int *conn_count,
+    int *stop, xtc_pid_t *out_pid)
 {
 	metrics_state_t *st;
 	xtc_proc_opts_t opts = XTC_PROC_OPTS_INIT;

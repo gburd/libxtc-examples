@@ -6,7 +6,7 @@
  *	Timer-driven key expiration proc.
  */
 
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 
 #include "db.h"
@@ -23,7 +23,7 @@ static inline int64_t xtc_now_ns(void) {
 
 typedef struct expire_state {
 	db_t        *db;
-	_Atomic int *stop;   /* server shutdown flag */
+	int *stop; /* server shutdown flag */
 } expire_state_t;
 
 static void
@@ -33,7 +33,7 @@ expire_proc(void *arg)
 	void *msg;
 	size_t msg_len;
 
-	while (!atomic_load(st->stop)) {
+	while (!xtc_atomic_load_i32(st->stop, xtc_mo_seq_cst)) {
 		int64_t now = xtc_now_ns();
 		int removed;
 
@@ -55,8 +55,7 @@ expire_proc(void *arg)
 }
 
 int
-expire_spawn(xtc_loop_t *loop, db_t *db, _Atomic int *stop,
-             xtc_pid_t *out_pid)
+expire_spawn(xtc_loop_t *loop, db_t *db, int *stop, xtc_pid_t *out_pid)
 {
 	expire_state_t *st;
 	xtc_proc_opts_t opts = XTC_PROC_OPTS_INIT;

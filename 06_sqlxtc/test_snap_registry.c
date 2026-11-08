@@ -32,7 +32,6 @@
  *	    equals their count, and every SELECT saw all NROW rows.
  */
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,8 +47,8 @@
 
 static int g_fail;
 static char g_path[256];
-static _Atomic int g_stop;
-static _Atomic long g_reads, g_bad, g_upd;
+static int g_stop;
+static long g_reads, g_bad, g_upd;
 
 #ifdef CK
 #undef CK
@@ -74,13 +73,14 @@ reader_tx(void *arg)
 	long i = (long)arg;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
 	if (sx_prepare(h, "SELECT v FROM t WHERE k = ?", -1, &q, NULL) != SX_OK) { g_fail = 1; return NULL; }
-	while (!atomic_load(&g_stop)) {
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
 		if (sx_exec(h, "BEGIN", NULL) != SX_OK) { g_fail = 1; break; }
 		sx_bind_int64(q, 1, (i++ % NROW) + 1);
-		if (sx_step(q) != SX_ROW) g_bad++;
+		if (sx_step(q) != SX_ROW)
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 		sx_reset(q);
 		if (sx_exec(h, "COMMIT", NULL) != SX_OK) { g_fail = 1; break; }
-		atomic_fetch_add(&g_reads, 1);
+		xtc_atomic_fetch_add_long(&g_reads, 1, xtc_mo_seq_cst);
 	}
 	sx_finalize(q);
 	sx_close(h);
@@ -101,7 +101,7 @@ spin(void *arg)
 {
 	volatile unsigned long n = 0;
 	(void)arg;
-	while (!atomic_load_explicit(&g_stop, memory_order_relaxed))
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_relaxed))
 		n++;
 	return NULL;
 }
@@ -115,12 +115,12 @@ capacity8(void)
 	pthread_t th[8];
 	double t0, c0;
 	int i;
-	atomic_store(&g_stop, 0);
+	xtc_atomic_store_i32(&g_stop, 0, xtc_mo_seq_cst);
 	t0 = now_s();
 	c0 = cpu_s();
 	for (i = 0; i < 8; i++) pthread_create(&th[i], NULL, spin, NULL);
 	usleep(400 * 1000);
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	for (i = 0; i < 8; i++) pthread_join(th[i], NULL);
 	return (cpu_s() - c0) / (now_s() - t0);
 }
@@ -132,14 +132,15 @@ rate(int nthr)
 	double t0;
 	long r0;
 	int i;
-	atomic_store(&g_stop, 0);
-	r0 = atomic_load(&g_reads);
+	xtc_atomic_store_i32(&g_stop, 0, xtc_mo_seq_cst);
+	r0 = xtc_atomic_load_long(&g_reads, xtc_mo_seq_cst);
 	t0 = now_s();
 	for (i = 0; i < nthr; i++) pthread_create(&th[i], NULL, reader_tx, (void *)(long)i);
 	usleep(1500 * 1000);
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	for (i = 0; i < nthr; i++) pthread_join(th[i], NULL);
-	return (double)(atomic_load(&g_reads) - r0) / (now_s() - t0);
+	return (double)(xtc_atomic_load_long(&g_reads, xtc_mo_seq_cst) - r0) /
+	    (now_s() - t0);
 }
 
 static void *
@@ -150,15 +151,16 @@ writer(void *arg)
 	long n = 0, id = (long)arg;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
 	(void)xstore_autovacuum_set((struct xsql *)h, 1);
-	while (!atomic_load(&g_stop)) {
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
 		snprintf(sql, sizeof sql, "UPDATE t SET v = v + 1 WHERE k = %ld", 1 + (n++ * 7 + id) % NROW);
-		if (sx_exec(h, sql, NULL) == SX_OK) atomic_fetch_add(&g_upd, 1);
+		if (sx_exec(h, sql, NULL) == SX_OK)
+			xtc_atomic_fetch_add_long(&g_upd, 1, xtc_mo_seq_cst);
 	}
 	sx_close(h);
 	return NULL;
 }
 
-static _Atomic long g_ac_ok, g_ac_zero, g_ac_short;
+static long g_ac_ok, g_ac_zero, g_ac_short;
 
 static void *
 ac_writer(void *arg)
@@ -169,10 +171,13 @@ ac_writer(void *arg)
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
 	(void)xstore_autovacuum_set((struct xsql *)h, 1);
 	if (sx_prepare(h, "UPDATE t SET v = v + 1 WHERE k = 1", -1, &u, NULL) != SX_OK) { g_fail = 1; return NULL; }
-	while (!atomic_load(&g_stop)) {
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
 		int rc = sx_step(u);
-		if (rc == SX_DONE && sx_stmt_changes(u) == 1) atomic_fetch_add(&g_ac_ok, 1);
-		else if (rc == SX_DONE) atomic_fetch_add(&g_ac_zero, 1);
+		if (rc == SX_DONE && sx_stmt_changes(u) == 1)
+			xtc_atomic_fetch_add_long(&g_ac_ok, 1, xtc_mo_seq_cst);
+		else if (rc == SX_DONE)
+			xtc_atomic_fetch_add_long(&g_ac_zero, 1,
+			    xtc_mo_seq_cst);
 		sx_reset(u);                   /* else: a bounded-restart conflict */
 	}
 	sx_finalize(u);
@@ -188,11 +193,13 @@ ac_reader(void *arg)
 	(void)arg;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
 	if (sx_prepare(h, "SELECT k FROM t", -1, &q, NULL) != SX_OK) { g_fail = 1; return NULL; }
-	while (!atomic_load(&g_stop)) {
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
 		int n = 0;
 		while (sx_step(q) == SX_ROW) n++;
 		sx_reset(q);
-		if (n != NROW) atomic_fetch_add(&g_ac_short, 1);
+		if (n != NROW)
+			xtc_atomic_fetch_add_long(&g_ac_short, 1,
+			    xtc_mo_seq_cst);
 	}
 	sx_finalize(q);
 	sx_close(h);
@@ -216,7 +223,7 @@ gcer(void *arg)
 	sx_db *h = NULL;
 	(void)arg;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
-	while (!atomic_load(&g_stop))
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst))
 		(void)xstore_gc_run((struct xsql *)h);
 	sx_close(h);
 	return NULL;
@@ -231,18 +238,21 @@ rr_reader(void *arg)
 	(void)arg;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
 	if (sx_prepare(h, "SELECT k, v FROM t ORDER BY k", -1, &q, NULL) != SX_OK) { g_fail = 1; return NULL; }
-	while (!atomic_load(&g_stop)) {
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
 		int n = 0, m = 0;
 		if (sx_exec(h, "BEGIN ISOLATION LEVEL REPEATABLE READ", NULL) != SX_OK) { g_fail = 1; break; }
 		while (sx_step(q) == SX_ROW && n < NROW) a[n++] = sx_column_int64(q, 1);
 		sx_reset(q);
 		usleep(200);
 		while (sx_step(q) == SX_ROW) {
-			if (m >= NROW || sx_column_int64(q, 1) != a[m]) g_bad++;
+			if (m >= NROW || sx_column_int64(q, 1) != a[m])
+				xtc_atomic_fetch_add_long(&g_bad, 1,
+				    xtc_mo_seq_cst);
 			m++;
 		}
 		sx_reset(q);
-		if (n != NROW || m != NROW) g_bad++;
+		if (n != NROW || m != NROW)
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 		(void)sx_exec(h, "COMMIT", NULL);
 	}
 	sx_finalize(q);
@@ -300,35 +310,41 @@ main(void)
 		    "%.2f CPUs (< 1.6)\n", cap);
 
 	/* (2) */
-	atomic_store(&g_stop, 0);
+	xtc_atomic_store_i32(&g_stop, 0, xtc_mo_seq_cst);
 	for (i = 0; i < 4; i++) pthread_create(&th[i], NULL, writer, (void *)(long)i);
 	pthread_create(&th[4], NULL, gcer, NULL);
 	for (i = 5; i < 9; i++) pthread_create(&th[i], NULL, rr_reader, NULL);
 	usleep(3000 * 1000);
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	for (i = 0; i < 9; i++) pthread_join(th[i], NULL);
-	printf("  updates=%ld snapshot-violations=%ld\n", atomic_load(&g_upd), atomic_load(&g_bad));
-	CK(atomic_load(&g_upd) > 1000);
-	CK(atomic_load(&g_bad) == 0);
+	printf("  updates=%ld snapshot-violations=%ld\n",
+	    xtc_atomic_load_long(&g_upd, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst));
+	CK(xtc_atomic_load_long(&g_upd, xtc_mo_seq_cst) > 1000);
+	CK(xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst) == 0);
 
 	/* (3) */
 	CK(sx_open(g_path, &h) == SX_OK);
 	v0 = one(h, "SELECT v FROM t WHERE k = 1");
-	atomic_store(&g_stop, 0);
+	xtc_atomic_store_i32(&g_stop, 0, xtc_mo_seq_cst);
 	for (i = 0; i < 4; i++) pthread_create(&th[i], NULL, ac_writer, NULL);
 	pthread_create(&th[4], NULL, gcer, NULL);
 	for (i = 5; i < 7; i++) pthread_create(&th[i], NULL, ac_reader, NULL);
 	usleep(3000 * 1000);
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	for (i = 0; i < 7; i++) pthread_join(th[i], NULL);
 	v1 = one(h, "SELECT v FROM t WHERE k = 1");
-	printf("  autocommit: %ld updates, %ld changed nothing, v advanced %lld; "
-	    "%ld short SELECTs\n", atomic_load(&g_ac_ok), atomic_load(&g_ac_zero),
-	    (long long)(v1 - v0), atomic_load(&g_ac_short));
-	CK(atomic_load(&g_ac_ok) > 1000);
-	CK(atomic_load(&g_ac_zero) == 0);
-	CK(v1 - v0 == atomic_load(&g_ac_ok));
-	CK(atomic_load(&g_ac_short) == 0);
+	printf(
+	    "  autocommit: %ld updates, %ld changed nothing, v advanced %lld; "
+	    "%ld short SELECTs\n",
+	    xtc_atomic_load_long(&g_ac_ok, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_ac_zero, xtc_mo_seq_cst),
+	    (long long)(v1 - v0),
+	    xtc_atomic_load_long(&g_ac_short, xtc_mo_seq_cst));
+	CK(xtc_atomic_load_long(&g_ac_ok, xtc_mo_seq_cst) > 1000);
+	CK(xtc_atomic_load_long(&g_ac_zero, xtc_mo_seq_cst) == 0);
+	CK(v1 - v0 == xtc_atomic_load_long(&g_ac_ok, xtc_mo_seq_cst));
+	CK(xtc_atomic_load_long(&g_ac_short, xtc_mo_seq_cst) == 0);
 	sx_close(h);
 
 	(void)sx_storage_close();

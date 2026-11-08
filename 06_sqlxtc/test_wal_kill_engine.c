@@ -22,7 +22,6 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,8 +42,8 @@
 #define HANG_S  8
 
 struct slot {
-	_Atomic int      phase;      /* 1 inside COMMIT */
-	_Atomic uint32_t seq;
+	int phase; /* 1 inside COMMIT */
+	uint32_t seq;
 	xtc_pid_t        pid;
 	int              live;
 	uint8_t         *acked;      /* acked[seq] = 1 once COMMIT returned OK */
@@ -53,8 +52,8 @@ struct slot {
 static char             g_path[256];
 static xtc_exec_t      *g_exec;
 static struct slot      g_slot[NC + 1];
-static _Atomic int      g_stop, g_done, g_final_ok;
-static _Atomic uint64_t g_commits, g_kills, g_errs;
+static int g_stop, g_done, g_final_ok;
+static uint64_t g_commits, g_kills, g_errs;
 static uint64_t         g_seed;
 static int64_t          g_ms;
 static int              g_any, g_mask;
@@ -74,7 +73,7 @@ static int
 txn(sx_db *h, int slot)
 {
 	struct slot *s = &g_slot[slot];
-	uint32_t seq = atomic_fetch_add(&s->seq, 1);
+	uint32_t seq = xtc_atomic_fetch_add_u32(&s->seq, 1, xtc_mo_seq_cst);
 	char sql[128];
 	int rc;
 	if (seq >= MAXSEQ)
@@ -91,22 +90,22 @@ txn(sx_db *h, int slot)
 		goto bad;
 	if (g_mask)
 		(void)xtc_mask_enter();      /* diagnostic: COMMIT unkillable */
-	atomic_store(&s->phase, 1);
+	xtc_atomic_store_i32(&s->phase, 1, xtc_mo_seq_cst);
 	rc = sx_exec(h, "COMMIT", NULL);
-	atomic_store(&s->phase, 0);
+	xtc_atomic_store_i32(&s->phase, 0, xtc_mo_seq_cst);
 	if (rc == SX_OK)
 		s->acked[seq] = 1;          /* before a latched kill unwinds */
 	if (g_mask)
 		(void)xtc_mask_leave();
 	if (rc == SX_OK) {
-		atomic_fetch_add(&g_commits, 1);
+		xtc_atomic_fetch_add_u64(&g_commits, 1, xtc_mo_seq_cst);
 	} else if (rc != SX_BUSY) {
-		atomic_fetch_add(&g_errs, 1);
+		xtc_atomic_fetch_add_u64(&g_errs, 1, xtc_mo_seq_cst);
 	}
 	return rc;
 bad:
 	(void)sx_exec(h, "ROLLBACK", NULL);
-	atomic_fetch_add(&g_errs, 1);
+	xtc_atomic_fetch_add_u64(&g_errs, 1, xtc_mo_seq_cst);
 	return -1;
 }
 
@@ -122,13 +121,13 @@ conn(void *arg)
 	int slot = (int)(intptr_t)arg;
 	sx_db *h = NULL;
 	if (sx_open(":memory:", &h) != SX_OK) {
-		atomic_fetch_add(&g_errs, 1);
+		xtc_atomic_fetch_add_u64(&g_errs, 1, xtc_mo_seq_cst);
 		return;
 	}
 	/* The connection proc owns the handle; a kill unwinds past the
 	 * close, as the server's dropped connection would. */
 	(void)xtc_proc_at_exit(close_db, h);
-	while (!atomic_load(&g_stop))
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst))
 		if (txn(h, slot) == -2)
 			break;
 }
@@ -139,8 +138,8 @@ watchdog(void *arg)
 	uint64_t last = 0;
 	int64_t since = xtc_clock_mono();
 	(void)arg;
-	while (!atomic_load(&g_done)) {
-		uint64_t c = atomic_load(&g_commits);
+	while (!xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst)) {
+		uint64_t c = xtc_atomic_load_u64(&g_commits, xtc_mo_seq_cst);
 		int64_t now = xtc_clock_mono();
 		int i;
 		if (c != last) {
@@ -148,14 +147,17 @@ watchdog(void *arg)
 			since = now;
 		} else if (now - since > (int64_t)HANG_S * 1000000000LL) {
 			struct wal *w = sx_storage_wal();
-			fprintf(stderr, "HANG (seed %llu): no commit for %d s; commits "
+			fprintf(stderr,
+			    "HANG (seed %llu): no commit for %d s; commits "
 			    "%llu kills %llu durable_lsn %llu\n",
 			    (unsigned long long)g_seed, HANG_S,
 			    (unsigned long long)c,
-			    (unsigned long long)atomic_load(&g_kills),
+			    (unsigned long long)xtc_atomic_load_u64(&g_kills,
+			        xtc_mo_seq_cst),
 			    (unsigned long long)(w ? wal_durable_lsn(w) : 0));
 			for (i = 0; i <= NC; i++)
-				if (atomic_load(&g_slot[i].phase))
+				if (xtc_atomic_load_i32(&g_slot[i].phase,
+				        xtc_mo_seq_cst))
 					fprintf(stderr, "  slot %d inside COMMIT\n", i);
 			fprintf(stderr, "FAIL: test_wal_kill_engine: hang\n");
 			if (getenv("WAL_KILL_ABORT") != NULL)
@@ -216,12 +218,14 @@ boss(void *arg)
 		int k = (int)(rng(&r) % NC);
 		(void)xtc_proc_sleep((int64_t)(200 + rng(&r) % 800) * 1000);
 		(void)reap(1);
-		if (!g_slot[k].live || (!g_any && !atomic_load(&g_slot[k].phase)))
+		if (!g_slot[k].live ||
+		    (!g_any &&
+		        !xtc_atomic_load_i32(&g_slot[k].phase, xtc_mo_seq_cst)))
 			continue;
 		if (xtc_exit_pid(g_slot[k].pid, 7) == XTC_OK)
-			atomic_fetch_add(&g_kills, 1);
+			xtc_atomic_fetch_add_u64(&g_kills, 1, xtc_mo_seq_cst);
 	}
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	while (reap(0) > 0)
 		(void)xtc_proc_sleep(1000LL * 1000);
 	if (sx_open(":memory:", &h) == SX_OK) {
@@ -229,7 +233,7 @@ boss(void *arg)
 			ok += txn(h, NC) == SX_OK;
 		sx_close(h);
 	}
-	atomic_store(&g_final_ok, ok == 20);
+	xtc_atomic_store_i32(&g_final_ok, ok == 20, xtc_mo_seq_cst);
 	sx_storage_quiesce();
 }
 
@@ -290,7 +294,7 @@ main(int argc, char **argv)
 		return 1;
 	(void)pthread_create(&wd, NULL, watchdog, NULL);
 	(void)xtc_exec_run(g_exec);
-	atomic_store(&g_done, 1);
+	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
 	(void)xtc_exec_fini(g_exec);
 
@@ -315,14 +319,17 @@ main(int argc, char **argv)
 		snprintf(side, sizeof side, "%s%s", g_path, sfx[i]);
 		unlink(side);
 	}
-	printf("  engine: kills %llu acked %llu lost %llu errs %llu checkpoints "
-	    "%llu final %s\n", (unsigned long long)atomic_load(&g_kills),
+	printf(
+	    "  engine: kills %llu acked %llu lost %llu errs %llu checkpoints "
+	    "%llu final %s\n",
+	    (unsigned long long)xtc_atomic_load_u64(&g_kills, xtc_mo_seq_cst),
 	    (unsigned long long)acked, (unsigned long long)lost,
-	    (unsigned long long)atomic_load(&g_errs),
+	    (unsigned long long)xtc_atomic_load_u64(&g_errs, xtc_mo_seq_cst),
 	    (unsigned long long)sx_storage_checkpoints(),
-	    atomic_load(&g_final_ok) ? "ok" : "FAILED");
-	if (lost || atomic_load(&g_errs) || !atomic_load(&g_final_ok) ||
-	    atomic_load(&g_kills) == 0)
+	    xtc_atomic_load_i32(&g_final_ok, xtc_mo_seq_cst) ? "ok" : "FAILED");
+	if (lost || xtc_atomic_load_u64(&g_errs, xtc_mo_seq_cst) ||
+	    !xtc_atomic_load_i32(&g_final_ok, xtc_mo_seq_cst) ||
+	    xtc_atomic_load_u64(&g_kills, xtc_mo_seq_cst) == 0)
 		fail = 1;
 	if (fail) {
 		fprintf(stderr, "FAIL: test_wal_kill_engine\n");

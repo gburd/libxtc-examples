@@ -31,7 +31,7 @@
 #include "xtc_loop.h"      /* xtc_loop_t -- background storage procs */
 
 #include <assert.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -238,9 +238,9 @@ static int    g_xrunning;        /* background procs spawned */
  * place and is retried.
  */
 static uint64_t     g_ckpt_min = 64ull << 20;  /* bytes; sx_storage_set_checkpoint */
-static _Atomic int  g_ckpt_stop, g_ckpt_alive;
+static int g_ckpt_stop, g_ckpt_alive;
 static xtc_pid_t    g_ckpt_pid;
-static _Atomic uint64_t g_ckpt_count;
+static uint64_t g_ckpt_count;
 
 void
 sx_storage_set_checkpoint(uint64_t min_bytes)
@@ -251,7 +251,7 @@ sx_storage_set_checkpoint(uint64_t min_bytes)
 uint64_t
 sx_storage_checkpoints(void)
 {
-	return atomic_load(&g_ckpt_count);
+	return xtc_atomic_load_u64(&g_ckpt_count, xtc_mo_seq_cst);
 }
 
 static xtc_pid_t g_pp_pid, g_tr_pid;   /* provider, trickler */
@@ -293,7 +293,7 @@ sx_storage_proc_pid(int which, xtc_pid_t *out)
 int
 sx_storage_ckpt_pid(xtc_pid_t *out)
 {
-	if (!atomic_load(&g_ckpt_alive))
+	if (!xtc_atomic_load_i32(&g_ckpt_alive, xtc_mo_seq_cst))
 		return 0;
 	*out = g_ckpt_pid;
 	return 1;
@@ -330,7 +330,7 @@ static void
 sx_ckpt_dead(void *arg)
 {
 	(void)arg;
-	atomic_store(&g_ckpt_alive, 0);
+	xtc_atomic_store_i32(&g_ckpt_alive, 0, xtc_mo_seq_cst);
 }
 
 static void
@@ -341,14 +341,14 @@ sx_ckpt_proc(void *arg)
 	int res;
 	(void)arg;
 	(void)xtc_proc_at_exit(sx_ckpt_dead, NULL);
-	while (!atomic_load(&g_ckpt_stop)) {
+	while (!xtc_atomic_load_i32(&g_ckpt_stop, xtc_mo_seq_cst)) {
 		uint64_t sz, trig;
 		void *m = NULL;
 		size_t mn = 0;
 		/* Tick every 50 ms; sx_ckpt_stop's message ends the wait early. */
 		if (xtc_recv(&m, &mn, 50LL * 1000 * 1000) == XTC_OK)
 			xtc_free(m);
-		if (atomic_load(&g_ckpt_stop))
+		if (xtc_atomic_load_i32(&g_ckpt_stop, xtc_mo_seq_cst))
 			break;
 		if (g_xwal == NULL || wal_failed(g_xwal))
 			continue;
@@ -363,7 +363,8 @@ sx_ckpt_proc(void *arg)
 			continue;                  /* pool unavailable: next tick */
 		if (job.rc == XTC_OK) {
 			floor = wal_size(g_xwal);
-			atomic_fetch_add(&g_ckpt_count, 1);
+			xtc_atomic_fetch_add_u64(&g_ckpt_count, 1,
+			    xtc_mo_seq_cst);
 		}
 	}
 }
@@ -377,14 +378,16 @@ static void
 sx_ckpt_stop(void)
 {
 	int i;
-	if (!atomic_load(&g_ckpt_alive))
+	if (!xtc_atomic_load_i32(&g_ckpt_alive, xtc_mo_seq_cst))
 		return;
-	atomic_store(&g_ckpt_stop, 1);
+	xtc_atomic_store_i32(&g_ckpt_stop, 1, xtc_mo_seq_cst);
 	xstore_checkpoint_cancel(1);            /* an online one in progress: abort */
 	(void)xtc_send(g_ckpt_pid, "s", 1);     /* end its tick wait now */
 	if (xtc_pid_is_none(xtc_self()))
 		return;
-	for (i = 0; i < 2000 && atomic_load(&g_ckpt_alive); i++)
+	for (i = 0;
+	     i < 2000 && xtc_atomic_load_i32(&g_ckpt_alive, xtc_mo_seq_cst);
+	     i++)
 		(void)xtc_proc_sleep(1LL * 1000 * 1000);
 }
 
@@ -717,7 +720,7 @@ sx_storage_open(const char *path, unsigned int n_frames)
 
 static xtc_loop_t  *g_sw_loop;
 static xtc_pid_t    g_sw_pid;
-static _Atomic int  g_sw_alive, g_sw_stop;
+static int g_sw_alive, g_sw_stop;
 
 static void
 sx_storage_failed(const char *what)
@@ -735,8 +738,8 @@ static void
 sx_sw_dead(void *arg)
 {
 	(void)arg;
-	atomic_store(&g_sw_alive, 0);
-	if (!atomic_load(&g_sw_stop))
+	xtc_atomic_store_i32(&g_sw_alive, 0, xtc_mo_seq_cst);
+	if (!xtc_atomic_load_i32(&g_sw_stop, xtc_mo_seq_cst))
 		sx_storage_failed("storage-watch");
 }
 
@@ -754,17 +757,19 @@ sx_sw_proc(void *arg)
 
 	(void)arg;
 	if (xtc_proc_at_exit(sx_sw_dead, NULL) != XTC_OK) {
-		atomic_store(&g_sw_alive, 0);
+		xtc_atomic_store_i32(&g_sw_alive, 0, xtc_mo_seq_cst);
 		return;                      /* no hook: run unsupervised */
 	}
 	pid[0] = g_xwal != NULL ? wal_writer_pid(g_xwal) : XTC_PID_NONE;
-	pid[1] = atomic_load(&g_ckpt_alive) ? g_ckpt_pid : XTC_PID_NONE;
+	pid[1] = xtc_atomic_load_i32(&g_ckpt_alive, xtc_mo_seq_cst) ?
+	    g_ckpt_pid :
+	    XTC_PID_NONE;
 	pid[2] = g_pp_pid;
 	pid[3] = g_tr_pid;
 	for (i = 0; i < 4; i++)
 		if (!xtc_pid_is_none(pid[i]))
 			(void)xtc_monitor(pid[i], &ref);   /* dead: DOWN at once */
-	while (!atomic_load(&g_sw_stop)) {
+	while (!xtc_atomic_load_i32(&g_sw_stop, xtc_mo_seq_cst)) {
 		if (xtc_recv(&m, &n, -1) != XTC_OK)
 			continue;
 		if (m == NULL || xtc_down_decode(m, n, &who, NULL) != XTC_OK) {
@@ -772,7 +777,7 @@ sx_sw_proc(void *arg)
 			continue;
 		}
 		xtc_free(m);
-		if (atomic_load(&g_sw_stop))
+		if (xtc_atomic_load_i32(&g_sw_stop, xtc_mo_seq_cst))
 			break;
 		for (i = 0; i < 4 && !xtc_pid_eq(pid[i], who); i++)
 			;
@@ -803,13 +808,14 @@ static void
 sx_sw_stop(void)
 {
 	int i;
-	atomic_store(&g_sw_stop, 1);
-	if (!atomic_load(&g_sw_alive))
+	xtc_atomic_store_i32(&g_sw_stop, 1, xtc_mo_seq_cst);
+	if (!xtc_atomic_load_i32(&g_sw_alive, xtc_mo_seq_cst))
 		return;
 	(void)xtc_send(g_sw_pid, "q", 1);
 	if (xtc_pid_is_none(xtc_self()))
 		return;
-	for (i = 0; i < 2000 && atomic_load(&g_sw_alive); i++)
+	for (i = 0;
+	     i < 2000 && xtc_atomic_load_i32(&g_sw_alive, xtc_mo_seq_cst); i++)
 		(void)xtc_proc_sleep(1LL * 1000 * 1000);
 }
 
@@ -833,22 +839,22 @@ sx_storage_run(xtc_loop_t *loop)
 		xtc_proc_opts_t co = XTC_PROC_OPTS_INIT;
 		xtc_pid_t cp;
 		co.name = "checkpoint";
-		atomic_store(&g_ckpt_stop, 0);
+		xtc_atomic_store_i32(&g_ckpt_stop, 0, xtc_mo_seq_cst);
 		xstore_checkpoint_cancel(0);
-		atomic_store(&g_ckpt_alive, 1);
+		xtc_atomic_store_i32(&g_ckpt_alive, 1, xtc_mo_seq_cst);
 		if (xtc_proc_spawn(loop, sx_ckpt_proc, NULL, &co, &cp) != XTC_OK)
-			atomic_store(&g_ckpt_alive, 0);
+			xtc_atomic_store_i32(&g_ckpt_alive, 0, xtc_mo_seq_cst);
 		else
 			g_ckpt_pid = cp;
 	}
 	(void)bm_provider_spawn(g_xbm, loop, 1LL * 1000 * 1000, &g_pp_pid);  /* 1ms */
 	(void)bm_trickler_spawn(g_xbm, loop, 5LL * 1000 * 1000, &g_tr_pid);  /* 5ms */
 	g_sw_loop = loop;
-	atomic_store(&g_sw_stop, 0);
-	atomic_store(&g_sw_alive, 1);
+	xtc_atomic_store_i32(&g_sw_stop, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_sw_alive, 1, xtc_mo_seq_cst);
 	so.name = "storage-watch";
 	if (xtc_proc_spawn(loop, sx_sw_proc, NULL, &so, &g_sw_pid) != XTC_OK)
-		atomic_store(&g_sw_alive, 0);
+		xtc_atomic_store_i32(&g_sw_alive, 0, xtc_mo_seq_cst);
 	g_xrunning = 1;
 	return SX_OK;
 }
@@ -874,7 +880,8 @@ sx_storage_checkpoint(void)
 		    g_xwal_path) != XTC_OK)
 			rc = SX_ERROR;
 		else
-			atomic_fetch_add(&g_ckpt_count, 1);
+			xtc_atomic_fetch_add_u64(&g_ckpt_count, 1,
+			    xtc_mo_seq_cst);
 		xstore_quiesce_end();
 	}
 	return rc;

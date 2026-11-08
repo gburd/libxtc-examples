@@ -126,7 +126,7 @@
 #include "xtc_dst_inject.h" /* DST planted bugs (no-op in prod) */
 
 #include <pthread.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include "xtc_sync.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -256,29 +256,29 @@ bt_check_node(const void *pg, const char *fn, int line)
 struct bt {
 	bm_t             *bm;
 	uint32_t          page_size;
-	_Atomic bm_pid_t  root_pid;    /* read by every descent */
+	bm_pid_t root_pid; /* read by every descent */
 	/* Keep the statistics below off root_pid's cache line: every reader
 	 * loads root_pid, and a counter write by any thread on the same line
 	 * would invalidate it in every other core's cache.  (Padding, not
 	 * _Alignas: the struct comes from calloc.) */
 	char              pad_root[64];
 
-	_Atomic uint64_t  st_inserts;
-	_Atomic uint64_t  st_lookups;
-	_Atomic uint64_t  st_splits;
-	_Atomic uint64_t  st_merges;   /* node merges (right sibling pulled left) */
-	_Atomic uint64_t  st_reclaimed;/* pages returned to the bufmgr freelist */
-	_Atomic uint64_t  st_stuck;    /* descents failed on a damaged tree */
-	_Atomic uint64_t  st_height;   /* number of levels (1 == root leaf) */
-	_Atomic uint64_t  st_descents; /* full root->leaf cursor descents */
-	_Atomic uint64_t  st_resumes;  /* parked-cursor O(1) resumes */
-	_Atomic uint64_t  st_ovf_writes; /* values stored out of line */
-	_Atomic uint64_t  st_ovf_reads;  /* out-of-line values read back */
-	_Atomic uint64_t  st_ovf_pages;  /* data pages written for them */
-	_Atomic uint64_t  st_ovf_freed;  /* data pages freed (delete/replace) */
-	_Atomic uint64_t  st_sample_pages; /* nodes read by bt_sample_keys */
-	_Atomic uint64_t  st_shifts;   /* splits avoided by a sibling shift */
-	_Atomic uint64_t  st_shifts_left; /* ... of them, into the LEFT sibling */
+	uint64_t st_inserts;
+	uint64_t st_lookups;
+	uint64_t st_splits;
+	uint64_t st_merges;       /* node merges (right sibling pulled left) */
+	uint64_t st_reclaimed;    /* pages returned to the bufmgr freelist */
+	uint64_t st_stuck;        /* descents failed on a damaged tree */
+	uint64_t st_height;       /* number of levels (1 == root leaf) */
+	uint64_t st_descents;     /* full root->leaf cursor descents */
+	uint64_t st_resumes;      /* parked-cursor O(1) resumes */
+	uint64_t st_ovf_writes;   /* values stored out of line */
+	uint64_t st_ovf_reads;    /* out-of-line values read back */
+	uint64_t st_ovf_pages;    /* data pages written for them */
+	uint64_t st_ovf_freed;    /* data pages freed (delete/replace) */
+	uint64_t st_sample_pages; /* nodes read by bt_sample_keys */
+	uint64_t st_shifts;       /* splits avoided by a sibling shift */
+	uint64_t st_shifts_left;  /* ... of them, into the LEFT sibling */
 	uint64_t          meta_clean;  /* superblock clean flag (open/close only) */
 	uint64_t          meta_clock;  /* superblock commit clock (open/close only) */
 	uint64_t          meta_ext[BT_SUPER_EXT]; /* engine-opaque superblock words */
@@ -446,8 +446,8 @@ ovf_write(bt_t *bt, const void *val, uint32_t vlen, uint8_t *ref)
 	bt_ovf_put32(ref + 8, bt_ovf_fnv(val, vlen));
 	for (i = 0; i < n; i++)
 		bt_ovf_put64(ref + BT_OVF_HDR + 8u * i, (uint64_t)pids[i]);
-	atomic_fetch_add(&bt->st_ovf_writes, 1);
-	atomic_fetch_add(&bt->st_ovf_pages, n);
+	xtc_atomic_fetch_add_u64(&bt->st_ovf_writes, 1, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_u64(&bt->st_ovf_pages, n, xtc_mo_seq_cst);
 	return bt_ovf_ref_len(n);
 }
 
@@ -522,7 +522,7 @@ ovf_read(bt_t *bt, const uint8_t *ref, uint32_t rlen, void *buf,
 		return XTC_E_AGAIN;           /* a page changed mid-read */
 	if (vlen != NULL)
 		*vlen = (uint16_t)total;
-	atomic_fetch_add(&bt->st_ovf_reads, 1);
+	xtc_atomic_fetch_add_u64(&bt->st_ovf_reads, 1, xtc_mo_seq_cst);
 	return XTC_OK;
 }
 
@@ -554,7 +554,8 @@ ovf_free(bt_t *bt, const uint8_t *ref, uint32_t rlen)
 		bm_pid_t pid = (bm_pid_t)bt_ovf_get64(ref + BT_OVF_HDR + 8u * i);
 
 		if (bm_free_pid(bt->bm, pid) == XTC_OK)
-			atomic_fetch_add(&bt->st_ovf_freed, 1);
+			xtc_atomic_fetch_add_u64(&bt->st_ovf_freed, 1,
+			    xtc_mo_seq_cst);
 	}
 }
 static int merge_level(bt_t *bt, bm_pid_t *path, int level,
@@ -591,8 +592,9 @@ bt_write_super(bt_t *bt)
 	memset(&s, 0, sizeof s);
 	s.magic = BT_SUPER_MAGIC;
 	s.page_size = bt->page_size;
-	s.root_pid = (uint64_t)atomic_load(&bt->root_pid);
-	s.height = atomic_load(&bt->st_height);
+	s.root_pid =
+	    (uint64_t)xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
+	s.height = xtc_atomic_load_u64(&bt->st_height, xtc_mo_seq_cst);
 	s.clean = bt->meta_clean;
 	s.commit_clock = bt->meta_clock;
 	memcpy(s.ext, bt->meta_ext, sizeof s.ext);
@@ -747,18 +749,22 @@ static void
 bt_stuck_report(bt_t *bt, const char *who, long n, const void *key,
     uint16_t klen, bm_frame_t *f, const char *why, bm_pid_t at)
 {
-	static atomic_int once;
+	static int once;
 	uint8_t fb[BT_MAX_KEY];
 	uint16_t fl = 0;
 	void *pg;
 
-	atomic_fetch_add(&bt->st_stuck, 1);
-	if (atomic_exchange(&once, 1) != 0)
+	xtc_atomic_fetch_add_u64(&bt->st_stuck, 1, xtc_mo_seq_cst);
+	if (xtc_atomic_exchange_i32(&once, 1, xtc_mo_seq_cst) != 0)
 		return;
-	fprintf(stderr, "sqlxtc btree: %s gave up after %ld steps (root %llu,"
-	    " height %llu); the tree is damaged:", who, n,
-	    (unsigned long long)atomic_load(&bt->root_pid),
-	    (unsigned long long)atomic_load(&bt->st_height));
+	fprintf(stderr,
+	    "sqlxtc btree: %s gave up after %ld steps (root %llu,"
+	    " height %llu); the tree is damaged:",
+	    who, n,
+	    (unsigned long long)xtc_atomic_load_u64(&bt->root_pid,
+	        xtc_mo_seq_cst),
+	    (unsigned long long)xtc_atomic_load_u64(&bt->st_height,
+	        xtc_mo_seq_cst));
 	if (key != NULL)
 		bt_hex("key", key, klen);
 	if (why != NULL)
@@ -903,8 +909,8 @@ bt_open(bm_t *bm, bt_t **out)
 	btnode_init(bm_page(rf), ps, 1);
 	btnode_set_fences(bm_page(rf), NULL, 0, NULL, 0);
 	BT_CHECK_NODE(bm_page(rf));
-	atomic_store(&bt->root_pid, rpid);
-	atomic_store(&bt->st_height, 1);
+	xtc_atomic_store_u64(&bt->root_pid, rpid, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&bt->st_height, 1, xtc_mo_seq_cst);
 	bm_unfix(bm, rf, 1);
 
 	(void)bt_write_super(bt);       /* persist where the root lives */
@@ -961,8 +967,9 @@ bt_reopen(bm_t *bm, bt_t **out)
 		free(bt);
 		return XTC_E_NOMEM;
 	}
-	atomic_store(&bt->root_pid, (bm_pid_t)s.root_pid);
-	atomic_store(&bt->st_height, s.height);
+	xtc_atomic_store_u64(&bt->root_pid, (bm_pid_t)s.root_pid,
+	    xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&bt->st_height, s.height, xtc_mo_seq_cst);
 	bt->meta_clean = s.clean;
 	bt->meta_clock = s.commit_clock;
 	if (s.page_size < sizeof s)      /* written without the ext words */
@@ -975,7 +982,7 @@ bt_reopen(bm_t *bm, bt_t **out)
 /* Set by every connection registration (always to the same function),
  * possibly from several loops at once: atomic so that is not a race. */
 typedef void (*bt_close_hook_fn)(bt_t *);
-static _Atomic(bt_close_hook_fn) bt_close_hook = NULL;
+static bt_close_hook_fn bt_close_hook = NULL;
 
 void
 bt_close(bt_t *bt)
@@ -983,7 +990,7 @@ bt_close(bt_t *bt)
 	bt_close_hook_fn hook;
 	if (bt == NULL)
 		return;
-	hook = atomic_load_explicit(&bt_close_hook, memory_order_acquire);
+	hook = xtc_atomic_load_ptr(&bt_close_hook, xtc_mo_acquire);
 	if (hook != NULL)
 		hook(bt);              /* let xstore drop cached state for this bt */
 	if (bt->smo != NULL)
@@ -995,7 +1002,7 @@ bt_close(bt_t *bt)
 void
 bt_set_close_hook(void (*fn)(bt_t *))
 {
-	atomic_store_explicit(&bt_close_hook, fn, memory_order_release);
+	xtc_atomic_store_ptr(&bt_close_hook, fn, xtc_mo_release);
 }
 
 void
@@ -1212,11 +1219,13 @@ bt_insert_fast(bt_t *bt, const void *key, uint16_t klen, const void *val,
 	void *pg;
 	int found, r, mr;
 
-	pid = atomic_load(&bt->root_pid);
+	pid = xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 	if (bm_fix_pid(bm, pid, &f) != XTC_OK)
 		return 0;
 	bm_latch_shared(f);
-	if (pid != atomic_load(&bt->root_pid)) {   /* root grew under us */
+	if (pid !=
+	    xtc_atomic_load_u64(&bt->root_pid,
+	        xtc_mo_seq_cst)) { /* root grew under us */
 		bm_unlatch(f); bm_unfix(bm, f, 0);
 		return 0;
 	}
@@ -1283,7 +1292,7 @@ bt_insert_fast(bt_t *bt, const void *key, uint16_t klen, const void *val,
 	r = btnode_insert_f(pg, key, klen, val, vlen, vflag);
 	if (r == 0) {
 		BT_CHECK_NODE(pg);
-		atomic_fetch_add(&bt->st_inserts, 1);
+		xtc_atomic_fetch_add_u64(&bt->st_inserts, 1, xtc_mo_seq_cst);
 		/* Physiological redo for a plain (non-split) in-leaf insert:
 		 * log the leaf's after-image so in-place recovery can repair a
 		 * torn NON-split leaf from its image (page-LSN gated) instead of
@@ -1385,7 +1394,7 @@ post_separator(bt_t *bt, bm_pid_t *path, int level,
 		bm_unlatch(pf); bm_unfix(bm, pf, 1);
 		if (r != 0)
 			return XTC_E_INTERNAL;
-		atomic_fetch_add(&bt->st_splits, 1);
+		xtc_atomic_fetch_add_u64(&bt->st_splits, 1, xtc_mo_seq_cst);
 		memcpy(cur_sep, pushup, pushuplen);
 		cur_seplen = pushuplen;
 		cur_right = rpid;
@@ -1400,7 +1409,8 @@ post_separator(bt_t *bt, bm_pid_t *path, int level,
 		bm_frame_t *nf;
 		bm_pid_t npid;
 		uint8_t empty = 0;
-		bm_pid_t oldroot = atomic_load(&bt->root_pid);
+		bm_pid_t oldroot =
+		    xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 
 		rc = bt_alloc_node(bm, &nf, &npid);
 		if (rc != XTC_OK)
@@ -1416,8 +1426,8 @@ post_separator(bt_t *bt, bm_pid_t *path, int level,
 		BT_CHECK_NODE(bm_page(nf));
 		bm_predirty(bm, nf); smo_log_page(bt, npid, bm_page(nf));
 		bm_unlatch(nf); bm_unfix(bm, nf, 1);
-		atomic_store(&bt->root_pid, npid);
-		atomic_fetch_add(&bt->st_height, 1);
+		xtc_atomic_store_u64(&bt->root_pid, npid, xtc_mo_seq_cst);
+		xtc_atomic_fetch_add_u64(&bt->st_height, 1, xtc_mo_seq_cst);
 		(void)bt_write_super(bt);   /* root pid changed: persist it */
 	}
 	return XTC_OK;
@@ -1592,9 +1602,10 @@ bt_shift(bt_t *bt, bm_pid_t ppid, bm_frame_t **fp, const void *key,
 	bm_predirty(bm, rf); smo_log_page(bt, opid, rp);
 	bm_predirty(bm, pf); smo_log_page(bt, ppid, pp);
 	smo_end(nta);
-	atomic_fetch_add(&bt->st_shifts, 1);
+	xtc_atomic_fetch_add_u64(&bt->st_shifts, 1, xtc_mo_seq_cst);
 	if (side < 0)
-		atomic_fetch_add(&bt->st_shifts_left, 1);
+		xtc_atomic_fetch_add_u64(&bt->st_shifts_left, 1,
+		    xtc_mo_seq_cst);
 	bm_unlatch(pf); bm_unfix(bm, pf, 1);
 	/* Keep the side the entry goes to (keys <= sep go left). */
 	i = key_cmp(key, klen, sep, seplen) <= 0;
@@ -1696,7 +1707,7 @@ bt_insert_leaf(bt_t *bt, const void *key, uint16_t klen, const void *val,
 	 * at every level recovers from splits that happened before we held
 	 * the SMO lock. */
 	depth = 0;
-	pid = atomic_load(&bt->root_pid);
+	pid = xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 	if ((rc = bm_fix_pid(bm, pid, &f)) != XTC_OK)
 		goto unlock;
 	bm_latch_exclusive(f);
@@ -1754,7 +1765,7 @@ bt_insert_leaf(bt_t *bt, const void *key, uint16_t klen, const void *val,
 	      xtc_sim_buggify_fault(200)) &&
 	    btnode_insert_f(pg, key, klen, val, vlen, vflag) == 0) {
 		BT_CHECK_NODE(pg);
-		atomic_fetch_add(&bt->st_inserts, 1);
+		xtc_atomic_fetch_add_u64(&bt->st_inserts, 1, xtc_mo_seq_cst);
 		/* Non-split in-leaf insert on the SMO path (an upsert, or a
 		 * fast-path miss re-run under the lock): log the leaf image too,
 		 * same physiological-redo reason as the fast path above. */
@@ -1786,7 +1797,8 @@ bt_insert_leaf(bt_t *bt, const void *key, uint16_t klen, const void *val,
 		}
 		if (btnode_insert_f(pg, key, klen, val, vlen, vflag) == 0) {
 			BT_CHECK_NODE(pg);
-			atomic_fetch_add(&bt->st_inserts, 1);
+			xtc_atomic_fetch_add_u64(&bt->st_inserts, 1,
+			    xtc_mo_seq_cst);
 			bm_predirty(bm, f); smo_log_leaf(bt, bm_frame_pid(f), pg);
 			bm_unlatch(f); bm_unfix(bm, f, 1);
 			rc = XTC_OK; goto unlock;
@@ -1834,8 +1846,8 @@ bt_insert_leaf(bt_t *bt, const void *key, uint16_t klen, const void *val,
 	bm_unlatch(rf); bm_unfix(bm, rf, 1);
 	bm_unlatch(f); bm_unfix(bm, f, 1);   /* left leaf modified */
 	if (r != 0) { smo_end(nta); rc = XTC_E_INTERNAL; goto unlock; }
-	atomic_fetch_add(&bt->st_inserts, 1);
-	atomic_fetch_add(&bt->st_splits, 1);
+	xtc_atomic_fetch_add_u64(&bt->st_inserts, 1, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_u64(&bt->st_splits, 1, xtc_mo_seq_cst);
 
 	rc = post_separator(bt, path, depth - 1, sep, seplen, rpid);
 	smo_end(nta);            /* close the NTA: the SMO is crash-atomic */
@@ -1882,7 +1894,8 @@ descend_optimistic(bt_t *bt, const void *key, uint16_t klen, bm_frame_t **out)
 
 	if (!BT_OLC_ENABLED)
 		return 0;
-	if (bm_fix_pid(bm, atomic_load(&bt->root_pid), &f) != XTC_OK)
+	if (bm_fix_pid(bm, xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst),
+	        &f) != XTC_OK)
 		return 0;
 	for (hops = 0; hops < 4 * BT_MAX_HEIGHT; hops++) {
 		void *pg = bm_page(f);
@@ -1965,7 +1978,7 @@ descend_shared(bt_t *bt, const void *key, uint16_t klen, bm_frame_t **out)
 	for (;; xtc_yield()) {
 		why = NULL;
 		BT_RESTART_TEST_HOOK();
-		pid = atomic_load(&bt->root_pid);
+		pid = xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 		rc = bm_fix_pid(bm, pid, &f);
 		if (rc == XTC_E_AGAIN) {   /* root pid quarantined: retry */
 			if (descent_give_up(bt, &restarts, "descend_shared", key,
@@ -2083,7 +2096,8 @@ bt_lookup_optimistic(bt_t *bt, const void *key, uint16_t klen,
 	if (!BT_OLC_ENABLED)
 		return XTC_E_AGAIN;              /* take the latched lookup */
 	for (attempt = 0; attempt < BT_OLC_RETRIES; attempt++) {
-		bm_pid_t pid = atomic_load(&bt->root_pid);
+		bm_pid_t pid =
+		    xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 		bm_frame_t *f;
 		int depth = 0;
 		int conflict = 0;
@@ -2297,7 +2311,7 @@ bt_lookup(bt_t *bt, const void *key, uint16_t klen, void *buf, uint16_t cap,
 
 	if (bt == NULL || key == NULL || klen > bt_key_max(bt))
 		return XTC_E_INVAL;
-	atomic_fetch_add(&bt->st_lookups, 1);
+	xtc_atomic_fetch_add_u64(&bt->st_lookups, 1, xtc_mo_seq_cst);
 
 	/*
 	 * OLC fast path: descend + read the leaf with no content latch,
@@ -2375,7 +2389,9 @@ seek_ge_optimistic(bt_t *bt, const void *key, uint16_t klen, void *kout,
 		bm_frame_t *f;
 		int depth = 0, first = 0, orc = XTC_E_AGAIN;
 
-		if (bm_fix_pid(bm, atomic_load(&bt->root_pid), &f) != XTC_OK)
+		if (bm_fix_pid(bm,
+		        xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst),
+		        &f) != XTC_OK)
 			return XTC_E_AGAIN;
 		for (;;) {
 			const struct btnode_hdr *h = bm_page(f);
@@ -2570,7 +2586,7 @@ bt_seek_ge_n(bt_t *bt, bt_probe_t *p, int n, void *buf, uint32_t bcap)
 	if (!BT_OLC_ENABLED || live == 0)
 		return XTC_OK;
 	bm = bt->bm;
-	at[0] = atomic_load(&bt->root_pid);
+	at[0] = xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 	for (i = 1; i < live; i++)
 		at[i] = at[0];
 	for (round = 0; live > 0 && round <= BT_MAX_HEIGHT; round++) {
@@ -2671,7 +2687,8 @@ collapse_root(bt_t *bt)
 	bm_t *bm = bt->bm;
 
 	for (;;) {
-		bm_pid_t rpid = atomic_load(&bt->root_pid);
+		bm_pid_t rpid =
+		    xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 		bm_frame_t *rf;
 		void *rp;
 		bm_pid_t only_child;
@@ -2689,11 +2706,12 @@ collapse_root(bt_t *bt)
 		bm_unlatch(rf); bm_unfix(bm, rf, 0);
 		if (only_child == BM_PID_NONE)
 			return;
-		atomic_store(&bt->root_pid, only_child);
-		atomic_fetch_sub(&bt->st_height, 1);
+		xtc_atomic_store_u64(&bt->root_pid, only_child, xtc_mo_seq_cst);
+		xtc_atomic_fetch_sub_u64(&bt->st_height, 1, xtc_mo_seq_cst);
 		(void)bt_write_super(bt);      /* root pid changed: persist it */
 		if (bm_free_pid(bm, rpid) == XTC_OK)
-			atomic_fetch_add(&bt->st_reclaimed, 1);
+			xtc_atomic_fetch_add_u64(&bt->st_reclaimed, 1,
+			    xtc_mo_seq_cst);
 	}
 }
 
@@ -2901,8 +2919,8 @@ merge_level(bt_t *bt, bm_pid_t *path, int level, const void *key,
 	bm_unlatch(rf); bm_unfix(bm, rf, 0);   /* R is dead: do not dirty */
 	rf = NULL;
 	if (bm_free_pid(bm, rpid) == XTC_OK)
-		atomic_fetch_add(&bt->st_reclaimed, 1);
-	atomic_fetch_add(&bt->st_merges, 1);
+		xtc_atomic_fetch_add_u64(&bt->st_reclaimed, 1, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_u64(&bt->st_merges, 1, xtc_mo_seq_cst);
 	merged = 1;
 
  done:
@@ -2996,7 +3014,7 @@ bt_merge(bt_t *bt, const void *key, uint16_t klen)
 	 * split that happened before we held the SMO lock.
 	 */
 	depth = 0;
-	pid = atomic_load(&bt->root_pid);
+	pid = xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 	if ((rc = bm_fix_pid(bm, pid, &f)) != XTC_OK)
 		goto unlock;
 	bm_latch_exclusive(f);
@@ -3091,7 +3109,7 @@ bt_delete(bt_t *bt, const void *key, uint16_t klen)
 	for (attempt = 0; attempt < BT_DELETE_RETRIES; attempt++) {
 		int stale = 0;
 
-		pid = atomic_load(&bt->root_pid);
+		pid = xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 		rc = bm_fix_pid(bm, pid, &f);
 		if (rc == XTC_E_AGAIN) {   /* root pid quarantined: retry */
 			f = NULL;
@@ -3225,7 +3243,7 @@ bt_delete(bt_t *bt, const void *key, uint16_t klen)
 	 */
 	if (xtc_arwlock_wrlock(bt->smo, -1) != XTC_OK)
 		return XTC_E_NOTFOUND;
-	pid = atomic_load(&bt->root_pid);
+	pid = xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 	if (bm_fix_pid(bm, pid, &f) != XTC_OK) {
 		(void)xtc_arwlock_unlock(bt->smo);
 		return XTC_E_NOTFOUND;
@@ -3289,7 +3307,7 @@ cursor_descend(bt_t *bt, const void *start, uint16_t klen, bm_frame_t **out)
 	long restarts = 0;
 	int rc;
 
-	atomic_fetch_add(&bt->st_descents, 1);
+	xtc_atomic_fetch_add_u64(&bt->st_descents, 1, xtc_mo_seq_cst);
 	if (!BT_STALE_TEST_HOOK_PEEK() && descend_optimistic(bt, start, klen, out))
 		return XTC_OK;
 
@@ -3307,7 +3325,7 @@ cursor_descend(bt_t *bt, const void *start, uint16_t klen, bm_frame_t **out)
 	for (;; xtc_yield()) {
 		why = NULL;
 		BT_RESTART_TEST_HOOK();
-		pid = atomic_load(&bt->root_pid);
+		pid = xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 		rc = bm_fix_pid(bm, pid, &f);
 		if (rc == XTC_E_AGAIN) {   /* root pid quarantined: retry */
 			if (descent_give_up(bt, &restarts, "cursor_descend", start,
@@ -3669,7 +3687,8 @@ sample_node(struct bt_sample *sm, void *pg, int level)
 		if (rc != XTC_OK)
 			return rc;
 		bm_latch_shared(cf);
-		atomic_fetch_add(&sm->bt->st_sample_pages, 1);
+		xtc_atomic_fetch_add_u64(&sm->bt->st_sample_pages, 1,
+		    xtc_mo_seq_cst);
 		cp = bm_page(cf);
 		if (btnode_is_dead(cp)) {
 			rc = XTC_E_AGAIN;
@@ -3712,7 +3731,8 @@ bt_sample_keys(bt_t *bt, const void *lo, uint16_t lolen, const void *hi,
 	sm.hilen = hilen;
 	sm.depth = depth < BT_MAX_HEIGHT ? depth : BT_MAX_HEIGHT;
 	for (;;) {
-		bm_pid_t pid = atomic_load(&bt->root_pid);
+		bm_pid_t pid =
+		    xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst);
 		bm_frame_t *f;
 
 		sm.n = 0;
@@ -3726,10 +3746,12 @@ bt_sample_keys(bt_t *bt, const void *lo, uint16_t lolen, const void *hi,
 		if (rc != XTC_OK)
 			break;
 		bm_latch_shared(f);
-		atomic_fetch_add(&bt->st_sample_pages, 1);
+		xtc_atomic_fetch_add_u64(&bt->st_sample_pages, 1,
+		    xtc_mo_seq_cst);
 		/* Dead, or no longer the root (it grew: its right half would
 		 * be missed): restart. */
-		if (btnode_is_dead(bm_page(f)) || pid != atomic_load(&bt->root_pid))
+		if (btnode_is_dead(bm_page(f)) ||
+		    pid != xtc_atomic_load_u64(&bt->root_pid, xtc_mo_seq_cst))
 			rc = XTC_E_AGAIN;
 		else if (btnode_is_leaf(bm_page(f)))
 			rc = sample_leaf(&sm, bm_page(f));   /* no separators yet */
@@ -4083,7 +4105,7 @@ bt_cursor_resume(bt_cursor_t *c)
 	} else
 		bm_latch_shared(nf);
 	rc = cursor_seek(c, nf);
-	atomic_fetch_add(&c->bt->st_resumes, 1);
+	xtc_atomic_fetch_add_u64(&c->bt->st_resumes, 1, xtc_mo_seq_cst);
 	return rc;
 }
 
@@ -4114,20 +4136,23 @@ bt_get_stats(bt_t *bt, bt_stats_t *out)
 {
 	if (bt == NULL || out == NULL)
 		return;
-	out->inserts = atomic_load(&bt->st_inserts);
-	out->lookups = atomic_load(&bt->st_lookups);
-	out->splits = atomic_load(&bt->st_splits);
-	out->merges = atomic_load(&bt->st_merges);
-	out->reclaimed = atomic_load(&bt->st_reclaimed);
-	out->stuck = atomic_load(&bt->st_stuck);
-	out->height = atomic_load(&bt->st_height);
-	out->descents = atomic_load(&bt->st_descents);
-	out->resumes = atomic_load(&bt->st_resumes);
-	out->ovf_writes = atomic_load(&bt->st_ovf_writes);
-	out->ovf_reads = atomic_load(&bt->st_ovf_reads);
-	out->ovf_pages = atomic_load(&bt->st_ovf_pages);
-	out->ovf_freed = atomic_load(&bt->st_ovf_freed);
-	out->sample_pages = atomic_load(&bt->st_sample_pages);
-	out->shifts = atomic_load(&bt->st_shifts);
-	out->shifts_left = atomic_load(&bt->st_shifts_left);
+	out->inserts = xtc_atomic_load_u64(&bt->st_inserts, xtc_mo_seq_cst);
+	out->lookups = xtc_atomic_load_u64(&bt->st_lookups, xtc_mo_seq_cst);
+	out->splits = xtc_atomic_load_u64(&bt->st_splits, xtc_mo_seq_cst);
+	out->merges = xtc_atomic_load_u64(&bt->st_merges, xtc_mo_seq_cst);
+	out->reclaimed = xtc_atomic_load_u64(&bt->st_reclaimed, xtc_mo_seq_cst);
+	out->stuck = xtc_atomic_load_u64(&bt->st_stuck, xtc_mo_seq_cst);
+	out->height = xtc_atomic_load_u64(&bt->st_height, xtc_mo_seq_cst);
+	out->descents = xtc_atomic_load_u64(&bt->st_descents, xtc_mo_seq_cst);
+	out->resumes = xtc_atomic_load_u64(&bt->st_resumes, xtc_mo_seq_cst);
+	out->ovf_writes =
+	    xtc_atomic_load_u64(&bt->st_ovf_writes, xtc_mo_seq_cst);
+	out->ovf_reads = xtc_atomic_load_u64(&bt->st_ovf_reads, xtc_mo_seq_cst);
+	out->ovf_pages = xtc_atomic_load_u64(&bt->st_ovf_pages, xtc_mo_seq_cst);
+	out->ovf_freed = xtc_atomic_load_u64(&bt->st_ovf_freed, xtc_mo_seq_cst);
+	out->sample_pages =
+	    xtc_atomic_load_u64(&bt->st_sample_pages, xtc_mo_seq_cst);
+	out->shifts = xtc_atomic_load_u64(&bt->st_shifts, xtc_mo_seq_cst);
+	out->shifts_left =
+	    xtc_atomic_load_u64(&bt->st_shifts_left, xtc_mo_seq_cst);
 }

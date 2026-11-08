@@ -38,7 +38,6 @@
 #define _GNU_SOURCE
 #endif
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,10 +60,10 @@ static bm_t   *g_bm;
 static bt_t   *g_bt;
 static long    g_n_keys;
 static long    g_iters_per_reader;    /* fixed lookup budget per reader */
-static atomic_int      g_go;          /* release readers together */
-static atomic_llong    g_reads;       /* total lookups performed */
-static atomic_llong    g_hits;        /* lookups that found the key */
-static atomic_int      g_readers_left;/* readers still running (last stops provider) */
+static int g_go;                      /* release readers together */
+static long long g_reads;             /* total lookups performed */
+static long long g_hits;              /* lookups that found the key */
+static int g_readers_left; /* readers still running (last stops provider) */
 
 static void
 mkkey(long i, char *k)
@@ -88,7 +87,7 @@ reader_proc(void *arg)
 	long long local_reads = 0, local_hits = 0;
 	long i;
 
-	while (!atomic_load_explicit(&g_go, memory_order_acquire))
+	while (!xtc_atomic_load_i32(&g_go, xtc_mo_acquire))
 		xtc_yield();
 
 	for (i = 0; i < g_iters_per_reader; i++) {
@@ -104,10 +103,9 @@ reader_proc(void *arg)
 			xtc_yield();   /* stay cooperative */
 	}
 
-	atomic_fetch_add_explicit(&g_reads, local_reads, memory_order_relaxed);
-	atomic_fetch_add_explicit(&g_hits, local_hits, memory_order_relaxed);
-	if (atomic_fetch_sub_explicit(&g_readers_left, 1,
-	    memory_order_acq_rel) == 1)
+	xtc_atomic_fetch_add_llong(&g_reads, local_reads, xtc_mo_relaxed);
+	xtc_atomic_fetch_add_llong(&g_hits, local_hits, xtc_mo_relaxed);
+	if (xtc_atomic_fetch_sub_i32(&g_readers_left, 1, xtc_mo_acq_rel) == 1)
 		bm_provider_stop(g_bm);   /* last reader releases the provider */
 }
 
@@ -122,10 +120,10 @@ run_point(int nloops)
 	int64_t t0, t1;
 	int i;
 
-	atomic_store(&g_go, 0);
-	atomic_store(&g_reads, 0);
-	atomic_store(&g_hits, 0);
-	atomic_store(&g_readers_left, readers);
+	xtc_atomic_store_i32(&g_go, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_llong(&g_reads, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_llong(&g_hits, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_readers_left, readers, xtc_mo_seq_cst);
 
 	if (xtc_exec_init(&e, nloops) != XTC_OK)
 		return -1;
@@ -138,13 +136,14 @@ run_point(int nloops)
 		    (void *)(intptr_t)(i + 1), NULL, NULL);
 
 	t0 = xtc_clock_mono();
-	atomic_store_explicit(&g_go, 1, memory_order_release);   /* release */
+	xtc_atomic_store_i32(&g_go, 1, xtc_mo_release);          /* release */
 	(void)xtc_exec_run(e);                                   /* blocks */
 	t1 = xtc_clock_mono();
 	xtc_exec_fini(e);
 
 	{
-		long long reads = atomic_load(&g_reads);
+		long long reads =
+		    xtc_atomic_load_llong(&g_reads, xtc_mo_seq_cst);
 		double secs = (double)(t1 - t0) / 1e9;
 		return secs > 0 ? (double)reads / secs : 0.0;
 	}

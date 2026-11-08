@@ -32,7 +32,10 @@ driver(void *arg)
 		uint32_t d = 0;
 		bm_get_stats(g_bm, &st);
 		for (i = 0; i < n; i++)
-			d += atomic_load(&g_bm->frames[i].dirty) ? 1 : 0;
+			d += xtc_atomic_load_i32(&g_bm->frames[i].dirty,
+			         xtc_mo_seq_cst) ?
+			    1 :
+			    0;
 		if (d == 0 && st.tr_passes >= want_passes)
 			break;
 		(void)xtc_proc_sleep(1LL * 1000 * 1000);
@@ -48,7 +51,8 @@ driver(void *arg)
 		g_fail = 1;
 	}
 	for (i = 0; i < n; i++)
-		if (atomic_load(&g_bm->frames[i].dirty)) {
+		if (xtc_atomic_load_i32(&g_bm->frames[i].dirty,
+		        xtc_mo_seq_cst)) {
 			fprintf(stderr, "FAIL: frame %u still dirty\n", i);
 			g_fail = 1;
 			break;

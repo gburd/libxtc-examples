@@ -37,7 +37,6 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <stdatomic.h>
 
 #include "engine.h"      /* SX_* result codes */
 #include "vexec.h"
@@ -7078,8 +7077,12 @@ struct sort_ctx {
  * slot was overwritten and then NULLed by a concurrent sort: SIGSEGV in
  * sort_index_cmp under a 4-loop reader workload.) */
 static _Thread_local struct sort_ctx *g_sort_ctx;
-static _Atomic uint64_t g_vx_sorts;   /* sorts run (metric) */
-uint64_t vx_sort_count(void) { return atomic_load(&g_vx_sorts); }
+static uint64_t g_vx_sorts; /* sorts run (metric) */
+uint64_t
+vx_sort_count(void)
+{
+	return xtc_atomic_load_u64(&g_vx_sorts, xtc_mo_seq_cst);
+}
 
 static int
 sort_index_cmp(const void *pa, const void *pb)
@@ -7449,13 +7452,13 @@ ordered_materialize(struct vx_stmt *st)
 		struct topn_ctx tc;
 		tc.keys = keys; tc.seq = seq; tc.nkey = nkey; tc.desc = st->order_desc;
 		g_topn_ctx = &tc;
-		atomic_fetch_add(&g_vx_sorts, 1);
+		xtc_atomic_fetch_add_u64(&g_vx_sorts, 1, xtc_mo_seq_cst);
 		qsort(idx, (size_t)nrow, sizeof(int), topn_index_cmp);
 		g_topn_ctx = NULL;
 	} else if (nkey > 0 && !presorted) {
 		struct sort_ctx sc; sc.keys = keys; sc.nkey = nkey; sc.desc = st->order_desc;
 		g_sort_ctx = &sc;
-		atomic_fetch_add(&g_vx_sorts, 1);
+		xtc_atomic_fetch_add_u64(&g_vx_sorts, 1, xtc_mo_seq_cst);
 		qsort(idx, (size_t)nrow, sizeof(int), sort_index_cmp);
 		g_sort_ctx = NULL;
 	}
@@ -7946,7 +7949,7 @@ join_ordered_materialize(struct vx_stmt *st)
 				    rows[(size_t)p * (size_t)ncollect + (size_t)(st->order_outcol[j] - 1)];
 		sc.keys = keys; sc.nkey = nkey; sc.desc = st->order_desc;
 		g_sort_ctx = &sc;
-		atomic_fetch_add(&g_vx_sorts, 1);
+		xtc_atomic_fetch_add_u64(&g_vx_sorts, 1, xtc_mo_seq_cst);
 		qsort(idx, (size_t)nrow, sizeof(int), sort_index_cmp);
 		g_sort_ctx = NULL;
 		free(keys);
@@ -8368,13 +8371,13 @@ result_dedup(struct vx_result *r)
 /* Shared context across the morsel workers. */
 struct vx_par {
 	const struct vx_stmt *plan;   /* compiled template (proj/filter/cols/table) */
-	_Atomic int  next;            /* next morsel to hand out */
+	int next;                     /* next morsel to hand out */
 	int          nmorsel;         /* morsel m = rowids [bound[m], bound[m+1]) */
 	int64_t     *bound;           /* nmorsel + 1 ascending rowid boundaries */
 	int          nworkers;
 	struct vx_result *parts;      /* nworkers result buffers (non-agg) */
 	vx_htab_t   *wht;             /* nworkers per-worker hash tables (agg) */
-	_Atomic int  error;           /* any worker failed */
+	int error;                    /* any worker failed */
 };
 
 /* One worker: own connection, own range-scoped source statement, reuse
@@ -8414,8 +8417,7 @@ par_worker(xtc_task_t *self, void *user)
 	w.srcrow = srcrow;
 
 	for (;;) {
-		int m = atomic_fetch_add_explicit(&par->next, 1,
-		                                  memory_order_relaxed);
+		int m = xtc_atomic_fetch_add_i32(&par->next, 1, xtc_mo_relaxed);
 		int64_t lo, mh;
 		xstore_scan_t *ms;
 		if (m >= par->nmorsel) break;
@@ -8424,13 +8426,21 @@ par_worker(xtc_task_t *self, void *user)
 
 		/* A morsel = the rowid range [lo, mh-1]. */
 		ms = xstore_scan_open(w.bt, w.table, w.snap, lo, 1, mh - 1, 1);
-		if (ms == NULL) { atomic_store(&par->error, 1); goto done; }
+		if (ms == NULL) {
+			xtc_atomic_store_i32(&par->error, 1, xtc_mo_seq_cst);
+			goto done;
+		}
 
 		for (;;) {
 			int64_t rowid; const uint8_t *rec; int reclen, j;
 			int step = xstore_scan_next(ms, &rowid, &rec, &reclen);
 			if (step == 0) break;
-			if (step != 1) { xstore_scan_close(ms); atomic_store(&par->error, 1); goto done; }
+			if (step != 1) {
+				xstore_scan_close(ms);
+				xtc_atomic_store_i32(&par->error, 1,
+				    xtc_mo_seq_cst);
+				goto done;
+			}
 
 			read_rec_row(&w, rowid, rec, reclen, &rowarena);
 
@@ -8442,7 +8452,10 @@ par_worker(xtc_task_t *self, void *user)
 				/* Accumulate into this worker's hash table. */
 				if (agg_step_row(&w, w.agg, &par->wht[widx], w.srcrow,
 				    &rowarena) == NULL) {
-					xstore_scan_close(ms); atomic_store(&par->error, 1); goto done;
+					xstore_scan_close(ms);
+					xtc_atomic_store_i32(&par->error, 1,
+					    xtc_mo_seq_cst);
+					goto done;
 				}
 			} else {
 				vx_cell_t out[32];
@@ -8450,7 +8463,9 @@ par_worker(xtc_task_t *self, void *user)
 					eval(&w, w.proj[j], w.srcrow, &rowarena, &out[j]);
 				if (result_push(&par->parts[widx], out) != 0) {
 					xstore_scan_close(ms);
-					atomic_store(&par->error, 1); goto done;
+					xtc_atomic_store_i32(&par->error, 1,
+					    xtc_mo_seq_cst);
+					goto done;
 				}
 			}
 		}
@@ -8462,7 +8477,8 @@ par_worker(xtc_task_t *self, void *user)
 done:
 	if (rowarena) arena_free(rowarena);
 	free(srcrow);
-	if (!rc_ok) atomic_store(&par->error, 1);
+	if (!rc_ok)
+		xtc_atomic_store_i32(&par->error, 1, xtc_mo_seq_cst);
 	return 0;   /* task DONE */
 }
 
@@ -8560,7 +8576,7 @@ run_parallel_plan(vx_stmt_t *plan, struct xsql *db, int n_workers,
 	memcpy(out->noaff, plan->outnoaff, sizeof out->noaff);
 
 	par.plan = plan;
-	atomic_store(&par.next, 0);
+	xtc_atomic_store_i32(&par.next, 0, xtc_mo_seq_cst);
 	par.nmorsel = morsel_bounds(bt, tid, lo, hi, n_workers, &par.bound);
 	if (par.nmorsel < 0) { rc = -1; goto cleanup; }
 	par.nworkers = n_workers;
@@ -8591,7 +8607,10 @@ run_parallel_plan(vx_stmt_t *plan, struct xsql *db, int n_workers,
 	}
 	(void)xtc_exec_run(exec);   /* blocks until all workers DONE */
 
-	if (atomic_load(&par.error)) { rc = -1; goto cleanup; }
+	if (xtc_atomic_load_i32(&par.error, xtc_mo_seq_cst)) {
+		rc = -1;
+		goto cleanup;
+	}
 
 	if (plan->agg != NULL) {
 		/* Combine the per-worker hash tables into worker 0's, merging
@@ -10180,12 +10199,12 @@ struct vx_pcache {
 	unsigned char sig[32];       /* bind storage classes it was built with */
 };
 
-static _Atomic uint64_t g_plan_builds;
+static uint64_t g_plan_builds;
 
 uint64_t
 vx_plan_build_count(void)
 {
-	return atomic_load_explicit(&g_plan_builds, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_plan_builds, xtc_mo_relaxed);
 }
 
 vx_pcache_t *
@@ -10255,7 +10274,7 @@ vx_pcache_run(vx_pcache_t *pc, struct xsql *db, const vx_cell_t *binds,
 		return rc;
 	}
 	pc->gen = xstore_catalog_gen();
-	atomic_fetch_add_explicit(&g_plan_builds, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_plan_builds, 1, xtc_mo_relaxed);
 	recog = vx_prepare_select(db, NULL, sel, binds, nbinds, &plan, errmsg);
 	if (recog != 1) return recog;
 	if (plan->noreuse) return collect_serial(plan, res);

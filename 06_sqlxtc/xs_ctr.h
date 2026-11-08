@@ -40,7 +40,7 @@
 #ifndef SQLXTC_XS_CTR_H
 #define SQLXTC_XS_CTR_H
 
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -52,8 +52,8 @@
 typedef struct xs_ctr {
 	char lead[XS_CTR_LINE];      /* slot 0 shares no line with a neighbour */
 	struct {
-		_Atomic uint64_t v;
-		char pad[XS_CTR_LINE - sizeof(_Atomic uint64_t)];
+		uint64_t v;
+		char pad[XS_CTR_LINE - sizeof(uint64_t)];
 	} slot[XS_CTR_SLOTS];
 } xs_ctr_t;
 
@@ -62,12 +62,13 @@ typedef struct xs_ctr {
 static inline unsigned
 xs_ctr_slot(void)
 {
-	static _Atomic unsigned next;
+	static unsigned next;
 	static _Thread_local unsigned mine;   /* 0 = unassigned, else slot + 1 */
 
 	if (mine == 0)
-		mine = 1 + (atomic_fetch_add_explicit(&next, 1,
-		    memory_order_relaxed) & (XS_CTR_SLOTS - 1));
+		mine = 1 +
+		    (xtc_atomic_fetch_add_u32(&next, 1, xtc_mo_relaxed) &
+		        (XS_CTR_SLOTS - 1));
 	return mine - 1;
 }
 
@@ -80,8 +81,7 @@ xs_ctr_init(xs_ctr_t *c)
 static inline void
 xs_ctr_add(xs_ctr_t *c, uint64_t n)
 {
-	atomic_fetch_add_explicit(&c->slot[xs_ctr_slot()].v, n,
-	    memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&c->slot[xs_ctr_slot()].v, n, xtc_mo_relaxed);
 }
 
 static inline uint64_t
@@ -91,8 +91,8 @@ xs_ctr_sum(const xs_ctr_t *c)
 	int i;
 
 	for (i = 0; i < XS_CTR_SLOTS; i++)
-		s += atomic_load_explicit(&((xs_ctr_t *)c)->slot[i].v,
-		    memory_order_relaxed);
+		s += xtc_atomic_load_u64(&((xs_ctr_t *)c)->slot[i].v,
+		    xtc_mo_relaxed);
 	return s;
 }
 

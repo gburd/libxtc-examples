@@ -58,7 +58,8 @@ test_dw_slot_failure(void)
 	if ((ro = open(dwp, O_RDONLY)) < 0) return 1;
 	bm->dw_fd = ro;                       /* slot writes now fail (EBADF) */
 	CHECK(flush_frame(bm, f) == 0);       /* not clean */
-	CHECK(atomic_load(&f->dirty) == 1);   /* still dirty */
+	CHECK(xtc_atomic_load_i32(&f->dirty, xtc_mo_seq_cst) ==
+	    1);                               /* still dirty */
 	CHECK(bm_checkpoint(bm) != XTC_OK);   /* failure reported */
 	CHECK(pread(bm->fd, &got, 1, (off_t)pid * bm->page_size) != 1 ||
 	    got != 0x5a);                     /* home page NOT written */

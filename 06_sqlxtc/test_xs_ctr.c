@@ -15,7 +15,6 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +28,7 @@
 #define M_ADDS 2000000
 
 static xs_ctr_t        g_ctr;
-static _Atomic uint64_t g_plain;
+static uint64_t g_plain;
 static unsigned        g_slot[XS_CTR_SLOTS];
 static int             g_mode;      /* 0 striped, 1 plain */
 
@@ -43,7 +42,7 @@ adder(void *arg)
 		if (g_mode == 0)
 			xs_ctr_add(&g_ctr, 1);
 		else
-			atomic_fetch_add_explicit(&g_plain, 1, memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&g_plain, 1, xtc_mo_relaxed);
 	}
 	return NULL;
 }
@@ -100,7 +99,8 @@ main(void)
 
 	/* C3: the same adds on one shared atomic. */
 	ns_p = run(1, N_THR);
-	CK(atomic_load(&g_plain) == (uint64_t)N_THR * M_ADDS);
+	CK(xtc_atomic_load_u64(&g_plain, xtc_mo_seq_cst) ==
+	    (uint64_t)N_THR * M_ADDS);
 	printf("  %s   C1 %d threads x %d adds: sum exact; C2 slots on their "
 	    "own lines, %d threads in distinct slots\n", g_fail ? "FAIL" : "ok",
 	    N_THR, M_ADDS, N_THR);

@@ -49,7 +49,6 @@
  *	the program has no OpenCL/Level-Zero dependency at all.
  */
 #define _POSIX_C_SOURCE 200112L /* posix_memalign */
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,8 +167,8 @@ struct device {
  * in the fake path.
  */
 #if defined(XTC_WITH_OPENCL) || defined(XTC_WITH_LEVELZERO)
-static atomic_int g_inflight;      /* groups currently mid device op */
-static atomic_int g_overlap_peak;  /* max concurrent in-flight groups */
+static int g_inflight;     /* groups currently mid device op */
+static int g_overlap_peak; /* max concurrent in-flight groups */
 #endif
 
 /* ---------------------------------------------------------------------- */
@@ -220,7 +219,7 @@ struct group {
 	ze_command_list_handle_t zelist;
 	ze_event_pool_handle_t zepool;
 	unsigned ze_evt_next;       /* rotating event index into zepool */
-	atomic_int ze_evt_busy[64]; /* index in use until its event is destroyed */
+	int ze_evt_busy[64]; /* index in use until its event is destroyed */
 	struct ze_ev *ze_evs;       /* per-index waiter argument (ZE_EVT_SLOTS) */
 	ze_device_handle_t zedev;
 	void *zdev_a, *zdev_b;      /* NPU device memory */
@@ -241,7 +240,7 @@ struct demo {
 	 * shared counters; a plain ++ lost increments (TSan: write/write race
 	 * at batch_complete), so the self-test flaked "every request completes
 	 * exactly once" although each request did complete exactly once. */
-	atomic_uint completed, cancelled, failed;
+	unsigned completed, cancelled, failed;
 };
 
 static void
@@ -362,11 +361,12 @@ static const struct device fake_device = {
 static void
 inflight_enter(struct group *g)
 {
-	int now = atomic_fetch_add(&g_inflight, 1) + 1;
-	int peak = atomic_load(&g_overlap_peak);
+	int now = xtc_atomic_fetch_add_i32(&g_inflight, 1, xtc_mo_seq_cst) + 1;
+	int peak = xtc_atomic_load_i32(&g_overlap_peak, xtc_mo_seq_cst);
 
 	while (now > peak &&
-	    !atomic_compare_exchange_weak(&g_overlap_peak, &peak, now))
+	    !xtc_atomic_cas_weak_i32(&g_overlap_peak, &peak, now,
+	        xtc_mo_seq_cst, xtc_mo_seq_cst))
 		; /* retry */
 	if (now >= 2)
 		g->overlap_ops++;
@@ -375,7 +375,7 @@ inflight_enter(struct group *g)
 static void
 inflight_leave(void)
 {
-	atomic_fetch_sub(&g_inflight, 1);
+	xtc_atomic_fetch_sub_i32(&g_inflight, 1, xtc_mo_seq_cst);
 }
 #endif
 
@@ -819,7 +819,7 @@ ze_group_init(struct group *g, int dev_index)
 	if (g->ze_evs == NULL)
 		return XTC_E_NOMEM;
 	for (k = 0; k < ZE_EVT_SLOTS; k++)
-		atomic_store(&g->ze_evt_busy[k], 0);
+		xtc_atomic_store_i32(&g->ze_evt_busy[k], 0, xtc_mo_seq_cst);
 
 	{
 		ze_event_pool_desc_t epdesc;
@@ -852,7 +852,7 @@ ze_release_ev(void *arg)
 {
 	struct ze_ev *e = arg;
 	zeEventDestroy(e->ev);
-	atomic_store(&e->g->ze_evt_busy[e->idx], 0);
+	xtc_atomic_store_i32(&e->g->ze_evt_busy[e->idx], 0, xtc_mo_seq_cst);
 }
 
 /*
@@ -891,7 +891,8 @@ ze_submit(struct group *g, const xtc_batch_item_t *items, size_t n,
 	if (!g->ze_ready)
 		return XTC_E_IO;
 	idx = g->ze_evt_next++ % ZE_EVT_SLOTS;
-	if (atomic_exchange(&g->ze_evt_busy[idx], 1) != 0) {
+	if (xtc_atomic_exchange_i32(&g->ze_evt_busy[idx], 1, xtc_mo_seq_cst) !=
+	    0) {
 		fprintf(stderr, "ze: event slot %u still in use\n", idx);
 		return XTC_E_AGAIN;
 	}
@@ -906,7 +907,7 @@ ze_submit(struct group *g, const xtc_batch_item_t *items, size_t n,
 	edesc.wait = ZE_EVENT_SCOPE_FLAG_HOST;
 	if (zeEventCreate(g->zepool, &edesc, &e->ev) != ZE_RESULT_SUCCESS) {
 		fprintf(stderr, "ze: eventCreate failed\n");
-		atomic_store(&g->ze_evt_busy[idx], 0);
+		xtc_atomic_store_i32(&g->ze_evt_busy[idx], 0, xtc_mo_seq_cst);
 		inflight_leave();
 		return XTC_E_IO;
 	}
@@ -946,7 +947,7 @@ ze_submit(struct group *g, const xtc_batch_item_t *items, size_t n,
 	    != XTC_OK) {
 		(void)zeCommandQueueSynchronize(g->zeq, UINT64_MAX);
 		zeEventDestroy(e->ev);
-		atomic_store(&g->ze_evt_busy[idx], 0);
+		xtc_atomic_store_i32(&g->ze_evt_busy[idx], 0, xtc_mo_seq_cst);
 		inflight_leave();
 		return rc;
 	}
@@ -959,7 +960,7 @@ ze_submit(struct group *g, const xtc_batch_item_t *items, size_t n,
 	return XTC_OK;
 fail:
 	zeEventDestroy(e->ev);
-	atomic_store(&g->ze_evt_busy[idx], 0);
+	xtc_atomic_store_i32(&g->ze_evt_busy[idx], 0, xtc_mo_seq_cst);
 	inflight_leave();
 	return XTC_E_IO;
 }
@@ -1052,11 +1053,13 @@ batch_complete(uint64_t handle, void *request, int outcome, void *user)
 		die("exactly-once terminal completion");
 	r->outcome = outcome;
 	if (outcome == XTC_OK)
-		g->demo->completed++;
+		xtc_atomic_fetch_add_u32(&g->demo->completed, 1,
+		    xtc_mo_seq_cst);
 	else if (outcome == XTC_E_ABORTED)
-		g->demo->cancelled++;
+		xtc_atomic_fetch_add_u32(&g->demo->cancelled, 1,
+		    xtc_mo_seq_cst);
 	else
-		g->demo->failed++;
+		xtc_atomic_fetch_add_u32(&g->demo->failed, 1, xtc_mo_seq_cst);
 	g->n_terminal++;
 	(void)xtc_notify_signal(g->done_note); /* wake the feeder */
 }
@@ -1238,7 +1241,7 @@ run(struct demo *d, int nreqs)
 		g->dev->group_fini(g);
 	}
 #if defined(XTC_WITH_OPENCL) || defined(XTC_WITH_LEVELZERO)
-	rs.overlap_peak = atomic_load(&g_overlap_peak);
+	rs.overlap_peak = xtc_atomic_load_i32(&g_overlap_peak, xtc_mo_seq_cst);
 #endif
 	if (rs.total_submits > 0)
 		rs.avg_occupancy = (double)rs.total_members /
@@ -1308,8 +1311,10 @@ self_test(void)
 	fake_use_sync = 0;
 	dc = demo_new(1, 2, 0);
 	rc = run(dc, 48);
-	if (dc->completed != (unsigned)dc->nreqs || dc->cancelled != 0 ||
-	    dc->failed != 0)
+	if (xtc_atomic_load_u32(&dc->completed, xtc_mo_seq_cst) !=
+	        (unsigned)dc->nreqs ||
+	    xtc_atomic_load_u32(&dc->cancelled, xtc_mo_seq_cst) != 0 ||
+	    xtc_atomic_load_u32(&dc->failed, xtc_mo_seq_cst) != 0)
 		die("every request completes exactly once");
 	for (i = 0; i < dc->nreqs; i++)
 		if (dc->reqs[i].completions != 1 || !dc->reqs[i].done ||
@@ -1347,7 +1352,8 @@ self_test(void)
 	sum_s = checksum_reqs(ds);
 	if (sum_s != ref)
 		die("static checksum != reference");
-	if (ds->completed != (unsigned)ds->nreqs)
+	if (xtc_atomic_load_u32(&ds->completed, xtc_mo_seq_cst) !=
+	    (unsigned)ds->nreqs)
 		die("static: every request completes exactly once");
 
 	/* 5. SYNC exec kind also works and matches. */
@@ -1447,8 +1453,9 @@ main(int argc, char **argv)
 	printf("mode=%s hetero=%d reqs=%d\n",
 	    continuous ? "continuous" : "static", hetero, d->nreqs);
 	printf("completed=%u cancelled=%u failed=%u (exactly-once enforced)\n",
-	    atomic_load(&d->completed), atomic_load(&d->cancelled),
-	    atomic_load(&d->failed));
+	    xtc_atomic_load_u32(&d->completed, xtc_mo_seq_cst),
+	    xtc_atomic_load_u32(&d->cancelled, xtc_mo_seq_cst),
+	    xtc_atomic_load_u32(&d->failed, xtc_mo_seq_cst));
 	printf("reqs_done=%u device_ops=%u avg_occupancy=%.2f members/op\n",
 	    rs.reqs_done, rs.total_submits, rs.avg_occupancy);
 	for (i = 0; i < 2; i++)

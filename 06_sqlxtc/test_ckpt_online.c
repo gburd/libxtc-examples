@@ -35,7 +35,6 @@
  *	checkpoint, for the fail-before.
  */
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,8 +58,8 @@
 static int          g_fail;
 static int          g_quiesced;
 static char         g_path[256], g_wal[300];
-static _Atomic int  g_left, g_stop, g_in_ckpt;
-static _Atomic long g_commits, g_during, g_last[NHOT];
+static int g_left, g_stop, g_in_ckpt;
+static long g_commits, g_during, g_last[NHOT];
 static uint64_t     g_tail;
 static long         g_max_wal;
 
@@ -87,20 +86,21 @@ committer(void *arg)
 	sx_db *h = NULL;
 	char sql[160];
 	if (sx_open(":memory:", &h) != SX_OK) { g_fail = 1; goto out; }
-	for (r = 0; !atomic_load(&g_stop); r++) {
+	for (r = 0; !xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst); r++) {
 		int row = (int)id + NCMT * (int)(r % (NHOT / NCMT));
 		long val = r * 100 + id;
-		int during = atomic_load(&g_in_ckpt);
+		int during = xtc_atomic_load_i32(&g_in_ckpt, xtc_mo_seq_cst);
 		snprintf(sql, sizeof sql, "UPDATE hot SET v=%ld WHERE k=%d", val, row);
 		if (sx_exec(h, sql, NULL) != SX_OK) { g_fail = 1; break; }
-		atomic_store(&g_last[row], val);
-		atomic_fetch_add(&g_commits, 1);
-		if (during && atomic_load(&g_in_ckpt))
-			atomic_fetch_add(&g_during, 1);   /* began and ended inside one */
+		xtc_atomic_store_long(&g_last[row], val, xtc_mo_seq_cst);
+		xtc_atomic_fetch_add_long(&g_commits, 1, xtc_mo_seq_cst);
+		if (during && xtc_atomic_load_i32(&g_in_ckpt, xtc_mo_seq_cst))
+			xtc_atomic_fetch_add_long(&g_during, 1,
+			    xtc_mo_seq_cst); /* began and ended inside one */
 	}
 	sx_close(h);
 out:
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		sx_storage_quiesce();
 }
 
@@ -113,7 +113,7 @@ checkpointer(void *arg)
 	for (i = 0; i < CHECKPOINTS; i++) {
 		uint64_t tail = 0;
 		long sz;
-		atomic_store(&g_in_ckpt, 1);
+		xtc_atomic_store_i32(&g_in_ckpt, 1, xtc_mo_seq_cst);
 		if (g_quiesced) {
 			xstore_quiesce_begin();
 			CK(xstore_checkpoint_wal(sx_storage_bt(), sx_storage_wal(),
@@ -123,22 +123,24 @@ checkpointer(void *arg)
 			CK(xstore_checkpoint_wal_online(sx_storage_bt(),
 			    sx_storage_wal(), sx_storage_wal_path(), &tail) == XTC_OK);
 		}
-		atomic_store(&g_in_ckpt, 0);
+		xtc_atomic_store_i32(&g_in_ckpt, 0, xtc_mo_seq_cst);
 		g_tail += tail;
 		if ((sz = wal_bytes()) > g_max_wal) g_max_wal = sz;
 		(void)xtc_proc_sleep(5LL * 1000 * 1000);
 	}
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 }
 
-static _Atomic int g_ock_rc = 99;
+static int g_ock_rc = 99;
 
 static void
 ock_proc(void *arg)
 {
 	(void)arg;
-	atomic_store(&g_ock_rc, xstore_checkpoint_wal_online(sx_storage_bt(),
-	    sx_storage_wal(), sx_storage_wal_path(), NULL));
+	xtc_atomic_store_i32(&g_ock_rc,
+	    xstore_checkpoint_wal_online(sx_storage_bt(), sx_storage_wal(),
+	        sx_storage_wal_path(), NULL),
+	    xtc_mo_seq_cst);
 }
 
 /* A proc that stops the engine (as the server's drain does) while the
@@ -172,9 +174,11 @@ stop_during_checkpoint(void)
 	CK(xtc_loop_run(loop) == XTC_OK);      /* hung forever before the fix */
 	(void)xtc_loop_fini(loop);
 	printf("  stop during an online checkpoint: loop drained in %lld ms, "
-	    "checkpoint rc=%d\n", (long long)((xtc_clock_mono() - t0) / 1000000),
-	    atomic_load(&g_ock_rc));
-	CK(atomic_load(&g_ock_rc) != 99);      /* it returned */
+	       "checkpoint rc=%d\n",
+	    (long long)((xtc_clock_mono() - t0) / 1000000),
+	    xtc_atomic_load_i32(&g_ock_rc, xtc_mo_seq_cst));
+	CK(xtc_atomic_load_i32(&g_ock_rc, xtc_mo_seq_cst) !=
+	    99); /* it returned */
 	sx_storage_abandon();
 	CK(sx_storage_open(g_path, 2048) == SX_OK);
 	CK(sx_open(":memory:", &h) == SX_OK);
@@ -228,11 +232,11 @@ main(void)
 	for (i = 0; i < NHOT; i++) {
 		snprintf(sql, sizeof sql, "INSERT INTO hot VALUES(%d, -1)", i);
 		CK(sx_exec(h, sql, NULL) == SX_OK);
-		atomic_store(&g_last[i], -1);
+		xtc_atomic_store_long(&g_last[i], -1, xtc_mo_seq_cst);
 	}
 	sx_close(h);
 
-	atomic_store(&g_left, NCMT);
+	xtc_atomic_store_i32(&g_left, NCMT, xtc_mo_seq_cst);
 	if (xtc_loop_init(&loop) != XTC_OK) return 1;
 	CK(sx_storage_run(loop) == SX_OK);
 	for (i = 0; i < NCMT; i++)
@@ -250,17 +254,21 @@ main(void)
 	CK(sx_open(":memory:", &h) == SX_OK);
 	for (i = 0; i < NHOT; i++) {
 		snprintf(sql, sizeof sql, "SELECT v FROM hot WHERE k=%d", i);
-		if (one(h, sql) != atomic_load(&g_last[i])) bad++;
+		if (one(h, sql) !=
+		    xtc_atomic_load_long(&g_last[i], xtc_mo_seq_cst))
+			bad++;
 	}
 	CK(one(h, "SELECT count(*) FROM big") == NBIG);
 	CK(one(h, "SELECT k FROM big WHERE k = 12345") == 12345);
 	sx_close(h);
-	printf("  %s: commits=%ld during-checkpoint=%ld live-frames-copied=%llu "
+	printf(
+	    "  %s: commits=%ld during-checkpoint=%ld live-frames-copied=%llu "
 	    "max-wal=%ld KB rows-wrong-after-crash=%ld\n",
-	    g_quiesced ? "quiesced" : "online", atomic_load(&g_commits),
-	    atomic_load(&g_during), (unsigned long long)g_tail,
-	    g_max_wal / 1024, bad);
-	CK(atomic_load(&g_during) > 0);
+	    g_quiesced ? "quiesced" : "online",
+	    xtc_atomic_load_long(&g_commits, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_during, xtc_mo_seq_cst),
+	    (unsigned long long)g_tail, g_max_wal / 1024, bad);
+	CK(xtc_atomic_load_long(&g_during, xtc_mo_seq_cst) > 0);
 	CK(g_quiesced || g_tail > 0);
 	CK(bad == 0);
 	CK(g_max_wal < 16L * 1024 * 1024);          /* compacted (~4 MB live) */

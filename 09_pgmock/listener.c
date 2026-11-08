@@ -14,7 +14,6 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-#include <stdatomic.h>
 
 #include "xtc.h"
 #include "xtc_io.h"
@@ -32,7 +31,7 @@ pgmock_listener_proc(void *arg)
 	size_t msg_len;
 	uint32_t revents;
 
-	while (!atomic_load(lst->shutdown)) {
+	while (!xtc_atomic_load_i32(lst->shutdown, xtc_mo_seq_cst)) {
 		/* Drain the accept backlog.  xtc_net_accept maps EMFILE /
 		 * ENFILE to XTC_E_RESOURCE: back off 10 ms (the connection
 		 * stays in the backlog) instead of spinning on a listen fd
@@ -52,10 +51,11 @@ pgmock_listener_proc(void *arg)
 			bo.fd = fd;
 			if (pgmock_backend_spawn(lst->loop, &bo, &pid) ==
 			    XTC_OK) {
-				atomic_fetch_add(&lst->accepted, 1);
+				xtc_atomic_fetch_add_i32(&lst->accepted, 1,
+				    xtc_mo_seq_cst);
 				if (lst->pids != NULL) {
-					int i = atomic_fetch_add(
-					    &lst->pids_n, 1);
+					int i = xtc_atomic_fetch_add_i32(
+					    &lst->pids_n, 1, xtc_mo_seq_cst);
 					if (i < lst->pids_cap)
 						lst->pids[i] = pid;
 				}

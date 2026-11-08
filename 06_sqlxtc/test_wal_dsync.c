@@ -20,7 +20,6 @@
 
 #include <fcntl.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +37,7 @@
 #define PER 500
 
 static wal_t           *g_wal;
-static _Atomic long     g_ok, g_bad;
+static long g_ok, g_bad;
 static int64_t          g_fiber_ns;
 
 static void
@@ -50,9 +49,9 @@ commit_n(long id)
 		uint64_t lsn;
 		int n = snprintf(rec, sizeof rec, "c%ld-%ld", id, i);
 		if (wal_commit(g_wal, rec, (uint32_t)n, &lsn) == XTC_OK)
-			atomic_fetch_add(&g_ok, 1);
+			xtc_atomic_fetch_add_long(&g_ok, 1, xtc_mo_seq_cst);
 		else
-			atomic_fetch_add(&g_bad, 1);
+			xtc_atomic_fetch_add_long(&g_bad, 1, xtc_mo_seq_cst);
 	}
 }
 
@@ -141,8 +140,9 @@ main(void)
 	for (i = 0; i < NT; i++)
 		(void)pthread_join(th[i], NULL);
 	(void)xtc_exec_fini(ex);
-	CK(atomic_load(&g_ok) == (long)(1 + NF + NT) * PER);
-	CK(atomic_load(&g_bad) == 0);
+	CK(xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst) ==
+	    (long)(1 + NF + NT) * PER);
+	CK(xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst) == 0);
 	memset(&s, 0, sizeof s);
 	s.ordered = 1;
 	CK(wal_scan(path, scan_cb, &s) == XTC_OK);
@@ -164,7 +164,9 @@ main(void)
 		fprintf(stderr, "FAIL: test_wal_dsync\n");
 		return 1;
 	}
-	printf("  ok   the log fd is O_DSYNC (a flush is one write); %ld commits "
-	    "from fibers and threads acked\n", atomic_load(&g_ok));
+	printf(
+	    "  ok   the log fd is O_DSYNC (a flush is one write); %ld commits "
+	    "from fibers and threads acked\n",
+	    xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst));
 	return 0;
 }

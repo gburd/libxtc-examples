@@ -28,7 +28,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,15 +125,15 @@ echo_handler(void *self_raw, xtc_tnt_message_t *msg)
 static int            g_listen_fd = -1;
 static int            g_port = 0;
 static int            g_shards = 1;
-static atomic_int     g_next_shard;
-static atomic_int     g_shutdown;
+static int g_next_shard;
+static int g_shutdown;
 
 static void
 listener_proc(void *arg)
 {
 	(void)arg;
 
-	while (!atomic_load(&g_shutdown)) {
+	while (!xtc_atomic_load_i32(&g_shutdown, xtc_mo_seq_cst)) {
 		for (;;) {
 			struct sockaddr_in addr;
 			socklen_t alen = sizeof(addr);
@@ -156,8 +155,10 @@ listener_proc(void *arg)
 				xtc_net_setnonblock(fd);
 			}
 			ea.client_fd = fd;
-			shard = (uint8_t)(atomic_fetch_add(&g_next_shard, 1) %
-			    g_shards);
+			shard =
+			    (uint8_t)(xtc_atomic_fetch_add_i32(&g_next_shard, 1,
+			                  xtc_mo_seq_cst) %
+			        g_shards);
 			if (xtc_tnt_spawn_on(shard, ECHO_TYPE, &ea, sizeof(ea))
 			    != XTC_TNT_SPAWN_OK) {
 				close(fd);
@@ -192,7 +193,7 @@ static void
 on_signal(int sig)
 {
 	(void)sig;
-	atomic_store(&g_shutdown, 1);
+	xtc_atomic_store_i32(&g_shutdown, 1, xtc_mo_seq_cst);
 	xtc_tnt_stop();
 }
 
@@ -324,8 +325,8 @@ main(int argc, char **argv)
 	g_port = port;
 	g_shards = shards;
 
-	atomic_init(&g_next_shard, 0);
-	atomic_init(&g_shutdown, 0);
+	xtc_atomic_store_i32(&g_next_shard, 0, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&g_shutdown, 0, xtc_mo_relaxed);
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
@@ -363,7 +364,7 @@ main(int argc, char **argv)
 	(void)xtc_tnt_start(&spec);
 
 	/* Shutdown. */
-	atomic_store(&g_shutdown, 1);
+	xtc_atomic_store_i32(&g_shutdown, 1, xtc_mo_seq_cst);
 	if (g_listen_loop)
 		(void)xtc_loop_stop(g_listen_loop);
 	pthread_join(lt, NULL);

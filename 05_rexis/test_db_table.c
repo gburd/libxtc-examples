@@ -13,7 +13,7 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -253,8 +253,8 @@ test_expiry_covers_table(void)
 struct sh_arg {
 	db_t           *db;
 	const char     *key;
-	_Atomic int    *inside;
-	_Atomic int    *maxin;
+	int *inside;
+	int *maxin;
 };
 
 static void *
@@ -266,14 +266,15 @@ sh_writer(void *arg)
 	int n;
 
 	db_lock(a->db, ks, 1);
-	n = atomic_fetch_add(a->inside, 1) + 1;
-	if (n > atomic_load(a->maxin))
-		atomic_store(a->maxin, n);
+	n = xtc_atomic_fetch_add_i32(a->inside, 1, xtc_mo_seq_cst) + 1;
+	if (n > xtc_atomic_load_i32(a->maxin, xtc_mo_seq_cst))
+		xtc_atomic_store_i32(a->maxin, n, xtc_mo_seq_cst);
 	end = xtc_clock_mono() + 200LL * 1000 * 1000;
-	while (atomic_load(a->inside) < 2 && xtc_clock_mono() < end)
+	while (xtc_atomic_load_i32(a->inside, xtc_mo_seq_cst) < 2 &&
+	    xtc_clock_mono() < end)
 		;                       /* wait for the other writer, bounded */
 	(void)db_set(a->db, a->key, strlen(a->key), "v", 1);
-	atomic_fetch_sub(a->inside, 1);
+	xtc_atomic_fetch_sub_i32(a->inside, 1, xtc_mo_seq_cst);
 	db_unlock(a->db, ks, 1);
 	return NULL;
 }
@@ -281,7 +282,7 @@ sh_writer(void *arg)
 static int
 sh_overlap(db_t *db, const char *k1, const char *k2)
 {
-	_Atomic int inside = 0, maxin = 0;
+	int inside = 0, maxin = 0;
 	struct sh_arg a = { db, k1, &inside, &maxin };
 	struct sh_arg b = { db, k2, &inside, &maxin };
 	pthread_t t1, t2;
@@ -290,7 +291,7 @@ sh_overlap(db_t *db, const char *k1, const char *k2)
 	ASSERT(pthread_create(&t2, NULL, sh_writer, &b) == 0);
 	(void)pthread_join(t1, NULL);
 	(void)pthread_join(t2, NULL);
-	return atomic_load(&maxin);
+	return xtc_atomic_load_i32(&maxin, xtc_mo_seq_cst);
 }
 
 static void

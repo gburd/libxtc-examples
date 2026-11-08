@@ -29,7 +29,6 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -181,7 +180,7 @@ picker_deck_get(void)
 
 /* ---- custom victim picker: deck card mod n_candidates ---- */
 
-static _Atomic int g_picks;
+static int g_picks;
 
 static int
 random_victim_picker(const uint64_t *candidates, int n, void *user)
@@ -189,18 +188,18 @@ random_victim_picker(const uint64_t *candidates, int n, void *user)
 	int card;
 	(void)user; (void)candidates;
 	card = picker_deck_get();
-	atomic_fetch_add(&g_picks, 1);
+	xtc_atomic_fetch_add_i32(&g_picks, 1, xtc_mo_seq_cst);
 	return card % n;
 }
 
 /* ---- coroutine-friendly quicksort ---- */
 
-static _Atomic int g_cmps;
+static int g_cmps;
 
 static int
 qcmp(int x, int y)
 {
-	atomic_fetch_add(&g_cmps, 1);
+	xtc_atomic_fetch_add_i32(&g_cmps, 1, xtc_mo_seq_cst);
 	/* Routing the comparison through a fiber yield demonstrates how
 	 * to bridge the synchronous qsort shape with async work.  In a
 	 * real app the compare might consult a database or a remote
@@ -232,9 +231,9 @@ qsort_yielding(int *a, int n)
 /* ---- the deadlock scenario ---- */
 
 static xtc_lockmgr_t *g_mgr;
-static _Atomic int    g_a_rc;
-static _Atomic int    g_b_rc;
-static _Atomic int    g_setup_failed;   /* a FIRST lock was not granted */
+static int g_a_rc;
+static int g_b_rc;
+static int g_setup_failed; /* a FIRST lock was not granted */
 
 /*
  * One transaction: X-lock `first`, hold it long enough that the other
@@ -252,7 +251,7 @@ txn(xtc_locker_t l, const char *first, const char *second)
 	if ((rc = xtc_lock_get(g_mgr, l, first, 1, XTC_LOCK_X, 0)) != XTC_OK) {
 		fprintf(stderr, "txn: first lock %s not granted: %s\n", first,
 		    xtc_strerror(rc));
-		atomic_store(&g_setup_failed, 1);
+		xtc_atomic_store_i32(&g_setup_failed, 1, xtc_mo_seq_cst);
 		return rc;
 	}
 	(void)xtc_sleep_ns(100 * 1000 * 1000);   /* hold the lock, force the cycle */
@@ -269,14 +268,16 @@ txn(xtc_locker_t l, const char *first, const char *second)
 static void *
 txn_a(void *arg)
 {
-	atomic_store(&g_a_rc, txn(*(xtc_locker_t *)arg, "A", "B"));
+	xtc_atomic_store_i32(&g_a_rc, txn(*(xtc_locker_t *)arg, "A", "B"),
+	    xtc_mo_seq_cst);
 	return NULL;
 }
 
 static void *
 txn_b(void *arg)
 {
-	atomic_store(&g_b_rc, txn(*(xtc_locker_t *)arg, "B", "A"));
+	xtc_atomic_store_i32(&g_b_rc, txn(*(xtc_locker_t *)arg, "B", "A"),
+	    xtc_mo_seq_cst);
 	return NULL;
 }
 
@@ -319,8 +320,8 @@ driver_proc(void *arg)
 			g_demo_failed = 1;
 			break;
 		}
-		atomic_store(&g_a_rc, 0);
-		atomic_store(&g_b_rc, 0);
+		xtc_atomic_store_i32(&g_a_rc, 0, xtc_mo_seq_cst);
+		xtc_atomic_store_i32(&g_b_rc, 0, xtc_mo_seq_cst);
 
 		/* Both threads must exist or there is no cycle to detect.
 		 * If the second cannot start, join the first (it finishes on
@@ -338,14 +339,14 @@ driver_proc(void *arg)
 		}
 		(void)pthread_join(t1, NULL);
 		(void)pthread_join(t2, NULL);
-		if (atomic_load(&g_setup_failed)) {
+		if (xtc_atomic_load_i32(&g_setup_failed, xtc_mo_seq_cst)) {
 			g_demo_failed = 1;   /* no cycle was built: not a result */
 			break;
 		}
 
 		{
-			int ar = atomic_load(&g_a_rc);
-			int br = atomic_load(&g_b_rc);
+			int ar = xtc_atomic_load_i32(&g_a_rc, xtc_mo_seq_cst);
+			int br = xtc_atomic_load_i32(&g_b_rc, xtc_mo_seq_cst);
 			if (ar == XTC_E_DEADLK) n_a_aborted++;
 			if (br == XTC_E_DEADLK) n_b_aborted++;
 			printf("  round %d: txn_a rc=%d txn_b rc=%d  (victim %s)\n",
@@ -360,7 +361,8 @@ driver_proc(void *arg)
 	}
 	printf("  abort tally: A=%d, B=%d (random expects rough split)\n",
 	    n_a_aborted, n_b_aborted);
-	printf("  total custom-picker calls: %d\n", atomic_load(&g_picks));
+	printf("  total custom-picker calls: %d\n",
+	    xtc_atomic_load_i32(&g_picks, xtc_mo_seq_cst));
 
 	/* Demonstrate the coroutine qsort: pull 32 cards from the deck,
 	 * sort them with our yielding quicksort. */
@@ -372,13 +374,14 @@ driver_proc(void *arg)
 		printf("  before: ");
 		for (i = 0; i < 16; i++) printf("%d ", arr[i]);
 		printf("...\n");
-		atomic_store(&g_cmps, 0);
+		xtc_atomic_store_i32(&g_cmps, 0, xtc_mo_seq_cst);
 		qsort_yielding(arr, 32);
 		printf("  after:  ");
 		for (i = 0; i < 16; i++) printf("%d ", arr[i]);
 		printf("...\n");
-		printf("  comparisons: %d (each yields, so the producer can run)\n",
-		    atomic_load(&g_cmps));
+		printf(
+		    "  comparisons: %d (each yields, so the producer can run)\n",
+		    xtc_atomic_load_i32(&g_cmps, xtc_mo_seq_cst));
 		/* Verify sort. */
 		for (i = 1; i < 32; i++) {
 			if (arr[i] < arr[i - 1]) {

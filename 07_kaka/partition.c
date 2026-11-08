@@ -111,15 +111,18 @@ struct plog {
  * KAKA_PLANT_DROP=N acks every Nth record without storing it;
  * KAKA_PLANT_COLD_FLIP=N flips a byte of every Nth record a FETCH reads
  * back from a segment file.  test_kaka_soak.sh must fail on each. */
-#include <stdatomic.h>
-static _Atomic unsigned long g_plant_n[2];
+#include "xtc_atomic.h"
+static unsigned long g_plant_n[2];
 static int
 __plant(int which, const char *env)
 {
 	const char *e = getenv(env);
 	unsigned long every = e != NULL ? strtoul(e, NULL, 10) : 0;
 	return every > 0 &&
-	    (atomic_fetch_add(&g_plant_n[which], 1) + 1) % every == 0;
+	    (xtc_atomic_fetch_add_ulong(&g_plant_n[which], 1, xtc_mo_seq_cst) +
+	        1) %
+	        every ==
+	    0;
 }
 #define PLANT(which, env) __plant((which), (env))
 #else

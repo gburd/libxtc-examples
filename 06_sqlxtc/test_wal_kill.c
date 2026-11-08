@@ -52,8 +52,8 @@
 #define MID_LEN   (256u << 10)
 
 struct slot {
-	_Atomic int      phase;       /* 1 while inside wal_commit */
-	_Atomic uint32_t seq;         /* next sequence number */
+	int phase;                    /* 1 while inside wal_commit */
+	uint32_t seq;                 /* next sequence number */
 	xtc_pid_t        pid;         /* boss-owned */
 	int              live;        /* boss-owned */
 	uint64_t        *ack;         /* ack[seq] = acked LSN, 0 = none */
@@ -67,11 +67,11 @@ static struct {
 static wal_t           *g_wal;
 static xtc_exec_t      *g_exec;
 static struct slot      g_slot[NS];
-static _Atomic int      g_stop;          /* stop killing + committing */
-static _Atomic int      g_done;          /* run finished (watchdog off) */
-static _Atomic uint64_t g_acked;         /* acked commits (progress) */
-static _Atomic uint64_t g_kills, g_respawn, g_errs;
-static _Atomic int      g_final_ok;
+static int g_stop;       /* stop killing + committing */
+static int g_done;       /* run finished (watchdog off) */
+static uint64_t g_acked; /* acked commits (progress) */
+static uint64_t g_kills, g_respawn, g_errs;
+static int g_final_ok;
 static uint64_t         g_seed;
 static int64_t          g_ms;
 
@@ -117,7 +117,7 @@ XTC_PREEMPTIBLE static int
 commit_one(int slot, uint8_t *buf)
 {
 	struct slot *s = &g_slot[slot];
-	uint32_t seq = atomic_fetch_add(&s->seq, 1);
+	uint32_t seq = xtc_atomic_fetch_add_u32(&s->seq, 1, xtc_mo_seq_cst);
 	uint32_t len;
 	uint64_t lsn = 0;
 	int rc;
@@ -126,16 +126,17 @@ commit_one(int slot, uint8_t *buf)
 		return XTC_E_RESOURCE;
 	len = rec_len(slot, seq);
 	rec_fill(buf, slot, seq, len);
-	atomic_store(&s->phase, 1);
+	xtc_atomic_store_i32(&s->phase, 1, xtc_mo_seq_cst);
 	rc = wal_commit(g_wal, buf, len, &lsn);
-	atomic_store(&s->phase, 0);
+	xtc_atomic_store_i32(&s->phase, 0, xtc_mo_seq_cst);
 	if (rc == XTC_OK) {
 		s->ack[seq] = lsn;
 		if (lsn > wal_durable_lsn(g_wal))
-			atomic_fetch_add(&g_errs, 1);   /* acked, not durable */
-		atomic_fetch_add(&g_acked, 1);
+			xtc_atomic_fetch_add_u64(&g_errs, 1,
+			    xtc_mo_seq_cst); /* acked, not durable */
+		xtc_atomic_fetch_add_u64(&g_acked, 1, xtc_mo_seq_cst);
 	} else {
-		atomic_fetch_add(&g_errs, 1);
+		xtc_atomic_fetch_add_u64(&g_errs, 1, xtc_mo_seq_cst);
 	}
 	return rc;
 }
@@ -161,7 +162,7 @@ committer(void *arg)
 	if (buf == NULL)
 		return;
 	(void)xtc_proc_at_exit(xtc_free, buf);   /* a kill unwinds past it */
-	while (!atomic_load(&g_stop)) {
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
 		if (g_cfg.link && (n++ & 7) == 0) {
 			xtc_proc_opts_t o = { .size = sizeof(xtc_proc_opts_t), .name = "lnk" };
 			xtc_pid_t c;
@@ -187,16 +188,22 @@ dump_state(const char *why)
 	fprintf(stderr, "fl_mu %s; res_mu %s\n", locked ? "free" : "HELD",
 	    pthread_mutex_trylock(&w->res_mu) == 0 ?
 	    (pthread_mutex_unlock(&w->res_mu), "free") : "HELD");
-	fprintf(stderr, "flushing %d direct %d next_lsn %llu copied_lsn %llu "
-	    "durable_lsn %llu\n", w->flushing, w->direct,
-	    (unsigned long long)w->next_lsn, (unsigned long long)w->copied_lsn,
-	    (unsigned long long)atomic_load(&w->durable_lsn));
-	fprintf(stderr, "res_pos %llu copied_pos %llu written %llu durable_off "
-	    "%llu failed %d\n", (unsigned long long)w->res_pos,
-	    (unsigned long long)w->copied_pos,
-	    (unsigned long long)atomic_load(&w->written),
-	    (unsigned long long)atomic_load(&w->durable_off),
-	    atomic_load(&w->failed));
+	fprintf(stderr,
+	    "flushing %d direct %d next_lsn %llu copied_lsn %llu "
+	    "durable_lsn %llu\n",
+	    w->flushing, w->direct, (unsigned long long)w->next_lsn,
+	    (unsigned long long)w->copied_lsn,
+	    (unsigned long long)xtc_atomic_load_u64(&w->durable_lsn,
+	        xtc_mo_seq_cst));
+	fprintf(stderr,
+	    "res_pos %llu copied_pos %llu written %llu durable_off "
+	    "%llu failed %d\n",
+	    (unsigned long long)w->res_pos, (unsigned long long)w->copied_pos,
+	    (unsigned long long)xtc_atomic_load_u64(&w->written,
+	        xtc_mo_seq_cst),
+	    (unsigned long long)xtc_atomic_load_u64(&w->durable_off,
+	        xtc_mo_seq_cst),
+	    xtc_atomic_load_i32(&w->failed, xtc_mo_seq_cst));
 	for (q = w->wq; q != NULL; q = q->next, n++)
 		if (n < 8)
 			fprintf(stderr, "  wq[%d] need %llu baton %d\n", n,
@@ -204,17 +211,21 @@ dump_state(const char *why)
 	fprintf(stderr, "wq length %d (live committers %d)\n", n, NC);
 	fprintf(stderr, "next slot lsn %llu has %llu\n",
 	    (unsigned long long)(w->copied_lsn + 1),
-	    (unsigned long long)atomic_load(&w->slot[(w->copied_lsn + 1) &
-	    (WAL_SLOTS - 1)].lsn));
+	    (unsigned long long)
+	        xtc_atomic_load_u64(&w->slot[(w->copied_lsn + 1) &
+	                                  (WAL_SLOTS - 1)]
+	                                 .lsn,
+	            xtc_mo_seq_cst));
 	for (i = 0; i < NS; i++)
-		if (atomic_load(&g_slot[i].phase))
+		if (xtc_atomic_load_i32(&g_slot[i].phase, xtc_mo_seq_cst))
 			fprintf(stderr, "  slot %d in wal_commit (seq %u)\n", i,
-			    atomic_load(&g_slot[i].seq));
+			    xtc_atomic_load_u32(&g_slot[i].seq,
+			        xtc_mo_seq_cst));
 	fprintf(stderr, "acked %llu kills %llu respawns %llu errs %llu\n",
-	    (unsigned long long)atomic_load(&g_acked),
-	    (unsigned long long)atomic_load(&g_kills),
-	    (unsigned long long)atomic_load(&g_respawn),
-	    (unsigned long long)atomic_load(&g_errs));
+	    (unsigned long long)xtc_atomic_load_u64(&g_acked, xtc_mo_seq_cst),
+	    (unsigned long long)xtc_atomic_load_u64(&g_kills, xtc_mo_seq_cst),
+	    (unsigned long long)xtc_atomic_load_u64(&g_respawn, xtc_mo_seq_cst),
+	    (unsigned long long)xtc_atomic_load_u64(&g_errs, xtc_mo_seq_cst));
 	if (locked)
 		(void)pthread_mutex_unlock(&w->fl_mu);
 }
@@ -226,8 +237,8 @@ watchdog(void *arg)
 	uint64_t last = 0;
 	int64_t since = xtc_clock_mono();
 	(void)arg;
-	while (!atomic_load(&g_done)) {
-		uint64_t a = atomic_load(&g_acked);
+	while (!xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst)) {
+		uint64_t a = xtc_atomic_load_u64(&g_acked, xtc_mo_seq_cst);
 		int64_t now = xtc_clock_mono();
 		if (a != last) {
 			last = a;
@@ -251,7 +262,7 @@ thread_committer(void *arg)
 	uint8_t *buf = malloc(BIG_LEN + 4096);
 	if (buf == NULL)
 		return NULL;
-	while (!atomic_load(&g_stop))
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst))
 		if (commit_one(slot, buf) == XTC_E_RESOURCE)
 			break;
 	free(buf);
@@ -284,7 +295,9 @@ reap(int respawn)
 				if (g_slot[i].live && xtc_pid_eq(g_slot[i].pid, who)) {
 					g_slot[i].live = 0;
 					if (respawn && spawn_slot(i) == 0)
-						atomic_fetch_add(&g_respawn, 1);
+						xtc_atomic_fetch_add_u64(
+						    &g_respawn, 1,
+						    xtc_mo_seq_cst);
 				}
 		xtc_free(m);
 	}
@@ -313,17 +326,19 @@ boss(void *arg)
 		    xtc_clock_mono() > end - g_ms * 500000LL) {
 			/* the writer proc, parked in xtc_recv, killed mid-run */
 			if (xtc_exit_pid(wal_writer_pid(g_wal), 7) == XTC_OK)
-				atomic_fetch_add(&g_kills, 1);
+				xtc_atomic_fetch_add_u64(&g_kills, 1,
+				    xtc_mo_seq_cst);
 			wkilled = 1;
 		}
 		if (!g_slot[k].live || g_cfg.link || g_cfg.nokill)
 			continue;
-		if (!g_cfg.kill_any && !atomic_load(&g_slot[k].phase))
+		if (!g_cfg.kill_any &&
+		    !xtc_atomic_load_i32(&g_slot[k].phase, xtc_mo_seq_cst))
 			continue;
 		if (xtc_exit_pid(g_slot[k].pid, 7) == XTC_OK)
-			atomic_fetch_add(&g_kills, 1);
+			xtc_atomic_fetch_add_u64(&g_kills, 1, xtc_mo_seq_cst);
 	}
-	atomic_store(&g_stop, 1);
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
 	while (reap(0) > 0)
 		(void)xtc_proc_sleep(1000LL * 1000);
 	/* The log must still accept commits after every kill. */
@@ -337,7 +352,8 @@ boss(void *arg)
 	if (t0 > 2000LL * 1000 * 1000)
 		fprintf(stderr, "  wal_writer_stop took %lld ms\n",
 		    (long long)(t0 / 1000000));
-	atomic_store(&g_final_ok, i == 50 && t0 <= 2000LL * 1000 * 1000);
+	xtc_atomic_store_i32(&g_final_ok, i == 50 && t0 <= 2000LL * 1000 * 1000,
+	    xtc_mo_seq_cst);
 }
 
 static int
@@ -351,12 +367,12 @@ scan_cb(uint64_t lsn, const void *rec, uint32_t len, void *user)
 	memcpy(&slot, p, 4);
 	memcpy(&seq, p + 4, 4);
 	if (slot >= NS || seq >= MAXSEQ || len != rec_len((int)slot, seq)) {
-		atomic_fetch_add(&g_errs, 1);
+		xtc_atomic_fetch_add_u64(&g_errs, 1, xtc_mo_seq_cst);
 		return 0;
 	}
 	for (i = 8; i < len; i++)
 		if (p[i] != rec_byte((int)slot, seq, i)) {
-			atomic_fetch_add(&g_errs, 1);
+			xtc_atomic_fetch_add_u64(&g_errs, 1, xtc_mo_seq_cst);
 			return 0;
 		}
 	found[slot][seq] = lsn;
@@ -433,13 +449,13 @@ run_mode(const char *mode)
 	g_cfg.preempt = strncmp(mode, "preempt", 7) == 0;
 	g_cfg.nokill = strcmp(mode, "preempt-nokill") == 0;
 	g_cfg.writer = strcmp(mode, "writer") == 0;
-	atomic_store(&g_stop, 0);
-	atomic_store(&g_done, 0);
-	atomic_store(&g_acked, 0);
-	atomic_store(&g_kills, 0);
-	atomic_store(&g_respawn, 0);
-	atomic_store(&g_errs, 0);
-	atomic_store(&g_final_ok, 0);
+	xtc_atomic_store_i32(&g_stop, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_done, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&g_acked, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&g_kills, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&g_respawn, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&g_errs, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_final_ok, 0, xtc_mo_seq_cst);
 	for (i = 0; i < NS; i++) {
 		memset(&g_slot[i], 0, sizeof g_slot[i]);
 		g_slot[i].ack = calloc(MAXSEQ, sizeof(uint64_t));
@@ -474,7 +490,7 @@ run_mode(const char *mode)
 	(void)xtc_exec_run(exec);
 	for (i = 0; g_cfg.mid && i < NT; i++)
 		(void)pthread_join(th[i], NULL);
-	atomic_store(&g_done, 1);
+	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
 	(void)xtc_exec_fini(exec);
 	if (g_cfg.preempt)
@@ -498,16 +514,22 @@ run_mode(const char *mode)
 			}
 		}
 	printf("  %-7s kills %llu respawns %llu acked %llu unacked-logged %llu "
-	    "errs %llu lost %llu final %s\n", mode,
-	    (unsigned long long)atomic_load(&g_kills),
-	    (unsigned long long)atomic_load(&g_respawn),
+	       "errs %llu lost %llu final %s\n",
+	    mode,
+	    (unsigned long long)xtc_atomic_load_u64(&g_kills, xtc_mo_seq_cst),
+	    (unsigned long long)xtc_atomic_load_u64(&g_respawn, xtc_mo_seq_cst),
 	    (unsigned long long)acked, (unsigned long long)extra,
-	    (unsigned long long)atomic_load(&g_errs), (unsigned long long)lost,
-	    atomic_load(&g_final_ok) ? "ok" : "FAILED");
+	    (unsigned long long)xtc_atomic_load_u64(&g_errs, xtc_mo_seq_cst),
+	    (unsigned long long)lost,
+	    xtc_atomic_load_i32(&g_final_ok, xtc_mo_seq_cst) ? "ok" : "FAILED");
 	if (lost)
 		scan_diag(path);
-	if (lost || atomic_load(&g_errs) || !atomic_load(&g_final_ok) ||
-	    (!g_cfg.nokill && atomic_load(&g_kills) + atomic_load(&g_respawn) == 0))
+	if (lost || xtc_atomic_load_u64(&g_errs, xtc_mo_seq_cst) ||
+	    !xtc_atomic_load_i32(&g_final_ok, xtc_mo_seq_cst) ||
+	    (!g_cfg.nokill &&
+	        xtc_atomic_load_u64(&g_kills, xtc_mo_seq_cst) +
+	                xtc_atomic_load_u64(&g_respawn, xtc_mo_seq_cst) ==
+	            0))
 		fail = 1;
 	wal_close(g_wal);
 	g_wal = NULL;

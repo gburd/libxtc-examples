@@ -14,7 +14,6 @@
  *	concurrent state machine never corrupts a frame.  No daemon.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +32,7 @@
 
 static bm_t       *g_bm;
 static bm_pid_t    g_pid[N_PAGES];
-static _Atomic int g_result;            /* 0 = not run, 1 = pass, -1 = fail */
+static int g_result; /* 0 = not run, 1 = pass, -1 = fail */
 
 /* page content: [u64 pid][u64 k][fill byte at 100..] */
 static void
@@ -85,7 +84,7 @@ worker_proc(void *arg)
 		bm_unfix(g_bm, f, (k & 1));            /* sometimes dirty */
 	}
 
-	atomic_store(&g_result, ok ? 1 : -1);
+	xtc_atomic_store_i32(&g_result, ok ? 1 : -1, xtc_mo_seq_cst);
 	bm_provider_stop(g_bm);                        /* let the loop drain */
 }
 
@@ -110,7 +109,7 @@ main(void)
 	bo.cool_pct = 25;
 	if (bm_create(&bo, &g_bm) != XTC_OK) { fprintf(stderr, "bm_create\n"); return 1; }
 
-	atomic_store(&g_result, 0);
+	xtc_atomic_store_i32(&g_result, 0, xtc_mo_seq_cst);
 	if (xtc_loop_init(&loop) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, &pp) != XTC_OK) return 1;
 	opts.name = "worker";
@@ -122,8 +121,9 @@ main(void)
 	bm_destroy(g_bm);
 	unlink(path);
 
-	if (atomic_load(&g_result) != 1) {
-		fprintf(stderr, "FAIL: workload result=%d\n", atomic_load(&g_result));
+	if (xtc_atomic_load_i32(&g_result, xtc_mo_seq_cst) != 1) {
+		fprintf(stderr, "FAIL: workload result=%d\n",
+		    xtc_atomic_load_i32(&g_result, xtc_mo_seq_cst));
 		return 1;
 	}
 	if (st.resident > N_FRAMES) {

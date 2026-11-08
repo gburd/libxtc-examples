@@ -21,15 +21,18 @@ static void
 check_owned(bm_t *bm, bm_frame_t *f)
 {
 	int reserved;
-	CHECK(atomic_load(&f->io_busy) == 1, "writeback owns io_busy");
+	CHECK(xtc_atomic_load_i32(&f->io_busy, xtc_mo_seq_cst) == 1,
+	    "writeback owns io_busy");
 	reserved = try_reserve(f);
 	CHECK(!reserved, "writeback pin excludes reservation");
 	if (reserved)
 		release_reservation(f);
 	if (drop) {
 		CHECK(bm_free_pid(bm, bm_frame_pid(f)) == XTC_OK, "drop during writeback");
-		CHECK(atomic_load(&f->state) != BM_FREE, "drop waits for writeback pin");
-		CHECK(atomic_load(&f->doomed) == 1, "drop deferred until I/O ends");
+		CHECK(xtc_atomic_load_u8(&f->state, xtc_mo_seq_cst) != BM_FREE,
+		    "drop waits for writeback pin");
+		CHECK(xtc_atomic_load_i32(&f->doomed, xtc_mo_seq_cst) == 1,
+		    "drop deferred until I/O ends");
 	}
 }
 
@@ -63,7 +66,7 @@ run(int trickler, int doomed, int fail_io)
 	if (bm_alloc_pid(bm, &f, &pid) != XTC_OK) goto err;
 	((unsigned char *)bm_page(f))[0] = 0x72;
 	bm_unfix(bm, f, 1);
-	atomic_store(&f->ref, 0);
+	xtc_atomic_store_i32(&f->ref, 0, xtc_mo_seq_cst);
 	/* A delayed writeback must not enter an evictor-owned frame. */
 	CHECK(try_reserve(f), "reserve before writeback");
 	if (trickler) {
@@ -81,12 +84,13 @@ run(int trickler, int doomed, int fail_io)
 	CHECK(rc == 0, "writeback rejects reserved frame");
 	release_reservation(f);
 	/* Restore dirty only for fail-before controls that wrongly wrote it. */
-	atomic_store(&f->dirty, 1);
-	atomic_store(&f->io_busy, 1);
+	xtc_atomic_store_i32(&f->dirty, 1, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&f->io_busy, 1, xtc_mo_seq_cst);
 	rc = trickler ? tr_prepare(bm, f, snap) : flush_frame(bm, f);
-	CHECK(rc == 0 && atomic_load(&f->pin) == 0 &&
-	    atomic_load(&f->io_busy) == 1, "busy failure releases only its pin");
-	atomic_store(&f->io_busy, 0);
+	CHECK(rc == 0 && xtc_atomic_load_i32(&f->pin, xtc_mo_seq_cst) == 0 &&
+	        xtc_atomic_load_i32(&f->io_busy, xtc_mo_seq_cst) == 1,
+	    "busy failure releases only its pin");
+	xtc_atomic_store_i32(&f->io_busy, 0, xtc_mo_seq_cst);
 	armed = 1;
 	drop = doomed;
 	hook_calls = 0;
@@ -109,22 +113,30 @@ run(int trickler, int doomed, int fail_io)
 	}
 	armed = 0;
 	CHECK(rc == !fail_io, "writeback reports I/O result");
-	CHECK(atomic_load(&f->io_busy) == 0, "writeback releases io_busy");
-	CHECK(atomic_load(&f->ref) == 0, "writeback does not promote ref");
+	CHECK(xtc_atomic_load_i32(&f->io_busy, xtc_mo_seq_cst) == 0,
+	    "writeback releases io_busy");
+	CHECK(xtc_atomic_load_i32(&f->ref, xtc_mo_seq_cst) == 0,
+	    "writeback does not promote ref");
 	if (doomed) {
-		CHECK(atomic_load(&f->state) == BM_FREE, "last I/O pin completes doomed drop");
-		CHECK(atomic_load(&f->pin) == -1, "doomed frame returns unpinable");
-		CHECK(atomic_load(&bm->free_n) == 4, "doomed frame returned exactly once");
+		CHECK(xtc_atomic_load_u8(&f->state, xtc_mo_seq_cst) == BM_FREE,
+		    "last I/O pin completes doomed drop");
+		CHECK(xtc_atomic_load_i32(&f->pin, xtc_mo_seq_cst) == -1,
+		    "doomed frame returns unpinable");
+		CHECK(xtc_atomic_load_u32(&bm->free_n, xtc_mo_seq_cst) == 4,
+		    "doomed frame returned exactly once");
 	} else {
-		CHECK(atomic_load(&f->pin) == 0, "writeback releases its pin");
-		CHECK(atomic_load(&f->dirty) == fail_io, "failed write stays dirty");
+		CHECK(xtc_atomic_load_i32(&f->pin, xtc_mo_seq_cst) == 0,
+		    "writeback releases its pin");
+		CHECK(xtc_atomic_load_i32(&f->dirty, xtc_mo_seq_cst) == fail_io,
+		    "failed write stays dirty");
 	}
 	if (fail_io) {
 		close(bm->fd);
 		bm->fd = saved_fd;
 		saved_fd = -1;
 		CHECK(flush_frame(bm, f) == 1, "failed write can be retried");
-		CHECK(atomic_load(&f->dirty) == 0, "retry cleans frame");
+		CHECK(xtc_atomic_load_i32(&f->dirty, xtc_mo_seq_cst) == 0,
+		    "retry cleans frame");
 	}
 	CHECK(pread(bm->fd, &got, 1, (off_t)pid * bm->page_size) == 1 &&
 	    got == 0x72, "writeback persists image");

@@ -20,7 +20,6 @@
  *	with the whole history (~8 MB here, unbounded in general).
  */
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,9 +40,9 @@
 #define PAD    200
 
 static char         g_wal[300];
-static _Atomic int  g_left;
-static _Atomic long g_max_wal, g_commits;
-static _Atomic long g_last[NROW];   /* last committed value per row */
+static int g_left;
+static long g_max_wal, g_commits;
+static long g_last[NROW]; /* last committed value per row */
 
 /* The log's length (the file runs up to 8 MiB ahead of it: the log
  * preallocates, see wal_prealloc). */
@@ -74,20 +73,23 @@ committer(void *arg)
 			CK(sx_exec(h, "BEGIN", NULL) == SX_OK);
 			CK(sx_exec(h, sql, NULL) == SX_OK);
 			if (sx_exec(h, "COMMIT", NULL) == SX_OK)
-				atomic_store(&g_last[row], val);
+				xtc_atomic_store_long(&g_last[row], val,
+				    xtc_mo_seq_cst);
 			else
 				g_fail = 1;
 		} else if (sx_exec(h, sql, NULL) == SX_OK)
-			atomic_store(&g_last[row], val);
+			xtc_atomic_store_long(&g_last[row], val,
+			    xtc_mo_seq_cst);
 		else
 			g_fail = 1;
-		atomic_fetch_add(&g_commits, 1);
+		xtc_atomic_fetch_add_long(&g_commits, 1, xtc_mo_seq_cst);
 		sz = wal_bytes();
-		if (sz > atomic_load(&g_max_wal)) atomic_store(&g_max_wal, sz);
+		if (sz > xtc_atomic_load_long(&g_max_wal, xtc_mo_seq_cst))
+			xtc_atomic_store_long(&g_max_wal, sz, xtc_mo_seq_cst);
 	}
 	sx_close(h);
 out:
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		sx_storage_quiesce();          /* stop the background procs */
 }
 
@@ -120,11 +122,11 @@ main(void)
 	for (i = 0; i < NROW; i++) {
 		snprintf(sql, sizeof sql, "INSERT INTO t(k,v,pad) VALUES(%d,-1,'')", i);
 		CK(sx_exec(h, sql, NULL) == SX_OK);
-		atomic_store(&g_last[i], -1);
+		xtc_atomic_store_long(&g_last[i], -1, xtc_mo_seq_cst);
 	}
 	sx_close(h);
 
-	atomic_store(&g_left, NCMT);
+	xtc_atomic_store_i32(&g_left, NCMT, xtc_mo_seq_cst);
 	if (xtc_loop_init(&loop) != XTC_OK) return 1;
 	CK(sx_storage_run(loop) == SX_OK);
 	for (c = 0; c < NCMT; c++)
@@ -145,13 +147,17 @@ main(void)
 			if (sx_step(st) == SX_ROW) got = (long)sx_column_int64(st, 0);
 			sx_finalize(st);
 		}
-		if (got != atomic_load(&g_last[i])) bad++;
+		if (got != xtc_atomic_load_long(&g_last[i], xtc_mo_seq_cst))
+			bad++;
 	}
 	sx_close(h);
 	printf("  commits=%ld log-written~%ld KB max-wal=%ld KB end-wal=%ld KB "
-	    "checkpoints=%llu rows-wrong-after-crash=%ld\n",
-	    atomic_load(&g_commits), atomic_load(&g_commits) * (PAD + 80) / 1024,
-	    atomic_load(&g_max_wal) / 1024, end_wal / 1024,
+	       "checkpoints=%llu rows-wrong-after-crash=%ld\n",
+	    xtc_atomic_load_long(&g_commits, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_commits, xtc_mo_seq_cst) * (PAD + 80) /
+	        1024,
+	    xtc_atomic_load_long(&g_max_wal, xtc_mo_seq_cst) / 1024,
+	    end_wal / 1024,
 #ifdef SX_HAVE_PERIODIC_CHECKPOINT
 	    (unsigned long long)sx_storage_checkpoints(),
 #else
@@ -160,7 +166,7 @@ main(void)
 	    bad);
 	/* Bound: the trigger is max(256 KiB, 2 x post-checkpoint size); the
 	 * live data is ~64 x 300 B, so the log must never pass ~1 MiB. */
-	CK(atomic_load(&g_max_wal) < 1024L * 1024L);
+	CK(xtc_atomic_load_long(&g_max_wal, xtc_mo_seq_cst) < 1024L * 1024L);
 	CK(bad == 0);
 	(void)sx_storage_close();
 	(void)sx_shutdown();

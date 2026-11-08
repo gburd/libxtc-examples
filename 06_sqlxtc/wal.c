@@ -30,7 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdint.h>
 #include <stdio.h>      /* snprintf, rename */
 #include <stdlib.h>
@@ -493,7 +493,7 @@ wal_frame_ok(int fd, off_t off, off_t fsize, uint64_t *lsn, uint32_t *len)
 #define WAL_SLOTS    (1u << 16)     /* completion slots (power of 2) */
 
 struct wal_slot {                   /* completion of one LSN */
-	_Atomic uint64_t lsn;           /* == the record's LSN once copied */
+	uint64_t lsn;               /* == the record's LSN once copied */
 	uint64_t         end;           /* position just past the record */
 };
 
@@ -514,11 +514,11 @@ struct wal {
 	                              * big record on its way to the file */
 	/* The append offset (== res_pos), for wal_size: stored under res_mu,
 	 * read with no lock (the checkpoint proc polls it), so atomic. */
-	_Atomic uint64_t off;
+	uint64_t off;
 	int64_t    window_ns;
 	uint32_t   max_batch;
 	xtc_pid_t  writer_pid;
-	_Atomic int writer_alive;    /* writer proc live; cleared on its exit */
+	int writer_alive; /* writer proc live; cleared on its exit */
 
 	/* Reservation (res_mu): the next LSN and byte position. */
 	pthread_mutex_t    res_mu;
@@ -538,30 +538,30 @@ struct wal {
 	                                  * leader-only, see wal_prealloc */
 	uint64_t           copied_lsn;   /* every LSN <= this is in the ring */
 	uint64_t           copied_pos;   /* ... and ends here */
-	_Atomic uint64_t   written;      /* bytes below are pwritten */
+	uint64_t written;                /* bytes below are pwritten */
 	struct wal_waiter *wq;           /* sorted by need (ascending) */
 	struct wal_waiter *wfree;        /* recycled waiters (BDB free_commits) */
 
-	_Atomic uint64_t   durable_lsn;
+	uint64_t durable_lsn;
 	/* Byte offset of the durable end of the file (always a frame
 	 * boundary), published with durable_lsn so an online checkpoint can
 	 * copy the durable tail from another thread; and a generation bumped
 	 * whenever the handle is rebound to a new file or truncated, so one
 	 * that raced a quiesced rewrite aborts instead of renaming over it. */
-	_Atomic uint64_t   durable_off;
-	_Atomic uint64_t   gen;
+	uint64_t durable_off;
+	uint64_t gen;
 	/* Fail-stop latch.  Set on the first failed or short log write or
 	 * fdatasync; once set, nothing more is written and every commit
 	 * fails with XTC_E_IO until the log is reopened (process restart).
 	 * After a failed fsync the kernel may have dropped the dirty pages
 	 * it could not write, so retrying cannot make the earlier records
 	 * durable (PostgreSQL's fsync lesson): stop instead. */
-	_Atomic int        failed;
+	int failed;
 
 	/* Stats (fl_mu). */
 	uint64_t s_commits;
 	uint64_t s_batches;
-	_Atomic uint64_t s_bytes;
+	uint64_t s_bytes;
 	uint64_t s_maxbatch;
 	uint64_t s_failed;            /* commits refused by a failed log write */
 };
@@ -616,16 +616,16 @@ wal_tail_ok(int fd, const wal_tail_t *t)
 static void
 wal_reset_marks(wal_t *w, uint64_t pos, uint64_t lsn)
 {
-	atomic_store_explicit(&w->off, pos, memory_order_relaxed);
+	xtc_atomic_store_u64(&w->off, pos, xtc_mo_relaxed);
 	w->res_pos = pos;
 	w->last_pos = pos == 0 ? 0 : UINT64_MAX;   /* see wal_get_tail */
 	w->next_lsn = lsn;
 	w->copied_pos = pos;
 	w->copied_lsn = lsn;
 	w->pre_end = pos;            /* the file ends at pos (see callers) */
-	atomic_store_explicit(&w->written, pos, memory_order_release);
-	atomic_store_explicit(&w->durable_off, pos, memory_order_release);
-	atomic_store_explicit(&w->durable_lsn, lsn, memory_order_release);
+	xtc_atomic_store_u64(&w->written, pos, xtc_mo_release);
+	xtc_atomic_store_u64(&w->durable_off, pos, xtc_mo_release);
+	xtc_atomic_store_u64(&w->durable_lsn, lsn, xtc_mo_release);
 }
 
 /*
@@ -862,7 +862,7 @@ wal_advance_copied(wal_t *w)
 	for (;;) {
 		uint64_t want = w->copied_lsn + 1;
 		struct wal_slot *s = &w->slot[want & (WAL_SLOTS - 1)];
-		if (atomic_load_explicit(&s->lsn, memory_order_acquire) != want)
+		if (xtc_atomic_load_u64(&s->lsn, xtc_mo_acquire) != want)
 			return;
 		w->copied_lsn = want;
 		w->copied_pos = s->end;
@@ -1049,7 +1049,7 @@ wal_flush_locked(wal_t *w, uint64_t need)
 		}
 		wal_lock(&w->fl_mu);
 	}
-	from = atomic_load_explicit(&w->written, memory_order_relaxed);
+	from = xtc_atomic_load_u64(&w->written, xtc_mo_relaxed);
 	upto = w->copied_pos;
 	lsn_upto = w->copied_lsn;
 	/* Buggify: flush only up to our own record instead of the whole
@@ -1058,20 +1058,22 @@ wal_flush_locked(wal_t *w, uint64_t need)
 	if (XTC_SIM_BUGGIFY("wal.flush.tiny_batch") && xtc_sim_buggify_fault(300) &&
 	    need > from && need < upto) {
 		uint64_t l = w->copied_lsn;
-		while (l > atomic_load_explicit(&w->durable_lsn, memory_order_relaxed) &&
+		while (
+		    l > xtc_atomic_load_u64(&w->durable_lsn, xtc_mo_relaxed) &&
 		    w->slot[l & (WAL_SLOTS - 1)].end > need)
 			l--;
 		upto = w->slot[l & (WAL_SLOTS - 1)].end;
 		lsn_upto = l;
 	}
-	nrec = (uint32_t)(lsn_upto - atomic_load_explicit(&w->durable_lsn,
-	    memory_order_relaxed));
+	nrec = (uint32_t)(lsn_upto -
+	    xtc_atomic_load_u64(&w->durable_lsn, xtc_mo_relaxed));
 	wal_unlock(&w->fl_mu);
 	wal_buggify_yield("wal.flush.leader_yield");
 
-	if (atomic_load_explicit(&w->failed, memory_order_acquire)) {
+	if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire)) {
 		ok = 0;
-	} else if (upto > atomic_load_explicit(&w->durable_off, memory_order_relaxed)) {
+	} else if (upto >
+	    xtc_atomic_load_u64(&w->durable_off, xtc_mo_relaxed)) {
 		wal_prealloc(w, upto);
 		ok = from == upto ? 1 :      /* written directly; only sync it */
 		    w->dio ? wal_write_dio(w, from, upto) :
@@ -1086,16 +1088,19 @@ wal_flush_locked(wal_t *w, uint64_t need)
 
 	wal_lock(&w->fl_mu);
 	if (ok) {
-		atomic_store_explicit(&w->written, upto, memory_order_release);
-		if (upto > atomic_load_explicit(&w->durable_off, memory_order_relaxed)) {
-			atomic_store_explicit(&w->durable_off, upto, memory_order_release);
-			atomic_store_explicit(&w->durable_lsn, lsn_upto, memory_order_release);
+		xtc_atomic_store_u64(&w->written, upto, xtc_mo_release);
+		if (upto >
+		    xtc_atomic_load_u64(&w->durable_off, xtc_mo_relaxed)) {
+			xtc_atomic_store_u64(&w->durable_off, upto,
+			    xtc_mo_release);
+			xtc_atomic_store_u64(&w->durable_lsn, lsn_upto,
+			    xtc_mo_release);
 		}
 		w->s_batches++;
 		w->s_commits += nrec;
 		if (nrec > w->s_maxbatch) w->s_maxbatch = nrec;
 	} else {
-		atomic_store_explicit(&w->failed, 1, memory_order_release);
+		xtc_atomic_store_i32(&w->failed, 1, xtc_mo_release);
 		w->s_failed += nrec;
 	}
 }
@@ -1150,16 +1155,19 @@ static int
 wal_durable_locked(wal_t *w, uint64_t need)
 {
 	for (;;) {
-		if (atomic_load_explicit(&w->durable_off, memory_order_acquire) >= need) {
+		if (xtc_atomic_load_u64(&w->durable_off, xtc_mo_acquire) >=
+		    need) {
 			/* Covered.  A baton holder that turns out to be covered
 			 * (noxu's handoff) passes the leadership on, so the
 			 * waiters behind it are never left without a leader. */
 			if (!w->flushing && w->wq != NULL)
-				wal_wake_locked(w, atomic_load_explicit(&w->durable_off,
-				    memory_order_relaxed), 1);
+				wal_wake_locked(w,
+				    xtc_atomic_load_u64(&w->durable_off,
+				        xtc_mo_relaxed),
+				    1);
 			return XTC_OK;
 		}
-		if (atomic_load_explicit(&w->failed, memory_order_acquire)) {
+		if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire)) {
 			wal_wake_locked(w, UINT64_MAX, 0);   /* fail them all */
 			return XTC_E_IO;
 		}
@@ -1167,9 +1175,12 @@ wal_durable_locked(wal_t *w, uint64_t need)
 			w->flushing = 1;
 			wal_flush_locked(w, need);
 			w->flushing = 0;
-			wal_wake_locked(w, atomic_load_explicit(&w->failed,
-			    memory_order_acquire) ? UINT64_MAX :
-			    atomic_load_explicit(&w->durable_off, memory_order_relaxed), 1);
+			wal_wake_locked(w,
+			    xtc_atomic_load_i32(&w->failed, xtc_mo_acquire) ?
+			        UINT64_MAX :
+			        xtc_atomic_load_u64(&w->durable_off,
+			            xtc_mo_relaxed),
+			    1);
 			continue;
 		}
 		wal_wait_locked(w, need);
@@ -1311,7 +1322,7 @@ wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
 	start = w->res_pos;              /* == target: nobody reserved since */
 	w->last_pos = start;
 	w->res_pos = start + need;
-	atomic_store_explicit(&w->off, w->res_pos, memory_order_relaxed);
+	xtc_atomic_store_u64(&w->off, w->res_pos, xtc_mo_relaxed);
 	wal_unlock(&w->res_mu);
 
 	memcpy(hdr, &lsn, 8);
@@ -1339,20 +1350,22 @@ wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
 	wal_lock(&w->fl_mu);
 	if (ok) {
 		/* in the page cache: the next leader only needs to sync it */
-		atomic_store_explicit(&w->written, start + need, memory_order_release);
+		xtc_atomic_store_u64(&w->written, start + need, xtc_mo_release);
 		s = &w->slot[lsn & (WAL_SLOTS - 1)];
 		s->end = start + need;
-		atomic_store_explicit(&s->lsn, lsn, memory_order_release);
-		atomic_fetch_add_explicit(&w->s_bytes, len, memory_order_relaxed);
+		xtc_atomic_store_u64(&s->lsn, lsn, xtc_mo_release);
+		xtc_atomic_fetch_add_u64(&w->s_bytes, len, xtc_mo_relaxed);
 	} else {
 		/* fail-stop: the reserved range is never published, so no LSN
 		 * after it can become durable either */
-		atomic_store_explicit(&w->failed, 1, memory_order_release);
+		xtc_atomic_store_i32(&w->failed, 1, xtc_mo_release);
 		w->s_failed++;
 	}
 	w->flushing = 0;
-	wal_wake_locked(w, ok ? atomic_load_explicit(&w->durable_off,
-	    memory_order_relaxed) : UINT64_MAX, 1);
+	wal_wake_locked(w,
+	    ok ? xtc_atomic_load_u64(&w->durable_off, xtc_mo_relaxed) :
+	         UINT64_MAX,
+	    1);
 	wal_unlock(&w->fl_mu);
 	wal_lock(&w->res_mu);
 	w->direct = 0;
@@ -1379,7 +1392,7 @@ wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end, int *rc)
 		return wal_append_direct(w, record, len, end, rc);
 	for (;;) {
 		wal_lock(&w->res_mu);
-		if (atomic_load_explicit(&w->failed, memory_order_acquire)) {
+		if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire)) {
 			wal_unlock(&w->res_mu);
 			*rc = XTC_E_IO;
 			return 0;
@@ -1393,10 +1406,14 @@ wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end, int *rc)
 		 * overwritten) and a free completion slot for the LSN. */
 		/* (from the start of the block holding the oldest unwritten
 		 * byte: a direct flush rewrites that block from the ring) */
-		if (w->res_pos + need - (atomic_load_explicit(&w->written,
-		    memory_order_acquire) & ~(uint64_t)(WAL_BLK - 1)) <= WAL_RING &&
-		    w->next_lsn + 1 - atomic_load_explicit(&w->durable_lsn,
-		    memory_order_acquire) < WAL_SLOTS)
+		if (w->res_pos + need -
+		            (xtc_atomic_load_u64(&w->written, xtc_mo_acquire) &
+		                ~(uint64_t)(WAL_BLK - 1)) <=
+		        WAL_RING &&
+		    w->next_lsn + 1 -
+		            xtc_atomic_load_u64(&w->durable_lsn,
+		                xtc_mo_acquire) <
+		        WAL_SLOTS)
 			break;
 		{
 			uint64_t target = w->res_pos;
@@ -1413,7 +1430,7 @@ wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end, int *rc)
 	start = w->res_pos;
 	w->last_pos = start;
 	w->res_pos += need;
-	atomic_store_explicit(&w->off, w->res_pos, memory_order_relaxed);
+	xtc_atomic_store_u64(&w->off, w->res_pos, xtc_mo_relaxed);
 	wal_unlock(&w->res_mu);
 
 	memcpy(hdr, &lsn, 8);
@@ -1427,8 +1444,8 @@ wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end, int *rc)
 	ring_put(w, start + WAL_REC_HDR + len, trl, WAL_REC_CRC);
 	s = &w->slot[lsn & (WAL_SLOTS - 1)];
 	s->end = start + need;
-	atomic_store_explicit(&s->lsn, lsn, memory_order_release);   /* publish */
-	atomic_fetch_add_explicit(&w->s_bytes, len, memory_order_relaxed);
+	xtc_atomic_store_u64(&s->lsn, lsn, xtc_mo_release); /* publish */
+	xtc_atomic_fetch_add_u64(&w->s_bytes, len, xtc_mo_relaxed);
 	*end = start + need;
 	*rc = XTC_OK;
 	return lsn;
@@ -1482,7 +1499,7 @@ static void
 wal_writer_gone(void *arg)
 {
 	wal_t *w = arg;
-	atomic_store_explicit(&w->writer_alive, 0, memory_order_release);
+	xtc_atomic_store_i32(&w->writer_alive, 0, xtc_mo_release);
 }
 
 static void
@@ -1519,10 +1536,10 @@ wal_writer_spawn(wal_t *w, xtc_loop_t *loop, xtc_pid_t *pid)
 	if (w == NULL || loop == NULL)
 		return XTC_E_INVAL;
 	o.name = "wal";
-	atomic_store_explicit(&w->writer_alive, 1, memory_order_release);
+	xtc_atomic_store_i32(&w->writer_alive, 1, xtc_mo_release);
 	rc = xtc_proc_spawn(loop, wal_writer_proc, w, &o, &p);
 	if (rc != XTC_OK) {
-		atomic_store_explicit(&w->writer_alive, 0, memory_order_release);
+		xtc_atomic_store_i32(&w->writer_alive, 0, xtc_mo_release);
 		return rc;
 	}
 	w->writer_pid = p;
@@ -1553,13 +1570,13 @@ void
 wal_fail_stop(wal_t *w)
 {
 	if (w != NULL)
-		atomic_store_explicit(&w->failed, 1, memory_order_release);
+		xtc_atomic_store_i32(&w->failed, 1, xtc_mo_release);
 }
 
 int
 wal_failed(const wal_t *w)
 {
-	return w != NULL && atomic_load_explicit(&w->failed, memory_order_acquire);
+	return w != NULL && xtc_atomic_load_i32(&w->failed, xtc_mo_acquire);
 }
 
 /* Rebind an open log handle to `path` after it was replaced on disk
@@ -1578,7 +1595,7 @@ wal_rebind_at(wal_t *w, const char *path, off_t off, uint64_t lsn)
 	w->dsync = dsync;
 	wal_reset_marks(w, (uint64_t)off, lsn);
 	wal_dio_setup(w);
-	atomic_fetch_add_explicit(&w->gen, 1, memory_order_acq_rel);
+	xtc_atomic_fetch_add_u64(&w->gen, 1, xtc_mo_acq_rel);
 	return XTC_OK;
 }
 
@@ -1687,7 +1704,7 @@ wal_checkpoint(wal_t *w, const char *path,
 		return XTC_E_INVAL;
 	if ((int)strlen(path) + 9 >= (int)sizeof tmp)
 		return XTC_E_INVAL;
-	if (atomic_load_explicit(&w->failed, memory_order_acquire))
+	if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire))
 		return XTC_E_IO;
 	snprintf(tmp, sizeof tmp, "%s.compact", path);
 	fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -1745,7 +1762,7 @@ wal_checkpoint(wal_t *w, const char *path,
 	(void)close(fd);
 	/* Failed during the dump (wal_fail_stop: a page it read was damaged,
 	 * so the dump may be cut short): never replace the complete log. */
-	if (atomic_load_explicit(&w->failed, memory_order_acquire)) {
+	if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire)) {
 		(void)unlink(tmp);
 		return XTC_E_IO;
 	}
@@ -1788,7 +1805,7 @@ wal_ockpt_begin(wal_t *w, const char *path, wal_ock_t **out)
 	if (w == NULL || path == NULL || out == NULL ||
 	    (int)strlen(path) + 9 >= (int)sizeof k->tmp)
 		return XTC_E_INVAL;
-	if (atomic_load_explicit(&w->failed, memory_order_acquire))
+	if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire))
 		return XTC_E_IO;
 	if ((k = calloc(1, sizeof *k)) == NULL)
 		return XTC_E_NOMEM;
@@ -1810,10 +1827,10 @@ wal_ockpt_begin(wal_t *w, const char *path, wal_ock_t **out)
 	}
 	/* Quiesced: every logged record is durable, so the durable end is
 	 * the append end and the durable LSN the last one handed out. */
-	k->src_off = (off_t)atomic_load_explicit(&w->durable_off,
-	    memory_order_acquire);
-	k->c.lsn = atomic_load_explicit(&w->durable_lsn, memory_order_acquire);
-	k->gen = atomic_load_explicit(&w->gen, memory_order_acquire);
+	k->src_off =
+	    (off_t)xtc_atomic_load_u64(&w->durable_off, xtc_mo_acquire);
+	k->c.lsn = xtc_atomic_load_u64(&w->durable_lsn, xtc_mo_acquire);
+	k->gen = xtc_atomic_load_u64(&w->gen, xtc_mo_acquire);
 	*out = k;
 	return XTC_OK;
 }
@@ -1899,9 +1916,9 @@ wal_ockpt_catchup(wal_ock_t *k, uint64_t *left)
 {
 	off_t end;
 	int rc;
-	if (atomic_load_explicit(&k->w->gen, memory_order_acquire) != k->gen)
+	if (xtc_atomic_load_u64(&k->w->gen, xtc_mo_acquire) != k->gen)
 		return XTC_E_AGAIN;           /* the log was rewritten under us */
-	end = (off_t)atomic_load_explicit(&k->w->durable_off, memory_order_acquire);
+	end = (off_t)xtc_atomic_load_u64(&k->w->durable_off, xtc_mo_acquire);
 	rc = wal_ock_copy(k, end, (off_t)(64u << 20));   /* bounded slice */
 	wal_cmp_flush(&k->c);
 	/*
@@ -1915,8 +1932,9 @@ wal_ockpt_catchup(wal_ock_t *k, uint64_t *left)
 	if (rc == XTC_OK && !k->c.err)
 		(void)fdatasync(k->c.fd);
 	if (left != NULL)
-		*left = (uint64_t)atomic_load_explicit(&k->w->durable_off,
-		    memory_order_acquire) - (uint64_t)k->src_off;
+		*left = (uint64_t)xtc_atomic_load_u64(&k->w->durable_off,
+		            xtc_mo_acquire) -
+		    (uint64_t)k->src_off;
 	return rc != XTC_OK ? rc : (k->c.err ? XTC_E_INTERNAL : XTC_OK);
 }
 
@@ -1925,18 +1943,18 @@ wal_ockpt_finish(wal_ock_t *k)
 {
 	wal_t *w = k->w;
 	int rc;
-	if (atomic_load_explicit(&w->gen, memory_order_acquire) != k->gen) {
+	if (xtc_atomic_load_u64(&w->gen, xtc_mo_acquire) != k->gen) {
 		wal_ockpt_abort(k);
 		return XTC_E_AGAIN;
 	}
-	if (atomic_load_explicit(&w->failed, memory_order_acquire)) {
+	if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire)) {
 		wal_ockpt_abort(k);
 		return XTC_E_IO;
 	}
 	/* Quiesced: the durable end is the append end, so after this copy
 	 * the new file holds every record the old one does past the dump. */
-	rc = wal_ock_copy(k, (off_t)atomic_load_explicit(&w->durable_off,
-	    memory_order_acquire), 0);
+	rc = wal_ock_copy(k,
+	    (off_t)xtc_atomic_load_u64(&w->durable_off, xtc_mo_acquire), 0);
 	wal_cmp_flush(&k->c);
 	if (rc != XTC_OK || k->c.err || k->c.off == 0 || fsync(k->c.fd) != 0) {
 		wal_ockpt_abort(k);
@@ -2052,7 +2070,7 @@ wal_truncate(wal_t *w)
 	}
 	/* next append at offset 0; next_lsn keeps rising */
 	wal_reset_marks(w, 0, w->next_lsn);
-	atomic_fetch_add_explicit(&w->gen, 1, memory_order_acq_rel);
+	xtc_atomic_fetch_add_u64(&w->gen, 1, xtc_mo_acq_rel);
 	wal_unlock(&w->fl_mu);
 	wal_unlock(&w->res_mu);
 	return XTC_OK;
@@ -2063,14 +2081,13 @@ wal_durable_lsn(const wal_t *w)
 {
 	if (w == NULL)
 		return 0;
-	return atomic_load_explicit(&w->durable_lsn, memory_order_relaxed);
+	return xtc_atomic_load_u64(&w->durable_lsn, xtc_mo_relaxed);
 }
 
 uint64_t
 wal_size(const wal_t *w)
 {
-	return w == NULL ? 0 :
-	    atomic_load_explicit(&w->off, memory_order_relaxed);
+	return w == NULL ? 0 : xtc_atomic_load_u64(&w->off, xtc_mo_relaxed);
 }
 
 int
@@ -2086,9 +2103,9 @@ wal_get_tail(wal_t *w, wal_tail_t *out)
 	/* Quiesced only: every reserved byte durable, no direct write, not
 	 * failed -- then the file holds exactly the frames in [0, res_pos). */
 	if (!w->direct && !w->flushing && w->last_pos != UINT64_MAX &&
-	    !atomic_load_explicit(&w->failed, memory_order_acquire) &&
-	    atomic_load_explicit(&w->durable_off, memory_order_acquire) ==
-	    w->res_pos) {
+	    !xtc_atomic_load_i32(&w->failed, xtc_mo_acquire) &&
+	    xtc_atomic_load_u64(&w->durable_off, xtc_mo_acquire) ==
+	        w->res_pos) {
 		out->valid = 1;
 		out->end = w->res_pos;
 		out->last_off = w->last_pos;
@@ -2116,7 +2133,7 @@ wal_flush_through(wal_t *w, uint64_t lsn)
 	 * the current commit-before-apply protocol; report whether it is.
 	 * (When uncommitted pages may be stolen to disk, this is where the
 	 * log would be forced.) */
-	if (atomic_load_explicit(&w->durable_lsn, memory_order_relaxed) >= lsn)
+	if (xtc_atomic_load_u64(&w->durable_lsn, xtc_mo_relaxed) >= lsn)
 		return XTC_OK;
 	return XTC_E_AGAIN;
 }
@@ -2134,7 +2151,8 @@ wal_writer_stop(wal_t *w)
 	/* Wait for the writer to drain its batch and exit before a caller
 	 * (wal_close) frees the log out from under it. */
 	for (i = 0; i < 100000 &&
-	    atomic_load_explicit(&w->writer_alive, memory_order_acquire); i++)
+	     xtc_atomic_load_i32(&w->writer_alive, xtc_mo_acquire);
+	     i++)
 		if (xtc_proc_sleep(200LL * 1000) != XTC_OK) break;
 	return rc;
 }
@@ -2151,6 +2169,6 @@ wal_get_stats(wal_t *w, wal_stats_t *out)
 	out->max_batch_seen = w->s_maxbatch;
 	out->failed = w->s_failed;
 	wal_unlock(&w->fl_mu);
-	out->bytes = atomic_load_explicit(&w->s_bytes, memory_order_relaxed);
-	out->durable_lsn = atomic_load_explicit(&w->durable_lsn, memory_order_relaxed);
+	out->bytes = xtc_atomic_load_u64(&w->s_bytes, xtc_mo_relaxed);
+	out->durable_lsn = xtc_atomic_load_u64(&w->durable_lsn, xtc_mo_relaxed);
 }

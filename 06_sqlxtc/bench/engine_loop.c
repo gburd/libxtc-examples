@@ -27,7 +27,6 @@
  */
 
 #include <inttypes.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,7 +50,7 @@ static int g_row      = 200;
 static const char *g_label = "loop";
 
 static char g_blob[4096];
-static _Atomic int g_left;        /* workers remaining; last one quiesces */
+static int g_left; /* workers remaining; last one quiesces */
 
 struct wk {
 	int        id;
@@ -113,7 +112,7 @@ worker_proc(void *arg)
 	sx_close(h);
 done:
 	/* Last worker out stops the background procs so the executor drains. */
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		sx_storage_quiesce();
 }
 
@@ -176,7 +175,7 @@ main(int argc, char **argv)
 	if (sx_storage_run(xtc_exec_loop(exec, 0)) != SX_OK) return 1;
 
 	ws = calloc((size_t)nworkers, sizeof *ws);
-	atomic_store(&g_left, nworkers);
+	xtc_atomic_store_i32(&g_left, nworkers, xtc_mo_seq_cst);
 	for (t = 0; t < nworkers; t++) {
 		ws[t].id = t;
 		ws[t].lat = calloc((size_t)g_ops, sizeof(uint32_t));

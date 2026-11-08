@@ -53,7 +53,8 @@ static void
 restart_hook(void)
 {
 	if (g_restore_root != 0 && g_restarts++ == 1) {
-		atomic_store(&g_bt->root_pid, (bm_pid_t)g_restore_root);
+		xtc_atomic_store_u64(&g_bt->root_pid, (bm_pid_t)g_restore_root,
+		    xtc_mo_seq_cst);
 		g_restore_root = 0;
 	}
 }
@@ -133,7 +134,7 @@ main(void)
 		TCK(bt_insert(g_bt, k, akey(k, i), v, sizeof v) == XTC_OK);
 		g_alive[i] = 1;
 	}
-	TCK(atomic_load(&g_bt->st_height) > 1);
+	TCK(xtc_atomic_load_u64(&g_bt->st_height, xtc_mo_seq_cst) > 1);
 
 	/* Scan; arm the hook on the FIRST leaf hop. */
 	memset(seen, 0, sizeof seen);
@@ -178,13 +179,15 @@ main(void)
 	 * the descent's first root fix, by the restart hook.) */
 	{
 		bm_frame_t *f = NULL;
-		bm_pid_t realroot = atomic_load(&g_bt->root_pid), mid;
+		bm_pid_t realroot = xtc_atomic_load_u64(&g_bt->root_pid,
+		             xtc_mo_seq_cst),
+		         mid;
 		TCK(cursor_descend(g_bt, (const void *)"z0100", 5, &f) == XTC_OK);
 		mid = bm_frame_pid(f);
 		bm_unlatch(f);
 		bm_unfix(g_bm, f, 0);
 		g_restore_root = realroot;
-		atomic_store(&g_bt->root_pid, mid);
+		xtc_atomic_store_u64(&g_bt->root_pid, mid, xtc_mo_seq_cst);
 		f = NULL;
 		TCK(cursor_descend(g_bt, NULL, 0, &f) == XTC_OK && f != NULL);
 		if (f != NULL) {
@@ -196,7 +199,7 @@ main(void)
 			bm_unlatch(f);
 			bm_unfix(g_bm, f, 0);
 		}
-		atomic_store(&g_bt->root_pid, realroot);
+		xtc_atomic_store_u64(&g_bt->root_pid, realroot, xtc_mo_seq_cst);
 	}
 	bt_close(g_bt);
 	bm_destroy(g_bm);

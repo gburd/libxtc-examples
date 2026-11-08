@@ -27,7 +27,6 @@
  *	No network, no daemon.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,10 +54,10 @@
 static bm_t       *g_bm;
 static bm_pid_t    g_pid[N_ROOTS];
 
-static _Atomic uint64_t g_verified;     /* pinned reads that matched */
-static _Atomic uint64_t g_mismatch;     /* content/pid mismatches (bugs) */
-static _Atomic uint64_t g_fix_fail;     /* bm_fix returned != XTC_OK */
-static _Atomic int      g_workers_done; /* count, last one stops provider */
+static uint64_t g_verified; /* pinned reads that matched */
+static uint64_t g_mismatch; /* content/pid mismatches (bugs) */
+static uint64_t g_fix_fail; /* bm_fix returned != XTC_OK */
+static int g_workers_done;  /* count, last one stops provider */
 
 struct warg { int id; unsigned seed; };
 static struct warg g_warg[N_WORKERS];
@@ -104,7 +103,7 @@ worker_proc(void *arg)
 
 	local = malloc(PAGE_SZ);                  /* off the fiber stack */
 	if (local == NULL) {
-		atomic_fetch_add(&g_fix_fail, 1);
+		xtc_atomic_fetch_add_u64(&g_fix_fail, 1, xtc_mo_seq_cst);
 		goto done;
 	}
 
@@ -119,7 +118,8 @@ worker_proc(void *arg)
 			k = lo + (int)((unsigned)rand_r(&seed) % (unsigned)(hi - lo));
 
 		if (bm_fix_pid(g_bm, g_pid[k], &f) != XTC_OK) {
-			atomic_fetch_add(&g_fix_fail, 1);
+			xtc_atomic_fetch_add_u64(&g_fix_fail, 1,
+			    xtc_mo_seq_cst);
 			continue;
 		}
 
@@ -133,9 +133,11 @@ worker_proc(void *arg)
 
 		if (fpid != g_pid[k] ||
 		    !check_page(local, g_pid[k], (uint64_t)k))
-			atomic_fetch_add(&g_mismatch, 1);
+			xtc_atomic_fetch_add_u64(&g_mismatch, 1,
+			    xtc_mo_seq_cst);
 		else
-			atomic_fetch_add(&g_verified, 1);
+			xtc_atomic_fetch_add_u64(&g_verified, 1,
+			    xtc_mo_seq_cst);
 
 		/* Yield periodically so peers on the same loop and the
 		 * page-provider interleave with us. */
@@ -149,7 +151,8 @@ done:
 	/* The last worker to finish stops the provider so the executor,
 	 * once every proc has returned and the provider's timer is gone,
 	 * observes a globally idle state and lets xtc_exec_run return. */
-	if (atomic_fetch_add(&g_workers_done, 1) + 1 == N_WORKERS)
+	if (xtc_atomic_fetch_add_i32(&g_workers_done, 1, xtc_mo_seq_cst) + 1 ==
+	    N_WORKERS)
 		bm_provider_stop(g_bm);
 }
 
@@ -221,10 +224,10 @@ main(void)
 		return 1;
 	}
 
-	atomic_store(&g_verified, 0);
-	atomic_store(&g_mismatch, 0);
-	atomic_store(&g_fix_fail, 0);
-	atomic_store(&g_workers_done, 0);
+	xtc_atomic_store_u64(&g_verified, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&g_mismatch, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_u64(&g_fix_fail, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_workers_done, 0, xtc_mo_seq_cst);
 
 	if (setup_roots() != 0) { bm_destroy(g_bm); unlink(path); return 1; }
 
@@ -278,18 +281,22 @@ main(void)
 	unlink(path);
 
 	/* ---- assertions ---- */
-	if (atomic_load(&g_mismatch) != 0 || bad != 0) {
-		fprintf(stderr, "FAIL: content corruption "
+	if (xtc_atomic_load_u64(&g_mismatch, xtc_mo_seq_cst) != 0 || bad != 0) {
+		fprintf(stderr,
+		    "FAIL: content corruption "
 		    "(concurrent mismatches=%llu, final-sweep mismatches=%d)\n",
-		    (unsigned long long)atomic_load(&g_mismatch), bad);
+		    (unsigned long long)xtc_atomic_load_u64(&g_mismatch,
+		        xtc_mo_seq_cst),
+		    bad);
 		return 1;
 	}
-	if (atomic_load(&g_fix_fail) != 0) {
+	if (xtc_atomic_load_u64(&g_fix_fail, xtc_mo_seq_cst) != 0) {
 		fprintf(stderr, "FAIL: %llu bm_fix calls failed\n",
-		    (unsigned long long)atomic_load(&g_fix_fail));
+		    (unsigned long long)xtc_atomic_load_u64(&g_fix_fail,
+		        xtc_mo_seq_cst));
 		return 1;
 	}
-	if (atomic_load(&g_verified) == 0) {
+	if (xtc_atomic_load_u64(&g_verified, xtc_mo_seq_cst) == 0) {
 		fprintf(stderr, "FAIL: no reads were verified\n");
 		return 1;
 	}
@@ -308,10 +315,11 @@ main(void)
 	}
 
 	printf("  ok   %d workers on %d loops (%d OS threads) did %d fixes "
-	    "each over %d roots / %d frames; %llu pinned reads verified, "
-	    "0 mismatches\n",
+	       "each over %d roots / %d frames; %llu pinned reads verified, "
+	       "0 mismatches\n",
 	    N_WORKERS, N_LOOPS, N_LOOPS, ITERS, N_ROOTS, N_FRAMES,
-	    (unsigned long long)atomic_load(&g_verified));
+	    (unsigned long long)xtc_atomic_load_u64(&g_verified,
+	        xtc_mo_seq_cst));
 	printf("  ok   final single-threaded sweep: all %d pages intact\n",
 	    N_ROOTS);
 	printf("  ok   concurrent cool/evict cycle "

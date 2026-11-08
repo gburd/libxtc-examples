@@ -20,7 +20,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -349,7 +349,8 @@ self_test(void *arg)
 		shard_cmds[i] = 0;
 	for (i = 0; i < venue_nsyms(); i++)
 		shard_cmds[venue_sym_shard(i)] +=
-		    atomic_load(&venue_sym_stats(i)->commands);
+		    xtc_atomic_load_u64(&venue_sym_stats(i)->commands,
+		        xtc_mo_seq_cst);
 	for (i = 0; i < g_shards; i++)
 		T(shard_cmds[i] > 0);
 	fprintf(stderr, "  self-test: order entry, fills both sides, "
@@ -372,7 +373,7 @@ static long g_bench_n;
 static int g_bench_clients = 4;
 static hist_t g_rtt;
 static pthread_mutex_t g_rtt_lock = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic int g_bench_done;
+static int g_bench_done;
 
 struct bench_arg {
 	int id;
@@ -414,7 +415,8 @@ out:
 	pthread_mutex_unlock(&g_rtt_lock);
 	if (fd >= 0)
 		close(fd);
-	if (atomic_fetch_add(&g_bench_done, 1) + 1 == g_bench_clients)
+	if (xtc_atomic_fetch_add_i32(&g_bench_done, 1, xtc_mo_seq_cst) + 1 ==
+	    g_bench_clients)
 		xtc_tnt_stop();
 	return NULL;
 }

@@ -161,7 +161,9 @@ build(const char *tag, bm_t **bmp, bt_t **btp, char *path, size_t cap)
 	for (i = 0; i < N_KEYS; i++)
 		if (bt_insert(*btp, k, mkkey(i, k), "v", 1) != XTC_OK)
 			return -1;
-	return atomic_load(&(*btp)->st_height) >= 2 ? 0 : -1;
+	return xtc_atomic_load_u64(&(*btp)->st_height, xtc_mo_seq_cst) >= 2 ?
+	    0 :
+	    -1;
 }
 
 static void
@@ -233,7 +235,7 @@ main(void)
 	expect_fail(bt, lo, "3. lo fence above routed keys:", 0);
 	expect_ok(bt, 0);
 	expect_ok(bt, N_KEYS - 1);
-	TCK(atomic_load(&bt->st_stuck) > 0);
+	TCK(xtc_atomic_load_u64(&bt->st_stuck, xtc_mo_seq_cst) > 0);
 	teardown(bm, bt, path);
 
 	/* 4. a right link to the wrong (leftmost) leaf: point reads are

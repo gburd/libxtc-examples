@@ -28,7 +28,6 @@
  *	and the loser was found only at COMMIT.
  */
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,7 +46,7 @@
 static bt_t        *g_bt;
 static wal_t       *g_wal;
 static sx_db       *g_c[2];
-static _Atomic int  g_step, g_left;
+static int g_step, g_left;
 static int          g_case;
 /* Results of the current case, written by the workers. */
 static int          g_upd_rc[2], g_commit_rc[2], g_after_rc[2];
@@ -81,7 +80,7 @@ val(sx_db *db, int id)
 static void
 await(int n)
 {
-	while (atomic_load(&g_step) < n)
+	while (xtc_atomic_load_i32(&g_step, xtc_mo_seq_cst) < n)
 		(void)xtc_proc_sleep(50LL * 1000);
 }
 
@@ -98,7 +97,7 @@ worker(void *arg)
 		if (me == 0) {
 			CK(run(db, begin, NULL, 0) == SX_OK);
 			CK(run(db, "UPDATE t SET v=v+10 WHERE id=1", NULL, 0) == SX_OK);
-			atomic_store(&g_step, 1);
+			xtc_atomic_store_i32(&g_step, 1, xtc_mo_seq_cst);
 			await(2);                         /* B started (and reads) */
 			(void)xtc_proc_sleep(5LL * 1000 * 1000);   /* B is waiting */
 			g_commit_rc[0] = run(db, "COMMIT", NULL, 0);
@@ -107,7 +106,7 @@ worker(void *arg)
 			CK(run(db, begin, NULL, 0) == SX_OK);
 			if (g_case != 3)
 				CK(val(db, 2) == 0);      /* fixes B's snapshot */
-			atomic_store(&g_step, 2);
+			xtc_atomic_store_i32(&g_step, 2, xtc_mo_seq_cst);
 			g_t0[1] = xtc_clock_mono();
 			g_upd_rc[1] = run(db, "UPDATE t SET v=v+20 WHERE id=1",
 			    g_msg[1], sizeof g_msg[1]);
@@ -124,7 +123,7 @@ worker(void *arg)
 		CK(run(db, "BEGIN", NULL, 0) == SX_OK);
 		snprintf(q, sizeof q, "UPDATE t SET v=v+1 WHERE id=%d", mine);
 		CK(run(db, q, NULL, 0) == SX_OK);
-		atomic_fetch_add(&g_step, 1);
+		xtc_atomic_fetch_add_i32(&g_step, 1, xtc_mo_seq_cst);
 		await(2);                                 /* both hold one */
 		snprintf(q, sizeof q, "UPDATE t SET v=v+1 WHERE id=%d", other);
 		g_t0[me] = xtc_clock_mono();
@@ -133,7 +132,7 @@ worker(void *arg)
 		g_commit_rc[me] = run(db, g_upd_rc[me] == SX_OK ? "COMMIT"
 		    : "ROLLBACK", NULL, 0);
 	}
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		(void)wal_writer_stop(g_wal);
 }
 
@@ -170,8 +169,8 @@ one_case(int c, int nloops)
 	CK(run(g_c[0], "INSERT INTO t(id,v) VALUES(1,0)", NULL, 0) == SX_OK);
 	CK(run(g_c[0], "INSERT INTO t(id,v) VALUES(2,0)", NULL, 0) == SX_OK);
 	g_case = c;
-	atomic_store(&g_step, 0);
-	atomic_store(&g_left, 2);
+	xtc_atomic_store_i32(&g_step, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_left, 2, xtc_mo_seq_cst);
 	memset(g_upd_rc, 0, sizeof g_upd_rc);
 	memset(g_commit_rc, 0, sizeof g_commit_rc);
 	memset(g_after_rc, 0, sizeof g_after_rc);

@@ -24,7 +24,6 @@
  *	No daemon.
  */
 
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,12 +62,12 @@
 
 static bm_t       *g_bm;
 static bt_t       *g_bt;
-static _Atomic int g_writers_left;
-static _Atomic int g_churners_left;
-static _Atomic int g_workers_active;   /* writers + churners still running;
-                                         * the last one stops the provider */
-static _Atomic long g_read_hits;
-static _Atomic long g_read_mismatch;   /* found a key with the wrong value */
+static int g_writers_left;
+static int g_churners_left;
+static int g_workers_active; /* writers + churners still running;
+                              * the last one stops the provider */
+static long g_read_hits;
+static long g_read_mismatch; /* found a key with the wrong value */
 
 static void
 churn_kv(int idx, char *k, char *v)
@@ -97,10 +96,10 @@ churner_proc(void *arg)
 			(void)bt_delete(g_bt, k, (uint16_t)strlen(k));
 		}
 	}
-	atomic_fetch_sub(&g_churners_left, 1);
+	xtc_atomic_fetch_sub_i32(&g_churners_left, 1, xtc_mo_seq_cst);
 	/* See writer_proc: the last of (writers + churners) to finish stops
 	 * the provider. */
-	if (atomic_fetch_sub(&g_workers_active, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_workers_active, 1, xtc_mo_seq_cst) == 1)
 		bm_provider_stop(g_bm);
 }
 
@@ -129,12 +128,12 @@ writer_proc(void *arg)
 		mkkv(idx, k, v);
 		(void)bt_insert(g_bt, k, (uint16_t)strlen(k), v, (uint16_t)strlen(v));
 	}
-	atomic_fetch_sub(&g_writers_left, 1);
+	xtc_atomic_fetch_sub_i32(&g_writers_left, 1, xtc_mo_seq_cst);
 	/* The last of (writers + churners) to finish stops the provider so
 	 * the executor can observe a globally idle state and return -- a
 	 * churner still running after the writers finish still needs page
 	 * I/O. */
-	if (atomic_fetch_sub(&g_workers_active, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_workers_active, 1, xtc_mo_seq_cst) == 1)
 		bm_provider_stop(g_bm);
 }
 
@@ -148,16 +147,19 @@ reader_proc(void *arg)
 
 	/* Probe random keys while writers/churners run.  A found key must be
 	 * correct; a not-yet-inserted key simply misses (no assertion). */
-	while (atomic_load(&g_workers_active) > 0 && spins < 200000) {
+	while (xtc_atomic_load_i32(&g_workers_active, xtc_mo_seq_cst) > 0 &&
+	    spins < 200000) {
 		int idx;
 		rng = rng * 6364136223846793005ull + 1442695040888963407ull;
 		idx = (int)((rng >> 33) % N_KEYS);
 		mkkv(idx, k, v);
 		if (bt_lookup(g_bt, k, (uint16_t)strlen(k), buf, sizeof buf, &vl)
 		    == XTC_OK) {
-			atomic_fetch_add(&g_read_hits, 1);
+			xtc_atomic_fetch_add_long(&g_read_hits, 1,
+			    xtc_mo_seq_cst);
 			if (vl != strlen(v) || memcmp(buf, v, vl) != 0)
-				atomic_fetch_add(&g_read_mismatch, 1);
+				xtc_atomic_fetch_add_long(&g_read_mismatch, 1,
+				    xtc_mo_seq_cst);
 		}
 		spins++;
 		if ((spins & 63) == 0) {
@@ -187,11 +189,12 @@ main(void)
 	if (bm_create(&bo, &g_bm) != XTC_OK) { fprintf(stderr, "bm_create\n"); return 1; }
 	if (bt_open(g_bm, &g_bt) != XTC_OK) { fprintf(stderr, "bt_open\n"); return 1; }
 
-	atomic_store(&g_writers_left, N_WRITERS);
-	atomic_store(&g_churners_left, N_CHURNERS);
-	atomic_store(&g_workers_active, N_WRITERS + N_CHURNERS);
-	atomic_store(&g_read_hits, 0);
-	atomic_store(&g_read_mismatch, 0);
+	xtc_atomic_store_i32(&g_writers_left, N_WRITERS, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_churners_left, N_CHURNERS, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_workers_active, N_WRITERS + N_CHURNERS,
+	    xtc_mo_seq_cst);
+	xtc_atomic_store_long(&g_read_hits, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_long(&g_read_mismatch, 0, xtc_mo_seq_cst);
 
 	if (xtc_exec_init(&exec, N_LOOPS) != XTC_OK) { fprintf(stderr, "exec_init\n"); return 1; }
 	l0 = xtc_exec_loop(exec, 0);
@@ -266,9 +269,10 @@ main(void)
 	bt_close(g_bt); bm_destroy(g_bm); unlink(path);
 	{ char wal[288]; snprintf(wal, sizeof wal, "%s-wal", path); unlink(wal); }
 
-	if (atomic_load(&g_read_mismatch) != 0) {
-		fprintf(stderr, "FAIL: %ld concurrent reads saw a wrong value\n",
-		    atomic_load(&g_read_mismatch));
+	if (xtc_atomic_load_long(&g_read_mismatch, xtc_mo_seq_cst) != 0) {
+		fprintf(stderr,
+		    "FAIL: %ld concurrent reads saw a wrong value\n",
+		    xtc_atomic_load_long(&g_read_mismatch, xtc_mo_seq_cst));
 		return 1;
 	}
 	if (missing != 0) {
@@ -284,11 +288,12 @@ main(void)
 	    N_WRITERS, N_CHURNERS, N_READERS, N_LOOPS, N_KEYS,
 	    (unsigned long long)ts.height, (unsigned long long)ts.splits,
 	    (unsigned long long)ts.merges);
-	printf("  ok   %ld concurrent shared-coupling reads, 0 wrong values; tree paged "
+	printf(
+	    "  ok   %ld concurrent shared-coupling reads, 0 wrong values; tree paged "
 	    "through the pool (loads=%llu evicted=%llu flushed=%llu resident=%llu)\n",
-	    atomic_load(&g_read_hits), (unsigned long long)bs.loads,
-	    (unsigned long long)bs.evicted, (unsigned long long)bs.flushed,
-	    (unsigned long long)bs.resident);
+	    xtc_atomic_load_long(&g_read_hits, xtc_mo_seq_cst),
+	    (unsigned long long)bs.loads, (unsigned long long)bs.evicted,
+	    (unsigned long long)bs.flushed, (unsigned long long)bs.resident);
 	printf("All sqlxtc concurrent B-tree tests passed.\n");
 	return 0;
 }

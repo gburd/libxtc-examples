@@ -32,7 +32,6 @@
  */
 
 #include <assert.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,7 +156,7 @@ static xtc_pid_t   g_ts_pid;
 static xtc_svr_t  *g_ts_svr;
 static xtc_pid_t   g_shard_pid[N_SHARDS];
 static xtc_svr_t  *g_shard_svr[N_SHARDS];
-static _Atomic int g_clients_left;
+static int g_clients_left;
 
 static uint32_t
 shard_of(uint32_t key)
@@ -206,7 +205,7 @@ client_proc(void *arg)
 	/* The last client to finish stops the control plane and every
 	 * shard so the loop/executor can drain (no in-flight calls remain
 	 * once every client is done). */
-	if (atomic_fetch_sub(&g_clients_left, 1) == 1) {
+	if (xtc_atomic_fetch_sub_i32(&g_clients_left, 1, xtc_mo_seq_cst) == 1) {
 		int sidx;
 		(void)xtc_svr_stop(g_ts_svr);
 		for (sidx = 0; sidx < N_SHARDS; sidx++)
@@ -265,7 +264,7 @@ spawn_all(xtc_loop_t *ts_loop, xtc_loop_t **shard_loops, xtc_loop_t **client_loo
 		g_shard_pid[i] = xtc_svr_pid(g_shard_svr[i]);
 	}
 
-	atomic_store(&g_clients_left, N_CLIENTS);
+	xtc_atomic_store_i32(&g_clients_left, N_CLIENTS, xtc_mo_seq_cst);
 	for (c = 0; c < N_CLIENTS; c++) {
 		xtc_proc_opts_t po = {
 			.size = sizeof(xtc_proc_opts_t),

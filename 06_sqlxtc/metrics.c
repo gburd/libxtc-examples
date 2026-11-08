@@ -12,7 +12,7 @@
  */
 
 #include <stdlib.h>
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stdio.h>
 
 #include "xtc_blocking.h"
@@ -45,10 +45,10 @@ metrics_register(void)
 
 typedef struct metrics_state {
 	xtc_res_t   *res;
-	_Atomic int *conn_count;
+	int *conn_count;
 } metrics_state_t;
 
-static _Atomic int g_metrics_stop, g_metrics_alive;
+static int g_metrics_stop, g_metrics_alive;
 static xtc_pid_t   g_metrics_pid;
 
 /*
@@ -73,7 +73,7 @@ static void
 metrics_dead(void *arg)
 {
 	free(arg);
-	atomic_store(&g_metrics_alive, 0);
+	xtc_atomic_store_i32(&g_metrics_alive, 0, xtc_mo_seq_cst);
 }
 
 static void
@@ -86,15 +86,16 @@ metrics_proc(void *arg)
 		metrics_dead(st);
 		return;
 	}
-	while (!atomic_load(&g_metrics_stop)) {
+	while (!xtc_atomic_load_i32(&g_metrics_stop, xtc_mo_seq_cst)) {
 		(void)xtc_recv(&msg, &msg_len, METRICS_INTERVAL_NS);
 		if (msg) xtc_free(msg);
-		if (atomic_load(&g_metrics_stop))
+		if (xtc_atomic_load_i32(&g_metrics_stop, xtc_mo_seq_cst))
 			break;
 
 		if (sqlxtc_stat_connections != NULL)
 			xtc_gauge_set(sqlxtc_stat_connections,
-			    (int64_t)atomic_load(st->conn_count));
+			    (int64_t)xtc_atomic_load_i32(st->conn_count,
+			        xtc_mo_seq_cst));
 		if (st->res != NULL && sqlxtc_stat_res_mem != NULL)
 			xtc_gauge_set(sqlxtc_stat_res_mem,
 			    xtc_res_used(st->res, XTC_RES_MEM_BYTES));
@@ -121,14 +122,15 @@ metrics_proc(void *arg)
 			    "plans=%llu wal_commits=%llu wal_fsyncs=%llu "
 			    "row_waits=%llu row_wait_ms=%llu row_conflicts=%llu "
 			    "row_deadlocks=%llu",
-			    atomic_load(st->conn_count),
-			    (long long)qs, (long long)errs,
-			    (long long)p50, (long long)p99, (long long)qmax,
-			    (long long)mem, sql_parse_count(),
+			    xtc_atomic_load_i32(st->conn_count, xtc_mo_seq_cst),
+			    (long long)qs, (long long)errs, (long long)p50,
+			    (long long)p99, (long long)qmax, (long long)mem,
+			    sql_parse_count(),
 			    (unsigned long long)vx_plan_build_count(),
 			    (unsigned long long)wc, (unsigned long long)wf,
 			    (unsigned long long)xstore_intent_waits(),
-			    (unsigned long long)(xstore_intent_wait_ns() / 1000000u),
+			    (unsigned long long)(xstore_intent_wait_ns() /
+			        1000000u),
 			    (unsigned long long)xstore_intent_conflicts(),
 			    (unsigned long long)xstore_intent_deadlocks());
 		}
@@ -145,19 +147,21 @@ void
 metrics_stop(void)
 {
 	int i;
-	if (!atomic_load(&g_metrics_alive))
+	if (!xtc_atomic_load_i32(&g_metrics_alive, xtc_mo_seq_cst))
 		return;
-	atomic_store(&g_metrics_stop, 1);
+	xtc_atomic_store_i32(&g_metrics_stop, 1, xtc_mo_seq_cst);
 	(void)xtc_send(g_metrics_pid, "s", 1);
 	if (xtc_pid_is_none(xtc_self()))
 		return;
-	for (i = 0; i < 2000 && atomic_load(&g_metrics_alive); i++)
+	for (i = 0;
+	     i < 2000 && xtc_atomic_load_i32(&g_metrics_alive, xtc_mo_seq_cst);
+	     i++)
 		(void)xtc_proc_sleep(1LL * 1000 * 1000);
 }
 
 int
-metrics_spawn(xtc_loop_t *loop, xtc_res_t *res, _Atomic int *conn_count,
-              _Atomic int64_t *queries_total, xtc_pid_t *out_pid)
+metrics_spawn(xtc_loop_t *loop, xtc_res_t *res, int *conn_count,
+    int64_t *queries_total, xtc_pid_t *out_pid)
 {
 	metrics_state_t *st;
 	xtc_proc_opts_t opts = XTC_PROC_OPTS_INIT;
@@ -171,11 +175,11 @@ metrics_spawn(xtc_loop_t *loop, xtc_res_t *res, _Atomic int *conn_count,
 	st->res = res;
 	st->conn_count = conn_count;
 	opts.name = "sqlxtc-metrics";
-	atomic_store(&g_metrics_stop, 0);
-	atomic_store(&g_metrics_alive, 1);
+	xtc_atomic_store_i32(&g_metrics_stop, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_metrics_alive, 1, xtc_mo_seq_cst);
 	if ((rc = xtc_proc_spawn(loop, metrics_proc, st, &opts,
 	    &g_metrics_pid)) != XTC_OK) {
-		atomic_store(&g_metrics_alive, 0);
+		xtc_atomic_store_i32(&g_metrics_alive, 0, xtc_mo_seq_cst);
 		free(st);
 		return rc;
 	}

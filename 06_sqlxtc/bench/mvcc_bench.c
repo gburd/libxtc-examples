@@ -27,7 +27,6 @@
  */
 
 #include <inttypes.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,7 +46,7 @@ static uint32_t g_keyspace = 1000000;
 static int      g_read_pct = 80;
 static const char *g_label = "mvcc";
 
-static _Atomic int g_left;
+static int g_left;
 static uint32_t   *g_lat_ns;            /* C*OPS latency samples (ns) */
 static xtc_loop_t **g_cloops;
 
@@ -93,7 +92,7 @@ client_proc(void *arg)
 		lat[i] = (t1 - t0) > 0xFFFFFFFFull ? 0xFFFFFFFFu
 		                                   : (uint32_t)(t1 - t0);
 	}
-	if (atomic_fetch_sub(&g_left, 1) == 1)
+	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		mvcc_stop();
 }
 
@@ -135,7 +134,7 @@ main(int argc, char **argv)
 	if (mvcc_start(sl, g_cores, xtc_exec_loop(exec, 0)) != XTC_OK) { fprintf(stderr, "mvcc\n"); return 1; }
 
 	g_cloops = sl;
-	atomic_store(&g_left, g_clients);
+	xtc_atomic_store_i32(&g_left, g_clients, xtc_mo_seq_cst);
 	wall0 = now_ns();
 	for (c = 0; c < g_clients; c++) {
 		xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "bench" };

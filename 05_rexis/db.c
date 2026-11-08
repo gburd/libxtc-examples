@@ -6,7 +6,7 @@
  *	Key-value database with xtc_lrlock protection.
  */
 
-#include <stdatomic.h>
+#include "xtc_atomic.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,11 +87,11 @@ struct db {
 	struct db_shard *sh;
 	int           nshard;
 	int           expire_shard;  /* db_expire_stale's current shard */
-	_Atomic size_t keys;         /* live keys + in-flight reservations */
-	_Atomic int64_t mem;         /* dataset bytes charged */
+	size_t keys;                 /* live keys + in-flight reservations */
+	int64_t mem;                 /* dataset bytes charged */
 	db_opts_t     opts;
 	bitcask_t    *bc;          /* persistence; NULL if disabled */
-	_Atomic int   refused;     /* last db_malloc failed on the budget */
+	int refused;               /* last db_malloc failed on the budget */
 };
 
 static struct db_shard *
@@ -117,9 +117,9 @@ wtable(db_t *db, uint64_t h)
 static int
 key_reserve(db_t *db)
 {
-	size_t n = atomic_fetch_add(&db->keys, 1);
+	size_t n = xtc_atomic_fetch_add_size(&db->keys, 1, xtc_mo_seq_cst);
 	if (db->opts.max_keys > 0 && n >= db->opts.max_keys) {
-		atomic_fetch_sub(&db->keys, 1);
+		xtc_atomic_fetch_sub_size(&db->keys, 1, xtc_mo_seq_cst);
 		return -1;
 	}
 	return 0;
@@ -128,7 +128,7 @@ key_reserve(db_t *db)
 static void
 key_unreserve(db_t *db)
 {
-	atomic_fetch_sub(&db->keys, 1);
+	xtc_atomic_fetch_sub_size(&db->keys, 1, xtc_mo_seq_cst);
 }
 
 /* ----- Memory tracking ----- */
@@ -137,24 +137,26 @@ static void *
 db_malloc(db_t *db, size_t sz)
 {
 	void *p;
-	int64_t was = atomic_fetch_add(&db->mem, (int64_t)sz);
+	int64_t was =
+	    xtc_atomic_fetch_add_i64(&db->mem, (int64_t)sz, xtc_mo_seq_cst);
 	if (db->opts.max_mem_bytes > 0 &&
 	    was + (int64_t)sz > db->opts.max_mem_bytes) {
-		atomic_fetch_sub(&db->mem, (int64_t)sz);
-		db->refused = 1;
+		xtc_atomic_fetch_sub_i64(&db->mem, (int64_t)sz, xtc_mo_seq_cst);
+		xtc_atomic_store_i32(&db->refused, 1, xtc_mo_seq_cst);
 		return NULL;
 	}
 	if (db->opts.res) {
 		if (xtc_res_acquire(db->opts.res, XTC_RES_MEM_BYTES,
 		                    (int64_t)sz) != XTC_OK) {
-			atomic_fetch_sub(&db->mem, (int64_t)sz);
-			db->refused = 1;
+			xtc_atomic_fetch_sub_i64(&db->mem, (int64_t)sz,
+			    xtc_mo_seq_cst);
+			xtc_atomic_store_i32(&db->refused, 1, xtc_mo_seq_cst);
 			return NULL;
 		}
 	}
 	p = xtc_malloc(sz);
 	if (p == NULL) {
-		atomic_fetch_sub(&db->mem, (int64_t)sz);
+		xtc_atomic_fetch_sub_i64(&db->mem, (int64_t)sz, xtc_mo_seq_cst);
 		if (db->opts.res)
 			xtc_res_release(db->opts.res, XTC_RES_MEM_BYTES,
 			    (int64_t)sz);
@@ -165,7 +167,7 @@ db_malloc(db_t *db, size_t sz)
 static void
 db_uncharge(db_t *db, size_t sz)
 {
-	atomic_fetch_sub(&db->mem, (int64_t)sz);
+	xtc_atomic_fetch_sub_i64(&db->mem, (int64_t)sz, xtc_mo_seq_cst);
 	if (db->opts.res)
 		xtc_res_release(db->opts.res, XTC_RES_MEM_BYTES, (int64_t)sz);
 }
@@ -186,7 +188,7 @@ db_free(db_t *db, void *p, size_t sz)
  * unchanged.  The keyspace holds one reference; a reply that sends the
  * bytes straight from here (cmd_get) holds another until they leave. */
 typedef struct db_blob {
-	_Atomic uint32_t refs;
+	uint32_t refs;
 	uint32_t         pad;
 	uint64_t         pad2;      /* data stays 16-byte aligned */
 	char             data[];
@@ -214,7 +216,7 @@ val_alloc(db_t *db, size_t len)
 		return db_malloc(db, len + 1);
 	if ((b = db_malloc(db, val_size(len))) == NULL)
 		return NULL;
-	atomic_init(&b->refs, 1);
+	xtc_atomic_store_u32(&b->refs, 1, xtc_mo_relaxed);
 	return b->data;
 }
 
@@ -223,7 +225,7 @@ blob_release(const char *data)
 {
 	db_blob_t *b = blob_of(data);
 
-	if (atomic_fetch_sub_explicit(&b->refs, 1, memory_order_acq_rel) == 1)
+	if (xtc_atomic_fetch_sub_u32(&b->refs, 1, xtc_mo_acq_rel) == 1)
 		xtc_free(b);
 }
 
@@ -250,8 +252,7 @@ void
 db_value_hold(const char *data)
 {
 #ifndef REXIS_PLANT_NOREF
-	atomic_fetch_add_explicit(&blob_of(data)->refs, 1,
-	    memory_order_relaxed);
+	xtc_atomic_fetch_add_u32(&blob_of(data)->refs, 1, xtc_mo_relaxed);
 #else
 	(void)data;
 #endif
@@ -499,7 +500,9 @@ shard_init(db_t *db, int k)
 		xtc_lrlock_write_end(sh->lr);
 		xtc_lrlock_destroy(sh->lr);
 		xtc_arwlock_destroy(sh->mt);
-		return db->refused ? XTC_E_RESOURCE : XTC_E_NOMEM;
+		return xtc_atomic_load_i32(&db->refused, xtc_mo_seq_cst) ?
+		    XTC_E_RESOURCE :
+		    XTC_E_NOMEM;
 	}
 	xtc_lrlock_publish_full_sync(sh->lr);
 	xtc_lrlock_write_end(sh->lr);
@@ -891,13 +894,13 @@ db_keys(db_t *db, const char *pattern, size_t pattern_len,
 size_t
 db_key_count(db_t *db)
 {
-	return atomic_load(&db->keys);
+	return xtc_atomic_load_size(&db->keys, xtc_mo_seq_cst);
 }
 
 size_t
 db_mem_used(db_t *db)
 {
-	int64_t m = atomic_load(&db->mem);
+	int64_t m = xtc_atomic_load_i64(&db->mem, xtc_mo_seq_cst);
 	return m > 0 ? (size_t)m : 0;
 }
 
@@ -1429,7 +1432,8 @@ db_flushdb(db_t *db)
 			}
 			*lh_bucket(&tbl->lh, i) = NULL;
 		}
-		atomic_fetch_sub(&db->keys, tbl->n_keys);
+		xtc_atomic_fetch_sub_size(&db->keys, tbl->n_keys,
+		    xtc_mo_seq_cst);
 		tbl->n_keys = 0;
 	}
 }

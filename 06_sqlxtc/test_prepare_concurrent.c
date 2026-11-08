@@ -28,13 +28,12 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <unistd.h>
 
 #include "xtc.h"
 
-static _Atomic int g_armed, g_parked, g_b_done;
-static _Atomic int g_b_during;      /* B finished while A was parked */
+static int g_armed, g_parked, g_b_done;
+static int g_b_during;              /* B finished while A was parked */
 static pthread_t   g_a_thr;         /* only A's prepare parks */
 
 /* Park A's first prepare after it armed until B is done, at most 10 s
@@ -43,16 +42,18 @@ static void
 park_hook(void)
 {
 	int64_t t0;
-	if (!atomic_load(&g_armed) || !pthread_equal(pthread_self(), g_a_thr) ||
-	    !atomic_exchange(&g_armed, 0))
+	if (!xtc_atomic_load_i32(&g_armed, xtc_mo_seq_cst) ||
+	    !pthread_equal(pthread_self(), g_a_thr) ||
+	    !xtc_atomic_exchange_i32(&g_armed, 0, xtc_mo_seq_cst))
 		return;
-	atomic_store(&g_parked, 1);
+	xtc_atomic_store_i32(&g_parked, 1, xtc_mo_seq_cst);
 	t0 = xtc_clock_mono();
-	while (!atomic_load(&g_b_done) && xtc_clock_mono() - t0 < 10000000000LL)
+	while (!xtc_atomic_load_i32(&g_b_done, xtc_mo_seq_cst) &&
+	    xtc_clock_mono() - t0 < 10000000000LL)
 		(void)xtc_sleep_ns(1000000);
-	if (atomic_load(&g_b_done))
-		atomic_store(&g_b_during, 1);
-	atomic_store(&g_parked, 0);
+	if (xtc_atomic_load_i32(&g_b_done, xtc_mo_seq_cst))
+		xtc_atomic_store_i32(&g_b_during, 1, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_parked, 0, xtc_mo_seq_cst);
 }
 #define VX_PREPARE_TEST_HOOK() park_hook()
 #include "vexec.c"
@@ -85,7 +86,7 @@ thr_a(void *arg)
 	(void)arg;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
 	g_a_thr = pthread_self();
-	atomic_store(&g_armed, 1);
+	xtc_atomic_store_i32(&g_armed, 1, xtc_mo_seq_cst);
 	CK(one(h, "SELECT count(*) FROM t WHERE k > 2", &ok) == 3 && ok);
 	sx_close(h);
 	return NULL;
@@ -98,10 +99,10 @@ thr_b(void *arg)
 	int ok;
 	(void)arg;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
-	while (!atomic_load(&g_parked))
+	while (!xtc_atomic_load_i32(&g_parked, xtc_mo_seq_cst))
 		(void)xtc_sleep_ns(100000);
 	CK(one(h, "SELECT sum(v) FROM t WHERE k <= 2", &ok) == 30 && ok);
-	atomic_store(&g_b_done, 1);
+	xtc_atomic_store_i32(&g_b_done, 1, xtc_mo_seq_cst);
 	sx_close(h);
 	return NULL;
 }
@@ -118,7 +119,7 @@ static const struct { const char *sql; int64_t want; } g_q[] = {
 	{ "SELECT sum(v) FROM t WHERE k IN (SELECT k FROM u)", 90 },
 };
 #define NQ ((int)(sizeof g_q / sizeof g_q[0]))
-static _Atomic long g_wrong, g_runs;
+static long g_wrong, g_runs;
 
 static void *
 thr_mix(void *arg)
@@ -131,11 +132,12 @@ thr_mix(void *arg)
 		int q = (int)((me + i) % NQ);
 		int64_t v = one(h, g_q[q].sql, &ok);
 		if (!ok || v != g_q[q].want) {
-			if (atomic_fetch_add(&g_wrong, 1) < 3)
+			if (xtc_atomic_fetch_add_long(&g_wrong, 1,
+			        xtc_mo_seq_cst) < 3)
 				fprintf(stderr, "  wrong: %s -> %lld (ok=%d), want %lld\n",
 				    g_q[q].sql, (long long)v, ok, (long long)g_q[q].want);
 		}
-		atomic_fetch_add(&g_runs, 1);
+		xtc_atomic_fetch_add_long(&g_runs, 1, xtc_mo_seq_cst);
 	}
 	sx_close(h);
 	return NULL;
@@ -172,8 +174,10 @@ main(void)
 	(void)pthread_join(a, NULL);
 	(void)pthread_join(b, NULL);
 	printf("  (a) B's SELECT ran while A was parked in its prepare: %s\n",
-	    atomic_load(&g_b_during) ? "yes" : "NO (serialized)");
-	CK(atomic_load(&g_b_during) == 1);
+	    xtc_atomic_load_i32(&g_b_during, xtc_mo_seq_cst) ?
+	        "yes" :
+	        "NO (serialized)");
+	CK(xtc_atomic_load_i32(&g_b_during, xtc_mo_seq_cst) == 1);
 
 	/* (b) */
 	for (j = 0; j < NT; j++)
@@ -181,9 +185,10 @@ main(void)
 	for (j = 0; j < NT; j++)
 		(void)pthread_join(m[j], NULL);
 	printf("  (b) %ld concurrent subquery SELECTs, %ld wrong\n",
-	    atomic_load(&g_runs), atomic_load(&g_wrong));
-	CK(atomic_load(&g_runs) == (long)NT * ITERS);
-	CK(atomic_load(&g_wrong) == 0);
+	    xtc_atomic_load_long(&g_runs, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_wrong, xtc_mo_seq_cst));
+	CK(xtc_atomic_load_long(&g_runs, xtc_mo_seq_cst) == (long)NT * ITERS);
+	CK(xtc_atomic_load_long(&g_wrong, xtc_mo_seq_cst) == 0);
 
 	sx_close(h);
 	CK(sx_storage_close() == SX_OK);

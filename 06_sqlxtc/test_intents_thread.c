@@ -35,7 +35,6 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,10 +50,10 @@
 
 static int         g_fail;
 static char        g_path[256];
-static _Atomic int g_step;
+static int g_step;
 static int         g_rc[2];
 static int64_t     g_t0, g_t1;
-static _Atomic long g_ham_ok, g_ham_bad;
+static long g_ham_ok, g_ham_bad;
 
 #ifdef CK
 #undef CK
@@ -86,7 +85,7 @@ one(sx_db *h, const char *sql)
 static void
 spin_until(int s)
 {
-	while (atomic_load(&g_step) < s)
+	while (xtc_atomic_load_i32(&g_step, xtc_mo_seq_cst) < s)
 		(void)xtc_sleep_ns(100 * 1000);
 }
 
@@ -99,7 +98,7 @@ holder(void *a)
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
 	CK(ex(h, "BEGIN") == SX_OK);
 	CK(ex(h, "UPDATE t SET v = v + 1 WHERE k = 1") == SX_OK);
-	atomic_store(&g_step, 1);
+	xtc_atomic_store_i32(&g_step, 1, xtc_mo_seq_cst);
 	(void)xtc_sleep_ns(50LL * 1000 * 1000);
 	g_rc[0] = ex(h, "COMMIT");
 	sx_close(h);
@@ -131,7 +130,7 @@ dl(void *a)
 	CK(ex(h, "BEGIN") == SX_OK);
 	snprintf(q, sizeof q, "UPDATE t SET v = v + 1 WHERE k = %ld", me ? 3L : 2L);
 	CK(ex(h, q) == SX_OK);
-	atomic_fetch_add(&g_step, 1);
+	xtc_atomic_fetch_add_i32(&g_step, 1, xtc_mo_seq_cst);
 	spin_until(12);                  /* both hold their first row */
 	snprintf(q, sizeof q, "UPDATE t SET v = v + 1 WHERE k = %ld", me ? 2L : 3L);
 	g_rc[me] = ex(h, q);
@@ -144,7 +143,7 @@ dl(void *a)
 }
 
 /* ---- first-statement UPDATE in a SNAPSHOT transaction ---- */
-static _Atomic long g_tx_ok, g_tx_bad;
+static long g_tx_ok, g_tx_bad;
 
 static void *
 txhammer(void *a)
@@ -158,9 +157,9 @@ txhammer(void *a)
 		CK(ex(h, "BEGIN") == SX_OK);
 		rc = ex(h, "UPDATE t SET v = v + 1 WHERE k = 5");
 		if (rc == SX_OK && (rc = ex(h, "COMMIT")) == SX_OK) {
-			atomic_fetch_add(&g_tx_ok, 1);
+			xtc_atomic_fetch_add_long(&g_tx_ok, 1, xtc_mo_seq_cst);
 		} else {
-			atomic_fetch_add(&g_tx_bad, 1);
+			xtc_atomic_fetch_add_long(&g_tx_bad, 1, xtc_mo_seq_cst);
 			(void)ex(h, "ROLLBACK");
 		}
 	}
@@ -180,9 +179,10 @@ hammer(void *a)
 		char *err = NULL;
 		int rc = sx_exec(h, "UPDATE t SET v = v + 1 WHERE k = 4", &err);
 		if (rc == SX_OK) {
-			atomic_fetch_add(&g_ham_ok, 1);
+			xtc_atomic_fetch_add_long(&g_ham_ok, 1, xtc_mo_seq_cst);
 		} else {
-			atomic_fetch_add(&g_ham_bad, 1);
+			xtc_atomic_fetch_add_long(&g_ham_bad, 1,
+			    xtc_mo_seq_cst);
 			CK(rc == SX_BUSY);        /* the bounded-restart conflict only */
 		}
 		free(err);
@@ -217,7 +217,7 @@ main(void)
 	}
 
 	/* (a) */
-	atomic_store(&g_step, 0);
+	xtc_atomic_store_i32(&g_step, 0, xtc_mo_seq_cst);
 	(void)pthread_create(&a, NULL, holder, NULL);
 	(void)pthread_create(&b, NULL, waiter, NULL);
 	(void)pthread_join(a, NULL);
@@ -232,7 +232,7 @@ main(void)
 	CK(one(h, "SELECT v FROM t WHERE k = 1") == 11);
 
 	/* (c) */
-	atomic_store(&g_step, 10);
+	xtc_atomic_store_i32(&g_step, 10, xtc_mo_seq_cst);
 	(void)pthread_create(&a, NULL, dl, (void *)0L);
 	(void)pthread_create(&b, NULL, dl, (void *)1L);
 	g_t0 = xtc_clock_mono();
@@ -250,15 +250,19 @@ main(void)
 		(void)pthread_create(&hm[i], NULL, txhammer, NULL);
 	for (i = 0; i < NHAM; i++)
 		(void)pthread_join(hm[i], NULL);
-	printf("  txn first-statement: %ld ok, %ld failed, v=%lld (want = ok)\n",
-	    atomic_load(&g_tx_ok), atomic_load(&g_tx_bad),
+	printf(
+	    "  txn first-statement: %ld ok, %ld failed, v=%lld (want = ok)\n",
+	    xtc_atomic_load_long(&g_tx_ok, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_tx_bad, xtc_mo_seq_cst),
 	    (long long)one(h, "SELECT v FROM t WHERE k = 5"));
 	/* Most must succeed.  Not all: a statement that loses the row to 8
 	 * successive writers gives up (the bounded re-run), and a slow build
 	 * (TSan: ~17% here, unfixed ~85%) loses more races than -O2 (0-2 of
 	 * 1600, unfixed 552). */
-	CK(atomic_load(&g_tx_bad) * 4 <= NHAM * PERH);      /* <= 25% */
-	CK(one(h, "SELECT v FROM t WHERE k = 5") == atomic_load(&g_tx_ok));
+	CK(xtc_atomic_load_long(&g_tx_bad, xtc_mo_seq_cst) * 4 <=
+	    NHAM * PERH); /* <= 25% */
+	CK(one(h, "SELECT v FROM t WHERE k = 5") ==
+	    xtc_atomic_load_long(&g_tx_ok, xtc_mo_seq_cst));
 
 	/* hammer */
 	for (i = 0; i < NHAM; i++)
@@ -266,10 +270,13 @@ main(void)
 	for (i = 0; i < NHAM; i++)
 		(void)pthread_join(hm[i], NULL);
 	printf("  hammer: %ld ok, %ld failed, v=%lld (want = ok)\n",
-	    atomic_load(&g_ham_ok), atomic_load(&g_ham_bad),
+	    xtc_atomic_load_long(&g_ham_ok, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_ham_bad, xtc_mo_seq_cst),
 	    (long long)one(h, "SELECT v FROM t WHERE k = 4"));
-	CK(atomic_load(&g_ham_bad) * 4 <= NHAM * PERH);     /* as above */
-	CK(one(h, "SELECT v FROM t WHERE k = 4") == atomic_load(&g_ham_ok));
+	CK(xtc_atomic_load_long(&g_ham_bad, xtc_mo_seq_cst) * 4 <=
+	    NHAM * PERH); /* as above */
+	CK(one(h, "SELECT v FROM t WHERE k = 4") ==
+	    xtc_atomic_load_long(&g_ham_ok, xtc_mo_seq_cst));
 
 	sx_close(h);
 	CK(sx_storage_close() == SX_OK);

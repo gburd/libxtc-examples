@@ -51,7 +51,6 @@
 #include "xstore.h"
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,8 +83,8 @@
 #define XS_LK_SSI  9u   /* SSI registry */
 /* slot 10 (XS_LK_SNAP, the snapshot registry) retired: lock-free now */
 #define XS_LK_COMMIT 11u /* commit validation + timestamp + in-flight registry */
-static _Atomic uint64_t g_cat_locks;   /* XS_LK_CAT acquisitions (metric) */
-static _Atomic uint64_t g_cat_scans;   /* catalog-tree scans (metric) */
+static uint64_t g_cat_locks; /* XS_LK_CAT acquisitions (metric) */
+static uint64_t g_cat_scans; /* catalog-tree scans (metric) */
 /*
  * Every hold runs with cancellation masked: a holder parks (a B-tree
  * latch, the WAL ack) and a kill delivered there would unwind with the
@@ -97,8 +96,9 @@ static xtc_amutex_t *xs_lk_get(unsigned slot);
 static void xs_lk(unsigned slot);
 static void xs_unlk(unsigned slot);
 static void xs_commit_unlock(void);
-#define xs_cat_lock()    (atomic_fetch_add_explicit(&g_cat_locks, 1, \
-	memory_order_relaxed), xs_lk(XS_LK_CAT))
+#define xs_cat_lock()                                                          \
+	(xtc_atomic_fetch_add_u64(&g_cat_locks, 1, xtc_mo_relaxed),            \
+	    xs_lk(XS_LK_CAT))
 #define xs_cat_unlock()  xs_unlk(XS_LK_CAT)
 #define xs_ssi_lock()    xs_lk(XS_LK_SSI)
 #define xs_ssi_unlock()  xs_unlk(XS_LK_SSI)
@@ -132,7 +132,7 @@ static void xs_commit_unlock(void);
  */
 #define HLC_LOGICAL_BITS 16
 #define HLC_LOGICAL_MASK ((1ULL << HLC_LOGICAL_BITS) - 1)
-static _Atomic uint64_t g_xclock = 1;
+static uint64_t g_xclock = 1;
 /*
  * Read horizon.  g_xclock is the newest timestamp HANDED OUT; a commit
  * holding one may still be writing its log record or applying its
@@ -142,7 +142,7 @@ static _Atomic uint64_t g_xclock = 1;
  * xs_inflight_remove -- so a snapshot never sees part of a transaction,
  * and a transaction never sees a row appear inside its own snapshot.
  */
-static _Atomic uint64_t g_xvisible = 1;
+static uint64_t g_xvisible = 1;
 static uint64_t xs_visible(void);
 static void xs_vis_wake(void);
 
@@ -179,24 +179,24 @@ hlc_phys_ms(void)
 	/* mono_base/epoch_base are set together on first call.  A benign
 	 * race between two first-callers only re-samples the same pair; the
 	 * HLC CAS below is what actually orders stamps. */
-	static _Atomic int64_t epoch_off_ms;   /* wall_ms - mono_ms, once */
-	static _Atomic int     epoch_set;
+	static int64_t epoch_off_ms; /* wall_ms - mono_ms, once */
+	static int epoch_set;
 	int64_t mono_ns = xtc_clock_mono();
 	int64_t mono_ms = (mono_ns < 0 ? 0 : mono_ns) / 1000000LL;
 
 	if (xtc_sim_clock_active())
 		return (uint64_t)mono_ms;    /* virtual: no real-time offset */
-	if (!atomic_load_explicit(&epoch_set, memory_order_acquire)) {
+	if (!xtc_atomic_load_i32(&epoch_set, xtc_mo_acquire)) {
 		/* One wall-clock read, outside any hot/simulated path, to
 		 * anchor the monotonic timeline to a human-meaningful epoch. */
 		int64_t wall_ns = xtc_clock_real();
 		int64_t wall_ms = (wall_ns < 0 ? 0 : wall_ns) / 1000000LL;
-		atomic_store_explicit(&epoch_off_ms, wall_ms - mono_ms,
-		    memory_order_relaxed);
-		atomic_store_explicit(&epoch_set, 1, memory_order_release);
+		xtc_atomic_store_i64(&epoch_off_ms, wall_ms - mono_ms,
+		    xtc_mo_relaxed);
+		xtc_atomic_store_i32(&epoch_set, 1, xtc_mo_release);
 	}
 	return (uint64_t)(mono_ms +
-	    atomic_load_explicit(&epoch_off_ms, memory_order_relaxed));
+	    xtc_atomic_load_i64(&epoch_off_ms, xtc_mo_relaxed));
 }
 
 /*
@@ -212,8 +212,7 @@ static uint64_t
 hlc_tick(void)
 {
 	for (;;) {
-		uint64_t cur = atomic_load_explicit(&g_xclock,
-		    memory_order_relaxed);
+		uint64_t cur = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 		uint64_t cur_phys = cur >> HLC_LOGICAL_BITS;
 		uint64_t cur_log = cur & HLC_LOGICAL_MASK;
 		uint64_t now = hlc_phys_ms();
@@ -226,8 +225,8 @@ hlc_tick(void)
 		} else {
 			nxt = (cur_phys + 1) << HLC_LOGICAL_BITS; /* carry */
 		}
-		if (atomic_compare_exchange_weak_explicit(&g_xclock, &cur, nxt,
-		    memory_order_relaxed, memory_order_relaxed))
+		if (xtc_atomic_cas_weak_u64(&g_xclock, &cur, nxt,
+		        xtc_mo_relaxed, xtc_mo_relaxed))
 			return nxt;
 	}
 }
@@ -238,13 +237,13 @@ hlc_tick(void)
  * so they never collide with commit timestamps (which come from
  * g_xclock); recovery sees a steal-txn never commits and undoes its
  * spilled payloads with CLRs. */
-static _Atomic uint64_t g_stage_seq  = 1;
-static _Atomic uint64_t g_steal_txn  = (1ULL << 62);
+static uint64_t g_stage_seq = 1;
+static uint64_t g_steal_txn = (1ULL << 62);
 
 /* Count of compensation records (CLRs) written across recovery undo
  * passes -- nonzero proves the undo path ran for real (see
  * xstore_undo_clrs). */
-static _Atomic uint64_t g_undo_clrs  = 0;
+static uint64_t g_undo_clrs = 0;
 
 /* Optional process-global write-ahead log (see xstore_set_wal). */
 static wal_t *g_xwal = NULL;
@@ -260,11 +259,19 @@ xstore_set_wal(struct wal *w)
 }
 
 /* Number of CLRs written during recovery undo so far (for tests/metrics). */
-uint64_t xstore_undo_clrs(void) { return atomic_load_explicit(&g_undo_clrs, memory_order_relaxed); }
+uint64_t
+xstore_undo_clrs(void)
+{
+	return xtc_atomic_load_u64(&g_undo_clrs, xtc_mo_relaxed);
+}
 
 /* The MVCC commit clock, for the engine to persist at a clean shutdown
  * and restore when it trusts the base on restart. */
-uint64_t xstore_clock(void) { return atomic_load_explicit(&g_xclock, memory_order_relaxed); }
+uint64_t
+xstore_clock(void)
+{
+	return xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
+}
 
 struct xs_inflight;
 static struct xs_inflight *g_inflight;   /* guarded by the commit lock */
@@ -317,21 +324,21 @@ static void xs_visible_catchup_locked(void);
  * timestamp and no STEAL spill writes the log.  Guarded by the commit
  * lock.  g_wal_busy counts log writes in progress (any xs_wal_emit). */
 static int g_ckpt_gate;
-static _Atomic int g_wal_busy;
+static int g_wal_busy;
 static void xs_gate_wait_locked(void);
 
 /* The static engine amutexes, cached: xtc_amutex_static takes a global
  * mutex on every call, so resolving it per lock and unlock put a second
  * process-wide mutex on every commit (seen in the 64-client stacks). */
-static _Atomic(xtc_amutex_t *) g_lk[XTC_AMUTEX_STATIC_MAX];
+static xtc_amutex_t *g_lk[XTC_AMUTEX_STATIC_MAX];
 
 static xtc_amutex_t *
 xs_lk_get(unsigned slot)
 {
-	xtc_amutex_t *m = atomic_load_explicit(&g_lk[slot], memory_order_acquire);
+	xtc_amutex_t *m = xtc_atomic_load_ptr(&g_lk[slot], xtc_mo_acquire);
 	if (m == NULL) {
 		m = xtc_amutex_static(slot);     /* idempotent: a race is benign */
-		atomic_store_explicit(&g_lk[slot], m, memory_order_release);
+		xtc_atomic_store_ptr(&g_lk[slot], m, xtc_mo_release);
 	}
 	return m;
 }
@@ -341,7 +348,7 @@ xs_lk_get(unsigned slot)
 static int  xs_inflight_prune_locked(int force);
 static int  g_commit_depth;          /* commit-lock nesting (holder only) */
 static int  g_vis_adv;               /* horizon advanced; wake at release */
-static _Atomic int g_ndone;          /* in-flight entries marked done */
+static int g_ndone;                  /* in-flight entries marked done */
 
 static void
 xs_lk(unsigned slot)
@@ -383,7 +390,7 @@ xs_commit_unlock(void)
 		g_vis_adv = 0;
 		g_commit_depth = 0;
 		(void)xtc_amutex_unlock(m);
-		if (atomic_load_explicit(&g_ndone, memory_order_seq_cst) <= 0 ||
+		if (xtc_atomic_load_i32(&g_ndone, xtc_mo_seq_cst) <= 0 ||
 		    xtc_amutex_try_lock(m) != XTC_OK)
 			break;           /* none pending, or the new holder prunes */
 		g_commit_depth = 1;
@@ -406,9 +413,9 @@ xstore_set_clock(uint64_t v)
 	 * observed.  Under the commit lock (timestamps are minted there), and
 	 * the read horizon follows only when no commit is in flight. */
 	xs_commit_lock();
-	cur = atomic_load_explicit(&g_xclock, memory_order_relaxed);
+	cur = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	if (v > cur)
-		atomic_store_explicit(&g_xclock, v, memory_order_relaxed);
+		xtc_atomic_store_u64(&g_xclock, v, xtc_mo_relaxed);
 	xs_visible_catchup_locked();
 	xs_commit_unlock();
 }
@@ -423,8 +430,8 @@ void
 xstore_clock_reset(void)
 {
 	xs_commit_lock();
-	atomic_store_explicit(&g_xclock, 1, memory_order_relaxed);
-	atomic_store_explicit(&g_xvisible, 1, memory_order_seq_cst);
+	xtc_atomic_store_u64(&g_xclock, 1, xtc_mo_relaxed);
+	xtc_atomic_store_u64(&g_xvisible, 1, xtc_mo_seq_cst);
 	xs_commit_unlock();
 }
 
@@ -493,7 +500,7 @@ typedef struct xs_rkey {
 typedef struct ssi_txn ssi_txn_t;     /* SSI registry slot (defined below) */
 typedef struct xstore_ctx {
 	bt_t            *bt;
-	_Atomic uint64_t read_snap;   /* 0 == read latest committed */
+	uint64_t read_snap;           /* 0 == read latest committed */
 	int              in_txn;      /* between xBegin and xCommit/xRollback */
 	uint64_t         txn_snap;    /* snapshot captured at xBegin */
 	xs_wrec_t       *wbuf;        /* buffered writes, applied atomically */
@@ -971,8 +978,8 @@ ssi_abort(ssi_txn_t *t)
  */
 #define SNAP_FREE    0u
 #define SNAP_CLAIMED 1u    /* owned, no pin (pins are commit timestamps > 1) */
-static _Atomic uint64_t g_holds[SNAP_MAX];
-static _Atomic uint64_t g_gc_horizon = 0;   /* newest reclaimed commit_ts */
+static uint64_t g_holds[SNAP_MAX];
+static uint64_t g_gc_horizon = 0; /* newest reclaimed commit_ts */
 
 /* Set connection slot *slotp to pin `ts` (0 releases the pin; the slot
  * stays claimed by the connection until snap_slot_free). */
@@ -985,8 +992,8 @@ snap_set(int *slotp, uint64_t ts)
 			return;                       /* nothing to release */
 		for (i = 0; i < SNAP_MAX; i++) {
 			uint64_t want = SNAP_FREE;
-			if (atomic_compare_exchange_strong_explicit(&g_holds[i], &want,
-			    SNAP_CLAIMED, memory_order_acq_rel, memory_order_relaxed)) {
+			if (xtc_atomic_cas_u64(&g_holds[i], &want, SNAP_CLAIMED,
+			        xtc_mo_acq_rel, xtc_mo_relaxed)) {
 				*slotp = i;
 				break;
 			}
@@ -997,8 +1004,8 @@ snap_set(int *slotp, uint64_t ts)
 		if (*slotp < 0)
 			return;
 	}
-	atomic_store_explicit(&g_holds[*slotp], ts != 0 ? ts : SNAP_CLAIMED,
-	    memory_order_seq_cst);
+	xtc_atomic_store_u64(&g_holds[*slotp], ts != 0 ? ts : SNAP_CLAIMED,
+	    xtc_mo_seq_cst);
 }
 
 /* Pin and return a snapshot of the current visible horizon (see the
@@ -1022,7 +1029,8 @@ static void
 snap_slot_free(int *slotp)
 {
 	if (*slotp >= 0) {
-		atomic_store_explicit(&g_holds[*slotp], SNAP_FREE, memory_order_release);
+		xtc_atomic_store_u64(&g_holds[*slotp], SNAP_FREE,
+		    xtc_mo_release);
 		*slotp = -1;
 	}
 }
@@ -1039,9 +1047,9 @@ snap_horizon(uint64_t now)
 	uint64_t h = now;
 	int i;
 	XS_HORIZON_TEST_HOOK();
-	atomic_thread_fence(memory_order_seq_cst);
+	xtc_atomic_thread_fence(xtc_mo_seq_cst);
 	for (i = 0; i < SNAP_MAX; i++) {
-		uint64_t v = atomic_load_explicit(&g_holds[i], memory_order_seq_cst);
+		uint64_t v = xtc_atomic_load_u64(&g_holds[i], xtc_mo_seq_cst);
 		if (v > SNAP_CLAIMED && v < h) h = v;
 	}
 	return h;
@@ -1057,7 +1065,8 @@ xs_pin_recompute(xstore_ctx_t *cx)
 	if (cx->in_txn)
 		pin = cx->txn_snap;
 	else {
-		uint64_t rs = atomic_load_explicit(&cx->read_snap, memory_order_relaxed);
+		uint64_t rs =
+		    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed);
 		if (rs != 0) pin = rs;
 	}
 	snap_set(&cx->snap_slot, pin);
@@ -1180,9 +1189,8 @@ static int g_cat_n;
 /* Bumped under the cat lock by every change to g_cat or g_idx, so a
  * thread-local copy of a lookup (xs_tcache_*) stays valid while it is
  * unchanged: the per-statement catalog reads then take no global lock. */
-static _Atomic uint64_t g_catc_gen = 1;
-#define XS_CATC_BUMP() \
-	atomic_fetch_add_explicit(&g_catc_gen, 1, memory_order_release)
+static uint64_t g_catc_gen = 1;
+#define XS_CATC_BUMP() xtc_atomic_fetch_add_u64(&g_catc_gen, 1, xtc_mo_release)
 
 /* This thread's copies of recently used g_cat entries (see g_catc_gen). */
 #define XS_TCAT_N 16
@@ -1197,7 +1205,7 @@ static _Thread_local unsigned t_cat_next;
 static int
 xs_tcat_get(bt_t *bt, const char *name, uint32_t *id, char *coldefs)
 {
-	uint64_t g = atomic_load_explicit(&g_catc_gen, memory_order_acquire);
+	uint64_t g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_acquire);
 	int k;
 	for (k = 0; k < XS_TCAT_N; k++)
 		if (t_cat[k].gen == g && t_cat[k].e.bt == bt &&
@@ -1214,7 +1222,7 @@ static void
 xs_tcat_put_locked(const struct xs_cat_ent *e)
 {
 	unsigned k = t_cat_next++ % XS_TCAT_N;
-	t_cat[k].gen = atomic_load_explicit(&g_catc_gen, memory_order_relaxed);
+	t_cat[k].gen = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_relaxed);
 	t_cat[k].e = *e;
 }
 
@@ -1231,7 +1239,7 @@ static struct xs_view_ent {
 	char  sql[1024];   /* the view's SELECT text */
 } g_view[XS_VIEW_MAX];
 static int g_view_n;
-static _Atomic int g_view_any;   /* set once any view exists (sticky) */
+static int g_view_any; /* set once any view exists (sticky) */
 
 /* Connection -> B-tree association, so a from-scratch executor driven
  * from a connection handle (xstore_bt_of) can open a storage-native
@@ -1245,7 +1253,7 @@ static int g_dbmap_n;
  * serializer (each contended release is a cross-loop wake).  A
  * per-thread copy of the last entry is valid while the generation is
  * unchanged: an entry only changes at register / unregister. */
-static _Atomic uint64_t g_dbmap_gen = 1;
+static uint64_t g_dbmap_gen = 1;
 /* A few entries per thread: in the server a loop thread runs several
  * connection fibers, which with a one-entry cache evicted each other on
  * every statement -- and every miss took the catalog lock (at 32
@@ -1258,14 +1266,14 @@ static _Thread_local unsigned t_dbmap_next;
 static const struct xs_dbmap_ent *
 xs_dbmap_get(struct xsql *db)
 {
-	uint64_t g = atomic_load_explicit(&g_dbmap_gen, memory_order_acquire);
+	uint64_t g = xtc_atomic_load_u64(&g_dbmap_gen, xtc_mo_acquire);
 	int i, k, found = 0;
 	for (k = 0; k < XS_TDBMAP_N; k++)
 		if (t_dbmap[k].gen == g && t_dbmap[k].e.db == db)
 			return &t_dbmap[k].e;
 	k = (int)(t_dbmap_next++ % XS_TDBMAP_N);
 	xs_cat_lock();
-	g = atomic_load_explicit(&g_dbmap_gen, memory_order_relaxed);
+	g = xtc_atomic_load_u64(&g_dbmap_gen, xtc_mo_relaxed);
 	for (i = 0; i < g_dbmap_n; i++)
 		if (g_dbmap[i].db == db) { t_dbmap[k].e = g_dbmap[i]; found = 1; break; }
 	xs_cat_unlock();
@@ -1305,7 +1313,7 @@ xs_cat_lookup(bt_t *bt, const char *name)
 	int64_t last_rowid = 0; int have_last = 0;
 	uint32_t found = 0;
 
-	atomic_fetch_add_explicit(&g_cat_scans, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_cat_scans, 1, xtc_mo_relaxed);
 	enc_vkey(XS_CAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
 	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
 		return 0;
@@ -1625,48 +1633,48 @@ struct xs_idx_ent {
 };
 static struct xs_idx_ent g_idx[XS_IDX_MAX];
 static int g_idx_n;
-static _Atomic uint64_t g_idx_gen;     /* bumped by every index create */
+static uint64_t g_idx_gen; /* bumped by every index create */
 /* Set when an index entry may be missing (an insert failed, a build ran
  * short, an index is not maintained): the indexes are then not trusted at
  * the next open.  Cleared by xstore_index_open.  shortcut: one flag for
  * the process (one storage engine per process); per-bt if that changes. */
-static _Atomic int g_idx_taint;
-static _Atomic uint64_t g_idx_rebuilds;   /* full index rebuilds (metric) */
+static int g_idx_taint;
+static uint64_t g_idx_rebuilds; /* full index rebuilds (metric) */
 /* Superseded entries left in the tree because the dead queue could not
  * hold or reap them, carried across trusted reopens in the superblock.
  * Stale entries are harmless but cost readers a fetch each, so a reopen
  * rebuilds once they pass XS_IDX_GARBAGE_MAX. */
-static _Atomic uint64_t g_idx_garbage;
+static uint64_t g_idx_garbage;
 #define XS_IDX_GARBAGE_MAX (1u << 16)
-static _Atomic int g_idx_failinj;         /* test hook: inserts to fail */
+static int g_idx_failinj; /* test hook: inserts to fail */
 
 /* Catalog generation: bumped by every DDL entry point (tables, indexes,
  * views) and index rebuild, so a cached plan built at an older one is
  * rebuilt (it may name a dropped index or miss a new one). */
-static _Atomic uint64_t g_cat_gen = 1;
+static uint64_t g_cat_gen = 1;
 
 uint64_t
 xstore_cat_scan_count(void)
 {
-	return atomic_load_explicit(&g_cat_scans, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_cat_scans, xtc_mo_relaxed);
 }
 
 uint64_t
 xstore_cat_lock_count(void)
 {
-	return atomic_load_explicit(&g_cat_locks, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_cat_locks, xtc_mo_relaxed);
 }
 
 uint64_t
 xstore_catalog_gen(void)
 {
-	return atomic_load_explicit(&g_cat_gen, memory_order_acquire);
+	return xtc_atomic_load_u64(&g_cat_gen, xtc_mo_acquire);
 }
 
 static void
 xs_cat_gen_bump(void)
 {
-	atomic_fetch_add_explicit(&g_cat_gen, 1, memory_order_acq_rel);
+	xtc_atomic_fetch_add_u64(&g_cat_gen, 1, xtc_mo_acq_rel);
 }
 
 /* Caller holds the cat lock: drop every cached index of a closing bt. */
@@ -1679,7 +1687,7 @@ xs_idx_cache_forget_locked(bt_t *bt)
 		else i++;
 	}
 }
-static _Atomic uint64_t g_idx_seeks;   /* index range seeks served (metric) */
+static uint64_t g_idx_seeks; /* index range seeks served (metric) */
 
 /* The (idx, rowid, key) of a superseded index entry, reaped once no
  * snapshot at or before `ts` can be live. */
@@ -1697,11 +1705,10 @@ static struct xs_idx_dead g_idx_dead[XS_IDX_DEAD_MAX];
 static int g_idx_dead_n;      /* guarded by the commit lock */
 /* Its value for the unlocked "anything queued?" fast paths (a hint: the
  * locked code re-reads g_idx_dead_n).  Written under the commit lock. */
-static _Atomic int g_idx_dead_hint;
-#define XS_IDX_DEAD_PUBLISH() atomic_store_explicit(&g_idx_dead_hint, \
-	g_idx_dead_n, memory_order_relaxed)
-#define XS_IDX_DEAD_HINT() atomic_load_explicit(&g_idx_dead_hint, \
-	memory_order_relaxed)
+static int g_idx_dead_hint;
+#define XS_IDX_DEAD_PUBLISH()                                                  \
+	xtc_atomic_store_i32(&g_idx_dead_hint, g_idx_dead_n, xtc_mo_relaxed)
+#define XS_IDX_DEAD_HINT() xtc_atomic_load_i32(&g_idx_dead_hint, xtc_mo_relaxed)
 
 static void
 xs_put_be64(uint8_t *p, uint64_t v)
@@ -1948,7 +1955,7 @@ xs_idx_for_table(bt_t *bt, uint32_t tableid, struct xs_idx_rt *hits, int cap)
 	uint64_t g;
 	int n = 0, i, k;
 	if (g_idx_n == 0) return 0;
-	g = atomic_load_explicit(&g_catc_gen, memory_order_acquire);
+	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_acquire);
 	for (k = 0; k < 4; k++)
 		if (tc[k].gen == g && tc[k].bt == bt && tc[k].tid == tableid &&
 		    tc[k].n <= cap) {
@@ -1956,7 +1963,7 @@ xs_idx_for_table(bt_t *bt, uint32_t tableid, struct xs_idx_rt *hits, int cap)
 			return tc[k].n;
 		}
 	xs_cat_lock();
-	g = atomic_load_explicit(&g_catc_gen, memory_order_relaxed);
+	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_relaxed);
 	for (i = 0; i < g_idx_n && n < cap; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.tableid == tableid)
 			hits[n++] = g_idx[i].rt;
@@ -1981,7 +1988,7 @@ xs_idx_dead_add(bt_t *bt, const struct xs_idx_rt *rt, int64_t rowid,
 	if (klen <= 0) return;
 	if (XS_IDX_DEAD_HINT() >= XS_IDX_DEAD_MAX ||
 	    (k = (uint8_t *)malloc((size_t)klen)) == NULL) {
-		atomic_fetch_add_explicit(&g_idx_garbage, 1, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&g_idx_garbage, 1, xtc_mo_relaxed);
 		return;
 	}
 	memcpy(k, key, (size_t)klen);
@@ -1996,7 +2003,7 @@ xs_idx_dead_add(bt_t *bt, const struct xs_idx_rt *rt, int64_t rowid,
 	}
 	xs_commit_unlock();
 	if (k != NULL)                     /* lost the race for the last slot */
-		atomic_fetch_add_explicit(&g_idx_garbage, 1, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&g_idx_garbage, 1, xtc_mo_relaxed);
 	free(k);
 }
 
@@ -2111,8 +2118,8 @@ xs_idx_drain(bt_t *bt)
 		}
 		xs_commit_lock();
 		if (d.ts > hz || xs_inflight_writes(d.tableid, d.rowid))
-			atomic_fetch_add_explicit(&g_idx_garbage, 1,
-			    memory_order_relaxed);   /* a snapshot still needs it */
+			xtc_atomic_fetch_add_u64(&g_idx_garbage, 1,
+			    xtc_mo_relaxed); /* a snapshot still needs it */
 		else if (!xs_idx_key_reused(bt, &rt, d.rowid, d.ts, d.key, d.klen))
 			(void)bt_delete(bt, d.key, d.klen);
 		xs_commit_unlock();
@@ -2128,8 +2135,8 @@ xs_idx_dead_forget(bt_t *bt)
 	xs_commit_lock();
 	for (i = 0; i < g_idx_dead_n; ) {
 		if (g_idx_dead[i].bt == bt) {
-			atomic_fetch_add_explicit(&g_idx_garbage, 1,
-			    memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&g_idx_garbage, 1,
+			    xtc_mo_relaxed);
 			free(g_idx_dead[i].key);
 			g_idx_dead[i] = g_idx_dead[--g_idx_dead_n];
 		} else {
@@ -2146,20 +2153,20 @@ static int
 xs_idx_put(bt_t *bt, const uint8_t *k, int kl)
 {
 	int rc;
-	if (atomic_load_explicit(&g_idx_failinj, memory_order_relaxed) > 0 &&
-	    atomic_fetch_sub_explicit(&g_idx_failinj, 1, memory_order_relaxed) > 0)
+	if (xtc_atomic_load_i32(&g_idx_failinj, xtc_mo_relaxed) > 0 &&
+	    xtc_atomic_fetch_sub_i32(&g_idx_failinj, 1, xtc_mo_relaxed) > 0)
 		rc = XTC_E_NOMEM;              /* xstore_index_fail_inject */
 	else
 		rc = bt_insert(bt, k, (uint16_t)kl, "", 0);
 	if (rc != XTC_OK)
-		atomic_store_explicit(&g_idx_taint, 1, memory_order_release);
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	return rc;
 }
 
 void
 xstore_index_fail_inject(int n)
 {
-	atomic_store_explicit(&g_idx_failinj, n, memory_order_relaxed);
+	xtc_atomic_store_i32(&g_idx_failinj, n, xtc_mo_relaxed);
 }
 
 /*
@@ -2181,7 +2188,7 @@ xs_idx_maintain_ts(bt_t *bt, uint32_t tableid, int64_t rowid,
 	int nh, i, nkl, okl;
 	nh = xs_idx_for_table(bt, tableid, hits, 17);
 	if (nh > 16) {                     /* the 17th+ index is not maintained */
-		atomic_store_explicit(&g_idx_taint, 1, memory_order_release);
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 		nh = 16;
 	}
 	for (i = 0; i < nh; i++) {
@@ -2864,7 +2871,8 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 	if (bt == NULL || table == NULL || !xstore_table_id(bt, table, &tid))
 		return 0;
 	if (cx != NULL) {
-		uint64_t rs = atomic_load_explicit(&cx->read_snap, memory_order_relaxed);
+		uint64_t rs =
+		    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed);
 		/* the read snapshot, chosen exactly as xstore_scan_open_txn does */
 		if (snap != 0) { /* caller's */ }
 		else if (rs != 0) snap = rs;
@@ -2941,7 +2949,8 @@ xstore_scan_open_txn(struct xsql *db, const char *table, uint64_t snap,
 	 * REPEATABLE READ and stricter, else the latest committed clock for
 	 * READ COMMITTED / autocommit.  A caller-supplied snap overrides. */
 	if (snap == 0 && ctx != NULL) {
-		uint64_t rs = atomic_load_explicit(&ctx->read_snap, memory_order_relaxed);
+		uint64_t rs =
+		    xtc_atomic_load_u64(&ctx->read_snap, xtc_mo_relaxed);
 		if (rs != 0)
 			snap = rs;
 		else if (ctx->in_txn && ctx->txn_iso >= XS_ISO_REPEATABLE_READ)
@@ -3174,12 +3183,12 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 /* Base-table version keys examined by storage scans (the rows-visited
  * metric: a point read touches O(1), a full scan O(table)).  Each scan
  * counts locally and publishes once at close. */
-static _Atomic uint64_t g_rows_visited;
+static uint64_t g_rows_visited;
 
 uint64_t
 xstore_rows_visited(void)
 {
-	return atomic_load_explicit(&g_rows_visited, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_rows_visited, xtc_mo_relaxed);
 }
 
 void
@@ -3187,8 +3196,8 @@ xstore_scan_close(xstore_scan_t *s)
 {
 	if (s == NULL) return;
 	if (s->c.visited)
-		atomic_fetch_add_explicit(&g_rows_visited, s->c.visited,
-		    memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&g_rows_visited, s->c.visited,
+		    xtc_mo_relaxed);
 	if (s->c.btc != NULL) bt_cursor_close(s->c.btc);
 	free(s->ryw_ins);
 	free(s->ra);
@@ -3535,7 +3544,7 @@ xs_cat_value(bt_t *bt, const char *name, uint8_t *out, int cap)
 	int64_t last_rowid = 0; int have_last = 0, got = 0;
 
 	enc_vkey(XS_CAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
-	atomic_fetch_add_explicit(&g_cat_scans, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_cat_scans, 1, xtc_mo_relaxed);
 	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) return 0;
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
@@ -3592,7 +3601,7 @@ xstore_table_schema(bt_t *bt, const char *name, xstore_col_t *cols, int cap)
 	int k, n;
 	if (bt == NULL || name == NULL || cols == NULL || cap <= 0)
 		return -1;
-	g = atomic_load_explicit(&g_catc_gen, memory_order_acquire);
+	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_acquire);
 	for (k = 0; k < XS_TSCH_N; k++)
 		if (t_sch[k].gen == g && t_sch[k].bt == bt &&
 		    strcasecmp(t_sch[k].name, name) == 0) {
@@ -3826,7 +3835,7 @@ xs_filter(xsql_vtab_cursor *pc, int idxNum, const char *idxStr,
 		c->btc = NULL;
 	}
 	xs_enter(v);
-	snap = atomic_load_explicit(&v->ctx->read_snap, memory_order_relaxed);
+	snap = xtc_atomic_load_u64(&v->ctx->read_snap, xtc_mo_relaxed);
 	if (snap == 0) {
 		if (v->ctx->in_txn &&
 		    v->ctx->isolation >= XS_ISO_REPEATABLE_READ)
@@ -3834,8 +3843,7 @@ xs_filter(xsql_vtab_cursor *pc, int idxNum, const char *idxStr,
 		else
 			/* READ COMMITTED / READ UNCOMMITTED, or autocommit:
 			 * a fresh latest-committed snapshot for this statement. */
-			snap = atomic_load_explicit(&g_xclock,
-			    memory_order_relaxed);
+			snap = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	}
 	c->snap = snap;
 	c->have_last = 0;
@@ -3957,12 +3965,12 @@ xs_wal_emit(const uint8_t *rec, size_t sz, uint64_t *lsn)
 	/* Masked: wal_commit delivers a latched kill at its end, which would
 	 * leave g_wal_busy raised and the checkpoint gate waiting forever. */
 	(void)xtc_mask_enter();
-	atomic_fetch_add_explicit(&g_wal_busy, 1, memory_order_acq_rel);
+	xtc_atomic_fetch_add_i32(&g_wal_busy, 1, xtc_mo_acq_rel);
 	if (xtc_pid_is_none(xtc_self()))
 		rc = wal_commit_sync(g_xwal, rec, (uint32_t)sz, lsn);
 	else
 		rc = wal_commit(g_xwal, rec, (uint32_t)sz, lsn);
-	atomic_fetch_sub_explicit(&g_wal_busy, 1, memory_order_acq_rel);
+	xtc_atomic_fetch_sub_i32(&g_wal_busy, 1, xtc_mo_acq_rel);
 	(void)xtc_mask_leave();
 	return rc;
 }
@@ -3996,7 +4004,7 @@ xs_gate_wait_locked(void)
  * xstore_quiesce_end; readers keep running.  Call from a proc (or off a
  * loop); never while holding an engine lock.
  */
-static _Atomic int g_ock_cancel;         /* xstore_checkpoint_cancel */
+static int g_ock_cancel; /* xstore_checkpoint_cancel */
 
 /* Take the checkpoint gate and drain the commits in flight.  With
  * `cancellable`, give up (returning 0, gate not taken) once
@@ -4010,7 +4018,7 @@ xs_quiesce_begin(int cancellable)
 	while (g_ckpt_gate) {          /* one checkpoint at a time */
 		xs_commit_unlock();
 		if (cancellable &&
-		    atomic_load_explicit(&g_ock_cancel, memory_order_acquire))
+		    xtc_atomic_load_i32(&g_ock_cancel, xtc_mo_acquire))
 			return 0;
 		xs_nap();
 		xs_commit_lock();
@@ -4020,7 +4028,7 @@ xs_quiesce_begin(int cancellable)
 	while (!idle) {
 		xs_commit_lock();
 		idle = g_inflight == NULL &&
-		    atomic_load_explicit(&g_wal_busy, memory_order_acquire) == 0;
+		    xtc_atomic_load_i32(&g_wal_busy, xtc_mo_acquire) == 0;
 		xs_commit_unlock();
 		if (!idle)
 			xs_nap();
@@ -4240,24 +4248,26 @@ xs_spill_payloads(xstore_ctx_t *cx)
 		gated = g_ckpt_gate;
 		if (!gated) {
 			(void)xtc_mask_enter();   /* until g_wal_busy drops */
-			atomic_fetch_add_explicit(&g_wal_busy, 1, memory_order_acq_rel);
+			xtc_atomic_fetch_add_i32(&g_wal_busy, 1,
+			    xtc_mo_acq_rel);
 		}
 		xs_commit_unlock();
 		if (gated)
 			break;
-		sid = (int64_t)atomic_fetch_add_explicit(&g_stage_seq, 1,
-		    memory_order_relaxed);
+		sid = (int64_t)xtc_atomic_fetch_add_u64(&g_stage_seq, 1,
+		    xtc_mo_relaxed);
 		enc_vkey(XS_STAGE_TID, sid, 0, key);
 		if (bt_insert(cx->bt, key, XS_VKLEN, w->data, w->len) != XTC_OK) {
-			atomic_fetch_sub_explicit(&g_wal_busy, 1, memory_order_acq_rel);
+			xtc_atomic_fetch_sub_i32(&g_wal_busy, 1,
+			    xtc_mo_acq_rel);
 			(void)xtc_mask_leave();
 			continue;                  /* keep it in memory on failure */
 		}
 		if (cx->steal_txn == 0)
-			cx->steal_txn = atomic_fetch_add_explicit(&g_steal_txn, 1,
-			    memory_order_relaxed);
+			cx->steal_txn = xtc_atomic_fetch_add_u64(&g_steal_txn,
+			    1, xtc_mo_relaxed);
 		xs_wal_emit_stage(cx->steal_txn, sid, w->data, w->len);
-		atomic_fetch_sub_explicit(&g_wal_busy, 1, memory_order_acq_rel);
+		xtc_atomic_fetch_sub_i32(&g_wal_busy, 1, xtc_mo_acq_rel);
 		free(w->data); w->data = NULL; w->spilled = 1; w->stage_id = sid;
 		cx->wbuf_bytes -= w->len;
 		(void)xtc_mask_leave();
@@ -4285,7 +4295,7 @@ struct xs_inflight {
 	int64_t             rid;
 	const uint8_t      *rec;    /* its record (NULL for a delete) */
 	int                 reclen;
-	_Atomic int         done;   /* applied or failed; unlink pending */
+	int done; /* applied or failed; unlink pending */
 	struct xs_inflight *next;
 };
 static int
@@ -4338,12 +4348,12 @@ static void
 xs_visible_catchup_locked(void)
 {
 	const struct xs_inflight *e;
-	uint64_t v = atomic_load_explicit(&g_xclock, memory_order_relaxed);
+	uint64_t v = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	for (e = g_inflight; e != NULL; e = e->next)
 		if (e->ts - 1 < v)
 			v = e->ts - 1;
-	if (v > atomic_load_explicit(&g_xvisible, memory_order_relaxed)) {
-		atomic_store_explicit(&g_xvisible, v, memory_order_seq_cst);
+	if (v > xtc_atomic_load_u64(&g_xvisible, xtc_mo_relaxed)) {
+		xtc_atomic_store_u64(&g_xvisible, v, xtc_mo_seq_cst);
 		g_vis_adv = 1;           /* xs_commit_unlock wakes the waiters */
 	}
 }
@@ -4358,13 +4368,13 @@ xs_inflight_prune_locked(int force)
 {
 	struct xs_inflight **pp, *e;
 	int n = 0;
-	if (!force && atomic_load_explicit(&g_ndone, memory_order_seq_cst) <= 0)
+	if (!force && xtc_atomic_load_i32(&g_ndone, xtc_mo_seq_cst) <= 0)
 		return 0;
 	for (pp = &g_inflight; (e = *pp) != NULL; ) {
-		if (atomic_load_explicit(&e->done, memory_order_acquire)) {
+		if (xtc_atomic_load_i32(&e->done, xtc_mo_acquire)) {
 			*pp = e->next;
 			/* Last touch: once it reads 2 its owner may return. */
-			atomic_store_explicit(&e->done, 2, memory_order_release);
+			xtc_atomic_store_i32(&e->done, 2, xtc_mo_release);
 			n++;
 		} else {
 			pp = &e->next;
@@ -4372,7 +4382,7 @@ xs_inflight_prune_locked(int force)
 	}
 	if (n == 0)
 		return 0;
-	atomic_fetch_sub_explicit(&g_ndone, n, memory_order_seq_cst);
+	xtc_atomic_fetch_sub_i32(&g_ndone, n, xtc_mo_seq_cst);
 	xs_visible_catchup_locked();
 	return 1;
 }
@@ -4396,8 +4406,8 @@ xs_inflight_remove(struct xs_inflight *e)
 	xtc_amutex_t *m = xs_lk_get(XS_LK_COMMIT);
 	/* done before the count: a pruner that sees done may drive the count
 	 * briefly negative, never spuriously positive. */
-	atomic_store_explicit(&e->done, 1, memory_order_release);
-	atomic_fetch_add_explicit(&g_ndone, 1, memory_order_seq_cst);
+	xtc_atomic_store_i32(&e->done, 1, xtc_mo_release);
+	xtc_atomic_fetch_add_i32(&g_ndone, 1, xtc_mo_seq_cst);
 	if (xtc_amutex_try_lock(m) == XTC_OK) {
 		(void)xtc_mask_enter();
 		g_commit_depth++;
@@ -4410,10 +4420,10 @@ xs_inflight_remove(struct xs_inflight *e)
 static void
 xs_inflight_unlinked(struct xs_inflight *e)
 {
-	if (atomic_load_explicit(&e->done, memory_order_acquire) == 2)
+	if (xtc_atomic_load_i32(&e->done, xtc_mo_acquire) == 2)
 		return;
 	xs_commit_lock();
-	if (atomic_load_explicit(&e->done, memory_order_acquire) != 2)
+	if (xtc_atomic_load_i32(&e->done, xtc_mo_acquire) != 2)
 		(void)xs_inflight_prune_locked(1);
 	xs_commit_unlock();
 }
@@ -4425,7 +4435,7 @@ xs_visible(void)
 {
 	/* seq_cst: snap_pin_visible's re-read is ordered against a GC
 	 * scanner's load of the same variable (see the snapshot registry). */
-	return atomic_load_explicit(&g_xvisible, memory_order_seq_cst);
+	return xtc_atomic_load_u64(&g_xvisible, xtc_mo_seq_cst);
 }
 
 /* Forget every in-flight commit and reopen the checkpoint gate.  Only for
@@ -4440,12 +4450,11 @@ xs_commit_state_reset(void)
 	xs_ilk_reset();
 	xs_commit_lock();
 	g_inflight = NULL;
-	atomic_store_explicit(&g_ndone, 0, memory_order_seq_cst);
+	xtc_atomic_store_i32(&g_ndone, 0, xtc_mo_seq_cst);
 	g_ckpt_gate = 0;
-	atomic_store_explicit(&g_wal_busy, 0, memory_order_relaxed);
-	atomic_store_explicit(&g_xvisible,
-	    atomic_load_explicit(&g_xclock, memory_order_relaxed),
-	    memory_order_seq_cst);
+	xtc_atomic_store_i32(&g_wal_busy, 0, xtc_mo_relaxed);
+	xtc_atomic_store_u64(&g_xvisible,
+	    xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed), xtc_mo_seq_cst);
 	xs_commit_unlock();
 	xs_vis_forget();
 }
@@ -4475,7 +4484,7 @@ struct xs_vwait {
 static pthread_mutex_t  g_vw_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct xs_vwait *g_vw;          /* queued, ascending ts */
 static struct xs_vwait *g_vw_free;
-static _Atomic int      g_vw_n;        /* waiters inside xs_wait_visible */
+static int g_vw_n; /* waiters inside xs_wait_visible */
 
 static void
 xs_vw_lock(void)
@@ -4498,7 +4507,7 @@ xs_vis_wake(void)
 {
 	struct xs_vwait *chain = NULL, *q;
 	uint64_t v;
-	if (atomic_load_explicit(&g_vw_n, memory_order_seq_cst) == 0)
+	if (xtc_atomic_load_i32(&g_vw_n, xtc_mo_seq_cst) == 0)
 		return;
 	xs_vw_lock();
 	v = xs_visible();
@@ -4525,7 +4534,7 @@ xs_vis_forget(void)
 {
 	xs_vw_lock();
 	g_vw = NULL;
-	atomic_store_explicit(&g_vw_n, 0, memory_order_seq_cst);
+	xtc_atomic_store_i32(&g_vw_n, 0, xtc_mo_seq_cst);
 	xs_vw_unlock();
 }
 
@@ -4542,7 +4551,7 @@ xs_wait_visible(uint64_t ts)
 		return;
 	(void)xtc_mask_enter();
 	xs_vw_lock();
-	atomic_fetch_add_explicit(&g_vw_n, 1, memory_order_seq_cst);
+	xtc_atomic_fetch_add_i32(&g_vw_n, 1, xtc_mo_seq_cst);
 	while (xs_visible() < ts) {
 		if (q == NULL && (q = g_vw_free) != NULL) {
 			g_vw_free = q->next;
@@ -4576,7 +4585,7 @@ xs_wait_visible(uint64_t ts)
 		/* The waker unlinked q before signalling it; a stray stored
 		 * signal finds it still queued and it simply waits again. */
 	}
-	atomic_fetch_sub_explicit(&g_vw_n, 1, memory_order_seq_cst);
+	xtc_atomic_fetch_sub_i32(&g_vw_n, 1, xtc_mo_seq_cst);
 	if (q != NULL) {
 		q->next = g_vw_free;
 		g_vw_free = q;
@@ -4968,9 +4977,9 @@ xs_prune_rowid(bt_t *bt, uint32_t tableid, int64_t rowid, uint64_t horizon)
  * cost.  Global (the engine is one shared store); a couple of relaxed
  * atomics, no per-rowid state. */
 #define XS_AV_MAX_INTERVAL 256
-static _Atomic int g_av_interval = 1;
-static _Atomic int g_av_countdown = 1;
-static _Atomic uint64_t g_av_prunes = 0;   /* prune passes actually run */
+static int g_av_interval = 1;
+static int g_av_countdown = 1;
+static uint64_t g_av_prunes = 0; /* prune passes actually run */
 /* The horizon is computed only for a write that prunes: snap_horizon is
  * a seq_cst fence plus a load of each of the SNAP_MAX pin slots, and
  * every written row paid it before the countdown skipped the prune
@@ -4979,19 +4988,19 @@ static void
 xs_maybe_prune(bt_t *bt, uint32_t tableid, int64_t rowid)
 {
 	int reclaimed, iv;
-	if (atomic_fetch_sub_explicit(&g_av_countdown, 1, memory_order_relaxed) > 1)
+	if (xtc_atomic_fetch_sub_i32(&g_av_countdown, 1, xtc_mo_relaxed) > 1)
 		return;                               /* not this write */
 	reclaimed = xs_prune_rowid(bt, tableid, rowid,
 	    snap_horizon(xs_visible()));
-	atomic_fetch_add_explicit(&g_av_prunes, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_av_prunes, 1, xtc_mo_relaxed);
 	if (reclaimed > 0) {
 		iv = 1;                               /* productive: prune every write */
 	} else {
-		iv = atomic_load_explicit(&g_av_interval, memory_order_relaxed) * 2;
+		iv = xtc_atomic_load_i32(&g_av_interval, xtc_mo_relaxed) * 2;
 		if (iv > XS_AV_MAX_INTERVAL) iv = XS_AV_MAX_INTERVAL;
 	}
-	atomic_store_explicit(&g_av_interval, iv, memory_order_relaxed);
-	atomic_store_explicit(&g_av_countdown, iv, memory_order_relaxed);
+	xtc_atomic_store_i32(&g_av_interval, iv, xtc_mo_relaxed);
+	xtc_atomic_store_i32(&g_av_countdown, iv, xtc_mo_relaxed);
 }
 
 /* ---- row write intents ------------------------------------------- *
@@ -5041,16 +5050,16 @@ static struct xs_ilk_stripe {
 } g_ilk[XS_ILK_STRIPE];
 static pthread_once_t g_ilk_once = PTHREAD_ONCE_INIT;
 static struct xs_ilk_owner {
-	_Atomic uint64_t seq;        /* current txn of this slot (0 = idle) */
-	_Atomic int      wait_slot;  /* the slot it waits for, or 0 */
-	_Atomic uint64_t wait_seq;
+	uint64_t seq;  /* current txn of this slot (0 = idle) */
+	int wait_slot; /* the slot it waits for, or 0 */
+	uint64_t wait_seq;
 } g_ilk_owner[XS_ILK_OWNERS + 1];
-static _Atomic int g_ilk_next_slot = 1;
+static int g_ilk_next_slot = 1;
 static int g_ilk_free[XS_ILK_OWNERS], g_ilk_nfree;   /* recycled slots */
 static pthread_mutex_t g_ilk_free_mu = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic uint64_t g_ilk_seqgen = 1;
-static _Atomic uint64_t g_ilk_waits, g_ilk_conflicts, g_ilk_deadlocks;
-static _Atomic uint64_t g_ilk_wait_ns;   /* nap time spent waiting (metric) */
+static uint64_t g_ilk_seqgen = 1;
+static uint64_t g_ilk_waits, g_ilk_conflicts, g_ilk_deadlocks;
+static uint64_t g_ilk_wait_ns; /* nap time spent waiting (metric) */
 
 static void
 xs_ilk_init(void)
@@ -5077,7 +5086,7 @@ static int
 xs_ilk_live(int slot, uint64_t seq)
 {
 	return slot > 0 && slot <= XS_ILK_OWNERS && seq != 0 &&
-	    atomic_load_explicit(&g_ilk_owner[slot].seq, memory_order_acquire) == seq;
+	    xtc_atomic_load_u64(&g_ilk_owner[slot].seq, xtc_mo_acquire) == seq;
 }
 
 /* Find or take (bt, tid, rid) for (slot, seq); slot 0 = only look.
@@ -5151,8 +5160,10 @@ xs_ilk_victim(int slot, uint64_t seq, int hslot, uint64_t hseq)
 			return hseq == seq && youngest == seq;
 		if (!xs_ilk_live(hslot, hseq)) return 0;
 		if (hseq > youngest) youngest = hseq;
-		ns = atomic_load_explicit(&g_ilk_owner[hslot].wait_slot, memory_order_seq_cst);
-		nq = atomic_load_explicit(&g_ilk_owner[hslot].wait_seq, memory_order_seq_cst);
+		ns = xtc_atomic_load_i32(&g_ilk_owner[hslot].wait_slot,
+		    xtc_mo_seq_cst);
+		nq = xtc_atomic_load_u64(&g_ilk_owner[hslot].wait_seq,
+		    xtc_mo_seq_cst);
 		if (ns == 0) return 0;
 		hslot = ns; hseq = nq;
 	}
@@ -5170,7 +5181,8 @@ xs_ilk_self(xstore_ctx_t *cx)
 		if (g_ilk_nfree > 0) s = g_ilk_free[--g_ilk_nfree];
 		(void)pthread_mutex_unlock(&g_ilk_free_mu);  /* leaf lock */
 		if (s == 0)
-			s = atomic_fetch_add_explicit(&g_ilk_next_slot, 1, memory_order_relaxed);
+			s = xtc_atomic_fetch_add_i32(&g_ilk_next_slot, 1,
+			    xtc_mo_relaxed);
 		/* shortcut: > 1024 connections at once: the extra ones take no
 		 * intents (their conflicts surface at COMMIT, as before). */
 		if (s > XS_ILK_OWNERS) { cx->ilk_slot = -1; return 0; }
@@ -5178,9 +5190,10 @@ xs_ilk_self(xstore_ctx_t *cx)
 	}
 	if (cx->ilk_slot < 0) return 0;
 	if (cx->ilk_seq == 0) {
-		cx->ilk_seq = atomic_fetch_add_explicit(&g_ilk_seqgen, 1, memory_order_relaxed);
-		atomic_store_explicit(&g_ilk_owner[cx->ilk_slot].seq, cx->ilk_seq,
-		    memory_order_release);
+		cx->ilk_seq =
+		    xtc_atomic_fetch_add_u64(&g_ilk_seqgen, 1, xtc_mo_relaxed);
+		xtc_atomic_store_u64(&g_ilk_owner[cx->ilk_slot].seq,
+		    cx->ilk_seq, xtc_mo_release);
 	}
 	return 1;
 }
@@ -5188,8 +5201,8 @@ xs_ilk_self(xstore_ctx_t *cx)
 static void
 xs_ilk_wait_clear(xstore_ctx_t *cx)
 {
-	atomic_store_explicit(&g_ilk_owner[cx->ilk_slot].wait_slot, 0,
-	    memory_order_release);
+	xtc_atomic_store_i32(&g_ilk_owner[cx->ilk_slot].wait_slot, 0,
+	    xtc_mo_release);
 }
 
 /*
@@ -5227,17 +5240,19 @@ xs_intent_take(xstore_ctx_t *cx, uint32_t tid, int64_t rid, uint64_t base)
 		    xs_newest_ts(cx->bt, tid, rid) > base) {
 			if (r == 0) xs_ilk_drop(cx->bt, tid, rid, cx->ilk_slot, cx->ilk_seq);
 			xs_ilk_wait_clear(cx);
-			atomic_fetch_add_explicit(&g_ilk_conflicts, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&g_ilk_wait_ns, (uint64_t)waited, memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&g_ilk_conflicts, 1,
+			    xtc_mo_relaxed);
+			xtc_atomic_fetch_add_u64(&g_ilk_wait_ns,
+			    (uint64_t)waited, xtc_mo_relaxed);
 			return XS_CONFL_STALE;
 		}
 		if (r == 0 || r < 0) break;        /* taken; or no room: COMMIT checks */
 		/* Held by another transaction.  Publish the edge, then look for
 		 * a cycle through it. */
-		atomic_store_explicit(&g_ilk_owner[cx->ilk_slot].wait_seq, hseq,
-		    memory_order_seq_cst);
-		atomic_store_explicit(&g_ilk_owner[cx->ilk_slot].wait_slot, hslot,
-		    memory_order_seq_cst);
+		xtc_atomic_store_u64(&g_ilk_owner[cx->ilk_slot].wait_seq, hseq,
+		    xtc_mo_seq_cst);
+		xtc_atomic_store_i32(&g_ilk_owner[cx->ilk_slot].wait_slot,
+		    hslot, xtc_mo_seq_cst);
 		/* Off a loop (an embedded caller on a plain thread) the wait
 		 * is a thread nap on the same schedule, not an immediate
 		 * conflict: that made a retrying client spin (2.8M Payment
@@ -5245,14 +5260,18 @@ xs_intent_take(xstore_ctx_t *cx, uint32_t tid, int64_t rid, uint64_t base)
 		if (waited >= XS_ILK_WAIT_NS ||
 		    (dl = xs_ilk_victim(cx->ilk_slot, cx->ilk_seq, hslot, hseq))) {
 			if (dl)
-				atomic_fetch_add_explicit(&g_ilk_deadlocks, 1, memory_order_relaxed);
+				xtc_atomic_fetch_add_u64(&g_ilk_deadlocks, 1,
+				    xtc_mo_relaxed);
 			xs_ilk_wait_clear(cx);
-			atomic_fetch_add_explicit(&g_ilk_conflicts, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&g_ilk_wait_ns, (uint64_t)waited, memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&g_ilk_conflicts, 1,
+			    xtc_mo_relaxed);
+			xtc_atomic_fetch_add_u64(&g_ilk_wait_ns,
+			    (uint64_t)waited, xtc_mo_relaxed);
 			return XS_CONFL_HARD;
 		}
 		if (waited == 0)
-			atomic_fetch_add_explicit(&g_ilk_waits, 1, memory_order_relaxed);
+			xtc_atomic_fetch_add_u64(&g_ilk_waits, 1,
+			    xtc_mo_relaxed);
 		if (xtc_pid_is_none(xtc_self()))
 			(void)xtc_sleep_ns(nap);
 		else
@@ -5262,7 +5281,8 @@ xs_intent_take(xstore_ctx_t *cx, uint32_t tid, int64_t rid, uint64_t base)
 	}
 	xs_ilk_wait_clear(cx);
 	if (waited > 0)
-		atomic_fetch_add_explicit(&g_ilk_wait_ns, (uint64_t)waited, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&g_ilk_wait_ns, (uint64_t)waited,
+		    xtc_mo_relaxed);
 	if (r < 0) return 0;
 	if (cx->ilk_n == cx->ilk_cap) {
 		int nc = cx->ilk_cap ? cx->ilk_cap * 2 : 16;
@@ -5297,7 +5317,7 @@ xs_intents_release(xstore_ctx_t *c)
 {
 	int i;
 	if (c->ilk_slot <= 0 || c->ilk_seq == 0) return;
-	atomic_store_explicit(&g_ilk_owner[c->ilk_slot].seq, 0, memory_order_release);
+	xtc_atomic_store_u64(&g_ilk_owner[c->ilk_slot].seq, 0, xtc_mo_release);
 	for (i = 0; i < c->ilk_n; i++)
 		xs_ilk_drop(c->bt, c->ilk[i].tid, c->ilk[i].rid, c->ilk_slot, c->ilk_seq);
 	c->ilk_n = 0;
@@ -5326,8 +5346,9 @@ xs_ilk_reset(void)
 {
 	unsigned i;
 	for (i = 1; i <= XS_ILK_OWNERS; i++) {
-		atomic_store_explicit(&g_ilk_owner[i].seq, 0, memory_order_release);
-		atomic_store_explicit(&g_ilk_owner[i].wait_slot, 0, memory_order_release);
+		xtc_atomic_store_u64(&g_ilk_owner[i].seq, 0, xtc_mo_release);
+		xtc_atomic_store_i32(&g_ilk_owner[i].wait_slot, 0,
+		    xtc_mo_release);
 	}
 	(void)pthread_once(&g_ilk_once, xs_ilk_init);
 	for (i = 0; i < XS_ILK_STRIPE; i++) {
@@ -5340,25 +5361,25 @@ xs_ilk_reset(void)
 uint64_t
 xstore_intent_waits(void)
 {
-	return atomic_load_explicit(&g_ilk_waits, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_ilk_waits, xtc_mo_relaxed);
 }
 
 uint64_t
 xstore_intent_conflicts(void)
 {
-	return atomic_load_explicit(&g_ilk_conflicts, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_ilk_conflicts, xtc_mo_relaxed);
 }
 
 uint64_t
 xstore_intent_wait_ns(void)
 {
-	return atomic_load_explicit(&g_ilk_wait_ns, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_ilk_wait_ns, xtc_mo_relaxed);
 }
 
 uint64_t
 xstore_intent_deadlocks(void)
 {
-	return atomic_load_explicit(&g_ilk_deadlocks, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_ilk_deadlocks, xtc_mo_relaxed);
 }
 
 /* Write a version, then (if this connection enabled autovacuum) prune
@@ -5372,14 +5393,17 @@ xstore_intent_deadlocks(void)
  * SQLXTC_PLANT_DROP=N reports every Nth autocommit row write applied
  * without writing it (a lost acknowledged write).
  * test/sqlxtc/test_sqlxtc_iosoak.sh must fail on it. */
-static _Atomic unsigned long g_plant_drop_n;
+static unsigned long g_plant_drop_n;
 static int
 xs_plant_drop(void)
 {
 	const char *e = getenv("SQLXTC_PLANT_DROP");
 	unsigned long every = e != NULL ? strtoul(e, NULL, 10) : 0;
 	return every > 0 &&
-	    (atomic_fetch_add(&g_plant_drop_n, 1) + 1) % every == 0;
+	    (xtc_atomic_fetch_add_ulong(&g_plant_drop_n, 1, xtc_mo_seq_cst) +
+	        1) %
+	        every ==
+	    0;
 }
 #endif
 
@@ -5641,7 +5665,7 @@ xs_stmt_pin(xstore_ctx_t *cx, struct xsql *db)
 	xs_enter_ctx(cx, db);
 	cx->stmt_puts = 0;
 	if (!cx->in_txn &&
-	    atomic_load_explicit(&cx->read_snap, memory_order_relaxed) == 0)
+	    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed) == 0)
 		return snap_pin_visible(&cx->snap_slot);
 	return xs_visible();
 }
@@ -5876,7 +5900,7 @@ xs_ssi_validate_locked(xstore_ctx_t *cx)
 			}
 	}
 	if (cx->did_scan &&
-	    atomic_load_explicit(&g_xclock, memory_order_relaxed) > cx->txn_snap)
+	    xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed) > cx->txn_snap)
 		out_edge = 1;
 	if (!out_edge)
 		return SX_OK;          /* no outgoing edge -> cannot be a pivot */
@@ -6259,7 +6283,7 @@ xstore_as_of(struct xsql *db, int64_t ts)
 	xstore_ctx_t *c = xstore_ctx_of(db);
 	if (c == NULL) return -1;
 	if (ts < 0) ts = 0;
-	atomic_store_explicit(&c->read_snap, (uint64_t)ts, memory_order_relaxed);
+	xtc_atomic_store_u64(&c->read_snap, (uint64_t)ts, xtc_mo_relaxed);
 	xs_pin_recompute(c);
 	return 0;
 }
@@ -6276,8 +6300,8 @@ xstore_gc_run(struct xsql *db)
 	now = xs_visible();             /* readers may sit at the horizon */
 	horizon = snap_horizon(now);
 	(void)xs_gc(c->bt, horizon, &reclaimed);
-	if (horizon > atomic_load_explicit(&g_gc_horizon, memory_order_relaxed))
-		atomic_store_explicit(&g_gc_horizon, horizon, memory_order_relaxed);
+	if (horizon > xtc_atomic_load_u64(&g_gc_horizon, xtc_mo_relaxed))
+		xtc_atomic_store_u64(&g_gc_horizon, horizon, xtc_mo_relaxed);
 	return reclaimed;
 }
 
@@ -6290,19 +6314,19 @@ xstore_gc_close(bt_t *bt)
 	if (bt == NULL) return 0;
 	horizon = snap_horizon(xs_visible());
 	(void)xs_gc(bt, horizon, &reclaimed);
-	if (horizon > atomic_load_explicit(&g_gc_horizon, memory_order_relaxed))
-		atomic_store_explicit(&g_gc_horizon, horizon, memory_order_relaxed);
+	if (horizon > xtc_atomic_load_u64(&g_gc_horizon, xtc_mo_relaxed))
+		xtc_atomic_store_u64(&g_gc_horizon, horizon, xtc_mo_relaxed);
 	return (uint64_t)reclaimed;
 }
 
 /* The autovacuum setting new connections start with (see
  * xstore_autovacuum_default in xstore.h). */
-static _Atomic int g_av_default;
+static int g_av_default;
 
 void
 xstore_autovacuum_default(int on)
 {
-	atomic_store_explicit(&g_av_default, on ? 1 : 0, memory_order_relaxed);
+	xtc_atomic_store_i32(&g_av_default, on ? 1 : 0, xtc_mo_relaxed);
 }
 
 /* Enable/disable autovacuum for the connection (xstore_autovacuum(on)). */
@@ -6342,7 +6366,7 @@ xstore_stage_rows(bt_t *bt)
 int64_t
 xstore_prune_count(void)
 {
-	return (int64_t)atomic_load_explicit(&g_av_prunes, memory_order_relaxed);
+	return (int64_t)xtc_atomic_load_u64(&g_av_prunes, xtc_mo_relaxed);
 }
 int
 xstore_native_begin(struct xsql *db)
@@ -6498,12 +6522,12 @@ xstore_rollback_to(struct xsql *db, int level)
  * buffered row's rowid is not reused (matching the vtab xUpdate auto-
  * rowid path).  Outside a txn this equals xstore_max_rowid.  Returns 0
  * for an empty table / unknown db. */
-static _Atomic uint64_t g_wmax_scanned;   /* wbuf entries scanned (metric) */
+static uint64_t g_wmax_scanned; /* wbuf entries scanned (metric) */
 
 uint64_t
 xstore_wbuf_scan_count(void)
 {
-	return atomic_load_explicit(&g_wmax_scanned, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_wmax_scanned, xtc_mo_relaxed);
 }
 
 int64_t
@@ -6520,8 +6544,8 @@ xstore_max_rowid_txn(struct xsql *db, uint32_t tableid)
 		for (i = 0; i < cx->wn && cx->wmax_ok; i++)
 			if (!wmax_note(cx, cx->wbuf[i].tableid, cx->wbuf[i].rowid))
 				cx->wmax_ok = 0;
-		atomic_fetch_add_explicit(&g_wmax_scanned, (uint64_t)i,
-		    memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&g_wmax_scanned, (uint64_t)i,
+		    xtc_mo_relaxed);
 	}
 	if (cx->wmax_ok) {
 		for (i = 0; i < cx->wmax_n; i++)
@@ -6532,8 +6556,8 @@ xstore_max_rowid_txn(struct xsql *db, uint32_t tableid)
 	for (i = 0; i < cx->wn; i++)        /* shortcut: > 8 tables in one txn scans */
 		if (cx->wbuf[i].tableid == tableid && cx->wbuf[i].rowid > mx)
 			mx = cx->wbuf[i].rowid;
-	atomic_fetch_add_explicit(&g_wmax_scanned, (uint64_t)cx->wn,
-	    memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_wmax_scanned, (uint64_t)cx->wn,
+	    xtc_mo_relaxed);
 	return mx;
 }
 
@@ -6627,7 +6651,7 @@ xstore_create_view(struct xsql *db, const char *name, const char *select_sql)
 		rc = 1;
 	}
 	if (rc)
-		atomic_store_explicit(&g_view_any, 1, memory_order_release);
+		xtc_atomic_store_i32(&g_view_any, 1, xtc_mo_release);
 	xs_cat_unlock();
 	return rc;
 }
@@ -6643,7 +6667,7 @@ xstore_view_sql(bt_t *bt, const char *name, char *out, int cap)
 	 * set (under the cat lock) before CREATE VIEW returns, so a lookup
 	 * that starts after it sees the view; a lookup racing the CREATE is
 	 * equivalent to running just before it. */
-	if (atomic_load_explicit(&g_view_any, memory_order_acquire) == 0)
+	if (xtc_atomic_load_i32(&g_view_any, xtc_mo_acquire) == 0)
 		return 0;
 	xs_cat_lock();
 	for (i = 0; i < g_view_n; i++)
@@ -6754,7 +6778,7 @@ xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name,
 		/* Not maintained while unresolved: if its table appears later
 		 * the index would be trusted with no entries -- do not. */
 		e.rt.tableid = 0;
-		atomic_store_explicit(&g_idx_taint, 1, memory_order_release);
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	}
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
@@ -6987,7 +7011,7 @@ xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
 	free(ord); free(nullf);
 	free(kb.bytes); free(kb.off); free(kb.len);
 	if (rc == -2)                      /* out of memory: built short */
-		atomic_store_explicit(&g_idx_taint, 1, memory_order_release);
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	return rc == -1 ? -1 : 0;
 }
 
@@ -7006,7 +7030,7 @@ struct xs_rb_job {
 	bt_t              *bt;
 	struct xs_idx_ent *e;
 	int                n;
-	_Atomic int        next, left;
+	int next, left;
 };
 
 static int
@@ -7014,16 +7038,16 @@ xs_rb_worker(void *arg)
 {
 	struct xs_rb_job *j = arg;
 	int i;
-	while ((i = atomic_fetch_add_explicit(&j->next, 1,
-	    memory_order_relaxed)) < j->n) {
+	while ((i = xtc_atomic_fetch_add_i32(&j->next, 1, xtc_mo_relaxed)) <
+	    j->n) {
 #if XTC_DST_BUG(XTC_DST_BUG_IDXSKIP)
 		if (j->n > 1 && i == j->n - 1)
 			continue;               /* planted: one index never rebuilt */
 #endif
 		if (xs_idx_build_one(j->bt, &j->e[i]) != 0)   /* UNIQUE dup: empty */
-			atomic_store_explicit(&g_idx_taint, 1, memory_order_release);
+			xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	}
-	atomic_fetch_sub_explicit(&j->left, 1, memory_order_acq_rel);
+	xtc_atomic_fetch_sub_i32(&j->left, 1, xtc_mo_acq_rel);
 	return 0;
 }
 
@@ -7038,11 +7062,11 @@ xs_idx_rebuild(bt_t *bt, int clear, int workers)
 	int i, nw;
 	memset(&j, 0, sizeof j);
 	xs_idx_dead_forget(bt);      /* every entry is rebuilt from the base */
-	atomic_store_explicit(&g_idx_garbage, 0, memory_order_relaxed);
+	xtc_atomic_store_u64(&g_idx_garbage, 0, xtc_mo_relaxed);
 	xs_idxcat_load(bt);          /* refresh cache from persisted catalog */
 	j.e = malloc(sizeof *j.e * XS_IDX_MAX);
 	if (j.e == NULL) {
-		atomic_store_explicit(&g_idx_taint, 1, memory_order_release);
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 		return;
 	}
 	j.bt = bt;
@@ -7052,16 +7076,17 @@ xs_idx_rebuild(bt_t *bt, int clear, int workers)
 	xs_cat_unlock();
 	for (i = 0; clear && i < j.n; i++)
 		xs_idx_clear(bt, j.e[i].rt.idx_id);
-	atomic_fetch_add_explicit(&g_idx_rebuilds, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_idx_rebuilds, 1, xtc_mo_relaxed);
 	nw = strcmp(xtc_io_backend_name(), "sim") == 0 ? 1 : workers;
 	if (nw > j.n) nw = j.n;
 	if (nw < 1) nw = 1;
-	atomic_store(&j.left, nw);
+	xtc_atomic_store_i32(&j.left, nw, xtc_mo_seq_cst);
 	for (i = 1; i < nw; i++)
 		if (xtc_blocking_submit(xs_rb_worker, &j) != XTC_OK)
-			atomic_fetch_sub(&j.left, 1);   /* this thread does its share */
+			xtc_atomic_fetch_sub_i32(&j.left, 1,
+			    xtc_mo_seq_cst); /* this thread does its share */
 	(void)xs_rb_worker(&j);
-	while (atomic_load_explicit(&j.left, memory_order_acquire) > 0) {
+	while (xtc_atomic_load_i32(&j.left, xtc_mo_acquire) > 0) {
 		if (xtc_pid_is_none(xtc_self()))
 			(void)xtc_sleep_ns(1000LL * 1000);
 		else
@@ -7082,7 +7107,7 @@ uint64_t
 xstore_index_trust_tag(bt_t *bt)
 {
 	int i, unresolved = 0;
-	if (atomic_load_explicit(&g_idx_taint, memory_order_acquire))
+	if (xtc_atomic_load_i32(&g_idx_taint, xtc_mo_acquire))
 		return 0;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
@@ -7097,15 +7122,15 @@ xstore_index_open(bt_t *bt, uint64_t tag, uint64_t garbage, int fresh,
     int workers)
 {
 	if (bt == NULL) return 0;
-	atomic_store_explicit(&g_idx_taint, 0, memory_order_release);
+	xtc_atomic_store_i32(&g_idx_taint, 0, xtc_mo_release);
 	if (!fresh && tag == XS_IDX_TRUST_TAG && garbage < XS_IDX_GARBAGE_MAX) {
 		xs_idx_dead_forget(bt);
-		atomic_store_explicit(&g_idx_garbage, garbage, memory_order_relaxed);
+		xtc_atomic_store_u64(&g_idx_garbage, garbage, xtc_mo_relaxed);
 		xs_idxcat_load(bt);        /* the entries are complete: trust them */
 		/* Loading may taint (an unresolvable index): rebuild then. */
-		if (!atomic_load_explicit(&g_idx_taint, memory_order_acquire))
+		if (!xtc_atomic_load_i32(&g_idx_taint, xtc_mo_acquire))
 			return 1;
-		atomic_store_explicit(&g_idx_taint, 0, memory_order_release);
+		xtc_atomic_store_i32(&g_idx_taint, 0, xtc_mo_release);
 	}
 	xs_idx_rebuild(bt, !fresh, workers);
 	return 0;
@@ -7116,13 +7141,13 @@ xstore_index_close(bt_t *bt)
 {
 	if (bt != NULL)
 		xs_idx_drain(bt);
-	return atomic_load_explicit(&g_idx_garbage, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_idx_garbage, xtc_mo_relaxed);
 }
 
 uint64_t
 xstore_index_rebuild_count(void)
 {
-	return atomic_load_explicit(&g_idx_rebuilds, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_idx_rebuilds, xtc_mo_relaxed);
 }
 
 /*
@@ -7242,7 +7267,7 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	 * flight (which may have missed it), and the build scans after it. */
 	xs_idx_cache_add(bt, idx_id, name, table, e.col, ncol, descmask, unique,
 	    kind ? (char)kind : 'i');
-	atomic_fetch_add_explicit(&g_idx_gen, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_idx_gen, 1, xtc_mo_relaxed);
 	xs_cat_gen_bump();
 	xstore_quiesce_begin();
 	xstore_quiesce_end();
@@ -7384,7 +7409,7 @@ xstore_index_list(bt_t *bt, const char *table, xstore_index_info_t *out,
 	uint64_t g;
 	int i, c, n = 0, k;
 	if (bt == NULL || table == NULL || out == NULL) return 0;
-	g = atomic_load_explicit(&g_catc_gen, memory_order_acquire);
+	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_acquire);
 	for (k = 0; k < 4; k++)
 		if (tc[k].gen == g && tc[k].bt == bt && tc[k].n <= cap &&
 		    strcasecmp(tc[k].table, table) == 0) {
@@ -7392,7 +7417,7 @@ xstore_index_list(bt_t *bt, const char *table, xstore_index_info_t *out,
 			return tc[k].n;
 		}
 	xs_cat_lock();
-	g = atomic_load_explicit(&g_catc_gen, memory_order_relaxed);
+	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_relaxed);
 	for (i = 0; i < g_idx_n && n < cap; i++) {
 		if (g_idx[i].bt != bt || strcasecmp(g_idx[i].table, table) != 0 ||
 		    g_idx[i].rt.tableid == 0)
@@ -7429,7 +7454,7 @@ xs_idx_get_rt(bt_t *bt, uint32_t idx_id, struct xs_idx_rt *rt)
 		uint64_t gen; bt_t *bt; struct xs_idx_rt rt;
 	} tc[8];
 	static _Thread_local unsigned tnext;
-	uint64_t g = atomic_load_explicit(&g_catc_gen, memory_order_acquire);
+	uint64_t g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_acquire);
 	int i, r = 0;
 	for (i = 0; i < 8; i++)
 		if (tc[i].gen == g && tc[i].bt == bt && tc[i].rt.idx_id == idx_id) {
@@ -7437,7 +7462,7 @@ xs_idx_get_rt(bt_t *bt, uint32_t idx_id, struct xs_idx_rt *rt)
 			return 1;
 		}
 	xs_cat_lock();
-	g = atomic_load_explicit(&g_catc_gen, memory_order_relaxed);
+	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_relaxed);
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
 			*rt = g_idx[i].rt; r = 1; break;
@@ -7458,7 +7483,7 @@ xs_idx_get(bt_t *bt, uint32_t idx_id, struct xs_idx_ent *e)
 {
 	static _Thread_local struct { uint64_t gen; struct xs_idx_ent e; } tc[8];
 	static _Thread_local unsigned tnext;
-	uint64_t g = atomic_load_explicit(&g_catc_gen, memory_order_acquire);
+	uint64_t g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_acquire);
 	int i, r = 0;
 	for (i = 0; i < 8; i++)
 		if (tc[i].gen == g && tc[i].e.bt == bt && tc[i].e.rt.idx_id == idx_id) {
@@ -7466,7 +7491,7 @@ xs_idx_get(bt_t *bt, uint32_t idx_id, struct xs_idx_ent *e)
 			return 1;
 		}
 	xs_cat_lock();
-	g = atomic_load_explicit(&g_catc_gen, memory_order_relaxed);
+	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_relaxed);
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
 			*e = g_idx[i]; r = 1; break;
@@ -7511,7 +7536,7 @@ xstore_index_seek_eq(bt_t *bt, uint32_t idx_id, int vclass,
 	uint8_t startk[XS_IDX_KMAX];
 	int startlen, n = 0;
 	if (bt == NULL || out == NULL || cap <= 0) return -1;
-	atomic_fetch_add_explicit(&g_idx_seeks, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_idx_seeks, 1, xtc_mo_relaxed);
 	startlen = xs_idx_prefix(idx_id, startk);
 	startlen = xs_tup_elem(startk, startlen, (int)sizeof startk, vclass,
 	    ival, rval, bytes, nbytes, 0);
@@ -7538,7 +7563,7 @@ xstore_index_seek_eq(bt_t *bt, uint32_t idx_id, int vclass,
 uint64_t
 xstore_index_seek_count(void)
 {
-	return atomic_load_explicit(&g_idx_seeks, memory_order_relaxed);
+	return xtc_atomic_load_u64(&g_idx_seeks, xtc_mo_relaxed);
 }
 
 /* ---- UNIQUE enforcement ----------------------------------------- */
@@ -7691,7 +7716,7 @@ xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid,
 	}
 	if (cx->in_txn && (cx->uniq_vis == 0 || vis < cx->uniq_vis)) {
 		cx->uniq_vis = vis;
-		cx->uniq_gen = atomic_load_explicit(&g_idx_gen, memory_order_relaxed);
+		cx->uniq_gen = xtc_atomic_load_u64(&g_idx_gen, xtc_mo_relaxed);
 	}
 	return 0;
 }
@@ -7777,7 +7802,7 @@ xs_uniq_validate_locked(bt_t *bt, xstore_ctx_t *cx, uint32_t tid1,
 	int skipok;
 	if (nu == 0) return 0;
 	skipok = cx != NULL && cx->uniq_vis != 0 &&
-	    cx->uniq_gen == atomic_load_explicit(&g_idx_gen, memory_order_relaxed);
+	    cx->uniq_gen == xtc_atomic_load_u64(&g_idx_gen, xtc_mo_relaxed);
 	for (wi = 0; wi < n; wi++) {
 		uint32_t tid = cx != NULL ? cx->wbuf[wi].tableid : tid1;
 		int64_t rid = cx != NULL ? cx->wbuf[wi].rowid : rid1;
@@ -7924,7 +7949,7 @@ xs_eff_snap(const xstore_ctx_t *ctx)
 {
 	uint64_t rs;
 	if (ctx == NULL) return xs_visible();
-	rs = atomic_load_explicit(&ctx->read_snap, memory_order_relaxed);
+	rs = xtc_atomic_load_u64(&ctx->read_snap, xtc_mo_relaxed);
 	if (rs != 0) return rs;
 	if (ctx->in_txn && ctx->txn_iso >= XS_ISO_REPEATABLE_READ) return ctx->txn_snap;
 	if (ctx->stmt_base != 0) return ctx->stmt_base;
@@ -8001,7 +8026,7 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 		if (s->hilen < 0) { free(s); return NULL; }
 		s->has_hi = 1; s->hi_incl = hi_incl;
 	}
-	atomic_fetch_add_explicit(&g_idx_seeks, 1, memory_order_relaxed);
+	xtc_atomic_fetch_add_u64(&g_idx_seeks, 1, xtc_mo_relaxed);
 	if (s->cx != NULL && s->cx->in_txn) {
 		s->cx->touched = 1;
 		if (s->cx->serializable)
@@ -8369,8 +8394,8 @@ xstore_iscan_close(xstore_iscan_t *s)
 {
 	if (s == NULL) return;
 	if (s->visited)
-		atomic_fetch_add_explicit(&g_rows_visited, s->visited,
-		    memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&g_rows_visited, s->visited,
+		    xtc_mo_relaxed);
 	if (s->cur != NULL) bt_cursor_close(s->cur);
 	free(s->ka);
 	free(s->ra);
@@ -8475,7 +8500,7 @@ fn_now(xsql_context *ctx, int argc, xsql_value **argv)
 {
 	(void)argc; (void)argv;
 	xsql_result_int64(ctx,
-	    (xsql_int64)atomic_load_explicit(&g_xclock, memory_order_relaxed));
+	    (xsql_int64)xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed));
 }
 #endif /* SQLXTC_VTAB */
 #if defined(SQLXTC_VTAB)
@@ -8485,7 +8510,7 @@ fn_as_of(xsql_context *ctx, int argc, xsql_value **argv)
 	xstore_ctx_t *c = (xstore_ctx_t *)xsql_user_data(ctx);
 	int64_t ts = (argc >= 1) ? xsql_value_int64(argv[0]) : 0;
 	if (ts < 0) ts = 0;
-	atomic_store_explicit(&c->read_snap, (uint64_t)ts, memory_order_relaxed);
+	xtc_atomic_store_u64(&c->read_snap, (uint64_t)ts, xtc_mo_relaxed);
 	xs_pin_recompute(c);      /* pin (or release) the as_of snapshot */
 	xsql_result_int64(ctx, ts);
 }
@@ -8571,13 +8596,13 @@ static void
 fn_gc(xsql_context *ctx, int argc, xsql_value **argv)
 {
 	xstore_ctx_t *c = (xstore_ctx_t *)xsql_user_data(ctx);
-	uint64_t now = atomic_load_explicit(&g_xclock, memory_order_relaxed);
+	uint64_t now = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	uint64_t horizon = snap_horizon(now);
 	int reclaimed = 0;
 	(void)argc; (void)argv;
 	(void)xs_gc(c->bt, horizon, &reclaimed);
-	if (horizon > atomic_load_explicit(&g_gc_horizon, memory_order_relaxed))
-		atomic_store_explicit(&g_gc_horizon, horizon, memory_order_relaxed);
+	if (horizon > xtc_atomic_load_u64(&g_gc_horizon, xtc_mo_relaxed))
+		xtc_atomic_store_u64(&g_gc_horizon, horizon, xtc_mo_relaxed);
 	xsql_result_int(ctx, reclaimed);
 }
 #endif /* SQLXTC_VTAB */
@@ -8606,7 +8631,7 @@ fn_prune_count(xsql_context *ctx, int argc, xsql_value **argv)
 {
 	(void)argc; (void)argv;
 	xsql_result_int64(ctx,
-	    (xsql_int64)atomic_load_explicit(&g_av_prunes, memory_order_relaxed));
+	    (xsql_int64)xtc_atomic_load_u64(&g_av_prunes, xtc_mo_relaxed));
 }
 #endif /* SQLXTC_VTAB */
 
@@ -8738,7 +8763,7 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 		if (g_dbmap[i].db == db) { slot = i; break; }
 	if (slot < 0 && g_dbmap_n < XS_DBMAP_MAX) slot = g_dbmap_n++;
 	if (slot >= 0) { g_dbmap[slot].db = db; g_dbmap[slot].bt = bt; g_dbmap[slot].ctx = ctx; }
-	atomic_fetch_add_explicit(&g_dbmap_gen, 1, memory_order_release);
+	xtc_atomic_fetch_add_u64(&g_dbmap_gen, 1, xtc_mo_release);
 	xs_cat_unlock();
 	if (slot < 0) {
 		/* Map full: refuse the connection rather than hand back a
@@ -8746,7 +8771,7 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 		free(ctx);
 		return NULL;
 	}
-	atomic_store(&ctx->read_snap, 0);
+	xtc_atomic_store_u64(&ctx->read_snap, 0, xtc_mo_seq_cst);
 	ctx->in_txn = 0;
 	ctx->txn_snap = 0;
 	ctx->wbuf = NULL;
@@ -8765,7 +8790,7 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 	ctx->did_scan = 0;
 	ctx->ssi = NULL;
 	ctx->snap_slot = -1;
-	ctx->autovacuum = atomic_load_explicit(&g_av_default, memory_order_relaxed);
+	ctx->autovacuum = xtc_atomic_load_i32(&g_av_default, xtc_mo_relaxed);
 	ctx->steal_txn = 0;
 	ctx->wbuf_bytes = 0;
 	ctx->sp_wn = NULL;
@@ -8851,7 +8876,8 @@ xstore_unregister(struct xsql *db)
 		if (g_dbmap[i].db == db) {
 			g_dbmap_n--;
 			if (i != g_dbmap_n) g_dbmap[i] = g_dbmap[g_dbmap_n];
-			atomic_fetch_add_explicit(&g_dbmap_gen, 1, memory_order_release);
+			xtc_atomic_fetch_add_u64(&g_dbmap_gen, 1,
+			    xtc_mo_release);
 			break;
 		}
 	xs_cat_unlock();
@@ -8874,7 +8900,8 @@ xstore_unregister_native(struct xsql *db)
 			ctx = g_dbmap[i].ctx;
 			g_dbmap_n--;
 			if (i != g_dbmap_n) g_dbmap[i] = g_dbmap[g_dbmap_n];
-			atomic_fetch_add_explicit(&g_dbmap_gen, 1, memory_order_release);
+			xtc_atomic_fetch_add_u64(&g_dbmap_gen, 1,
+			    xtc_mo_release);
 			break;
 		}
 	xs_cat_unlock();
@@ -9011,7 +9038,7 @@ xs_undo_loser(bt_t *bt, wal_t *w, struct rec_txn *t)
 			return XTC_E_INTERNAL;
 		if ((rc = wal_commit_sync(w, clr, (uint32_t)n, &lsn)) != XTC_OK)
 			return rc;
-		atomic_fetch_add_explicit(&g_undo_clrs, 1, memory_order_relaxed);
+		xtc_atomic_fetch_add_u64(&g_undo_clrs, 1, xtc_mo_relaxed);
 	}
 	eh.type = XL_END;
 	eh.txn_id = t->txn_id;
@@ -9335,7 +9362,8 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 		if (dc->snap != 0 && (++dc->n & 1023) == 0) {
 			/* Online dump: let writers at the leaf now and then, and
 			 * stop at once if the engine is shutting down. */
-			if (atomic_load_explicit(&g_ock_cancel, memory_order_acquire)) {
+			if (xtc_atomic_load_i32(&g_ock_cancel,
+			        xtc_mo_acquire)) {
 				dc->cancelled = 1;
 				break;
 			}
@@ -9412,7 +9440,7 @@ xstore_checkpoint_wal(bt_t *bt, struct wal *w, const char *wal_path)
 	struct xs_dump_ctx dc;
 	memset(&dc, 0, sizeof dc);
 	dc.bt = bt;
-	dc.clock = atomic_load_explicit(&g_xclock, memory_order_relaxed);
+	dc.clock = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	return wal_checkpoint((wal_t *)w, wal_path, xs_dump_tree, &dc);
 }
 
@@ -9474,7 +9502,7 @@ xs_ock_body(void *arg)
 	}
 	for (round = 0; round < 64; round++) {
 		xs_ock_yield("xstore.ockpt.catchup");
-		if (atomic_load_explicit(&g_ock_cancel, memory_order_acquire)) {
+		if (xtc_atomic_load_i32(&g_ock_cancel, xtc_mo_acquire)) {
 			j->rc = XTC_E_AGAIN;
 			return 0;
 		}
@@ -9489,7 +9517,7 @@ xs_ock_body(void *arg)
 void
 xstore_checkpoint_cancel(int on)
 {
-	atomic_store_explicit(&g_ock_cancel, on ? 1 : 0, memory_order_release);
+	xtc_atomic_store_i32(&g_ock_cancel, on ? 1 : 0, xtc_mo_release);
 }
 
 int
@@ -9506,7 +9534,7 @@ xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
 	j.dc.bt = bt;
 	if (!xs_quiesce_begin(1))
 		return XTC_E_AGAIN;
-	j.dc.snap = atomic_load_explicit(&g_xclock, memory_order_relaxed);
+	j.dc.snap = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	if (j.dc.snap == 0)
 		j.dc.snap = 1;
 	j.dc.clock = j.dc.snap;
@@ -9626,7 +9654,7 @@ xstore_fuzzy_checkpoint(bt_t *bt, bm_t *bm, struct wal *w,
 	/* Compact the log: keep only the tail at/after the horizon, led by a
 	 * fuzzy CHECKPOINT record.  Atomic rename + rebind (wal_checkpoint). */
 	fc.path = wal_path;
-	fc.clock = atomic_load_explicit(&g_xclock, memory_order_relaxed);
+	fc.clock = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	fc.horizon = horizon;
 	fc.emit = NULL; fc.ectx = NULL;
 	if ((rc = wal_checkpoint((wal_t *)w, wal_path, xs_dump_fuzzy, &fc)) != XTC_OK)

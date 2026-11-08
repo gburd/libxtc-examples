@@ -24,7 +24,6 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,9 +44,9 @@
 
 static char             g_path[256];
 static xtc_exec_t      *g_exec;
-static _Atomic int      g_stop, g_done, g_live;
-static _Atomic int64_t  g_next = NROW + 1, g_acked;
-static _Atomic int      g_hook_wal, g_hook_ckpt, g_hook_pp, g_hook_tr;
+static int g_stop, g_done, g_live;
+static int64_t g_next = NROW + 1, g_acked;
+static int g_hook_wal, g_hook_ckpt, g_hook_pp, g_hook_tr;
 static int64_t          g_bound_ms = 500, g_q_ms[2] = { -1, -1 };
 static int              g_restarts[2], g_session;
 static uint64_t         g_seed;
@@ -72,20 +71,20 @@ on_failure(const char *what, void *arg)
 {
 	(void)arg;
 	if (strcmp(what, "wal") == 0)
-		atomic_fetch_add(&g_hook_wal, 1);
+		xtc_atomic_fetch_add_i32(&g_hook_wal, 1, xtc_mo_seq_cst);
 	else if (strcmp(what, "checkpoint") == 0)
-		atomic_fetch_add(&g_hook_ckpt, 1);
+		xtc_atomic_fetch_add_i32(&g_hook_ckpt, 1, xtc_mo_seq_cst);
 	else if (strcmp(what, "bm-provider") == 0)
-		atomic_fetch_add(&g_hook_pp, 1);
+		xtc_atomic_fetch_add_i32(&g_hook_pp, 1, xtc_mo_seq_cst);
 	else if (strcmp(what, "bm-trickler") == 0)
-		atomic_fetch_add(&g_hook_tr, 1);
+		xtc_atomic_fetch_add_i32(&g_hook_tr, 1, xtc_mo_seq_cst);
 }
 
 static void
 close_db(void *arg)
 {
 	sx_close(arg);
-	atomic_fetch_sub(&g_live, 1);
+	xtc_atomic_fetch_sub_i32(&g_live, 1, xtc_mo_seq_cst);
 }
 
 static void
@@ -95,7 +94,7 @@ writer(void *arg)
 	char sql[160];
 	(void)arg;
 	if (sx_open(":memory:", &h) != SX_OK) {
-		atomic_fetch_sub(&g_live, 1);
+		xtc_atomic_fetch_sub_i32(&g_live, 1, xtc_mo_seq_cst);
 		return;
 	}
 	if (xtc_proc_at_exit(close_db, h) != XTC_OK) {
@@ -103,13 +102,14 @@ writer(void *arg)
 		close_db(h);
 		return;
 	}
-	while (!atomic_load(&g_stop)) {
-		int64_t k = atomic_fetch_add(&g_next, 1);
+	while (!xtc_atomic_load_i32(&g_stop, xtc_mo_seq_cst)) {
+		int64_t k =
+		    xtc_atomic_fetch_add_i64(&g_next, 1, xtc_mo_seq_cst);
 		snprintf(sql, sizeof sql, "INSERT INTO t VALUES(%lld, %lld, "
 		    "'pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad')",
 		    (long long)k, (long long)k);
 		if (sx_exec(h, sql, NULL) == SX_OK)
-			atomic_fetch_add(&g_acked, 1);
+			xtc_atomic_fetch_add_i64(&g_acked, 1, xtc_mo_seq_cst);
 	}
 }
 
@@ -136,15 +136,15 @@ kill_restart(int which)
 
 /* Wait for *hook to reach `want` within the bound: 1 if it did. */
 static int
-await_hook(_Atomic int *hook, int want)
+await_hook(int *hook, int want)
 {
 	int64_t t0 = ms();
 	while (ms() - t0 < g_bound_ms) {
-		if (atomic_load(hook) >= want)
+		if (xtc_atomic_load_i32(hook, xtc_mo_seq_cst) >= want)
 			return 1;
 		(void)xtc_proc_sleep(1000LL * 1000);
 	}
-	return atomic_load(hook) >= want;
+	return xtc_atomic_load_i32(hook, xtc_mo_seq_cst) >= want;
 }
 
 static void
@@ -166,10 +166,10 @@ boss(void *arg)
 	(void)arg;
 
 	for (i = 0; i < NW; i++) {
-		atomic_fetch_add(&g_live, 1);
+		xtc_atomic_fetch_add_i32(&g_live, 1, xtc_mo_seq_cst);
 		if (xtc_proc_spawn(xtc_exec_loop(g_exec, 1), writer, NULL, &o,
 		    &wp) != XTC_OK)
-			atomic_fetch_sub(&g_live, 1);
+			xtc_atomic_fetch_sub_i32(&g_live, 1, xtc_mo_seq_cst);
 	}
 	(void)xtc_proc_sleep(50LL * 1000 * 1000);
 	if (s == 0) {
@@ -183,7 +183,8 @@ boss(void *arg)
 		}
 		CK(g_restarts[0] == 4);
 		CK(g_restarts[1] == 4);
-		CK(atomic_load(&g_hook_pp) == 0 && atomic_load(&g_hook_tr) == 0);
+		CK(xtc_atomic_load_i32(&g_hook_pp, xtc_mo_seq_cst) == 0 &&
+		    xtc_atomic_load_i32(&g_hook_tr, xtc_mo_seq_cst) == 0);
 		/* Not restartable: the checkpoint proc escalates. */
 		kill_one(SX_PROC_CKPT);
 		CK(await_hook(&g_hook_ckpt, 1));
@@ -193,15 +194,15 @@ boss(void *arg)
 		for (i = 0; i < BUDGET; i++)
 			g_restarts[1] += kill_restart(SX_PROC_TRICKLER);
 		CK(g_restarts[1] == BUDGET);
-		CK(atomic_load(&g_hook_tr) == 0);
+		CK(xtc_atomic_load_i32(&g_hook_tr, xtc_mo_seq_cst) == 0);
 		kill_one(SX_PROC_TRICKLER);
 		CK(await_hook(&g_hook_tr, 1));
 		kill_one(SX_PROC_WAL);
 		CK(await_hook(&g_hook_wal, 1));
 	}
 	(void)xtc_proc_sleep(30LL * 1000 * 1000);     /* commits continue */
-	atomic_store(&g_stop, 1);
-	while (atomic_load(&g_live) > 0)
+	xtc_atomic_store_i32(&g_stop, 1, xtc_mo_seq_cst);
+	while (xtc_atomic_load_i32(&g_live, xtc_mo_seq_cst) > 0)
 		(void)xtc_proc_sleep(1000LL * 1000);
 	a = ms();
 	sx_storage_quiesce();
@@ -213,7 +214,7 @@ watchdog(void *arg)
 {
 	int64_t t0 = ms();
 	(void)arg;
-	while (!atomic_load(&g_done)) {
+	while (!xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst)) {
 		if (ms() - t0 > 120 * g_bound_ms) {   /* 60 s; x20 if slow */
 			fprintf(stderr, "FAIL: test_storage_sup: hang (session %d)\n",
 			    g_session);
@@ -251,8 +252,8 @@ session(int s)
 
 	g_session = s;
 	g_restarts[0] = g_restarts[1] = 0;
-	atomic_store(&g_stop, 0);
-	atomic_store(&g_done, 0);
+	xtc_atomic_store_i32(&g_stop, 0, xtc_mo_seq_cst);
+	xtc_atomic_store_i32(&g_done, 0, xtc_mo_seq_cst);
 	if (sx_storage_open(g_path, 64) != SX_OK)
 		return -1;
 	sx_storage_on_failure(on_failure, NULL);
@@ -262,19 +263,26 @@ session(int s)
 		return -1;
 	(void)pthread_create(&wd, NULL, watchdog, NULL);
 	(void)xtc_exec_run(g_exec);
-	atomic_store(&g_done, 1);
+	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
 	(void)xtc_exec_fini(g_exec);
 	CK(sx_storage_close() == SX_OK);
 	rows = count_rows();
 	printf("  session %d: restarts pp %d tr %d  hooks ckpt %d wal %d "
-	    "pp %d tr %d  quiesce %lld ms  acked %lld rows %lld\n", s,
-	    g_restarts[0], g_restarts[1], atomic_load(&g_hook_ckpt),
-	    atomic_load(&g_hook_wal), atomic_load(&g_hook_pp),
-	    atomic_load(&g_hook_tr), (long long)g_q_ms[s],
-	    (long long)atomic_load(&g_acked), (long long)rows);
+	       "pp %d tr %d  quiesce %lld ms  acked %lld rows %lld\n",
+	    s, g_restarts[0], g_restarts[1],
+	    xtc_atomic_load_i32(&g_hook_ckpt, xtc_mo_seq_cst),
+	    xtc_atomic_load_i32(&g_hook_wal, xtc_mo_seq_cst),
+	    xtc_atomic_load_i32(&g_hook_pp, xtc_mo_seq_cst),
+	    xtc_atomic_load_i32(&g_hook_tr, xtc_mo_seq_cst),
+	    (long long)g_q_ms[s],
+	    (long long)xtc_atomic_load_i64(&g_acked, xtc_mo_seq_cst),
+	    (long long)rows);
 	CK(g_q_ms[s] >= 0 && g_q_ms[s] < 1000);
-	CK(rows == NROW + atomic_load(&g_acked));    /* no acked commit lost */
+	CK(rows ==
+	    NROW +
+	        xtc_atomic_load_i64(&g_acked,
+	            xtc_mo_seq_cst)); /* no acked commit lost */
 	return 0;
 }
 
