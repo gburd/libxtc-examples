@@ -1,0 +1,7 @@
+clickstream
+clickstream.out
+*.o
+core
+core.*
+*.core
+vgcore.*

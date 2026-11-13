@@ -1,0 +1,7 @@
+edgeacl
+edgeacl.out
+*.o
+core
+core.*
+*.core
+vgcore.*

@@ -16,7 +16,7 @@ that is the normal way to build it:
 git clone --recurse-submodules https://codeberg.org/gregburd/libxtc.git
 cd libxtc/dist && autoreconf -i && cd ..
 mkdir build_unix && cd build_unix && ../dist/configure && make
-make examples          # the teaching examples 01-04, 08, 10
+make examples          # the teaching examples 01-04, 08, 10, 17-19
 make check             # includes check-examples and check-rexis
 ```
 
@@ -64,6 +64,9 @@ History: split from libxtc's `examples/` (and `test/sqlxtc`, `test/m99`,
 | `12_continuous_batching/` | **Continuous numerical batching**: shared coefficient setup, variable-length requests, bounded admission, cancellation and BLOCKED/resume. Compares static cohorts with continuous refill under default or batch-aware scheduling; two groups plus a heartbeat. Requires `--enable-sched-policy`; root `make check` runs its self-test in an enabled build. |
 | `16_l2book/` | **A level-2 limit order book venue using Isolates and fibers together**: one stackless `xtc_tnt` Isolate per symbol owns its book (single writer, no lock on the match path); supervised fibers run TCP order entry, market data, an HTTP + SSE console and the flow.  The engine is pure C and also compiles to a 50 KB wasm32 module the browser console runs.  The full order surface of intrepidkarthi/orderbook (stops, iceberg, OCO, pegged, STP, auction, ...); `docker compose up` gives a running market.  ~28 M ops/s bare engine; see its README. |
 | `15_usdt/` | **A lock convoy and a lost reply, to find with the USDT probes** (`man xtc_usdt`): eight fibers sleep while holding one `xtc_amutex` (`convoy`), the same work done right (`fixed`), and a server that drops one reply in ten (`lostwake`).  Every mode exits 0; the bugs show only as time.  `tools/dtrace/xtc_lock_contention.d` and `xtc_park_latency.d` find them.  `make check` runs all three.  See its README and `docs/guide/12-tracing.md`. |
+| `17_checkout/` | **A checkout service: `xtc_saga` + `xtc_pool` + `xtc_pdict`.**  Six orders, each a proc running a four-step saga (quote, reserve, charge, ship) over two pooled backend connections; three fail at different steps and are compensated in reverse (refund, release).  The request context lives in the proc's dictionary.  Checks the ledger balances.  See its README. |
+| `18_clickstream/` | **Web analytics: `xtc_stream` + `xtc_bloom` + `xtc_hll`.**  Four front-end logs, one proc per loop, each a lazy map/filter pipeline; a Bloom filter drops lines the shipper delivered twice; per-shard HyperLogLog sketches merge into the distinct-user count.  Checked against an exact oracle.  See its README. |
+| `19_edgeacl/` | **An edge gateway's IP access table: `xtc_cskip` + `xtc_rcu` + `xtc_cfg` sessions.**  Eight sessions on four loops do floor lookups in a range table while a feed rewrites it; every live answer is checked against per-version snapshots.  Settings read through `xtc_cfg_ref`, overridden per session, changed globally at run time, and rolled back per request.  See its README. |
 
 ## What each example proves
 
@@ -114,12 +117,32 @@ See [the example README](12_continuous_batching/README.md). In a
 `--enable-sched-policy` build, root `make check` runs its self-test; a
 default build skips it explicitly.
 
+**17** -- a saga is the right shape for a checkout that spans systems
+with no shared transaction: each step's undo is plain C next to the step,
+and `xtc_saga_run` unwinds exactly the completed prefix, newest first.
+The pool is the concurrency limit (orders park, the loop does not), and
+the per-process dictionary carries the request's context to code that
+cannot take it as an argument.
+
+**18** -- the probabilistic structures pay off where an exact answer
+needs shared, growing state: the Bloom filter deduplicates in fixed
+memory and never lets a repeat through, and per-shard HyperLogLog sketches
+merge exactly, so shards share nothing while they run.  The stream
+combinators make the pipeline a chain of one-job functions.
+
+**19** -- an ordered map answers the range question a hash table cannot,
+and RCU lets every loop read it while a writer changes it, with the
+writer retiring what it replaced.  The settings layer gives each session
+its own view of a global knob, transactional per-request overrides, and
+source precedence, the shape PostgreSQL's GUCs need.
+
 ## Building
 
 The Makefile target `examples` is built by:
 
 ```
 make 01_hello 02_pingpong 03_supervised_app 04_lockmgr_demo 10_circuit_breaker
+make 17_checkout 18_clickstream 19_edgeacl
 cd 05_rexis && make
 ```
 

@@ -1,0 +1,24 @@
+edgeacl: 4 loops, 8 sessions (2 partner), 41 ranges, a feed of 46 updates
+live feed: 46 updates applied while the sessions looked up addresses; 0 inconsistent answers
+batch 1 (edge.unknown=allow; partner sessions edge.mode=audit):
+  10.2.17.9     in no range               public: allow  partner: allow
+  10.0.4.4      in 10.0.0.0/16 JP deny    public: deny   partner: audit
+  10.1.200.1    in 10.1.128.0/17 BR allow public: allow  partner: allow
+  10.3.0.1      in no range               public: allow  partner: allow
+  10.12.1.1     in 10.12.0.0/16 IN allow  public: allow  partner: allow
+  10.12.201.1   in 10.12.0.0/16 IN allow  public: allow  partner: allow
+  10.33.99.99   in 10.33.0.0/16 DE allow  public: allow  partner: allow
+  10.49.0.1     in no range               public: allow  partner: allow
+operator: edge.unknown allow -> deny; feed: 10.1.0.0/16 DE deny
+batch 2:
+  10.2.17.9     in no range               public: deny   partner: audit
+  10.0.4.4      in 10.0.0.0/16 JP deny    public: deny   partner: audit
+  10.1.200.1    in 10.1.128.0/17 BR allow public: allow  partner: allow
+  10.3.0.1      in no range               public: deny   partner: audit
+  10.12.1.1     in 10.12.0.0/16 IN allow  public: allow  partner: allow
+  10.12.201.1   in 10.12.0.0/16 IN allow  public: allow  partner: allow
+  10.33.99.99   in 10.33.0.0/16 DE allow  public: allow  partner: allow
+  10.49.0.1     in no range               public: deny   partner: audit
+dry-run request from session 1 for 10.0.4.4: audit, then deny once the level is aborted
+partner: edge.mode=enforce from source user: rc 0, mode stays audit (source client)
+OK

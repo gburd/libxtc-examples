@@ -1,0 +1,34 @@
+checkout: 6 orders, 2 backend connections
+order 1001 alice: 2 x widget to Boston: OK
+  [a6ead519] quote: 2 x widget = $25.00
+  [a6ead519] reserve 2 x widget: ok
+  [a6ead519] charge alice $25.00: ok
+  [a6ead519] ship to Boston: booked
+order 1002 bob: 1 x gadget to Lisbon: OK
+  [45224eca] quote: 1 x gadget = $49.99
+  [45224eca] reserve 1 x gadget: ok
+  [45224eca] charge bob $49.99: ok
+  [45224eca] ship to Lisbon: booked
+order 1003 carol: 1 x gizmo to Osaka: FAILED at charge (card declined) after 2 completed steps
+  [e359c87b] quote: 1 x gizmo = $899.00
+  [e359c87b] reserve 1 x gizmo: ok
+  [e359c87b] charge carol $899.00: declined
+  [e359c87b] release 1 x gizmo
+order 1004 dave: 3 x widget to Antarctica: FAILED at ship (no carrier) after 3 completed steps
+  [8191422c] quote: 3 x widget = $37.50
+  [8191422c] reserve 3 x widget: ok
+  [8191422c] charge dave $37.50: ok
+  [8191422c] ship to Antarctica: no carrier serves it
+  [8191422c] refund dave $37.50
+  [8191422c] release 3 x widget
+order 1005 erin: 1 x widget to Nairobi: OK
+  [1fc8bbdd] quote: 1 x widget = $12.50
+  [1fc8bbdd] reserve 1 x widget: ok
+  [1fc8bbdd] charge erin $12.50: ok
+  [1fc8bbdd] ship to Nairobi: booked
+order 1006 frank: 5 x gadget to Toronto: FAILED at reserve (out of stock) after 1 completed step
+  [be00358e] quote: 5 x gadget = $249.95
+  [be00358e] reserve 5 x gadget: out of stock
+ledger: stock widget=7 gadget=3 gizmo=2; 3 shipments; 4 charges, 1 refunds
+pool: 2 connections, peak 2 in use, 4 orders queued for one, 24 round trips
+OK

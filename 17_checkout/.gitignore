@@ -1,0 +1,7 @@
+checkout
+checkout.out
+*.o
+core
+core.*
+*.core
+vgcore.*

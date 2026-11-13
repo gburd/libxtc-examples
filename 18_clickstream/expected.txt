@@ -1,0 +1,11 @@
+clickstream: 4 front ends x 50000 log lines, 20000 user ids
+front end 0: 50000 lines: 275 malformed, 6006 bot/health, 1282 redelivered dropped, 17 new lost, 42420 counted
+front end 1: 50000 lines: 221 malformed, 6134 bot/health, 1321 redelivered dropped, 16 new lost, 42308 counted
+front end 2: 50000 lines: 241 malformed, 6003 bot/health, 1363 redelivered dropped, 17 new lost, 42376 counted
+front end 3: 50000 lines: 250 malformed, 6062 bot/health, 1293 redelivered dropped, 22 new lost, 42373 counted
+distinct users: estimate 20111, exact 19980 (+0.66%)
+  (adding the 4 per-front-end estimates gives 66121: a user seen by several front ends counts several times)
+distinct users who checked out: estimate 2548, exact 2553 (-0.20%)
+conversion: 12.7% estimated, 12.8% exact
+Bloom filter: 72 of 169549 new lines lost to false positives (0.042%, sized for 1%)
+OK
