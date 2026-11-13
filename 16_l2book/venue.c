@@ -476,7 +476,7 @@ int
 venue_main(const venue_opts_t *opts)
 {
 	static xtc_tnt_type_t types[2];
-	xtc_tnt_spec_t spec;
+	xtc_tnt_spec_t spec = XTC_TNT_SPEC_INIT;
 	int rc, i;
 
 	g_shards = opts->shards;
@@ -502,7 +502,6 @@ venue_main(const venue_opts_t *opts)
 	types[T_BOOT].budget_weight = 1;
 	types[T_BOOT].init_fn = boot_init_fn;
 	types[T_BOOT].handler_fn = boot_handler;
-	memset(&spec, 0, sizeof spec);
 	spec.name = "l2book";
 	spec.types = types;
 	spec.n_types = 2;

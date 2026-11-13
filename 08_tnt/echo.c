@@ -315,7 +315,7 @@ parse_args(int argc, char **argv, int *port, int *shards)
 int
 main(int argc, char **argv)
 {
-	xtc_tnt_spec_t spec;
+	xtc_tnt_spec_t spec = XTC_TNT_SPEC_INIT;
 	xtc_tcp_opts_t topts = XTC_TCP_OPTS_DEFAULT;
 	pthread_t lt;
 	int port = 7777, shards = 1, rc;
@@ -351,7 +351,6 @@ main(int argc, char **argv)
 	}
 
 	/* Boot the tnt runtime (blocks until xtc_tnt_stop). */
-	memset(&spec, 0, sizeof(spec));
 	spec.name = "tnt-echo";
 	spec.types = echo_types;
 	spec.n_types = 1;
