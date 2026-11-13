@@ -23,7 +23,7 @@
 #include "xtc_proc.h"
 #include "xtc_sync.h"     /* xtc_notify: waiters park (fiber) or block (thread) */
 #include "xtc_sim.h"      /* XTC_SIM_BUGGIFY -- DST pessimal batching (no-op in prod) */
-#include "xtc_dst_inject.h" /* DST bug-injection harness (no-op in prod) */
+#include "sx_dst.h"       /* DST planted bugs (no-op in prod) */
 #include "xtc_io.h"       /* xtc_io_backend_name */
 #include "xtc_fs.h"       /* xtc_fs_dio_align */
 

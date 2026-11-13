@@ -28,7 +28,7 @@
 #include "xtc_stats.h"
 #include "xtc_sync.h"
 #include "xtc_dio_sched.h"
-#include "xtc_dst_inject.h" /* DST planted bugs (no-op in prod) */
+#include "sx_dst.h"       /* DST planted bugs (no-op in prod) */
 #include <stdlib.h>
 #include <fcntl.h>
 

@@ -66,7 +66,7 @@
 #include "xtc_io.h"      /* xtc_io_backend_name: no pool threads under sim */
 #include "xtc_proc.h"
 #include "xtc_sync.h"
-#include "xtc_dst_inject.h" /* DST planted bugs (no-op in prod) */
+#include "sx_dst.h"       /* DST planted bugs (no-op in prod) */
 #include "xtc_sim.h"      /* XTC_SIM_BUGGIFY: DST pessimal points (no-op in prod) */
 
 /*

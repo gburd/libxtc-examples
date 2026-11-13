@@ -123,7 +123,7 @@
 #include "btnode.h"
 #include "btovf.h"
 #include "xtc_sim.h"    /* XTC_SIM_BUGGIFY -- DST eager-split (no-op in prod) */
-#include "xtc_dst_inject.h" /* DST planted bugs (no-op in prod) */
+#include "sx_dst.h"       /* DST planted bugs (no-op in prod) */
 
 #include <pthread.h>
 #include "xtc_atomic.h"
