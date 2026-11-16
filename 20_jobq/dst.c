@@ -86,13 +86,13 @@ static struct {
 static int g_n_sites;
 
 static struct faults g_f;
-static int g_acts;         /* nemesis actions this run */
-static int g_tally[3];     /* this run: queue kills, worker kills, cuts */
+static int g_acts;     /* nemesis actions this run */
+static int g_tally[3]; /* this run: queue kills, worker kills, cuts */
 static struct {
 	int tally[3];
 	int fenced, regrants, epochs; /* seeds where each happened */
 } g_sweep;
-static char g_why[256];    /* the consistency check's verdict */
+static char g_why[256]; /* the consistency check's verdict */
 static int g_verbose;
 
 /* splitmix64: the fault mix is derived from the seed before the run,
@@ -173,8 +173,8 @@ nemesis(void *arg)
 			xtc_sim_partition_isolate(loop + 1);
 			g_tally[2]++;
 			jq_trace("nemesis.cut", loop, 0);
-			(void)xtc_proc_sleep(5 * MS +
-			    (int64_t)xtc_sim_rand(60 * MS));
+			(void)xtc_proc_sleep(
+			    5 * MS + (int64_t)xtc_sim_rand(60 * MS));
 			heal();
 			jq_trace("nemesis.heal", loop, 0);
 		}
@@ -193,7 +193,8 @@ print_proc(const xtc_proc_info_t *pi, void *user)
 	printf("  alive: pid %u.%u state %d park %s mailbox %zu kill %d\n",
 	    pi->pid.loop_id, pi->pid.local_id, pi->run_state,
 	    pi->park_reason >= 0 && pi->park_reason <= 3 ?
-	        park[pi->park_reason] : "?",
+	        park[pi->park_reason] :
+	        "?",
 	    pi->mbox_len, pi->kill_pending);
 	return 0;
 }
@@ -252,8 +253,8 @@ run_seed(uint64_t seed, struct outcome *out)
 	if ((out->rc = xtc_exec_init(&e, JQ_LOOPS)) != XTC_OK)
 		return;
 	if ((out->rc = jq_start(e, &cfg)) != XTC_OK ||
-	    (out->rc = xtc_proc_spawn(xtc_exec_loop(e, 1), nemesis, NULL,
-	         NULL, NULL)) != XTC_OK) {
+	    (out->rc = xtc_proc_spawn(xtc_exec_loop(e, 1), nemesis, NULL, NULL,
+	         NULL)) != XTC_OK) {
 		(void)xtc_exec_fini(e);
 		return;
 	}
@@ -294,8 +295,8 @@ run_seed(uint64_t seed, struct outcome *out)
 static int
 same(const struct outcome *a, const struct outcome *b)
 {
-	return a->rc == b->rc && a->trace == b->trace &&
-	    a->state == b->state && a->acts == b->acts &&
+	return a->rc == b->rc && a->trace == b->trace && a->state == b->state &&
+	    a->acts == b->acts &&
 	    memcmp(a->tally, b->tally, sizeof a->tally) == 0 &&
 	    memcmp(&a->stats, &b->stats, sizeof a->stats) == 0;
 }

@@ -67,19 +67,19 @@
 #include "jobq.h"
 
 #define MS (1000LL * 1000)
-#define RPC_NS (10 * MS)        /* a client waits this long for a reply */
-#define POLL_NS (2 * MS)        /* an idle worker asks again after this */
-#define WORK_NS (3 * MS)        /* a job takes 1..3 ms */
-#define ATTEMPTS 4              /* tries of one store write or completion */
-#define LOG_MAX 4096            /* the store's write log, for the checks */
+#define RPC_NS (10 * MS) /* a client waits this long for a reply */
+#define POLL_NS (2 * MS) /* an idle worker asks again after this */
+#define WORK_NS (3 * MS) /* a job takes 1..3 ms */
+#define ATTEMPTS 4       /* tries of one store write or completion */
+#define LOG_MAX 4096     /* the store's write log, for the checks */
 
 /*
  * Planted bugs, for the harness's bug-detection check.  Each is compiled
  * in only with -DXTC_DST_INJECT_BUG=n (make PLANT=n); see xtc_sim(3).
  */
-#define JQ_BUG_NOFENCE 1   /* the store accepts a write without the fence */
-#define JQ_BUG_EARLYACK 2  /* the queue acks a submit before it is durable */
-#define JQ_BUG_EPOCH 3     /* a restarted queue reuses its epoch */
+#define JQ_BUG_NOFENCE 1  /* the store accepts a write without the fence */
+#define JQ_BUG_EARLYACK 2 /* the queue acks a submit before it is durable */
+#define JQ_BUG_EPOCH 3    /* a restarted queue reuses its epoch */
 
 enum jq_msg_type {
 	M_SUBMIT = 1, /* producer -> queue: job */
@@ -140,7 +140,7 @@ static int g_acked[JQ_JOBS_MAX]; /* the queue acknowledged the submit */
 static int g_lost[JQ_JOBS_MAX];  /* the queue later did not know the job */
 static int g_seen[JQ_JOBS_MAX];  /* the producer saw the job done */
 static int g_gave_up;
-static int g_finished;           /* xtc_atomic: the producer is done */
+static int g_finished; /* xtc_atomic: the producer is done */
 
 static struct jq_config g_cfg;
 static struct jq_stats g_stats;
@@ -148,7 +148,7 @@ static xtc_reg_t *g_reg;
 static xtc_supervisor_t *g_sup[3]; /* the queue's, then the workers' */
 static xtc_atomic_pid_t g_worker[JQ_WORKERS];
 static xtc_atomic_pid_t g_store_pid;
-static uint64_t g_next_rid;        /* xtc_atomic */
+static uint64_t g_next_rid; /* xtc_atomic */
 static uint64_t g_trace;
 static int g_verbose;
 
@@ -401,8 +401,8 @@ queue_complete(const struct jq_msg *m)
 	struct qjob *q = &g_q[m->job];
 
 	if (q->state == JS_DONE) {
-		reply(m, g_journal.done_token[m->job] == m->token ? M_ACK :
-		                                                    M_STALE);
+		reply(m,
+		    g_journal.done_token[m->job] == m->token ? M_ACK : M_STALE);
 		return;
 	}
 	if (q->state != JS_READY || q->token != m->token) {
@@ -731,8 +731,8 @@ jq_start(xtc_exec_t *e, const struct jq_config *cfg)
 	    (rc = start_sup(e, 3, &w[2], 2, &g_sup[2])) != XTC_OK ||
 	    (rc = xtc_proc_spawn(xtc_exec_loop(e, 1), store_main, NULL, NULL,
 	         NULL)) != XTC_OK ||
-	    (rc = xtc_proc_spawn(xtc_exec_loop(e, 1), producer_main, NULL,
-	         NULL, NULL)) != XTC_OK)
+	    (rc = xtc_proc_spawn(xtc_exec_loop(e, 1), producer_main, NULL, NULL,
+	         NULL)) != XTC_OK)
 		return rc;
 	return XTC_OK;
 }
@@ -761,16 +761,20 @@ check_writes(int j, char *why, size_t len)
 		if (g_store.log[i].job != j)
 			continue;
 		if (g_store.log[i].token < last) {
-			snprintf(why, len, "FENCE: job %d: a write under lease "
+			snprintf(why, len,
+			    "FENCE: job %d: a write under lease "
 			    "%llx landed after one under the newer lease %llx",
 			    j, (unsigned long long)g_store.log[i].token,
 			    (unsigned long long)last);
 			return 1;
 		}
-		if (g_store.log[i].token == last && g_store.log[i].worker != w) {
-			snprintf(why, len, "DOUBLE-EXEC: job %d: workers %d and "
-			    "%d both ran it under the one lease %llx", j, w,
-			    g_store.log[i].worker, (unsigned long long)last);
+		if (g_store.log[i].token == last &&
+		    g_store.log[i].worker != w) {
+			snprintf(why, len,
+			    "DOUBLE-EXEC: job %d: workers %d and "
+			    "%d both ran it under the one lease %llx",
+			    j, w, g_store.log[i].worker,
+			    (unsigned long long)last);
 			return 1;
 		}
 		last = g_store.log[i].token;
@@ -790,25 +794,30 @@ jq_check(char *why, size_t len)
 		return XTC_E_INTERNAL;
 	}
 	for (j = 0; j < g_cfg.n_jobs; j++) {
-		if (g_acked[j] && (g_lost[j] || g_journal.state[j] == JS_NONE)) {
-			snprintf(why, len, "ACKED-LOST: job %d was acknowledged "
-			    "and then lost", j);
+		if (g_acked[j] &&
+		    (g_lost[j] || g_journal.state[j] == JS_NONE)) {
+			snprintf(why, len,
+			    "ACKED-LOST: job %d was acknowledged "
+			    "and then lost",
+			    j);
 			return XTC_E_INTERNAL;
 		}
 		if (check_writes(j, why, len))
 			return XTC_E_INTERNAL;
 		if (g_journal.state[j] == JS_DONE &&
 		    g_store.fence[j] != g_journal.done_token[j]) {
-			snprintf(why, len, "RESULT: job %d completed under lease "
-			    "%llx, but the stored result is from lease %llx", j,
-			    (unsigned long long)g_journal.done_token[j],
+			snprintf(why, len,
+			    "RESULT: job %d completed under lease "
+			    "%llx, but the stored result is from lease %llx",
+			    j, (unsigned long long)g_journal.done_token[j],
 			    (unsigned long long)g_store.fence[j]);
 			return XTC_E_INTERNAL;
 		}
 	}
 	for (j = 0; j < g_cfg.n_jobs; j++)
 		if (!g_acked[j] || g_journal.state[j] != JS_DONE) {
-			snprintf(why, len, "LIVENESS: job %d is not done (%s)", j,
+			snprintf(why, len, "LIVENESS: job %d is not done (%s)",
+			    j,
 			    g_acked[j] ? "acknowledged" : "never acknowledged");
 			return XTC_E_INTERNAL;
 		}

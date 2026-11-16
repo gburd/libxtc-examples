@@ -21,16 +21,16 @@
 #include "xtc_exec.h"
 #include "xtc_proc.h"
 
-#define JQ_LOOPS 4    /* loop 0 queue, 1 store + producer, 2-3 workers */
-#define JQ_WORKERS 4  /* two per worker loop */
+#define JQ_LOOPS 4   /* loop 0 queue, 1 store + producer, 2-3 workers */
+#define JQ_WORKERS 4 /* two per worker loop */
 #define JQ_JOBS_MAX 64
 
 /* What a run does.  jq_config_default fills in the values main.c uses. */
 struct jq_config {
-	int n_jobs;          /* jobs the producer submits, <= JQ_JOBS_MAX */
-	int64_t lease_ns;    /* how long a lease lasts */
-	int64_t journal_ns;  /* one durable journal write (an fsync) */
-	int64_t give_up_ns;  /* the producer stops waiting after this */
+	int n_jobs;         /* jobs the producer submits, <= JQ_JOBS_MAX */
+	int64_t lease_ns;   /* how long a lease lasts */
+	int64_t journal_ns; /* one durable journal write (an fsync) */
+	int64_t give_up_ns; /* the producer stops waiting after this */
 };
 
 /* Counters a run leaves behind, for the harness's coverage report. */
