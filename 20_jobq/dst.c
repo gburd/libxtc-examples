@@ -73,10 +73,12 @@ struct outcome {
 	uint64_t state;
 	struct jq_stats stats;
 	int acts;
+	int tally[3]; /* queue kills, worker kills, cuts */
 	char why[256];
 };
 
-/* The buggify sites the sweep reached, and how often each was on. */
+/* The buggify sites the sweep reached, and how often each was on (over
+ * every run, two per seed). */
 static struct {
 	char name[48];
 	int reached, active;
@@ -85,7 +87,11 @@ static int g_n_sites;
 
 static struct faults g_f;
 static int g_acts;         /* nemesis actions this run */
-static int g_tally[3];     /* sweep totals: queue kills, worker kills, cuts */
+static int g_tally[3];     /* this run: queue kills, worker kills, cuts */
+static struct {
+	int tally[3];
+	int fenced, regrants, epochs; /* seeds where each happened */
+} g_sweep;
 static char g_why[256];    /* the consistency check's verdict */
 static int g_verbose;
 
@@ -241,6 +247,7 @@ run_seed(uint64_t seed, struct outcome *out)
 	pick_faults(seed, &g_f);
 	jq_config_default(&cfg);
 	g_acts = 0;
+	memset(g_tally, 0, sizeof g_tally);
 	g_why[0] = '\0';
 	if ((out->rc = xtc_exec_init(&e, JQ_LOOPS)) != XTC_OK)
 		return;
@@ -274,6 +281,7 @@ run_seed(uint64_t seed, struct outcome *out)
 	out->state = xtc_sim_state_hash(e);
 	out->stats = *jq_stats();
 	out->acts = g_acts;
+	memcpy(out->tally, g_tally, sizeof out->tally);
 	jq_finish();
 	(void)xtc_exec_fini(e);
 	if (out->rc != XTC_OK && g_why[0] == '\0' &&
@@ -288,6 +296,7 @@ same(const struct outcome *a, const struct outcome *b)
 {
 	return a->rc == b->rc && a->trace == b->trace &&
 	    a->state == b->state && a->acts == b->acts &&
+	    memcmp(a->tally, b->tally, sizeof a->tally) == 0 &&
 	    memcmp(&a->stats, &b->stats, sizeof a->stats) == 0;
 }
 
@@ -300,7 +309,21 @@ print_faults(void)
 	    g_f.kills, g_f.cuts);
 }
 
-/* Run seed twice: the invariants, then the replay.  0 or 1. */
+/* Add one passing seed to the sweep's coverage totals. */
+static void
+tally(const struct outcome *o)
+{
+	int k;
+
+	for (k = 0; k < 3; k++)
+		g_sweep.tally[k] += o->tally[k];
+	g_sweep.fenced += o->stats.fenced > 0;
+	g_sweep.regrants += o->stats.regrants > 0;
+	g_sweep.epochs += o->stats.epochs > 1;
+}
+
+/* Run seed twice: the invariants, then the replay.  0 or 1.  With -v
+ * only the first run prints its trace. */
 static int
 check_seed(const char *prog, uint64_t seed)
 {
@@ -314,7 +337,9 @@ check_seed(const char *prog, uint64_t seed)
 		printf("  replay: %s -v --replay %llu\n", prog, s);
 		return 1;
 	}
+	jq_set_verbose(0);
 	run_seed(seed, &b);
+	jq_set_verbose(g_verbose);
 	if (!same(&a, &b)) {
 		printf("FAIL seed %llu: NONDETERMINISM: the replay differs "
 		       "(trace %016llx vs %016llx, state %016llx vs %016llx)\n",
@@ -324,6 +349,7 @@ check_seed(const char *prog, uint64_t seed)
 		printf("  replay: %s -v --replay %llu\n", prog, s);
 		return 1;
 	}
+	tally(&a);
 	return 0;
 }
 
@@ -335,7 +361,10 @@ report(uint64_t n)
 	printf("OK: %llu seeds, each run twice and replayed identically\n",
 	    (unsigned long long)n);
 	printf("  nemesis: %d queue kills, %d worker kills, %d network cuts\n",
-	    g_tally[0], g_tally[1], g_tally[2]);
+	    g_sweep.tally[0], g_sweep.tally[1], g_sweep.tally[2]);
+	printf("  seeds where the queue restarted %d, a lease was granted "
+	       "again %d, the store fenced a stale write %d\n",
+	    g_sweep.epochs, g_sweep.regrants, g_sweep.fenced);
 	for (k = 0; k < g_n_sites; k++)
 		printf("  buggify %-28s reached in %5d runs, on in %5d\n",
 		    g_sites[k].name, g_sites[k].reached, g_sites[k].active);

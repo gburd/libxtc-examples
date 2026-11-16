@@ -67,6 +67,7 @@ History: split from libxtc's `examples/` (and `test/sqlxtc`, `test/m99`,
 | `17_checkout/` | **A checkout service: `xtc_saga` + `xtc_pool` + `xtc_pdict`.**  Six orders, each a proc running a four-step saga (quote, reserve, charge, ship) over two pooled backend connections; three fail at different steps and are compensated in reverse (refund, release).  The request context lives in the proc's dictionary.  Checks the ledger balances.  See its README. |
 | `18_clickstream/` | **Web analytics: `xtc_stream` + `xtc_bloom` + `xtc_hll`.**  Four front-end logs, one proc per loop, each a lazy map/filter pipeline; a Bloom filter drops lines the shipper delivered twice; per-shard HyperLogLog sketches merge into the distinct-user count.  Checked against an exact oracle.  See its README. |
 | `19_edgeacl/` | **An edge gateway's IP access table: `xtc_cskip` + `xtc_rcu` + `xtc_cfg` sessions.**  Eight sessions on four loops do floor lookups in a range table while a feed rewrites it; every live answer is checked against per-version snapshots.  Settings read through `xtc_cfg_ref`, overridden per session, changed globally at run time, and rolled back per request.  See its README. |
+| `20_jobq/` | **A job queue with leases and fencing tokens, tested by its own deterministic simulation**: a supervised queue that recovers from a journal, an object store that refuses stale writes by token, four workers and a producer on four loops.  `dst.c` uses only the public `xtc_sim.h`: a seeded fault mix (latency, reordering, starvation, clock jitter, the service's own `XTC_SIM_BUGGIFY` sites), a nemesis that kills the queue and workers and cuts loops off, the invariants checked at quiescence, and every seed run twice to prove the replay.  Three planted bugs, each caught within seven seeds.  `make check` runs it (300 seeds, about 1 s).  See its README. |
 
 ## What each example proves
 
@@ -108,6 +109,13 @@ reference C++ data structure faithfully while fixing its latent
 AVL-delete and book-edge bugs, proven by an invariant fuzzer (30 seeds
 x 2M ops) and clean ASan/UBSan runs where the stock C++ original
 crashes.
+
+**20** -- an application can be tested the way libxtc tests itself.  The
+same service code runs on real threads (`main.c`) and under the
+simulator (`dst.c`), and the simulator finds what a stress test cannot
+replay: a stale lease holder's write after a newer one, an acknowledged
+job lost to a crash, a shutdown that waits on a lost message.  Each
+failure comes with the seed that replays it.
 
 **12** -- batch membership and scheduling policy are separate controls.
 The same unsigned vector kernel runs in all four mode/policy combinations;
