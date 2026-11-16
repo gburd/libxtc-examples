@@ -28,7 +28,7 @@ xtc-sim` gives its link line.  In a libxtc build tree, `make check` runs
 both halves (`check-jobq`; a native build makes its own simulation
 library in `jobq-sim/` the first time), and `make check-jobq-sweep
 JOBQ_SEEDS=100000` runs a longer sweep.  20,000 seeds (four shards of
-5,000 from bases 0, 5000, 10000 and 15000) pass, with 87,000 injected
+5,000 from bases 0, 5000, 10000 and 15000) pass, with 92,763 injected
 crashes and 32,000 network cuts.
 
 ## What deterministic simulation testing is
