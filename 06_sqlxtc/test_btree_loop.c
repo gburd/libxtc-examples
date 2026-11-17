@@ -108,13 +108,13 @@ main(void)
 	if (bt_open(g_bm, &g_bt) != XTC_OK) { fprintf(stderr, "bt_open\n"); return 1; }
 
 	xtc_atomic_store_i32(&g_result, 0, xtc_mo_seq_cst);
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, &pp) != XTC_OK) return 1;
 	if (bm_trickler_spawn(g_bm, loop, 1LL * 1000 * 1000, NULL) != XTC_OK) return 1;
 	opts.name = "bt-worker";
 	if (xtc_proc_spawn(loop, worker_proc, NULL, &opts, &w) != XTC_OK) return 1;
 	if (xtc_loop_run(loop) != XTC_OK) { fprintf(stderr, "loop_run\n"); return 1; }
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	bm_get_stats(g_bm, &bs);
 	bt_get_stats(g_bt, &ts);

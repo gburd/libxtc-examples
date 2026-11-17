@@ -37,6 +37,7 @@
 #include "xtc_orc.h"
 #include "xtc_proc.h"
 #include "xtc_res.h"
+#include "xtc_runtime.h"
 
 #include "conn.h"
 #include "db.h"
@@ -433,10 +434,10 @@ main(int argc, char **argv)
 {
 	server_t *srv = &g_server;
 	server_cfg_t cfg;
-	xtc_log_opts_t log_opts = XTC_LOG_OPTS_DEFAULT;
+	xtc_log_opts_t log_opts = XTC_LOG_OPTS_INIT;
 	xtc_log_t *log;
-	xtc_res_caps_t caps = XTC_RES_CAPS_DEFAULT;
-	xtc_tcp_opts_t tcp_opts = XTC_TCP_OPTS_DEFAULT;
+	xtc_res_caps_t caps = XTC_RES_CAPS_INIT;
+	xtc_tcp_opts_t tcp_opts = XTC_TCP_OPTS_INIT;
 	db_opts_t db_opts = DB_OPTS_DEFAULT;
 	xtc_pid_t metrics_pid;
 	int i, rc, exit_rc = 0, mem_store = 0;
@@ -444,7 +445,7 @@ main(int argc, char **argv)
 	/* Parsing and execution have deeper stacks than a small actor,
 	 * particularly with sanitizer instrumentation. Set this before
 	 * creating any fibers (the runtime default is 64 KiB). */
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK) {
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK) {
 		fprintf(stderr, "cannot configure SQL fiber stack\n");
 		return 1;
 	}
@@ -550,7 +551,7 @@ main(int argc, char **argv)
 			        cfg.host, cfg.port);
 			return 1;
 		}
-		(void)xtc_sleep_ns(50LL * 1000 * 1000);
+		(void)xtc_thrd_sleep_ns(50LL * 1000 * 1000);
 	}
 	xtc_net_setnonblock(srv->listen_fd);
 
@@ -563,8 +564,8 @@ main(int argc, char **argv)
 	 * <= 1 is a single supervised loop.  The root supervisor restarts
 	 * the listener if it crashes. */
 	{
-		xtc_app_opts_t app_opts = XTC_APP_OPTS_DEFAULT;
-		xtc_sup_opts_t app_opts_sup = XTC_SUP_OPTS_DEFAULT;
+		xtc_app_opts_t app_opts = XTC_APP_OPTS_INIT;
+		xtc_sup_opts_t app_opts_sup = XTC_SUP_OPTS_INIT;
 		xtc_child_spec_t kids[1];
 		app_opts.name = "sqlxtc";
 		app_opts.n_loops = cfg.threads > 1 ? cfg.threads : 1;

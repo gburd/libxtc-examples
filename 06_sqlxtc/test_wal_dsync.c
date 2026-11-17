@@ -120,16 +120,18 @@ main(void)
 	CK(fl >= 0 && (fl & O_DSYNC) == O_DSYNC);
 
 	/* one fiber alone first: the per-commit cost of a lone committer */
-	CK(xtc_exec_init(&ex, 1) == XTC_OK);
+	CK(xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = 1 }, &ex) == XTC_OK);
 	CK(xtc_proc_spawn(xtc_exec_loop(ex, 0), fiber_main, (void *)(intptr_t)0,
 	    &po, &p) == XTC_OK);
 	(void)xtc_exec_run(ex);
-	(void)xtc_exec_fini(ex);
+	xtc_exec_destroy(ex);
 	printf("  one fiber: %.1f us per commit\n",
 	    (double)g_fiber_ns / 1e3 / PER);
 
 	/* fibers on 2 loops and plain threads at once */
-	CK(xtc_exec_init(&ex, 2) == XTC_OK);
+	CK(xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = 2 }, &ex) == XTC_OK);
 	for (i = 1; i <= NF; i++)
 		CK(xtc_proc_spawn(xtc_exec_loop(ex, (int)(i % 2)), fiber_main,
 		    (void *)(intptr_t)i, &po, &p) == XTC_OK);
@@ -139,7 +141,7 @@ main(void)
 	(void)xtc_exec_run(ex);
 	for (i = 0; i < NT; i++)
 		(void)pthread_join(th[i], NULL);
-	(void)xtc_exec_fini(ex);
+	xtc_exec_destroy(ex);
 	CK(xtc_atomic_load_long(&g_ok, xtc_mo_seq_cst) ==
 	    (long)(1 + NF + NT) * PER);
 	CK(xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst) == 0);

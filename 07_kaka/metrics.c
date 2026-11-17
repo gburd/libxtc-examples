@@ -30,7 +30,7 @@ static int            g_inited;
 void
 kaka_metrics_init(void)
 {
-	xtc_res_caps_t caps = XTC_RES_CAPS_DEFAULT;
+	xtc_res_caps_t caps = XTC_RES_CAPS_INIT;
 
 	if (g_inited)
 		return;

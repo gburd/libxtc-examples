@@ -31,6 +31,7 @@
 #include "xtc_orc.h"
 #include "xtc_proc.h"
 #include "xtc_res.h"
+#include "xtc_runtime.h"
 
 #include "broker.h"
 #include "metrics.h"
@@ -206,11 +207,11 @@ main(int argc, char **argv)
 	broker_t          *b;
 	broker_cfg_t       cfg;
 	xtc_log_t         *log = NULL;
-	xtc_log_opts_t     log_opts = XTC_LOG_OPTS_DEFAULT;
-	xtc_app_opts_t     app_opts = XTC_APP_OPTS_DEFAULT;
-	xtc_sup_opts_t     app_opts_sup = XTC_SUP_OPTS_DEFAULT;
+	xtc_log_opts_t     log_opts = XTC_LOG_OPTS_INIT;
+	xtc_app_opts_t     app_opts = XTC_APP_OPTS_INIT;
+	xtc_sup_opts_t     app_opts_sup = XTC_SUP_OPTS_INIT;
 	xtc_child_spec_t   kids[1];
-	xtc_tcp_opts_t     tcp_opts = XTC_TCP_OPTS_DEFAULT;
+	xtc_tcp_opts_t     tcp_opts = XTC_TCP_OPTS_INIT;
 	int                rc;
 
 	/* 1 = --help (success), -1 = bad option (usage already printed). */
@@ -246,7 +247,7 @@ main(int argc, char **argv)
 	 * job on that loop's io-wq.  The library caps a ring's bounded
 	 * io-wq at 4 workers (built for many-carrier hosts), which would
 	 * cap the broker at 4 concurrent partition syncs. */
-	xtc_io_set_iowq_max_workers(MAX_SYNC_WORKERS, 0);
+	xtc_runtime_set_iowq_workers(MAX_SYNC_WORKERS, 0);
 
 	app_opts.name = "kaka";
 	app_opts_sup.strategy = XTC_SUP_ONE_FOR_ONE;

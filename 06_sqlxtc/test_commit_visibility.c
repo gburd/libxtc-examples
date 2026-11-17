@@ -208,7 +208,8 @@ main(void)
 		xtc_atomic_store_long(&g_nonrepeat, 0, xtc_mo_seq_cst);
 		xtc_atomic_store_long(&g_reads, 0, xtc_mo_seq_cst);
 		xtc_atomic_store_long(&g_badkeys, 0, xtc_mo_seq_cst);
-		if (xtc_exec_init(&ex, nloops) != XTC_OK) return 1;
+		if (xtc_exec_create(&(xtc_exec_opts_t){
+		    .size = sizeof(xtc_exec_opts_t), .n_loops = nloops }, &ex) != XTC_OK) return 1;
 		if (wal_writer_spawn(g_wal, xtc_exec_loop(ex, 0), NULL) != XTC_OK) return 1;
 		for (i = 0; i < READERS; i++)
 			if (xtc_proc_spawn(xtc_exec_loop(ex, i % nloops), reader, NULL,
@@ -217,7 +218,7 @@ main(void)
 		if (xtc_proc_spawn(xtc_exec_loop(ex, 0), writer, NULL, &po, &pid) != XTC_OK)
 			return 1;
 		if (xtc_exec_run(ex) != XTC_OK) return 1;
-		(void)xtc_exec_fini(ex);
+		xtc_exec_destroy(ex);
 		printf(
 		    "  [%d loop%s] reads=%ld torn-scans=%ld non-repeatable-snapshots=%ld"
 		    " bad-key-sets=%ld\n",

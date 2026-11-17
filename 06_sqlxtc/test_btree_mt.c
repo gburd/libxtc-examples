@@ -196,7 +196,8 @@ main(void)
 	xtc_atomic_store_long(&g_read_hits, 0, xtc_mo_seq_cst);
 	xtc_atomic_store_long(&g_read_mismatch, 0, xtc_mo_seq_cst);
 
-	if (xtc_exec_init(&exec, N_LOOPS) != XTC_OK) { fprintf(stderr, "exec_init\n"); return 1; }
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = N_LOOPS }, &exec) != XTC_OK) { fprintf(stderr, "exec_init\n"); return 1; }
 	l0 = xtc_exec_loop(exec, 0);
 	if (bm_provider_spawn(g_bm, l0, 1LL * 1000 * 1000, NULL) != XTC_OK) return 1;
 
@@ -229,7 +230,7 @@ main(void)
 
 	if (xtc_exec_run(exec) != XTC_OK) { fprintf(stderr, "exec_run\n"); return 1; }
 	bm_provider_stop(g_bm);
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 
 	/* Gate: every key must be present with the correct value. */
 	for (i = 0; i < N_KEYS; i++) {

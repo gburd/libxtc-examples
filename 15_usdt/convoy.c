@@ -137,7 +137,7 @@ main(int argc, char **argv)
 	lostwake = strcmp(mode, "lostwake") == 0;
 
 	if (xtc_amutex_create(&g_mu) != XTC_OK ||
-	    xtc_loop_init(&loop) != XTC_OK)
+	    xtc_loop_create(&loop) != XTC_OK)
 		return 1;
 	t0 = xtc_clock_mono();
 	if (lostwake) {
@@ -152,7 +152,7 @@ main(int argc, char **argv)
 	if (xtc_loop_run(loop) != XTC_OK)
 		return 1;
 	t1 = xtc_clock_mono();
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	xtc_amutex_destroy(g_mu);
 
 	if (lostwake) {

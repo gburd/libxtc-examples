@@ -171,7 +171,8 @@ main(int argc, char **argv)
 	load1 = now_ns();
 
 	/* executor + the engine's background procs (incl. group-commit writer) */
-	if (xtc_exec_init(&exec, g_loops) != XTC_OK) return 1;
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = g_loops }, &exec) != XTC_OK) return 1;
 	if (sx_storage_run(xtc_exec_loop(exec, 0)) != SX_OK) return 1;
 
 	ws = calloc((size_t)nworkers, sizeof *ws);
@@ -184,7 +185,7 @@ main(int argc, char **argv)
 		    &ws[t], &opts, &pid) != XTC_OK) return 1;
 	}
 	if (xtc_exec_run(exec) != XTC_OK) return 1;
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 	sx_storage_close();
 	(void)sx_shutdown();
 

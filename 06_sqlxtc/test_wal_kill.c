@@ -39,6 +39,7 @@
 #include "xtc_exec.h"
 #include "xtc_preempt.h"
 #include "xtc_preempt_involuntary.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define NL        4
@@ -250,7 +251,7 @@ watchdog(void *arg)
 				abort();          /* leave a core / stop under gdb */
 			_exit(3);
 		}
-		(void)xtc_sleep_ns(50LL * 1000 * 1000);
+		(void)xtc_thrd_sleep_ns(50LL * 1000 * 1000);
 	}
 	return NULL;
 }
@@ -469,7 +470,8 @@ run_mode(const char *mode)
 	close(fd);
 	memset(&wo, 0, sizeof wo);
 	wo.path = path;
-	if (wal_open(&wo, &g_wal) != XTC_OK || xtc_exec_init(&exec, NL) != XTC_OK)
+	if (wal_open(&wo, &g_wal) != XTC_OK || xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = NL }, &exec) != XTC_OK)
 		return 1;
 	g_exec = exec;
 	if (g_cfg.preempt) {
@@ -477,7 +479,7 @@ run_mode(const char *mode)
 		/* Only the XTC_PREEMPTIBLE committer path is preemptible:
 		 * this binary links libxtc statically. */
 		if (xtc_preempt_involuntary_supported() &&
-		    xtc_preempt_set_involuntary(1) != XTC_OK)
+		    xtc_runtime_set_preempt_involuntary(1) != XTC_OK)
 			return 1;
 	}
 	(void)wal_writer_spawn(g_wal, xtc_exec_loop(exec, 0), NULL);
@@ -492,9 +494,9 @@ run_mode(const char *mode)
 		(void)pthread_join(th[i], NULL);
 	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 	if (g_cfg.preempt)
-		(void)xtc_preempt_set_involuntary(0);
+		(void)xtc_runtime_set_preempt_involuntary(0);
 
 	if (wal_scan(path, scan_cb, found) != XTC_OK)
 		fail = 1;

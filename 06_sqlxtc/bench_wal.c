@@ -184,7 +184,8 @@ main(int argc, char **argv)
 	t0 = xtc_clock_mono();
 	g_end = t0 + (int64_t)secs * 1000000000LL;
 	if (fiber) {
-		if (xtc_exec_init(&ex, loops) != XTC_OK)
+		if (xtc_exec_create(&(xtc_exec_opts_t){
+		    .size = sizeof(xtc_exec_opts_t), .n_loops = loops }, &ex) != XTC_OK)
 			return 1;
 		xtc_atomic_store_i32(&g_live, c, xtc_mo_seq_cst);
 		for (i = 0; i < c; i++) {
@@ -195,7 +196,7 @@ main(int argc, char **argv)
 				return 1;
 		}
 		(void)xtc_exec_run(ex);
-		(void)xtc_exec_fini(ex);
+		xtc_exec_destroy(ex);
 	} else {
 		for (i = 0; i < c; i++)
 			if (pthread_create(&th[i], NULL, thread_main, (void *)(intptr_t)i))

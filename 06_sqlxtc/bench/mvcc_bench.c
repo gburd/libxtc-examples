@@ -129,7 +129,8 @@ main(int argc, char **argv)
 	g_lat_ns = calloc(n_samples, sizeof *g_lat_ns);
 	if (g_lat_ns == NULL) { fprintf(stderr, "oom\n"); return 1; }
 
-	if (xtc_exec_init(&exec, g_cores) != XTC_OK) { fprintf(stderr, "exec\n"); return 1; }
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = g_cores }, &exec) != XTC_OK) { fprintf(stderr, "exec\n"); return 1; }
 	for (c = 0; c < g_cores; c++) sl[c] = xtc_exec_loop(exec, c);
 	if (mvcc_start(sl, g_cores, xtc_exec_loop(exec, 0)) != XTC_OK) { fprintf(stderr, "mvcc\n"); return 1; }
 
@@ -145,7 +146,7 @@ main(int argc, char **argv)
 	if (xtc_exec_run(exec) != XTC_OK) { fprintf(stderr, "run\n"); return 1; }
 	wall1 = now_ns();
 	mvcc_fini();
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 
 	secs = (double)(wall1 - wall0) / 1e9;
 	kops = (double)n_samples / secs / 1000.0;

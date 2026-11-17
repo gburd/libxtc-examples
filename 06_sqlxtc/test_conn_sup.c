@@ -53,6 +53,7 @@
 #include "xtc_inspect.h"
 #include "xtc_io.h"
 #include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 /* conn.c's view of main.c's server: only the connection count. */
@@ -394,7 +395,7 @@ watchdog(void *arg)
 			fprintf(stderr, "FAIL: test_conn_sup: hang\n");
 			_exit(3);
 		}
-		(void)xtc_sleep_ns(50LL * 1000 * 1000);
+		(void)xtc_thrd_sleep_ns(50LL * 1000 * 1000);
 	}
 	return NULL;
 }
@@ -403,7 +404,7 @@ int
 main(int argc, char **argv)
 {
 	const char *sfx[] = { "", "-wal", ".dwb", "-wal.ocompact", "-wal.compact" };
-	xtc_res_caps_t caps = XTC_RES_CAPS_DEFAULT;
+	xtc_res_caps_t caps = XTC_RES_CAPS_INIT;
 	db_opts_t dopt = DB_OPTS_DEFAULT;
 	xtc_proc_opts_t bo = { .size = sizeof(xtc_proc_opts_t), .name = "boss" };
 	char side[320], sql[96];
@@ -417,7 +418,7 @@ main(int argc, char **argv)
 	if (getenv("XTC_UNDER_VALGRIND") != NULL ||
 	    getenv("XTC_TEST_EMULATED") != NULL)
 		g_slow = 20;
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK)
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK)
 		return 1;
 	t_tmpl(g_path, sizeof g_path, "sqlxtc-connsup");
 	if ((fd = mkstemp(g_path)) < 0)
@@ -441,7 +442,8 @@ main(int argc, char **argv)
 	dopt.res = &g_res;
 	if (db_create(&dopt, &g_db) != XTC_OK)
 		return 1;
-	if (xtc_exec_init(&g_exec, 2) != XTC_OK ||
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = 2 }, &g_exec) != XTC_OK ||
 	    sx_storage_run(xtc_exec_loop(g_exec, 0)) != SX_OK ||
 	    xtc_proc_spawn(xtc_exec_loop(g_exec, 0), boss, NULL, &bo, &bp) != XTC_OK)
 		return 1;
@@ -449,7 +451,7 @@ main(int argc, char **argv)
 	(void)xtc_exec_run(g_exec);
 	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
-	(void)xtc_exec_fini(g_exec);
+	xtc_exec_destroy(g_exec);
 	(void)sx_storage_close();
 	(void)sx_shutdown();
 	for (i = 0; i < (int)(sizeof sfx / sizeof sfx[0]); i++) {

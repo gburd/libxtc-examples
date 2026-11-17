@@ -990,11 +990,11 @@ lob_book_create(lob_book_t **out)
 	if (b == NULL)
 		return XTC_E_NOMEM;
 
-	xtc_slab_opts_t oopts = XTC_SLAB_OPTS_DEFAULT;
+	xtc_slab_opts_t oopts = XTC_SLAB_OPTS_INIT;
 	oopts.name = "lob-order";
 	oopts.obj_size = sizeof(lob_order_t);
 	oopts.align = _Alignof(lob_order_t);
-	xtc_slab_opts_t lopts = XTC_SLAB_OPTS_DEFAULT;
+	xtc_slab_opts_t lopts = XTC_SLAB_OPTS_INIT;
 	lopts.name = "lob-limit";
 	lopts.obj_size = sizeof(lob_limit_t);
 	lopts.align = _Alignof(lob_limit_t);

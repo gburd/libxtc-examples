@@ -118,7 +118,7 @@ run_one(int n_loops, const char *tag)
 	if (n_loops <= 1) {
 		xtc_loop_t *loop = NULL;
 		long c;
-		assert(xtc_loop_init(&loop) == XTC_OK);
+		assert(xtc_loop_create(&loop) == XTC_OK);
 		assert(wal_writer_spawn(g_wal, loop, NULL) == XTC_OK);
 		for (c = 0; c < N_COMMITTERS; c++) {
 			xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "cmt" };
@@ -126,11 +126,12 @@ run_one(int n_loops, const char *tag)
 			assert(xtc_proc_spawn(loop, committer_proc, (void *)c, &po, &pid) == XTC_OK);
 		}
 		assert(xtc_loop_run(loop) == XTC_OK);
-		assert(xtc_loop_fini(loop) == XTC_OK);
+		xtc_loop_destroy(loop);
 	} else {
 		xtc_exec_t *exec = NULL;
 		long c;
-		assert(xtc_exec_init(&exec, n_loops) == XTC_OK);
+		assert(xtc_exec_create(&(xtc_exec_opts_t){
+		    .size = sizeof(xtc_exec_opts_t), .n_loops = n_loops }, &exec) == XTC_OK);
 		assert(wal_writer_spawn(g_wal, xtc_exec_loop(exec, 0), NULL) == XTC_OK);
 		for (c = 0; c < N_COMMITTERS; c++) {
 			xtc_loop_t *lp = xtc_exec_loop(exec, (int)(c % n_loops));
@@ -139,7 +140,7 @@ run_one(int n_loops, const char *tag)
 			assert(xtc_proc_spawn(lp, committer_proc, (void *)c, &po, &pid) == XTC_OK);
 		}
 		assert(xtc_exec_run(exec) == XTC_OK);
-		(void)xtc_exec_fini(exec);
+		xtc_exec_destroy(exec);
 	}
 
 	wal_get_stats(g_wal, &st);

@@ -362,14 +362,14 @@ main(void)
 		xtc_loop_t *sl[N_SHARDS], *cl[N_CLIENTS];
 		int i;
 
-		assert(xtc_loop_init(&loop) == XTC_OK);
+		assert(xtc_loop_create(&loop) == XTC_OK);
 		for (i = 0; i < N_SHARDS; i++) sl[i] = loop;
 		for (i = 0; i < N_CLIENTS; i++) cl[i] = loop;
 		if (spawn_all(loop, sl, cl) != XTC_OK) { fprintf(stderr, "spawn\n"); return 1; }
 		assert(xtc_loop_run(loop) == XTC_OK);
 		if (verify("single-loop", 1) != 0) return 1;
 		cleanup();
-		assert(xtc_loop_fini(loop) == XTC_OK);
+		xtc_loop_destroy(loop);
 	}
 
 	/* Executor run: one shard per loop (== one core), clients spread
@@ -381,7 +381,8 @@ main(void)
 		xtc_loop_t *sl[N_SHARDS], *cl[N_CLIENTS];
 		int i;
 
-		assert(xtc_exec_init(&exec, N_SHARDS) == XTC_OK);
+		assert(xtc_exec_create(&(xtc_exec_opts_t){
+		    .size = sizeof(xtc_exec_opts_t), .n_loops = N_SHARDS }, &exec) == XTC_OK);
 		for (i = 0; i < N_SHARDS; i++) sl[i] = xtc_exec_loop(exec, i);
 		for (i = 0; i < N_CLIENTS; i++) cl[i] = xtc_exec_loop(exec, i % N_SHARDS);
 		if (spawn_all(xtc_exec_loop(exec, 0), sl, cl) != XTC_OK) {
@@ -390,7 +391,7 @@ main(void)
 		assert(xtc_exec_run(exec) == XTC_OK);
 		if (verify("4-loop executor", 0) != 0) return 1;
 		cleanup();
-		(void)xtc_exec_fini(exec);
+		xtc_exec_destroy(exec);
 	}
 
 	printf("All sqlxtc sharded-store tests passed.\n");

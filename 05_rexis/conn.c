@@ -883,7 +883,7 @@ conn_proc(void *arg)
 	 * was skipped on a kill, leaking the fd and both buffers; the scope
 	 * closes them LIFO no matter how the fiber leaves.  See
 	 * conn_teardown(). */
-	scope = xtc_scope_open();
+	scope = xtc_scope_enter();
 	if (scope != NULL)
 		(void)xtc_scope_defer(scope, conn_teardown, st);
 
@@ -1035,7 +1035,7 @@ conn_proc(void *arg)
 	 * runs the same finalizer -- so this one call and the kill path are
 	 * the SAME cleanup, and neither can leak. */
 	if (scope != NULL)
-		xtc_scope_close(scope);
+		xtc_scope_leave(scope);
 	else
 		conn_teardown(st);   /* off a proc / scope exhausted: clean up directly */
 }

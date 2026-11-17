@@ -174,11 +174,11 @@ scenario_onloop(void)
 	g_fail = 0;
 	CK(bm_create(&bo, &g_bm) == XTC_OK);
 	CK(bt_open(g_bm, &g_bt) == XTC_OK);
-	CK(xtc_loop_init(&loop) == XTC_OK);
+	CK(xtc_loop_create(&loop) == XTC_OK);
 	CK(bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, NULL) == XTC_OK);
 	CK(xtc_proc_spawn(loop, sql_proc, NULL, &po, &pid) == XTC_OK);
 	CK(xtc_loop_run(loop) == XTC_OK);
-	CK(xtc_loop_fini(loop) == XTC_OK);
+	xtc_loop_destroy(loop);
 	bt_close(g_bt); bm_destroy(g_bm); unlink(path);
 	{ char wal[288]; snprintf(wal, sizeof wal, "%s-wal", path); unlink(wal); }
 	return g_loop_rc || g_fail;

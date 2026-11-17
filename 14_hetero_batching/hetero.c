@@ -295,7 +295,7 @@ fake_submit(struct group *g, const xtc_batch_item_t *items, size_t n,
 	{
 		xtc_promise_t *prom;
 		xtc_future_t *fut;
-		if (xtc_future_new_pair(&prom, &fut) != XTC_OK)
+		if (xtc_future_create(&prom, &fut) != XTC_OK)
 			return XTC_E_NOMEM;
 		exec->future = fut;
 		xtc_promise_set(prom, 0, XTC_OK);
@@ -456,7 +456,7 @@ dev_waiter_post(struct group *g, int (*wait)(void *),
 	xtc_promise_t *prom;
 	xtc_future_t *fut;
 
-	if (xtc_future_new_pair(&prom, &fut) != XTC_OK)
+	if (xtc_future_create(&prom, &fut) != XTC_OK)
 		return XTC_E_NOMEM;
 	pthread_mutex_lock(&g->wmu);
 	g->wwait = wait;
@@ -1137,7 +1137,7 @@ feeder(void *arg)
 		while (g->n_terminal < target)
 			must(xtc_notify_wait(g->done_note, -1), "wait");
 	}
-	must(xtc_batch_close(g->batch, XTC_BATCH_DRAIN), "close");
+	must(xtc_batch_shutdown(g->batch, XTC_BATCH_DRAIN), "close");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1189,7 +1189,8 @@ run(struct demo *d, int nreqs)
 	int i, per;
 
 	memset(&rs, 0, sizeof rs);
-	must(xtc_exec_init(&exec, d->ngroups), "exec_init");
+	must(xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = d->ngroups }, &exec), "exec_init");
 	build_reqs(d, nreqs);
 	per = (d->nreqs + d->ngroups - 1) / d->ngroups;
 	for (i = 0; i < d->ngroups; i++) {
@@ -1246,7 +1247,7 @@ run(struct demo *d, int nreqs)
 	if (rs.total_submits > 0)
 		rs.avg_occupancy = (double)rs.total_members /
 		    (double)rs.total_submits;
-	must(xtc_exec_fini(exec), "exec_fini");
+	xtc_exec_destroy(exec);
 	return rs;
 }
 

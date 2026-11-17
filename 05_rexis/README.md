@@ -48,7 +48,7 @@ as are inline commands (`PING\r\n`, `SET k v\r\n` -- what telnet and
 `nc` send; words are split on spaces/tabs and not unquoted).
 
 Pub/Sub is built on libxtc process groups (`xtc_pg`, over the
-duplicate-key registry `xtc_reg_register_dup`): SUBSCRIBE joins the
+duplicate-key registry `xtc_reg_put`): SUBSCRIBE joins the
 connection's pid to a channel group, PUBLISH fans a RESP push frame out
 to every subscriber's mailbox (which the connection proc appends to its
 socket), and a closing connection calls `xtc_reg_drop_pid` to leave every

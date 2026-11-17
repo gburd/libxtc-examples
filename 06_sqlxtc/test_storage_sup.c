@@ -36,6 +36,7 @@
 #include "xtc_inspect.h"
 #include "xtc_loop.h"
 #include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define NW       4
@@ -220,7 +221,7 @@ watchdog(void *arg)
 			    g_session);
 			_exit(3);
 		}
-		(void)xtc_sleep_ns(50LL * 1000 * 1000);
+		(void)xtc_thrd_sleep_ns(50LL * 1000 * 1000);
 	}
 	return NULL;
 }
@@ -257,7 +258,8 @@ session(int s)
 	if (sx_storage_open(g_path, 64) != SX_OK)
 		return -1;
 	sx_storage_on_failure(on_failure, NULL);
-	if (xtc_exec_init(&g_exec, 2) != XTC_OK ||
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = 2 }, &g_exec) != XTC_OK ||
 	    sx_storage_run(xtc_exec_loop(g_exec, 0)) != SX_OK ||
 	    xtc_proc_spawn(xtc_exec_loop(g_exec, 0), boss, NULL, &bo, &bp) != XTC_OK)
 		return -1;
@@ -265,7 +267,7 @@ session(int s)
 	(void)xtc_exec_run(g_exec);
 	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
-	(void)xtc_exec_fini(g_exec);
+	xtc_exec_destroy(g_exec);
 	CK(sx_storage_close() == SX_OK);
 	rows = count_rows();
 	printf("  session %d: restarts pp %d tr %d  hooks ckpt %d wal %d "
@@ -300,7 +302,7 @@ main(int argc, char **argv)
 	if (getenv("XTC_UNDER_VALGRIND") != NULL ||
 	    getenv("XTC_TEST_EMULATED") != NULL)
 		g_bound_ms *= 20;
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK)
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK)
 		return 1;
 	t_tmpl(g_path, sizeof g_path, "sqlxtc-storsup");
 	if ((fd = mkstemp(g_path)) < 0)

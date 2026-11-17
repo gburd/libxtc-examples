@@ -225,7 +225,7 @@ The entire surface is in `<xtc_tnt.h>`; see `man xtc_tnt`:
 
 - Types: `xtc_tnt_handle_t`, `xtc_tnt_transition_t`,
   `xtc_tnt_message_t`, `xtc_tnt_type_t`, `xtc_tnt_spec_t`.
-- Boot: `xtc_tnt_start`, `xtc_tnt_stop`, `xtc_tnt_spawn_on`.
+- Boot: `xtc_tnt_run`, `xtc_tnt_stop`, `xtc_tnt_spawn_on`.
 - Ambient (handler-only): `xtc_tnt_send`, `xtc_tnt_spawn`,
   `xtc_tnt_submit_recv`, `xtc_tnt_io_send`, `xtc_tnt_submit_close`,
   `xtc_tnt_register_timer`, `xtc_tnt_self`, `xtc_tnt_shard_id`,

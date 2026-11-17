@@ -275,7 +275,7 @@ fake_submit(struct group *g, const xtc_batch_item_t *items, size_t n,
 	{
 		xtc_promise_t *prom;
 		xtc_future_t *fut;
-		if (xtc_future_new_pair(&prom, &fut) != XTC_OK)
+		if (xtc_future_create(&prom, &fut) != XTC_OK)
 			return XTC_E_NOMEM;
 		exec->future = fut;
 		/* Resolve immediately: the work already ran in submit. The
@@ -528,7 +528,7 @@ cl_submit(struct group *g, const xtc_batch_item_t *items, size_t n,
 		}
 	}
 	clFlush(g->q);
-	if (xtc_future_new_pair(&prom, &fut) != XTC_OK) {
+	if (xtc_future_create(&prom, &fut) != XTC_OK) {
 		if (ev != NULL)
 			clReleaseEvent(ev);
 		clFinish(g->q);
@@ -745,7 +745,7 @@ feeder(void *arg)
 			must(xtc_notify_wait(g->done_note, -1), "wait");
 	}
 	/* DRAIN finishes every submitted tile before the driver exits. */
-	must(xtc_batch_close(g->batch, XTC_BATCH_DRAIN), "close");
+	must(xtc_batch_shutdown(g->batch, XTC_BATCH_DRAIN), "close");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -773,7 +773,8 @@ run(struct demo *d)
 	xtc_batch_async_opts_t opts;
 	int i, slice, per;
 
-	must(xtc_exec_init(&exec, d->ngroups), "exec_init");
+	must(xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = d->ngroups }, &exec), "exec_init");
 	build_tiles(d);
 	/* Partition tiles across groups (round-robin would interleave depth;
 	 * contiguous slices keep each group's workload reproducible). */
@@ -827,7 +828,7 @@ run(struct demo *d)
 	if (rs.total_submits > 0)
 		rs.avg_occupancy = (double)rs.total_members /
 		    (double)rs.total_submits;
-	must(xtc_exec_fini(exec), "exec_fini");
+	xtc_exec_destroy(exec);
 	return rs;
 }
 

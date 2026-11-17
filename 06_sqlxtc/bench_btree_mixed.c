@@ -181,7 +181,8 @@ main(int argc, char **argv)
 		snprintf(v, sizeof v, "v%010ld", i);
 		if (bt_insert(g_bt, k, 11, v, 11) != XTC_OK) return 1;
 	}
-	if (xtc_exec_init(&e, L) != XTC_OK) return 1;
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = L }, &e) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, xtc_exec_loop(e, 0), 1000000LL, NULL) != XTC_OK)
 		return 1;
 	xtc_atomic_store_i32(&g_left, L * (R + W), xtc_mo_seq_cst);
@@ -197,7 +198,7 @@ main(int argc, char **argv)
 	g_stop_at = xtc_clock_mono() + (int64_t)secs * 1000000000LL;
 	xtc_atomic_store_i32(&g_go, 1, xtc_mo_seq_cst);
 	(void)xtc_exec_run(e);
-	xtc_exec_fini(e);
+	xtc_exec_destroy(e);
 	reads = xtc_atomic_load_llong(&g_reads, xtc_mo_seq_cst);
 	writes = xtc_atomic_load_llong(&g_writes, xtc_mo_seq_cst);
 	dt = (double)secs;

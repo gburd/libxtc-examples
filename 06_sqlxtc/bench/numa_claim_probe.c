@@ -432,7 +432,8 @@ run_workload(int nloops)
 	xtc_atomic_store_i32(&g_go, 0, xtc_mo_seq_cst);
 	xtc_atomic_store_i32(&g_readers_left, readers, xtc_mo_seq_cst);
 	xtc_atomic_store_i32(&g_tick_stop, 0, xtc_mo_seq_cst);
-	if (xtc_exec_init(&e, nloops) != XTC_OK) { fprintf(stderr, "exec_init\n"); exit(1); }
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = nloops }, &e) != XTC_OK) { fprintf(stderr, "exec_init\n"); exit(1); }
 	if (bm_provider_spawn(g_bm, xtc_exec_loop(e, 0), 1LL * 1000 * 1000,
 	    NULL) != XTC_OK) { fprintf(stderr, "provider\n"); exit(1); }
 	for (i = 0; i < readers; i++)
@@ -443,7 +444,7 @@ run_workload(int nloops)
 	(void)xtc_exec_run(e);
 	xtc_atomic_store_i32(&g_tick_stop, 1, xtc_mo_relaxed);
 	pthread_join(tick, NULL);
-	xtc_exec_fini(e);
+	xtc_exec_destroy(e);
 }
 
 /* ---- report ---- */

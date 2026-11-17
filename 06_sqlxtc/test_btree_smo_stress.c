@@ -437,7 +437,7 @@ run_phase(int nth, int secs, char *why, size_t wl, int *checks)
 			return snprintf(why, wl, "pthread_create"), 1;
 	t0 = xtc_clock_mono();
 	while (xtc_clock_mono() - t0 < (int64_t)secs * 1000000000LL && !bad) {
-		(void)xtc_sleep_ns(200LL * 1000 * 1000);
+		(void)xtc_thrd_sleep_ns(200LL * 1000 * 1000);
 		bad = check_tree(why, wl);
 		(*checks)++;
 	}
@@ -522,7 +522,7 @@ main(void)
 		bt_get_meta(g_bt, &clean, &clock);
 		if (clean != 1)
 			return 1;
-		if (xtc_loop_init(&loop) != XTC_OK ||
+		if (xtc_loop_create(&loop) != XTC_OK ||
 		    bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, NULL) != XTC_OK ||
 		    bm_trickler_spawn(g_bm, loop, 1LL * 1000 * 1000, NULL) != XTC_OK ||
 		    pthread_create(&lt, NULL, loop_thread, loop) != 0)
@@ -535,7 +535,7 @@ main(void)
 		bm_provider_stop(g_bm);
 		bm_trickler_stop(g_bm);
 		(void)pthread_join(lt, NULL);
-		(void)xtc_loop_fini(loop);
+		xtc_loop_destroy(loop);
 	}
 	bt_close(g_bt);
 	bm_destroy(g_bm);

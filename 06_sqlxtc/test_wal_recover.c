@@ -138,11 +138,11 @@ main(void)
 	if (sx_exec(g_db1, "CREATE TABLE t2(k INTEGER PRIMARY KEY, v)", NULL) != SX_OK)
 		return 1;
 
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	if (wal_writer_spawn(g_wal, loop, NULL) != XTC_OK) return 1;
 	if (xtc_proc_spawn(loop, worker, NULL, &po, &w) != XTC_OK) return 1;
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	if (xtc_atomic_load_i32(&g_phase1, xtc_mo_seq_cst) != 1) {
 		fprintf(stderr, "FAIL: phase 1 commits failed\n");
 		return 1;

@@ -220,26 +220,26 @@ main(int argc, char **argv)
 	}
 
 	memset(&b, 0, sizeof b);
-	if (xtc_loop_init(&loop) != XTC_OK) {
+	if (xtc_loop_create(&loop) != XTC_OK) {
 		fprintf(stderr, "loop init failed\n");
 		return 1;
 	}
 	if (xtc_fsm_start(loop, &CB_CALLBACKS, &b, CB_CLOSED, NULL, &fsm)
 	    != XTC_OK) {
 		fprintf(stderr, "fsm start failed\n");
-		(void)xtc_loop_fini(loop);
+		xtc_loop_destroy(loop);
 		return 1;
 	}
 	da.fsm = fsm;
 	da.b = &b;
 	if (xtc_proc_spawn(loop, driver_proc, &da, NULL, NULL) != XTC_OK) {
 		fprintf(stderr, "spawn failed\n");
-		(void)xtc_loop_fini(loop);
+		xtc_loop_destroy(loop);
 		return 1;
 	}
 	(void)xtc_loop_run(loop);
 	(void)xtc_fsm_join(fsm, 0);
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	/* Assert the observed behavior (this doubles as the example's
 	 * self-check: trip once, recover once, and reject at least the

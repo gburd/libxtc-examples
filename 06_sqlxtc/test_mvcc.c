@@ -148,13 +148,13 @@ run_correctness(void)
 	int i;
 
 	xtc_atomic_store_i32(&g_fail, 0, xtc_mo_seq_cst);
-	assert(xtc_loop_init(&loop) == XTC_OK);
+	assert(xtc_loop_create(&loop) == XTC_OK);
 	for (i = 0; i < N_SHARDS; i++) sl[i] = loop;
 	if (mvcc_start(sl, N_SHARDS, loop) != XTC_OK) return 1;
 	assert(xtc_proc_spawn(loop, correctness_driver, NULL, &o, &pid) == XTC_OK);
 	assert(xtc_loop_run(loop) == XTC_OK);
 	mvcc_fini();
-	assert(xtc_loop_fini(loop) == XTC_OK);
+	xtc_loop_destroy(loop);
 	if (xtc_atomic_load_i32(&g_fail, xtc_mo_seq_cst))
 		return 1;
 	printf("  ok   snapshot isolation + cross-shard atomic commit "
@@ -178,20 +178,21 @@ run_conflict(int n_loops, int n_clients, const char *tag)
 		xtc_loop_t *cloops[1];
 		xtc_proc_opts_t o = { .size = sizeof(xtc_proc_opts_t), .name = "start" };
 		xtc_pid_t pid;
-		assert(xtc_loop_init(&loop) == XTC_OK);
+		assert(xtc_loop_create(&loop) == XTC_OK);
 		for (i = 0; i < N_SHARDS; i++) sl[i] = loop;
 		if (mvcc_start(sl, N_SHARDS, loop) != XTC_OK) return 1;
 		cloops[0] = loop; g_conflict_loops = cloops; g_conflict_nloops = 1;
 		assert(xtc_proc_spawn(loop, conflict_starter, NULL, &o, &pid) == XTC_OK);
 		assert(xtc_loop_run(loop) == XTC_OK);
 		mvcc_fini();
-		assert(xtc_loop_fini(loop) == XTC_OK);
+		xtc_loop_destroy(loop);
 	} else {
 		xtc_exec_t *exec = NULL;
 		xtc_loop_t *cloops[N_SHARDS];
 		xtc_proc_opts_t o = { .size = sizeof(xtc_proc_opts_t), .name = "start" };
 		xtc_pid_t pid;
-		assert(xtc_exec_init(&exec, n_loops) == XTC_OK);
+		assert(xtc_exec_create(&(xtc_exec_opts_t){
+		    .size = sizeof(xtc_exec_opts_t), .n_loops = n_loops }, &exec) == XTC_OK);
 		for (i = 0; i < N_SHARDS; i++) sl[i] = xtc_exec_loop(exec, i % n_loops);
 		if (mvcc_start(sl, N_SHARDS, xtc_exec_loop(exec, 0)) != XTC_OK) return 1;
 		for (i = 0; i < n_loops; i++) cloops[i] = xtc_exec_loop(exec, i);
@@ -200,7 +201,7 @@ run_conflict(int n_loops, int n_clients, const char *tag)
 		    NULL, &o, &pid) == XTC_OK);
 		assert(xtc_exec_run(exec) == XTC_OK);
 		mvcc_fini();
-		(void)xtc_exec_fini(exec);
+		xtc_exec_destroy(exec);
 	}
 
 	if (xtc_atomic_load_i32(&g_fail, xtc_mo_seq_cst)) {
@@ -283,13 +284,13 @@ run_gc(void)
 	int i;
 
 	xtc_atomic_store_i32(&g_fail, 0, xtc_mo_seq_cst);
-	assert(xtc_loop_init(&loop) == XTC_OK);
+	assert(xtc_loop_create(&loop) == XTC_OK);
 	for (i = 0; i < N_SHARDS; i++) sl[i] = loop;
 	if (mvcc_start(sl, N_SHARDS, loop) != XTC_OK) return 1;
 	assert(xtc_proc_spawn(loop, gc_driver, NULL, &o, &pid) == XTC_OK);
 	assert(xtc_loop_run(loop) == XTC_OK);
 	mvcc_fini();
-	assert(xtc_loop_fini(loop) == XTC_OK);
+	xtc_loop_destroy(loop);
 	if (xtc_atomic_load_i32(&g_fail, xtc_mo_seq_cst))
 		return 1;
 	printf("  ok   version GC against the oldest live snapshot: a hot key's "

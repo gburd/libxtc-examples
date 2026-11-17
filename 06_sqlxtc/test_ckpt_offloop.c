@@ -43,6 +43,7 @@
 #include "xtc_async.h"
 #include "xtc_loop.h"
 #include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define NROW          32
@@ -130,7 +131,7 @@ main(void)
 	int fd, i, nf;
 	uint64_t ck;
 
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK) return 1;
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK) return 1;
 	t_tmpl(path, sizeof path, "sqlxtc-ckoff");
 	if ((fd = mkstemp(path)) < 0) return 1;
 	close(fd);
@@ -148,13 +149,13 @@ main(void)
 
 	ck = g_ck0 = sx_storage_checkpoints();
 	nf = xtc_atomic_load_i32(&g_fsyncs, xtc_mo_seq_cst);
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	CK(sx_storage_run(loop) == SX_OK);
 	if (xtc_proc_spawn(loop, committer, NULL, &po, &pid) != XTC_OK) return 1;
 	po.name = "tick";
 	if (xtc_proc_spawn(loop, ticker, NULL, &po, &pid) != XTC_OK) return 1;
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	ck = sx_storage_checkpoints() - ck;
 	nf = xtc_atomic_load_i32(&g_fsyncs, xtc_mo_seq_cst) - nf;
 

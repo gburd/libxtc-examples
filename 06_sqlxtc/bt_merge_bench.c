@@ -138,7 +138,8 @@ main(int argc, char **argv)
 	xtc_atomic_store_long(&g_ops, 0, xtc_mo_seq_cst);
 	xtc_atomic_store_i32(&g_workers_left, workers, xtc_mo_seq_cst);
 
-	if (xtc_exec_init(&exec, n_loops) != XTC_OK) {
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = n_loops }, &exec) != XTC_OK) {
 		fprintf(stderr, "exec_init\n");
 		return 1;
 	}
@@ -164,7 +165,7 @@ main(int argc, char **argv)
 		return 1;
 	}
 	bm_provider_stop(g_bm);
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 
 	elapsed = (double)(now_ns() - t0) / 1e9;
 	ops = xtc_atomic_load_long(&g_ops, xtc_mo_seq_cst);

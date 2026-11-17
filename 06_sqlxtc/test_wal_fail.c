@@ -42,6 +42,7 @@
 #include "xtc_async.h"
 #include "xtc_loop.h"
 #include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define CAP_BYTES   (64 * 1024)
@@ -136,7 +137,7 @@ test_wal_level(void)
 	xtc_atomic_store_i32(&g_left, N_CMT, xtc_mo_seq_cst);
 
 	cap_fsize(CAP_BYTES);
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	if (wal_writer_spawn(g_wal, loop, NULL) != XTC_OK) return 1;
 	for (c = 0; c < N_CMT; c++) {
 		xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "cmt" };
@@ -145,7 +146,7 @@ test_wal_level(void)
 			return 1;
 	}
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	/* Off-loop path is refused too once the log has failed. */
 	wal_get_stats(g_wal, &st);
@@ -279,11 +280,11 @@ test_engine_level(void)
 		return 1;
 
 	cap_fsize(CAP_BYTES * 4);
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	if (wal_writer_spawn(g_wal, loop, NULL) != XTC_OK) return 1;
 	if (xtc_proc_spawn(loop, engine_worker, NULL, &po, &pid) != XTC_OK) return 1;
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	cap_fsize(RLIM_INFINITY);
 
 	/* crash: drop the pool unflushed, recover a fresh tree from the log */
@@ -332,7 +333,7 @@ main(void)
 	signal(SIGXFSZ, SIG_IGN);
 	/* SQL runs on fibers: use the server's 512 KiB stack (main.c), not
 	 * the 64 KiB library default, which sanitizer frames can exceed. */
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK) return 1;
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK) return 1;
 	if (test_wal_level() != 0) { fprintf(stderr, "FAIL: wal setup\n"); return 1; }
 	if (test_engine_level() != 0) { fprintf(stderr, "FAIL: engine setup\n"); return 1; }
 	if (g_fail) { fprintf(stderr, "FAIL: test_wal_fail\n"); return 1; }

@@ -125,7 +125,8 @@ run_point(int nloops)
 	xtc_atomic_store_llong(&g_hits, 0, xtc_mo_seq_cst);
 	xtc_atomic_store_i32(&g_readers_left, readers, xtc_mo_seq_cst);
 
-	if (xtc_exec_init(&e, nloops) != XTC_OK)
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = nloops }, &e) != XTC_OK)
 		return -1;
 	/* The buffer-manager provider proc lives on loop 0. */
 	if (bm_provider_spawn(g_bm, xtc_exec_loop(e, 0), 1LL * 1000 * 1000,
@@ -139,7 +140,7 @@ run_point(int nloops)
 	xtc_atomic_store_i32(&g_go, 1, xtc_mo_release);          /* release */
 	(void)xtc_exec_run(e);                                   /* blocks */
 	t1 = xtc_clock_mono();
-	xtc_exec_fini(e);
+	xtc_exec_destroy(e);
 
 	{
 		long long reads =

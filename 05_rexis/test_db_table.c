@@ -127,7 +127,7 @@ static void
 test_growth_is_budgeted(void)
 {
 	xtc_res_t res;
-	xtc_res_caps_t caps = XTC_RES_CAPS_DEFAULT;
+	xtc_res_caps_t caps = XTC_RES_CAPS_INIT;
 	db_t *db = NULL;
 	db_opts_t o = DB_OPTS_DEFAULT;
 	char k[32];

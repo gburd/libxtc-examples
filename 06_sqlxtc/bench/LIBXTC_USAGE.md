@@ -62,7 +62,7 @@ OS primitives and would benefit from moving to the libxtc model.
 
 ### The vectorized executor (vexec.c)
 
-- **`xtc_exec`** -- morsel-parallel scan/aggregation: `xtc_exec_init(N)`
+- **`xtc_exec`** -- morsel-parallel scan/aggregation: `xtc_exec_create(N)`
   fans a scan across N loops with `xtc_exec_spawn_on`, then
   `xtc_exec_run` blocks until every worker is DONE.  Each worker owns a
   rowid range and aggregates locally; results merge at the end.  This is

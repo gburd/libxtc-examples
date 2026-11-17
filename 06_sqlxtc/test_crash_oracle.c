@@ -57,6 +57,7 @@
 #include "xtc.h"
 #include "xtc_loop.h"
 #include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 /* Declared here too so the oracle builds against an engine whose
@@ -177,7 +178,7 @@ worker(int64_t round_start, const int64_t *cuts, int ncut, int create)
 	xtc_pid_t pid;
 	uint64_t miss, stale;
 	int i, l, n;
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK) return 1;
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK) return 1;
 	if (sx_init() != SX_OK) return 1;
 	sx_storage_set_checkpoint(64u << 10);   /* online checkpoints */
 	if (sx_storage_open(g_path, FRAMES) != SX_OK) return 1;
@@ -206,13 +207,13 @@ worker(int64_t round_start, const int64_t *cuts, int ncut, int create)
 			send_msg('O', 0, 0, 0);          /* an in-process reopen */
 		}
 		xtc_atomic_store_i32(&g_left, NLANE, xtc_mo_seq_cst);
-		if (xtc_loop_init(&loop) != XTC_OK) return 1;
+		if (xtc_loop_create(&loop) != XTC_OK) return 1;
 		if (sx_storage_run(loop) != SX_OK) return 1;
 		for (l = 0; l < NLANE; l++)
 			if (xtc_proc_spawn(loop, lane, (void *)(long)l, &po, &pid) != XTC_OK)
 				return 1;
 		if (xtc_loop_run(loop) != XTC_OK) return 1;
-		(void)xtc_loop_fini(loop);
+		xtc_loop_destroy(loop);
 		send_msg('C', 0, (int64_t)sx_storage_checkpoints(), 0);
 		/* In-run completeness, before the close (a rebuild at the next
 		 * open would hide a loss): commits are stopped here. */

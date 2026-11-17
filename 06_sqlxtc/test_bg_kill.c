@@ -109,13 +109,13 @@ main(void)
 	bo.path = path;
 	bo.n_frames = 1024;
 	if (bm_create(&bo, &g_bm) != XTC_OK) { unlink(path); return 1; }
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	CK(bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, &g_pp) == XTC_OK);
 	CK(bm_trickler_spawn(g_bm, loop, 1LL * 1000 * 1000, &g_tr) == XTC_OK);
 	CK(metrics_spawn(loop, NULL, &conns, NULL, &g_mx) == XTC_OK);
 	CK(xtc_proc_spawn(loop, driver, NULL, &po, &pid) == XTC_OK);
 	(void)xtc_loop_run(loop);
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	bm_destroy(g_bm);
 	unlink(path);
 	printf("  killed provider, trickler, metrics: gone after %lld ms; "
@@ -130,12 +130,12 @@ main(void)
 	close(fd);
 	CK(sx_init() == SX_OK);
 	CK(sx_storage_open(path, 256) == SX_OK);
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	CK(sx_storage_run(loop) == SX_OK);
 	po.name = "drv2";
 	CK(xtc_proc_spawn(loop, storage_driver, NULL, &po, &pid) == XTC_OK);
 	(void)xtc_loop_run(loop);
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	(void)sx_storage_close();
 	(void)sx_shutdown();
 	printf("  killed the checkpoint proc (found=%d): sx_storage_quiesce "

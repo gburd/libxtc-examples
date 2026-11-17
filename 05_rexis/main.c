@@ -656,13 +656,13 @@ main(int argc, char **argv)
 {
 	server_t *srv = &g_server;
 	server_cfg_t cfg;
-	xtc_app_opts_t app_opts = XTC_APP_OPTS_DEFAULT;
-	xtc_sup_opts_t app_opts_sup = XTC_SUP_OPTS_DEFAULT;
+	xtc_app_opts_t app_opts = XTC_APP_OPTS_INIT;
+	xtc_sup_opts_t app_opts_sup = XTC_SUP_OPTS_INIT;
 	xtc_child_spec_t kids[3];
-	xtc_log_opts_t log_opts = XTC_LOG_OPTS_DEFAULT;
+	xtc_log_opts_t log_opts = XTC_LOG_OPTS_INIT;
 	xtc_log_t *log;
-	xtc_res_caps_t res_caps = XTC_RES_CAPS_DEFAULT;
-	xtc_tcp_opts_t tcp_opts = XTC_TCP_OPTS_DEFAULT;
+	xtc_res_caps_t res_caps = XTC_RES_CAPS_INIT;
+	xtc_tcp_opts_t tcp_opts = XTC_TCP_OPTS_INIT;
 	db_opts_t db_opts = DB_OPTS_DEFAULT;
 	int64_t fd_max;
 	int rc;

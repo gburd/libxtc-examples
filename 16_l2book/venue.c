@@ -45,7 +45,7 @@ struct sym {
 
 static struct sym syms[VENUE_MAX_SYMS];
 /* Each book's memory, recorded by its Isolate's init so the venue frees
- * it after xtc_tnt_start returns (an Isolate has no teardown hook). */
+ * it after xtc_tnt_run returns (an Isolate has no teardown hook). */
 static void *book_mem[VENUE_MAX_SYMS];
 static int nsyms;
 static int64_t g_ref = 10000;
@@ -514,7 +514,7 @@ venue_main(const venue_opts_t *opts)
 
 	if (venue_fibers_start(opts) != 0)
 		return 1;
-	rc = xtc_tnt_start(&spec);	/* blocks until xtc_tnt_stop */
+	rc = xtc_tnt_run(&spec);	/* blocks until xtc_tnt_stop */
 	xtc_atomic_store_i32(&venue_stopping, 1, xtc_mo_seq_cst);
 	venue_fibers_join();
 	for (i = 0; i < nsyms; i++) {

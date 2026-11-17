@@ -370,7 +370,7 @@ group_selftest(void)
 	xtc_pid_t client;
 
 	memset(&st, 0, sizeof st);
-	if (xtc_loop_init(&loop) != XTC_OK)
+	if (xtc_loop_create(&loop) != XTC_OK)
 		return -1;
 	if (group_coordinator_spawn(loop, &st.coord) != XTC_OK)
 		return -1;
@@ -455,7 +455,7 @@ grp_persist_phase(const char *dir, int mode)
 
 	memset(&st, 0, sizeof st);
 	st.mode = mode;
-	if (xtc_loop_init(&loop) != XTC_OK)
+	if (xtc_loop_create(&loop) != XTC_OK)
 		return -1;
 	if (group_coordinator_spawn_ex(loop, dir, &st.coord) != XTC_OK)
 		return -1;

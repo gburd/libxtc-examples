@@ -88,7 +88,7 @@ counter_proc(void *arg)
 	res = xtc_calloc(1, sizeof *res);
 	if (res != NULL)
 		res->scratch = xtc_calloc(1, 4096);
-	scope = xtc_scope_open();
+	scope = xtc_scope_enter();
 	/* Register the release, and only then treat it as owned by the
 	 * scope.  If the defer fails (the scope's finalizer table is full)
 	 * the scope will NOT free it, so the direct release at the bottom
@@ -97,7 +97,7 @@ counter_proc(void *arg)
 	    xtc_scope_defer(scope, counter_release, res) != XTC_OK) {
 		fprintf(stderr, "counter: xtc_scope_defer failed; releasing "
 		    "the scratch buffer directly on exit\n");
-		xtc_scope_close(scope);   /* nothing registered: a no-op close */
+		xtc_scope_leave(scope);   /* nothing registered: a no-op close */
 		scope = NULL;
 	}
 
@@ -119,9 +119,9 @@ counter_proc(void *arg)
 	/* Closing the scope runs counter_release LIFO; an async kill while
 	 * parked in xtc_recv above would run the same finalizer on the
 	 * proc's exit path -- either way the scratch buffer is freed.
-	 * (xtc_scope_close returns void: it cannot fail.) */
+	 * (xtc_scope_leave returns void: it cannot fail.) */
 	if (scope != NULL)
-		xtc_scope_close(scope);
+		xtc_scope_leave(scope);
 	else
 		counter_release(res);   /* NULL-safe */
 }
@@ -158,8 +158,8 @@ int
 main(int argc, char **argv)
 {
 	xtc_app_t *app;
-	xtc_app_opts_t opts = XTC_APP_OPTS_DEFAULT;
-	xtc_sup_opts_t sup_opts = XTC_SUP_OPTS_DEFAULT;
+	xtc_app_opts_t opts = XTC_APP_OPTS_INIT;
+	xtc_sup_opts_t sup_opts = XTC_SUP_OPTS_INIT;
 	xtc_child_spec_t kids[2];
 	xtc_pid_t watcher_pid;
 	int rc, status = 1;

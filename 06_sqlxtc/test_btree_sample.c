@@ -390,7 +390,8 @@ t_concurrent(void)
 	g_bm = mk(p, 48);
 	CHECK(bt_open(g_bm, &g_bt) == XTC_OK, "open");
 	xtc_atomic_store_i32(&g_left, 4, xtc_mo_seq_cst);
-	CHECK(xtc_exec_init(&exec, 4) == XTC_OK, "exec");
+	CHECK(xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = 4 }, &exec) == XTC_OK, "exec");
 	CHECK(bm_provider_spawn(g_bm, xtc_exec_loop(exec, 0), 1000000LL,
 	    NULL) == XTC_OK, "provider");
 	for (w = 0; w < 4; w++) {
@@ -402,7 +403,7 @@ t_concurrent(void)
 	CHECK(xtc_proc_spawn(xtc_exec_loop(exec, 3), sampler, NULL, &po,
 	    NULL) == XTC_OK, "spawn sampler");
 	CHECK(xtc_exec_run(exec) == XTC_OK, "run");
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 	CHECK(xtc_atomic_load_i32(&g_bad, xtc_mo_seq_cst) == 0,
 	    "%d bad samples", xtc_atomic_load_i32(&g_bad, xtc_mo_seq_cst));
 	CHECK(xtc_atomic_load_i32(&g_samples, xtc_mo_seq_cst) > 0,

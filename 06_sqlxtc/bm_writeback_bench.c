@@ -155,13 +155,13 @@ main(int argc, char **argv)
 	g_deadline_ns = now_ns() + (int64_t)secs * 1000000000LL;
 	t0 = now_ns();
 
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, &pp) != XTC_OK) return 1;
 	if (bm_trickler_spawn(g_bm, loop, 2LL * 1000 * 1000, &tr) != XTC_OK) return 1;
 	opts.name = "wb-worker";
 	if (xtc_proc_spawn(loop, worker_proc, NULL, &opts, &w) != XTC_OK) return 1;
 	if (xtc_loop_run(loop) != XTC_OK) { fprintf(stderr, "loop_run\n"); return 1; }
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	elapsed = (double)(now_ns() - t0) / 1e9;
 	ops = xtc_atomic_load_long(&g_ops, xtc_mo_seq_cst);

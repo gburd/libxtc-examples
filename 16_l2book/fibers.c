@@ -790,7 +790,7 @@ listener_fiber(void *arg)
 		if (rc == XTC_OK) {
 			struct conn_args *ca = xtc_malloc(sizeof *ca);
 			xtc_proc_opts_t po = XTC_PROC_OPTS_INIT;
-			xtc_tcp_opts_t t = XTC_TCP_OPTS_DEFAULT;
+			xtc_tcp_opts_t t = XTC_TCP_OPTS_INIT;
 			xtc_pid_t pid;
 			t.nodelay = 1;
 			(void)xtc_net_apply_tcp_opts(cfd, &t);
@@ -930,7 +930,7 @@ flow_fiber(void *arg)
 static int
 listen_on(int port, xtc_proc_fn fiber, const char *name)
 {
-	xtc_tcp_opts_t t = XTC_TCP_OPTS_DEFAULT;
+	xtc_tcp_opts_t t = XTC_TCP_OPTS_INIT;
 	int fd;
 	if (port <= 0)
 		return 0;
@@ -1024,8 +1024,9 @@ venue_fibers_start(const venue_opts_t *opts)
 	    listen_on(opts->md_port, md_fiber, "md") != 0 ||
 	    listen_on(opts->web_port, web_fiber, "web") != 0)
 		return -1;
-	if (xtc_exec_init(&g_exec, opts->fiber_loops > 0 ?
-	    opts->fiber_loops : 2) != XTC_OK)
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = opts->fiber_loops > 0 ?
+	    opts->fiber_loops : 2 }, &g_exec) != XTC_OK)
 		return -1;
 	/* A service: the exec runs until the stopper stops it, not until it
 	 * goes idle (a venue with no connections is idle, not finished). */
@@ -1048,7 +1049,7 @@ venue_fibers_join(void)
 	if (g_exec == NULL)
 		return;
 	(void)pthread_join(g_loop_thread, NULL);
-	(void)xtc_exec_fini(g_exec);
+	xtc_exec_destroy(g_exec);
 	g_exec = NULL;
 	g_loop = NULL;
 }

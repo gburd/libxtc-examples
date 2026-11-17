@@ -34,6 +34,7 @@
 #include "xtc_exec.h"
 #include "xtc_loop.h"
 #include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define NL      4
@@ -164,7 +165,7 @@ watchdog(void *arg)
 				abort();
 			_exit(3);
 		}
-		(void)xtc_sleep_ns(50LL * 1000 * 1000);
+		(void)xtc_thrd_sleep_ns(50LL * 1000 * 1000);
 	}
 	return NULL;
 }
@@ -269,7 +270,7 @@ main(int argc, char **argv)
 	g_mask = argc > 3 && strcmp(argv[3], "mask") == 0;
 	if (g_seed == 0)
 		g_seed = 1;
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK)
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK)
 		return 1;
 	for (i = 0; i <= NC; i++)
 		if ((g_slot[i].acked = calloc(MAXSEQ, 1)) == NULL)
@@ -288,7 +289,8 @@ main(int argc, char **argv)
 	    NULL) != SX_OK)
 		return 1;
 	sx_close(h);
-	if (xtc_exec_init(&g_exec, NL) != XTC_OK ||
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = NL }, &g_exec) != XTC_OK ||
 	    sx_storage_run(xtc_exec_loop(g_exec, 0)) != SX_OK ||
 	    xtc_proc_spawn(xtc_exec_loop(g_exec, 0), boss, NULL, &bo, &bp) != XTC_OK)
 		return 1;
@@ -296,7 +298,7 @@ main(int argc, char **argv)
 	(void)xtc_exec_run(g_exec);
 	xtc_atomic_store_i32(&g_done, 1, xtc_mo_seq_cst);
 	(void)pthread_join(wd, NULL);
-	(void)xtc_exec_fini(g_exec);
+	xtc_exec_destroy(g_exec);
 
 	sx_storage_abandon();                    /* crash */
 	if (sx_storage_open(g_path, 4096) != SX_OK || sx_open(":memory:", &h) != SX_OK)

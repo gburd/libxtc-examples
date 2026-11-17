@@ -215,12 +215,12 @@ listen_thread(void *arg)
 	xtc_pid_t pid;
 	xtc_proc_opts_t popts = XTC_PROC_OPTS_INIT;
 
-	if (xtc_loop_init(&g_listen_loop) != XTC_OK)
+	if (xtc_loop_create(&g_listen_loop) != XTC_OK)
 		return NULL;
 	popts.name = "tnt-listener";
 	(void)xtc_proc_spawn(g_listen_loop, listener_proc, NULL, &popts, &pid);
 	(void)xtc_loop_run(g_listen_loop);
-	(void)xtc_loop_fini(g_listen_loop);
+	xtc_loop_destroy(g_listen_loop);
 	return NULL;
 }
 
@@ -316,7 +316,7 @@ int
 main(int argc, char **argv)
 {
 	xtc_tnt_spec_t spec = XTC_TNT_SPEC_INIT;
-	xtc_tcp_opts_t topts = XTC_TCP_OPTS_DEFAULT;
+	xtc_tcp_opts_t topts = XTC_TCP_OPTS_INIT;
 	pthread_t lt;
 	int port = 7777, shards = 1, rc;
 
@@ -360,7 +360,7 @@ main(int argc, char **argv)
 	spec.boot_type = -1;   /* echo has no boot isolate; the listener
 	                        * spawns connections via xtc_tnt_spawn_on */
 
-	(void)xtc_tnt_start(&spec);
+	(void)xtc_tnt_run(&spec);
 
 	/* Shutdown. */
 	xtc_atomic_store_i32(&g_shutdown, 1, xtc_mo_seq_cst);

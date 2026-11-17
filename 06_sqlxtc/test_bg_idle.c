@@ -100,13 +100,13 @@ main(void)
 	bo.path = path;
 	bo.n_frames = N_FRAMES;
 	if (bm_create(&bo, &g_bm) != XTC_OK) { unlink(path); return 1; }
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, loop, (int64_t)PP_IV_MS * 1000 * 1000, NULL) != XTC_OK ||
 	    bm_trickler_spawn(g_bm, loop, (int64_t)TR_IV_MS * 1000 * 1000, NULL) != XTC_OK ||
 	    xtc_proc_spawn(loop, driver, NULL, &po, &pid) != XTC_OK)
 		return 1;
 	(void)xtc_loop_run(loop);
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	bm_destroy(g_bm);
 	unlink(path);
 

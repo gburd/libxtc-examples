@@ -753,7 +753,7 @@ cmd_subscribe(cmd_ctx_t *ctx)
 			resp_write_error(ctx->out, "channel name too long");
 			continue;
 		}
-		if (xtc_pg_join(ctx->pubsub, key, ctx->self) == XTC_OK)
+		if (xtc_pg_subscribe(ctx->pubsub, key, ctx->self) == XTC_OK)
 			(*ctx->sub_count)++;
 		resp_write_array(ctx->out, 3);
 		resp_write_bulk(ctx->out, "subscribe", 9);
@@ -781,7 +781,7 @@ cmd_unsubscribe(cmd_ctx_t *ctx)
 		size_t clen = ctx->argv[i].u.str.len;
 		const char *key = pubsub_key(keybuf, sizeof keybuf, ch, clen);
 		if (key != NULL &&
-		    xtc_pg_leave(ctx->pubsub, key, ctx->self) == XTC_OK &&
+		    xtc_pg_unsubscribe(ctx->pubsub, key, ctx->self) == XTC_OK &&
 		    *ctx->sub_count > 0)
 			(*ctx->sub_count)--;
 		resp_write_array(ctx->out, 3);

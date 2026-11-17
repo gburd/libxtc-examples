@@ -48,6 +48,7 @@
 #include "xtc_async.h"
 #include "xtc_loop.h"
 #include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define NBIG        20000
@@ -165,14 +166,14 @@ stop_during_checkpoint(void)
 	int64_t t0;
 
 	CK(sx_storage_open(g_path, 2048) == SX_OK);
-	if (xtc_loop_init(&loop) != XTC_OK) { g_fail = 1; return; }
+	if (xtc_loop_create(&loop) != XTC_OK) { g_fail = 1; return; }
 	CK(sx_storage_run(loop) == SX_OK);
 	(void)xtc_proc_spawn(loop, ock_proc, NULL, &po, &pid);
 	po.name = "stop";
 	(void)xtc_proc_spawn(loop, stopper, NULL, &po, &pid);
 	t0 = xtc_clock_mono();
 	CK(xtc_loop_run(loop) == XTC_OK);      /* hung forever before the fix */
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	printf("  stop during an online checkpoint: loop drained in %lld ms, "
 	       "checkpoint rc=%d\n",
 	    (long long)((xtc_clock_mono() - t0) / 1000000),
@@ -211,7 +212,7 @@ main(void)
 	const char *q = getenv("SQLXTC_CKPT_QUIESCED");
 
 	g_quiesced = q != NULL && q[0] == '1';
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK) return 1;
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK) return 1;
 	t_tmpl(g_path, sizeof g_path, "sqlxtc-ockpt");
 	if ((fd = mkstemp(g_path)) < 0) return 1;
 	close(fd);
@@ -237,7 +238,7 @@ main(void)
 	sx_close(h);
 
 	xtc_atomic_store_i32(&g_left, NCMT, xtc_mo_seq_cst);
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	CK(sx_storage_run(loop) == SX_OK);
 	for (i = 0; i < NCMT; i++)
 		if (xtc_proc_spawn(loop, committer, (void *)(long)i, &po, &pid) != XTC_OK)
@@ -246,7 +247,7 @@ main(void)
 	if (xtc_proc_spawn(loop, checkpointer, NULL, &po, &pid) != XTC_OK)
 		return 1;
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	/* crash, then recover from the (compacted) log alone */
 	sx_storage_abandon();

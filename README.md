@@ -50,7 +50,7 @@ History: split from libxtc's `examples/` (and `test/sqlxtc`, `test/m99`,
 
 | File | Demonstrates |
 |---|---|
-| `01_hello_async.c` | Minimal coroutine: `xtc_async`, `xtc_yield`, `xtc_await`. ~30 LOC. |
+| `01_hello_async.c` | Minimal coroutine: `xtc_coro_spawn`, `xtc_yield`, `xtc_coro_join`. ~30 LOC. |
 | `02_proc_pingpong.c` | Erlang-style processes: `xtc_proc_spawn`, `xtc_send`, `xtc_recv`. Bounce a counter 100 rounds. |
 | `03_supervised_app.c` | OTP application: `xtc_app` with a root supervisor (`one_for_all`), two workers, restart-on-crash. |
 | `04_lockmgr_demo.c` | Heavyweight lock manager: deadlock between two transactions; detector aborts the youngest. |

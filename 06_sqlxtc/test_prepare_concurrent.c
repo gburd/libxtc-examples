@@ -50,7 +50,7 @@ park_hook(void)
 	t0 = xtc_clock_mono();
 	while (!xtc_atomic_load_i32(&g_b_done, xtc_mo_seq_cst) &&
 	    xtc_clock_mono() - t0 < 10000000000LL)
-		(void)xtc_sleep_ns(1000000);
+		(void)xtc_thrd_sleep_ns(1000000);
 	if (xtc_atomic_load_i32(&g_b_done, xtc_mo_seq_cst))
 		xtc_atomic_store_i32(&g_b_during, 1, xtc_mo_seq_cst);
 	xtc_atomic_store_i32(&g_parked, 0, xtc_mo_seq_cst);
@@ -100,7 +100,7 @@ thr_b(void *arg)
 	(void)arg;
 	if (sx_open(g_path, &h) != SX_OK) { g_fail = 1; return NULL; }
 	while (!xtc_atomic_load_i32(&g_parked, xtc_mo_seq_cst))
-		(void)xtc_sleep_ns(100000);
+		(void)xtc_thrd_sleep_ns(100000);
 	CK(one(h, "SELECT sum(v) FROM t WHERE k <= 2", &ok) == 30 && ok);
 	xtc_atomic_store_i32(&g_b_done, 1, xtc_mo_seq_cst);
 	sx_close(h);

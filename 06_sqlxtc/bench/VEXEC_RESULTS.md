@@ -36,7 +36,7 @@ But the PARALLEL path regressed below serial (all < 1x).  Investigation
   - The libxtc executor itself is NOT the problem: a pure CPU-bound
     worker task carries only ~11% overhead vs running on the main
     thread, and N workers each doing a full busy-loop finish in close
-    to 1x wall time (they genuinely run in parallel).  xtc_exec_init +
+    to 1x wall time (they genuinely run in parallel).  xtc_exec_create +
     run + fini is ~3-5 ms, negligible at these query sizes.
   - Coarsening morsels (from span/(workers*4) to span/(workers*2) with a
     64K-row floor, so each xstore_scan_open's B-tree descent amortizes

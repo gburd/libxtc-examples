@@ -57,7 +57,7 @@ main(int argc, char **argv)
 	int port = 15442;
 	int listen_fd = -1;
 	int c;
-	xtc_app_opts_t app_opts = XTC_APP_OPTS_DEFAULT;
+	xtc_app_opts_t app_opts = XTC_APP_OPTS_INIT;
 	xtc_child_spec_t kids[1];
 
 	/* getopt has no long options; --help is the one every example
@@ -98,7 +98,7 @@ main(int argc, char **argv)
 		}
 		fprintf(stderr, "pgmock listening on unix:%s\n", unix_path);
 	} else {
-		xtc_tcp_opts_t tcp = XTC_TCP_OPTS_DEFAULT;
+		xtc_tcp_opts_t tcp = XTC_TCP_OPTS_INIT;
 		if (xtc_net_listen(XTC_NET_INET, host, port, &tcp,
 		                   &listen_fd) != XTC_OK) {
 			fprintf(stderr, "listen %s:%d failed\n", host, port);

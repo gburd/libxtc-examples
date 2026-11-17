@@ -232,8 +232,9 @@ main(void)
 	if (setup_roots() != 0) { bm_destroy(g_bm); unlink(path); return 1; }
 
 	/* Multi-loop executor: N_LOOPS loops, each its own OS thread. */
-	if (xtc_exec_init(&exec, N_LOOPS) != XTC_OK) {
-		fprintf(stderr, "FAIL: xtc_exec_init\n");
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = N_LOOPS }, &exec) != XTC_OK) {
+		fprintf(stderr, "FAIL: xtc_exec_create\n");
 		bm_destroy(g_bm); unlink(path); return 1;
 	}
 
@@ -241,7 +242,7 @@ main(void)
 	if (bm_provider_spawn(g_bm, xtc_exec_loop(exec, 0), 1LL * 1000 * 1000,
 	    &pp) != XTC_OK) {
 		fprintf(stderr, "FAIL: bm_provider_spawn\n");
-		(void)xtc_exec_fini(exec); bm_destroy(g_bm); unlink(path);
+		xtc_exec_destroy(exec); bm_destroy(g_bm); unlink(path);
 		return 1;
 	}
 
@@ -257,7 +258,7 @@ main(void)
 			/* Drain whatever we started, then bail. */
 			bm_provider_stop(g_bm);
 			(void)xtc_exec_run(exec);
-			(void)xtc_exec_fini(exec);
+			xtc_exec_destroy(exec);
 			bm_destroy(g_bm); unlink(path);
 			return 1;
 		}
@@ -267,10 +268,10 @@ main(void)
 	 * stopped (so the loops drain to idle). */
 	if (xtc_exec_run(exec) != XTC_OK) {
 		fprintf(stderr, "FAIL: xtc_exec_run\n");
-		(void)xtc_exec_fini(exec); bm_destroy(g_bm); unlink(path);
+		xtc_exec_destroy(exec); bm_destroy(g_bm); unlink(path);
 		return 1;
 	}
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 
 	/* Final single-threaded consistency sweep. */
 	bad = final_check();

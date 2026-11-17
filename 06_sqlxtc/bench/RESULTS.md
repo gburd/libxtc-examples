@@ -106,7 +106,7 @@ Observations from that run:
 To actually saturate four cores we would need either:
 
 1. Multiple xtc_loops on multiple worker threads
-   (`xtc_exec_init(N)`), each owning a shard of connections, or
+   (`xtc_exec_create(N)`), each owning a shard of connections, or
 2. xtc_proc_wait_fd so we don't poll every 1 ms (currently every
    one of the 200 conn procs takes a 1-ms timeout when blocked,
    producing ~200 K loop wakeups/sec).

@@ -86,7 +86,7 @@ static void
 spin_until(int s)
 {
 	while (xtc_atomic_load_i32(&g_step, xtc_mo_seq_cst) < s)
-		(void)xtc_sleep_ns(100 * 1000);
+		(void)xtc_thrd_sleep_ns(100 * 1000);
 }
 
 /* ---- (a) wait then succeed ---- */
@@ -99,7 +99,7 @@ holder(void *a)
 	CK(ex(h, "BEGIN") == SX_OK);
 	CK(ex(h, "UPDATE t SET v = v + 1 WHERE k = 1") == SX_OK);
 	xtc_atomic_store_i32(&g_step, 1, xtc_mo_seq_cst);
-	(void)xtc_sleep_ns(50LL * 1000 * 1000);
+	(void)xtc_thrd_sleep_ns(50LL * 1000 * 1000);
 	g_rc[0] = ex(h, "COMMIT");
 	sx_close(h);
 	return NULL;

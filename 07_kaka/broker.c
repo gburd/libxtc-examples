@@ -1126,7 +1126,7 @@ st_run(void (*client)(void *), struct st *st)
 	xtc_proc_opts_t opts = XTC_PROC_OPTS_INIT;
 	xtc_pid_t pid;
 
-	if (xtc_loop_init(&loop) != XTC_OK) return -1;
+	if (xtc_loop_create(&loop) != XTC_OK) return -1;
 	if ((pa = calloc(1, sizeof *pa)) == NULL) return -1;
 	pa->topic[0] = 't';
 	opts.name = "selftest-partition";
@@ -1140,7 +1140,7 @@ st_run(void (*client)(void *), struct st *st)
 	if (xtc_proc_spawn(loop, client, st, &opts, &pid) != XTC_OK)
 		return -1;
 	if (xtc_loop_run(loop) != XTC_OK) return -1;
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	return st->result;
 }
 
@@ -1556,7 +1556,7 @@ broker_timeout_selftest(const char *dir)
 	int i;
 
 	memset(&st, 0, sizeof st);
-	if (xtc_loop_init(&loop) != XTC_OK) return -1;
+	if (xtc_loop_create(&loop) != XTC_OK) return -1;
 	broker_set_loop(loop);
 	broker_set_log_dir(dir);
 	plog_set_sync_hook(st_sync_hook);
@@ -1564,7 +1564,7 @@ broker_timeout_selftest(const char *dir)
 	if (xtc_proc_spawn(loop, timeout_main, &st, &opts, &pid) != XTC_OK)
 		return -1;
 	if (xtc_loop_run(loop) != XTC_OK) return -1;
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	plog_set_sync_hook(NULL);
 	broker_set_log_dir(NULL);
 	xtc_atomic_store_i32(&g_stopping, 0, xtc_mo_seq_cst);

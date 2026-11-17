@@ -30,6 +30,7 @@
 #include "xtc_async.h"
 #include "xtc_exec.h"
 #include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define NCLI 8
@@ -105,7 +106,7 @@ main(void)
 	int fd, nloops, key;
 	long i;
 
-	if (xtc_set_stack_size(512u * 1024u) != XTC_OK) return 1;
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK) return 1;
 	for (nloops = 1; nloops <= 4; nloops += 3) {
 		t_tmpl(logp, sizeof logp, "sqlxtc-dupcomp-log");
 		t_tmpl(pg, sizeof pg, "sqlxtc-dupcomp-pg");
@@ -131,14 +132,15 @@ main(void)
 			xtc_atomic_store_long(&g_winner[key], -1,
 			    xtc_mo_seq_cst);
 		}
-		if (xtc_exec_init(&ex, nloops) != XTC_OK) return 1;
+		if (xtc_exec_create(&(xtc_exec_opts_t){
+		    .size = sizeof(xtc_exec_opts_t), .n_loops = nloops }, &ex) != XTC_OK) return 1;
 		if (wal_writer_spawn(g_wal, xtc_exec_loop(ex, 0), NULL) != XTC_OK) return 1;
 		for (i = 0; i < NCLI; i++)
 			if (xtc_proc_spawn(xtc_exec_loop(ex, (int)(i % nloops)), worker,
 			    (void *)i, &po, &pid) != XTC_OK)
 				return 1;
 		if (xtc_exec_run(ex) != XTC_OK) return 1;
-		(void)xtc_exec_fini(ex);
+		xtc_exec_destroy(ex);
 
 		multi = lost = zero = rows = 0;
 		for (key = 0; key < KEYS; key++) {

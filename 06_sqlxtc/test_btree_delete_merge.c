@@ -650,7 +650,8 @@ test_concurrent_merge(void)
 	}
 
 	xtc_atomic_store_i32(&g_cm_left, CM_CHURNERS, xtc_mo_seq_cst);
-	CHECK(xtc_exec_init(&exec, CM_LOOPS) == XTC_OK, "exec_init cmerge");
+	CHECK(xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = CM_LOOPS }, &exec) == XTC_OK, "exec_init cmerge");
 	l0 = xtc_exec_loop(exec, 0);
 	CHECK(bm_provider_spawn(g_cm_bm, l0, 1LL * 1000 * 1000, NULL) == XTC_OK,
 	    "provider cmerge");
@@ -663,7 +664,7 @@ test_concurrent_merge(void)
 	}
 	CHECK(xtc_exec_run(exec) == XTC_OK, "exec_run cmerge");
 	bm_provider_stop(g_cm_bm);
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 
 	/* Every anchor key survived the merge storm intact. */
 	for (i = 0; i < CM_ANCHORS; i++) {

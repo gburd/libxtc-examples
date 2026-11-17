@@ -47,16 +47,16 @@ admin_state_label(const xtc_proc_info_t *info, char *buf, size_t cap)
 	}
 
 	switch (info->park_reason) {
-	case XTC_PARK_FD:
+	case XTC_PROC_PARK_FD:
 		snprintf(buf, cap, "parked:fd");
 		break;
-	case XTC_PARK_TIMER:
+	case XTC_PROC_PARK_TIMER:
 		snprintf(buf, cap, "parked:timer");
 		break;
-	case XTC_PARK_MAILBOX:
+	case XTC_PROC_PARK_MAILBOX:
 		snprintf(buf, cap, "parked:mailbox");
 		break;
-	case XTC_PARK_NONE:
+	case XTC_PROC_PARK_NONE:
 	default:
 		snprintf(buf, cap, "parked");
 		break;

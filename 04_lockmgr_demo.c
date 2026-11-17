@@ -254,7 +254,7 @@ txn(xtc_locker_t l, const char *first, const char *second)
 		xtc_atomic_store_i32(&g_setup_failed, 1, xtc_mo_seq_cst);
 		return rc;
 	}
-	(void)xtc_sleep_ns(100 * 1000 * 1000);   /* hold the lock, force the cycle */
+	(void)xtc_thrd_sleep_ns(100 * 1000 * 1000);   /* hold the lock, force the cycle */
 	rc = xtc_lock_get(g_mgr, l, second, 1, XTC_LOCK_X,
 	    5LL * 1000 * 1000 * 1000);
 	if (rc == XTC_OK)
@@ -290,7 +290,7 @@ struct driver_args { xtc_loop_t *loop; };
 static void
 driver_proc(void *arg)
 {
-	xtc_lockmgr_opts_t opts = XTC_LOCKMGR_OPTS_DEFAULT;
+	xtc_lockmgr_opts_t opts = XTC_LOCKMGR_OPTS_INIT;
 	xtc_locker_t l1, l2;
 	pthread_t t1, t2;
 	int round, rc;
@@ -425,7 +425,7 @@ main(int argc, char **argv)
 		return 0;
 	}
 
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	args.loop = loop;
 
 	/* Spawn the card-producer first so the driver and its child
@@ -446,6 +446,6 @@ main(int argc, char **argv)
 		goto out;
 	status = g_demo_failed ? 1 : 0;
 out:
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	return status;
 }

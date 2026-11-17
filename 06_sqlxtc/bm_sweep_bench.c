@@ -209,7 +209,8 @@ main(int argc, char **argv)
 	bo.claim_threshold = theta;
 	if (bm_create(&bo, &g_bm) != XTC_OK ||
 	    xtc_hist_create("bm_sweep_fix_ns", &g_lat) != XTC_OK ||
-	    xtc_exec_init(&e, (int)loops) != XTC_OK)
+	    xtc_exec_create(&(xtc_exec_opts_t){
+	        .size = sizeof(xtc_exec_opts_t), .n_loops = (int)loops }, &e) != XTC_OK)
 		return 1;
 
 	/* No fixed cold-start window: require eviction in three consecutive
@@ -253,7 +254,7 @@ main(int argc, char **argv)
 	    (long long)xtc_hist_quantile(g_lat, 0.99),
 	    (long long)xtc_hist_quantile(g_lat, 0.999),
 	    (long long)xtc_hist_max(g_lat));
-	xtc_exec_fini(e);
+	xtc_exec_destroy(e);
 	bm_destroy(g_bm);
 	xtc_hist_destroy(g_lat);
 	xtc_free(g_cdf);

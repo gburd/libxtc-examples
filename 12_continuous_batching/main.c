@@ -139,7 +139,7 @@ owner(void *arg)
 				xtc_yield();
 			must(xtc_batch_submit(g->batch, &r[LATE], 1, &r[LATE].handle));
 		}
-		must(xtc_batch_close(g->batch, XTC_BATCH_DRAIN));
+		must(xtc_batch_shutdown(g->batch, XTC_BATCH_DRAIN));
 	}
 	for (i = 0; i < GROUPS; i++) {
 		while (d->groups[i].sequence != REQUESTS)
@@ -181,7 +181,7 @@ run(int continuous, int policy)
 	unsigned i, j, k;
 
 	d.continuous = continuous;
-	must(xtc_loop_init(&loop));
+	must(xtc_loop_create(&loop));
 	if (policy)
 		must(xtc_sched_continuous_set(loop, 3));
 	must(xtc_proc_spawn(loop, heartbeat, &d, NULL, &pid));
@@ -237,7 +237,7 @@ run(int continuous, int policy)
 	out.heartbeat = d.heartbeat;
 	out.long_order = d.groups[0].requests[LONG].order;
 	out.late_order = d.groups[0].requests[LATE].order;
-	must(xtc_loop_fini(loop));
+	xtc_loop_destroy(loop);
 	printf("mode=%s policy=%s: terminals=%u updates=%u late=%u long=%u OK\n",
 	    continuous ? "continuous" : "static", policy ? "continuous" : "default",
 	    out.terminals, out.updates, out.late_order, out.long_order);

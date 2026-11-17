@@ -547,7 +547,7 @@ dry_run(struct session *s, uint32_t ip)
 	struct answer a = table_lookup(ip);
 
 	(void)xtc_cfg_session_push(s->cfg);
-	(void)xtc_cfg_ssn_set_enum(s->cfg, "edge.mode", MODE_AUDIT,
+	(void)xtc_cfg_session_set_enum(s->cfg, "edge.mode", MODE_AUDIT,
 	    XTC_CFG_SRC_SESSION);
 	s->dry_run = decide(&a);
 	(void)xtc_cfg_session_abort(s->cfg);
@@ -584,7 +584,7 @@ session_proc(void *arg)
 	if (s->partner) {
 		/* A per-role default (source USER) ranks below the client's
 		 * startup option, so it does not displace it. */
-		s->lower_rc = xtc_cfg_ssn_set_enum(s->cfg, "edge.mode",
+		s->lower_rc = xtc_cfg_session_set_enum(s->cfg, "edge.mode",
 		    MODE_ENFORCE, XTC_CFG_SRC_USER);
 		(void)xtc_cfg_session_source(s->cfg, "edge.mode", &s->mode_src);
 		(void)xtc_cfg_get_enum("edge.mode", &s->mode_after_lower);
@@ -820,7 +820,7 @@ setup(void)
 		if (xtc_cfg_session_create(&s->cfg) != XTC_OK)
 			return -1;
 		if (s->partner &&
-		    xtc_cfg_ssn_set_enum(s->cfg, "edge.mode", MODE_AUDIT,
+		    xtc_cfg_session_set_enum(s->cfg, "edge.mode", MODE_AUDIT,
 		        XTC_CFG_SRC_CLIENT) != XTC_OK)
 			return -1;
 	}
@@ -862,7 +862,8 @@ main(int argc, char **argv)
 
 	build_script();
 	script_init();
-	if (setup() != 0 || xtc_exec_init(&exec, N_LOOPS) != XTC_OK) {
+	if (setup() != 0 || xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = N_LOOPS }, &exec) != XTC_OK) {
 		fprintf(stderr, "edgeacl: setup failed\n");
 		return 1;
 	}
@@ -874,7 +875,7 @@ main(int argc, char **argv)
 	        NULL) != XTC_OK)
 		return 1;
 	(void)xtc_exec_run(exec);
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 
 	report(verbose);
 	teardown();

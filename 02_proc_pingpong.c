@@ -106,12 +106,12 @@ main(int argc, char **argv)
 		return 0;
 	}
 
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	if (xtc_proc_spawn(loop, pong, NULL, NULL, &pong_pid) != XTC_OK) return 1;
 	st.pong = pong_pid;
 	if (xtc_proc_spawn(loop, ping, &st, NULL, &ping_pid) != XTC_OK) return 1;
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	/* Assert the observable outcome.  Without this the program prints
 	 * "completed 0 rounds" and still exits 0, so CI (and a reader) could

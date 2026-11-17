@@ -3980,7 +3980,7 @@ static void
 xs_nap(void)
 {
 	if (xtc_pid_is_none(xtc_self()))
-		(void)xtc_sleep_ns(200LL * 1000);
+		(void)xtc_thrd_sleep_ns(200LL * 1000);
 	else
 		(void)xtc_proc_sleep(200LL * 1000);
 }
@@ -4563,7 +4563,7 @@ xs_wait_visible(uint64_t ts)
 				q = NULL;
 				xs_vw_unlock();
 				if (xtc_pid_is_none(xtc_self()))
-					(void)xtc_sleep_ns(20LL * 1000);
+					(void)xtc_thrd_sleep_ns(20LL * 1000);
 				else
 					(void)xtc_proc_sleep(20LL * 1000);
 				xs_vw_lock();
@@ -5273,7 +5273,7 @@ xs_intent_take(xstore_ctx_t *cx, uint32_t tid, int64_t rid, uint64_t base)
 			xtc_atomic_fetch_add_u64(&g_ilk_waits, 1,
 			    xtc_mo_relaxed);
 		if (xtc_pid_is_none(xtc_self()))
-			(void)xtc_sleep_ns(nap);
+			(void)xtc_thrd_sleep_ns(nap);
 		else
 			(void)xtc_proc_sleep(nap);
 		waited += nap;
@@ -7088,7 +7088,7 @@ xs_idx_rebuild(bt_t *bt, int clear, int workers)
 	(void)xs_rb_worker(&j);
 	while (xtc_atomic_load_i32(&j.left, xtc_mo_acquire) > 0) {
 		if (xtc_pid_is_none(xtc_self()))
-			(void)xtc_sleep_ns(1000LL * 1000);
+			(void)xtc_thrd_sleep_ns(1000LL * 1000);
 		else
 			(void)xtc_proc_sleep(1000LL * 1000);
 	}

@@ -90,7 +90,7 @@ main(void)
 	xtc_pid_t       pid;
 	int             i;
 
-	if (xtc_loop_init(&loop) != XTC_OK) {
+	if (xtc_loop_create(&loop) != XTC_OK) {
 		fprintf(stderr, "FAIL: loop_init\n");
 		return 1;
 	}
@@ -114,7 +114,7 @@ main(void)
 		fprintf(stderr, "FAIL: loop_run\n");
 		return 1;
 	}
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	if (g_failed) {
 		fprintf(stderr, "FAIL: driver reported an error\n");

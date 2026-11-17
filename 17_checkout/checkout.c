@@ -509,7 +509,7 @@ main(int argc, char **argv)
 
 	memcpy(be.stock, sku_stock0, sizeof be.stock);
 	memcpy(be.balance, cust_balance0, sizeof be.balance);
-	if (xtc_loop_init(&loop) != XTC_OK ||
+	if (xtc_loop_create(&loop) != XTC_OK ||
 	    xtc_pool_create(POOL_CONNS, &pool) != XTC_OK) {
 		fprintf(stderr, "checkout: loop or pool init failed\n");
 		return 1;
@@ -529,7 +529,7 @@ main(int argc, char **argv)
 		}
 	}
 	(void)xtc_loop_run(loop);
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	printf("checkout: %d orders, %d backend connections\n", N_ORDERS,
 	    POOL_CONNS);

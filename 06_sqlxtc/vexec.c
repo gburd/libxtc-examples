@@ -8594,7 +8594,8 @@ run_parallel_plan(vx_stmt_t *plan, struct xsql *db, int n_workers,
 	}
 
 	/* Run one worker per loop on a libxtc executor. */
-	if (xtc_exec_init(&exec, n_workers) != XTC_OK) { rc = -1; goto cleanup; }
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = n_workers }, &exec) != XTC_OK) { rc = -1; goto cleanup; }
 	out->nworkers = xtc_exec_n_loops(exec);
 	args = (void *)calloc((size_t)n_workers, sizeof *args);
 	if (args == NULL) { rc = -1; goto cleanup; }
@@ -8664,7 +8665,7 @@ run_parallel_plan(vx_stmt_t *plan, struct xsql *db, int n_workers,
 	rc = 1;
 
 cleanup:
-	if (exec) xtc_exec_fini(exec);
+	if (exec) xtc_exec_destroy(exec);
 	free(par.bound);
 	if (par.parts) {
 		for (i = 0; i < n_workers; i++) {

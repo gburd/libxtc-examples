@@ -497,7 +497,8 @@ t_concurrent(void)
 		CK(bt_insert(g_bt, k, 8, v, s2_vlen(i)) == XTC_OK);
 	}
 	xtc_atomic_store_i32(&g_active, N_CHURNERS, xtc_mo_seq_cst);
-	CK(xtc_exec_init(&ex, N_LOOPS) == XTC_OK);
+	CK(xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = N_LOOPS }, &ex) == XTC_OK);
 	CK(bm_provider_spawn(g_bm, xtc_exec_loop(ex, 0), 1LL * 1000 * 1000,
 	    NULL) == XTC_OK);
 	for (c = 0; c < N_CHURNERS; c++)
@@ -514,7 +515,7 @@ t_concurrent(void)
 		    reader_n, (void *)(r + 1), NULL, NULL) == XTC_OK);
 	CK(xtc_exec_run(ex) == XTC_OK);
 	bm_provider_stop(g_bm);
-	(void)xtc_exec_fini(ex);
+	xtc_exec_destroy(ex);
 
 	bt_get_stats(g_bt, &ts);
 	bm_get_stats(g_bm, &bs);

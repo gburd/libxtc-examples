@@ -50,6 +50,7 @@ crc_init_spin(void)
 #include "wal.c"
 
 #include "xtc_exec.h"
+#include "xtc_runtime.h"
 
 static int g_done;
 static uint32_t   g_sum[2];
@@ -71,7 +72,7 @@ watchdog(void *arg)
 	(void)arg;
 	for (i = 0;
 	     i < 1000 && xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst) < 2; i++)
-		(void)xtc_sleep_ns(10 * 1000 * 1000);
+		(void)xtc_thrd_sleep_ns(10 * 1000 * 1000);
 	if (xtc_atomic_load_i32(&g_done, xtc_mo_seq_cst) < 2) {
 		fprintf(stderr,
 		    "FAIL: the loop wedged in the CRC32C init "
@@ -92,13 +93,14 @@ main(void)
 		printf("SKIP: no preemption timer on this host\n");
 		return 0;
 	}
-	if (xtc_exec_init(&e, 1) != XTC_OK ||
+	if (xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = 1 }, &e) != XTC_OK ||
 	    xtc_exec_set_preempt(e, 50 * 1000) != XTC_OK) {
 		fprintf(stderr, "FAIL: executor setup\n");
 		return 1;
 	}
 	if (xtc_preempt_involuntary_supported() &&
-	    xtc_preempt_set_involuntary(1) != XTC_OK) {
+	    xtc_runtime_set_preempt_involuntary(1) != XTC_OK) {
 		fprintf(stderr, "FAIL: involuntary preemption refused\n");
 		return 1;
 	}
@@ -112,8 +114,8 @@ main(void)
 	}
 	(void)xtc_exec_run(e);
 	(void)pthread_join(wd, NULL);
-	(void)xtc_preempt_set_involuntary(0);
-	(void)xtc_exec_fini(e);
+	(void)xtc_runtime_set_preempt_involuntary(0);
+	xtc_exec_destroy(e);
 
 	if (!xtc_atomic_load_i32(&g_in_init, xtc_mo_seq_cst) ||
 	    g_sum[0] != g_sum[1]) {

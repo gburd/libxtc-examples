@@ -110,12 +110,12 @@ main(void)
 	if (bm_create(&bo, &g_bm) != XTC_OK) { fprintf(stderr, "bm_create\n"); return 1; }
 
 	xtc_atomic_store_i32(&g_result, 0, xtc_mo_seq_cst);
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	if (bm_provider_spawn(g_bm, loop, 1LL * 1000 * 1000, &pp) != XTC_OK) return 1;
 	opts.name = "worker";
 	if (xtc_proc_spawn(loop, worker_proc, NULL, &opts, &w) != XTC_OK) return 1;
 	if (xtc_loop_run(loop) != XTC_OK) { fprintf(stderr, "loop_run\n"); return 1; }
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 
 	bm_get_stats(g_bm, &st);
 	bm_destroy(g_bm);

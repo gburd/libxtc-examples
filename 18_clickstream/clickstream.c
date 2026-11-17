@@ -462,9 +462,9 @@ shards_init(void)
 		struct shard *s = &shards[i];
 		s->id = i;
 		s->rng = 0x5eed0000u + (uint64_t)i;
-		if (xtc_bloom_init(&s->seen, N_LINES, BLOOM_FP) != XTC_OK ||
-		    xtc_hll_init(&s->users, HLL_P) != XTC_OK ||
-		    xtc_hll_init(&s->buyers, HLL_P) != XTC_OK)
+		if (xtc_bloom_create(N_LINES, BLOOM_FP, &s->seen) != XTC_OK ||
+		    xtc_hll_create(HLL_P, &s->users) != XTC_OK ||
+		    xtc_hll_create(HLL_P, &s->buyers) != XTC_OK)
 			return -1;
 	}
 	return 0;
@@ -476,9 +476,9 @@ shards_fini(void)
 	int i;
 
 	for (i = 0; i < N_SHARDS; i++) {
-		xtc_bloom_fini(shards[i].seen);
-		xtc_hll_fini(shards[i].users);
-		xtc_hll_fini(shards[i].buyers);
+		xtc_bloom_destroy(shards[i].seen);
+		xtc_hll_destroy(shards[i].users);
+		xtc_hll_destroy(shards[i].buyers);
 	}
 }
 
@@ -501,9 +501,10 @@ main(int argc, char **argv)
 		return strcmp(argv[1], "--help") == 0 ? 0 : 2;
 	}
 
-	if (shards_init() != 0 || xtc_hll_init(&users, HLL_P) != XTC_OK ||
-	    xtc_hll_init(&buyers, HLL_P) != XTC_OK ||
-	    xtc_exec_init(&exec, N_SHARDS) != XTC_OK) {
+	if (shards_init() != 0 || xtc_hll_create(HLL_P, &users) != XTC_OK ||
+	    xtc_hll_create(HLL_P, &buyers) != XTC_OK ||
+	    xtc_exec_create(&(xtc_exec_opts_t){
+	        .size = sizeof(xtc_exec_opts_t), .n_loops = N_SHARDS }, &exec) != XTC_OK) {
 		fprintf(stderr, "clickstream: init failed\n");
 		return 1;
 	}
@@ -515,7 +516,7 @@ main(int argc, char **argv)
 		}
 	}
 	(void)xtc_exec_run(exec);
-	(void)xtc_exec_fini(exec);
+	xtc_exec_destroy(exec);
 
 	printf("clickstream: %d front ends x %d log lines, %d user ids\n",
 	    N_SHARDS, N_LINES, N_USERS);
@@ -523,8 +524,8 @@ main(int argc, char **argv)
 		report_shard(&shards[i]);
 	report_totals(users, buyers);
 
-	xtc_hll_fini(users);
-	xtc_hll_fini(buyers);
+	xtc_hll_destroy(users);
+	xtc_hll_destroy(buyers);
 	shards_fini();
 	if (failures != 0) {
 		printf("FAIL: %d check(s) failed\n", failures);

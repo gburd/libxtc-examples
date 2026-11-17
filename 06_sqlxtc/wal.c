@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include "xtc_atomic.h"
+#include "xtc_runtime.h"
 #include <stdint.h>
 #include <stdio.h>      /* snprintf, rename */
 #include <stdlib.h>
@@ -804,7 +805,7 @@ wal_close(wal_t *w)
 
 /*
  * res_mu / fl_mu are held only for a few instructions and never across a
- * park, but under involuntary preemption (xtc_preempt_set_involuntary) a
+ * park, but under involuntary preemption (xtc_runtime_set_preempt_involuntary) a
  * fiber could still be preempted while holding one; a loop-mate that
  * then blocks its OS thread on the same mutex can never let the holder
  * run again (test_wal_kill preempt-nokill hung that way with no kill at
@@ -1044,7 +1045,7 @@ wal_flush_locked(wal_t *w, uint64_t need)
 		 * wait for it outside the lock. */
 		wal_unlock(&w->fl_mu);
 		if (++spins > 64) {
-			if (xtc_pid_is_none(xtc_self())) (void)xtc_sleep_ns(1000);
+			if (xtc_pid_is_none(xtc_self())) (void)xtc_thrd_sleep_ns(1000);
 			else xtc_yield();
 		}
 		wal_lock(&w->fl_mu);
@@ -1121,7 +1122,7 @@ wal_wait_locked(wal_t *w, uint64_t need)
 			/* no waiter object: poll instead */
 			xtc_free(q);
 			wal_unlock(&w->fl_mu);
-			if (xtc_pid_is_none(xtc_self())) (void)xtc_sleep_ns(20000);
+			if (xtc_pid_is_none(xtc_self())) (void)xtc_thrd_sleep_ns(20000);
 			else (void)xtc_proc_sleep(20000);
 			wal_lock(&w->fl_mu);
 			return;
@@ -1192,7 +1193,7 @@ static void
 wal_nap(void)
 {
 	if (xtc_pid_is_none(xtc_self()))
-		(void)xtc_sleep_ns(20LL * 1000);
+		(void)xtc_thrd_sleep_ns(20LL * 1000);
 	else
 		(void)xtc_proc_sleep(20LL * 1000);
 }

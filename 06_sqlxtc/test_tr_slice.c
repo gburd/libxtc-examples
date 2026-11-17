@@ -83,11 +83,11 @@ run(uint32_t n_frames, uint32_t ndirty)
 		memset(bm_page(f), (int)(i & 0xFF), g_bm->page_size);
 		bm_unfix(g_bm, f, 1);
 	}
-	if (xtc_loop_init(&loop) != XTC_OK) return 1;
+	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	(void)bm_trickler_spawn(g_bm, loop, 1LL * 1000 * 1000, NULL);
 	(void)xtc_proc_spawn(loop, driver, NULL, &po, &pid);
 	(void)xtc_loop_run(loop);
-	(void)xtc_loop_fini(loop);
+	xtc_loop_destroy(loop);
 	bm_destroy(g_bm);
 	unlink(path);
 	return 0;
