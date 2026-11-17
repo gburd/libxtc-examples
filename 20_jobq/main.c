@@ -38,14 +38,16 @@ main(int argc, char **argv)
 		return strcmp(argv[1], "--help") == 0 ? 0 : 2;
 	}
 	jq_config_default(&cfg);
-	if ((rc = xtc_exec_init(&e, JQ_LOOPS)) != XTC_OK ||
+	if ((rc = xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = JQ_LOOPS },
+	    &e)) != XTC_OK ||
 	    (rc = jq_start(e, &cfg)) != XTC_OK) {
 		fprintf(stderr, "jobq: start failed: %s\n", xtc_strerror(rc));
 		return 1;
 	}
 	rc = xtc_exec_run(e);
 	jq_finish();
-	(void)xtc_exec_fini(e);
+	xtc_exec_destroy(e);
 	if (rc != XTC_OK) {
 		fprintf(stderr, "jobq: run failed: %s\n", xtc_strerror(rc));
 		return 1;

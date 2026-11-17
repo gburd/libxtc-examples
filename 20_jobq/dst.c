@@ -250,12 +250,14 @@ run_seed(uint64_t seed, struct outcome *out)
 	g_acts = 0;
 	memset(g_tally, 0, sizeof g_tally);
 	g_why[0] = '\0';
-	if ((out->rc = xtc_exec_init(&e, JQ_LOOPS)) != XTC_OK)
+	if ((out->rc = xtc_exec_create(&(xtc_exec_opts_t){
+	    .size = sizeof(xtc_exec_opts_t), .n_loops = JQ_LOOPS },
+	    &e)) != XTC_OK)
 		return;
 	if ((out->rc = jq_start(e, &cfg)) != XTC_OK ||
 	    (out->rc = xtc_proc_spawn(xtc_exec_loop(e, 1), nemesis, NULL, NULL,
 	         NULL)) != XTC_OK) {
-		(void)xtc_exec_fini(e);
+		xtc_exec_destroy(e);
 		return;
 	}
 	xtc_sim_partition_clear();
@@ -284,7 +286,7 @@ run_seed(uint64_t seed, struct outcome *out)
 	out->acts = g_acts;
 	memcpy(out->tally, g_tally, sizeof out->tally);
 	jq_finish();
-	(void)xtc_exec_fini(e);
+	xtc_exec_destroy(e);
 	if (out->rc != XTC_OK && g_why[0] == '\0' &&
 	    jq_check(g_why, sizeof g_why) == XTC_OK)
 		snprintf(g_why, sizeof g_why, "the run ended with %s",

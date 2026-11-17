@@ -49,7 +49,7 @@ void jq_config_default(struct jq_config *cfg);
  * XTC_E_* code. */
 int jq_start(xtc_exec_t *e, const struct jq_config *cfg);
 
-/* After the run: free the supervisors.  Call before xtc_exec_fini. */
+/* After the run: free the supervisors.  Call before xtc_exec_destroy. */
 void jq_finish(void);
 
 /* The safety and liveness checks.  XTC_OK if all hold; otherwise

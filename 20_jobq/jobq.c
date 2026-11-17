@@ -221,7 +221,7 @@ lookup(const char *name)
 {
 	xtc_pid_t pid = XTC_PID_NONE;
 
-	(void)xtc_reg_whereis(g_reg, name, &pid);
+	(void)xtc_reg_get(g_reg, name, &pid);
 	return pid;
 }
 
@@ -333,8 +333,8 @@ queue_recover(void)
 		g_q[j].deadline = 0;
 	}
 	g_stats.epochs++;
-	(void)xtc_reg_unregister(g_reg, "jobq");
-	(void)xtc_reg_register(g_reg, "jobq", xtc_self());
+	(void)xtc_reg_del(g_reg, "jobq", XTC_PID_NONE);
+	(void)xtc_reg_put(g_reg, "jobq", xtc_self(), NULL, 0);
 	jq_trace("queue.epoch", 0, epoch);
 }
 
@@ -492,7 +492,7 @@ store_main(void *arg)
 
 	(void)arg;
 	xtc_atomic_pid_store(&g_store_pid, xtc_self());
-	(void)xtc_reg_register(g_reg, "store", xtc_self());
+	(void)xtc_reg_put(g_reg, "store", xtc_self(), NULL, 0);
 	for (;;) {
 		if (recv_msg(&m, -1) != XTC_OK)
 			continue;
@@ -696,7 +696,7 @@ static int
 start_sup(xtc_exec_t *e, int loop, xtc_child_spec_t *kids, int n,
     xtc_supervisor_t **out)
 {
-	xtc_sup_opts_t opts = XTC_SUP_OPTS_DEFAULT;
+	xtc_sup_opts_t opts = XTC_SUP_OPTS_INIT;
 
 	opts.max_restarts = 1000; /* the harness kills often, on purpose */
 	opts.period_ns = 1000 * MS;
