@@ -10,6 +10,7 @@
 #include "xtc.h"
 #include "xtc_async.h"
 #include "xtc_batch.h"
+#include "xtc_orc.h"
 #include "xtc_proc.h"
 #include "xtc_sched.h"
 
@@ -244,6 +245,149 @@ run(int continuous, int policy)
 	return out;
 }
 
+/*
+ * --restart: the group belongs to a supervised engine that restarts.
+ *
+ * The engine is a TRANSIENT child of a supervisor on the running loop.
+ * It creates its group itself, on that running loop (libxtc 2.2), and
+ * submits every request that has not finished.  A watcher kills the
+ * first incarnation after its batch has run a few vectors.  The group
+ * belonged to the dead engine, so libxtc closes it with XTC_BATCH_CANCEL:
+ * its unfinished requests complete with XTC_E_ABORTED.  The supervisor
+ * restarts the engine; the new incarnation destroys the old group once
+ * its driver has ended, creates a new one, and resubmits the aborted
+ * requests from their first round.  Every request then finishes with
+ * XTC_OK and the scalar reference checks its arithmetic.
+ */
+struct restart {
+	struct group g;
+	xtc_loop_t *loop;
+	xtc_supervisor_t *sup;
+	xtc_pid_t engine;
+	unsigned incarnations, aborted, kills;
+	int done;
+};
+
+static void
+restart_complete(uint64_t handle, void *request, int outcome, void *arg)
+{
+	struct restart *s = arg;
+	struct request *r = request;
+
+	check(handle == r->handle, "restart: completion handle");
+	if (outcome == XTC_E_ABORTED) {
+		/* Closed under a dead engine: start the request over. */
+		s->aborted++;
+		r->rounds = 0;
+		return;
+	}
+	check(outcome == XTC_OK && ++r->terminals == 1,
+	    "restart: one XTC_OK terminal per request");
+	r->outcome = outcome;
+	r->order = ++s->g.sequence;
+}
+
+static int
+restart_step(const xtc_batch_item_t *items, xtc_batch_result_t *results,
+    size_t n, void *arg)
+{
+	struct restart *s = arg;
+
+	return step(items, results, n, &s->g);
+}
+
+static void
+restart_engine(void *arg)
+{
+	struct restart *s = arg;
+	xtc_batch_opts_t opts = { .size = sizeof(opts), .version = XTC_BATCH_VERSION,
+	    .capacity = REQUESTS, .max_active = 2, .resource_capacity = 2,
+	    .step = restart_step, .complete = restart_complete, .user = s };
+	struct request *r;
+	unsigned j, k;
+
+	s->engine = xtc_self();
+	s->incarnations++;
+	if (s->g.batch != NULL) {
+		/* The last incarnation's group: closing since its owner died. */
+		while (xtc_batch_destroy(s->g.batch) == XTC_E_AGAIN)
+			xtc_yield();
+		s->g.batch = NULL;
+	}
+	must(xtc_batch_create(s->loop, &opts, &s->g.batch));
+	for (j = 0; j < REQUESTS; j++) {
+		r = &s->g.requests[j];
+		if (r->terminals != 0)
+			continue;
+		r->rounds = 0;
+		for (k = 0; k < WIDTH; k++)
+			r->values[k] = r->seed + k;
+		must(xtc_batch_submit(s->g.batch, r, 1, &r->handle));
+	}
+	while (s->g.sequence != REQUESTS)
+		xtc_yield();
+	must(xtc_batch_shutdown(s->g.batch, XTC_BATCH_DRAIN));
+	while (xtc_batch_destroy(s->g.batch) == XTC_E_AGAIN)
+		xtc_yield();
+	s->g.batch = NULL;
+	s->done = 1;
+	must(xtc_sup_stop(s->sup));
+}
+
+/* Kills the first incarnation once its batch has run a few vectors. */
+static void
+restart_watcher(void *arg)
+{
+	struct restart *s = arg;
+
+	while (s->g.requests[LONG].rounds < 3)
+		xtc_yield();
+	s->kills++;
+	must(xtc_exit_pid(s->engine, 9));
+}
+
+static void
+restart_run(void)
+{
+	struct restart s = {0};
+	xtc_sup_opts_t so = XTC_SUP_OPTS_INIT;
+	xtc_child_spec_t kid = XTC_CHILD_SPEC_INIT;
+	struct request *r;
+	xtc_pid_t pid;
+	unsigned j, k;
+
+	s.g.coefficient_seed = 3;
+	for (j = 0; j < REQUESTS; j++) {
+		r = &s.g.requests[j];
+		r->length = j == LONG ? 64 : j == SHORT ? 4 : 2;
+		r->seed = UINT64_MAX - j * WIDTH;
+		r->released = 1; /* no BLOCKED dependency in this mode */
+		for (k = 0; k < WIDTH; k++)
+			r->values[k] = r->seed + k;
+	}
+	must(xtc_loop_create(&s.loop));
+	kid.name = "engine";
+	kid.fn = restart_engine;
+	kid.arg = &s;
+	kid.policy = XTC_RESTART_TRANSIENT;
+	must(xtc_sup_start(s.loop, &so, &kid, 1, &s.sup));
+	must(xtc_proc_spawn(s.loop, restart_watcher, &s, NULL, &pid));
+	must(xtc_loop_run(s.loop));
+	check(s.done && s.kills == 1 && s.incarnations == 2,
+	    "restart: one kill, one restart, the work finished");
+	check(s.aborted > 0, "restart: the dead engine's group was closed");
+	for (j = 0; j < REQUESTS; j++) {
+		r = &s.g.requests[j];
+		check(r->terminals == 1 && r->rounds == r->length,
+		    "restart: every request ran to completion once");
+		reference(&s.g, r);
+	}
+	(void)xtc_sup_join(s.sup, -1);
+	xtc_loop_destroy(s.loop);
+	printf("mode=restart: incarnations=%u aborted=%u terminals=%u OK\n",
+	    s.incarnations, s.aborted, REQUESTS);
+}
+
 static void
 self_test(void)
 {
@@ -261,25 +405,31 @@ self_test(void)
 			    "late short completion order");
 		}
 	}
-	puts("continuous batching self-test: PASS (4 mode/policy combinations)");
+	restart_run();
+	puts("continuous batching self-test: PASS (4 mode/policy combinations, "
+	    "supervised restart)");
 }
 
 int
 main(int argc, char **argv)
 {
-	int i, continuous = 1, policy = 0, test = 0;
+	int i, continuous = 1, policy = 0, test = 0, restart = 0;
 
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--help") == 0) {
-			puts("usage: continuous_batching [--mode=static|continuous]\n"
+			puts("usage: continuous_batching [--mode=static|continuous|restart]\n"
 			    "       [--policy=default|continuous] [--self-test] [--help]\n"
-			    "Defaults: continuous mode, default policy. --self-test runs all four combinations.\n"
-			    "Requires libxtc configured with --enable-sched-policy.");
+			    "Defaults: continuous mode, default policy. --self-test runs all four combinations\n"
+			    "and the supervised restart. --mode=restart kills a supervised engine that owns\n"
+			    "its group; the restarted engine recreates the group and finishes the work.\n"
+			    "Requires libxtc 2.2 configured with --enable-sched-policy.");
 			return 0;
 		} else if (strcmp(argv[i], "--mode=static") == 0)
 			continuous = 0;
 		else if (strcmp(argv[i], "--mode=continuous") == 0)
 			continuous = 1;
+		else if (strcmp(argv[i], "--mode=restart") == 0)
+			restart = 1;
 		else if (strcmp(argv[i], "--policy=default") == 0)
 			policy = 0;
 		else if (strcmp(argv[i], "--policy=continuous") == 0)
@@ -293,6 +443,8 @@ main(int argc, char **argv)
 	}
 	if (test)
 		self_test();
+	else if (restart)
+		restart_run();
 	else
 		(void)run(continuous, policy);
 	return 0;

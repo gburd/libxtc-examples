@@ -9,11 +9,12 @@ XTC_LIBS := $(shell sed -n 's/^LIBS[[:space:]]*=[[:space:]]*//p' $(XTC_BUILD)/Ma
 
 .PHONY: all test clean
 all: continuous_batching
-continuous_batching: main.c $(XTC_INC)/xtc_batch.h $(XTC_INC)/xtc_sched.h $(XTC_BUILD)/libxtc.a
+continuous_batching: main.c $(XTC_INC)/xtc_batch.h $(XTC_INC)/xtc_sched.h $(XTC_INC)/xtc_orc.h $(XTC_BUILD)/libxtc.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra -Wpedantic -o $@ main.c $(XTC_BUILD)/libxtc.a $(LDFLAGS) $(XTC_LDFLAGS) $(XTC_LIBS) -pthread
 
 test: continuous_batching
 	./continuous_batching --self-test
+	./continuous_batching --mode=restart
 	./continuous_batching --help >/dev/null
 	@if ./continuous_batching --mode=invalid >/dev/null 2>&1; then exit 1; fi
 	@if ./continuous_batching --policy=invalid >/dev/null 2>&1; then exit 1; fi

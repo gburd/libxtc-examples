@@ -20,8 +20,10 @@ The binary accepts:
   refill a free active slot between iterations. Default: `continuous`.
 - `--policy=default|continuous`: ordinary class scheduling, or the built-in
   batch-lane preference with a maximum bypass budget of 3. Default: `default`.
-- `--self-test`: run and check all four combinations, regardless of the
-  selected mode and policy.
+- `--mode=restart`: a supervised engine owns its group and is killed
+  mid-batch; the restarted engine recreates the group (see below).
+- `--self-test`: run and check all four combinations and the restart
+  mode, regardless of the selected mode and policy.
 - `--help`: print usage without initializing a loop.
 
 For example, run `./continuous_batching --mode=static --policy=default`,
@@ -59,9 +61,24 @@ or claims that the scheduling policy accelerates arithmetic. Policy and
 batch membership are independent: continuous refill also works under the
 default policy.
 
+## A group owned by a supervised engine
+
+`--mode=restart` is the restartable-scheduler shape (libxtc 2.2). The
+engine is a TRANSIENT child of a supervisor and creates its group itself,
+on the running loop, then submits every request that has not finished. A
+watcher kills the first incarnation after a few vectors. The group
+belonged to the dead engine, so libxtc closes it with `XTC_BATCH_CANCEL`
+and its unfinished requests complete with `XTC_E_ABORTED`; the example
+starts those over. The supervisor restarts the engine, and the new
+incarnation destroys the old group (retrying while its driver is still
+ending), creates a new one on the same loop and resubmits. It prints
+`mode=restart: incarnations=2 aborted=3 terminals=4 OK`, and the scalar
+reference checks every request's arithmetic from its restart.
+
 ## Ownership
 
-Create classes and groups before the loop's first run. Setup mutations
+In the two batching modes, classes and groups are created before the
+loop's first run. Setup mutations
 are externally serialized; later submit/resume/close operations run in
 the owner process on that same loop. The callbacks only compute results
 or record completion. They do not yield, mutate groups, or call across
