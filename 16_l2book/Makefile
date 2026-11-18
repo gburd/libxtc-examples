@@ -12,9 +12,13 @@
 #
 # XTC_BUILD / XTC_INC point at a libxtc build tree and its headers; the
 # defaults work inside a libxtc checkout (examples/ is the submodule).
+# O is the directory the binaries go to (default: this one).  A libxtc
+# build's `make check` passes a directory of its own, so two builds of
+# one checkout never write, run or delete each other's binaries.
 
 XTC_BUILD ?= ../../build_unix
 XTC_INC   ?= ../../src/inc
+O         ?= .
 
 CC      ?= cc
 CFLAGS  ?= -O3 -g
@@ -56,32 +60,35 @@ CONSOLE_SRC = console.c signals.c gorand.c
 CONSOLE_HDR = console.h signals.h gorand.h
 VENUE_HDR = book.h venue.h hist.h
 
-all: test_book test_signals bench_book bench_scenarios l2book l2book-flow l2book-xeng
+BINS = test_book test_signals bench_book bench_scenarios l2book l2book-flow \
+       l2book-xeng
+
+all: $(addprefix $(O)/,$(BINS))
 
 # intrepidkarthi/orderbook's per-op latency scenarios, ported (COMPARISON.md).
-bench_scenarios: bench_scenarios.c book.c book.h
+$(O)/bench_scenarios: bench_scenarios.c book.c book.h
 	$(CC) $(CFLAGS) -o $@ bench_scenarios.c book.c
 
 # The cross-engine adapter (intrepidkarthi/orderbook docs/CROSS-ENGINE.md):
 # the engine only, no libxtc.
-l2book-xeng: xeng.c book.c book.h
+$(O)/l2book-xeng: xeng.c book.c book.h
 	$(CC) $(CFLAGS) -o $@ xeng.c book.c
 
-l2book-flow: flow.c
+$(O)/l2book-flow: flow.c
 	$(CC) $(CFLAGS) -o $@ flow.c $(NETLIBS)
 
-l2book: $(VENUE_SRC) $(VENUE_HDR) $(XTC_BUILD)/libxtc.a
+$(O)/l2book: $(VENUE_SRC) $(VENUE_HDR) $(XTC_BUILD)/libxtc.a
 	$(CC) $(CFLAGS) $(XTC_CINC) -o $@ $(VENUE_SRC) $(LIBXTC) $(NETLIBS)
 
-test_book: book.c book.h refbook.h test_book.c
+$(O)/test_book: book.c book.h refbook.h test_book.c
 	$(CC) $(CFLAGS) -o $@ book.c test_book.c
 
 # The console's market, signals and surveillance (what book.wasm runs in
 # the page), against known answers from intrepidkarthi/orderbook.
-test_signals: test_signals.c book.c book.h $(CONSOLE_SRC) $(CONSOLE_HDR)
+$(O)/test_signals: test_signals.c book.c book.h $(CONSOLE_SRC) $(CONSOLE_HDR)
 	$(CC) $(CFLAGS) -o $@ test_signals.c book.c $(CONSOLE_SRC) -lm
 
-bench_book: book.c book.h hist.h bench_book.c
+$(O)/bench_book: book.c book.h hist.h bench_book.c
 	$(CC) $(CFLAGS) -o $@ book.c bench_book.c
 
 # The browser engine: book.c + wasm.c, freestanding wasm32.  WASM_CC must
@@ -96,16 +103,16 @@ web/book.wasm: book.c book.h wasm.c $(CONSOLE_SRC) $(CONSOLE_HDR)
 check-wasm: web/book.wasm check_wasm.mjs
 	node check_wasm.mjs web/book.wasm
 
-check: test_book test_signals l2book l2book-flow
-	./test_book
-	./test_signals
-	./l2book --self-test
-	./l2book --self-test --shards 4
-	./l2book --help >/dev/null
-	./l2book-flow --help >/dev/null
+check: $(O)/test_book $(O)/test_signals $(O)/l2book $(O)/l2book-flow
+	$(O)/test_book
+	$(O)/test_signals
+	$(O)/l2book --self-test
+	$(O)/l2book --self-test --shards 4
+	$(O)/l2book --help >/dev/null
+	$(O)/l2book-flow --help >/dev/null
 
-bench: bench_book
-	taskset -c 2 ./bench_book 2>/dev/null || ./bench_book
+bench: $(O)/bench_book
+	taskset -c 2 $(O)/bench_book 2>/dev/null || $(O)/bench_book
 
 clean:
-	rm -f test_book test_signals bench_book bench_scenarios l2book l2book-flow l2book-xeng
+	rm -f $(addprefix $(O)/,$(BINS))
