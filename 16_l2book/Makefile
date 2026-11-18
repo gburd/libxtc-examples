@@ -20,6 +20,15 @@ CC      ?= cc
 CFLAGS  ?= -O3 -g
 CFLAGS  += -std=c11 -Wall -Wextra -Wpedantic -D_DEFAULT_SOURCE -I. -I$(XTC_INC)
 
+# illumos: -std=c11 hides clock_gettime, usleep, nanosleep and
+# posix_memalign unless __EXTENSIONS__ is set, and the socket calls live
+# in libsocket and libnsl.
+NETLIBS =
+ifeq ($(shell uname -s),SunOS)
+CFLAGS  += -D__EXTENSIONS__
+NETLIBS  = -lsocket -lnsl
+endif
+
 # libxtc's own link flags (liburing, TLS, ...) come from its Makefile.
 XTC_LIBS := $(shell [ -f $(XTC_BUILD)/Makefile ] && \
     awk '/^LIBS[[:space:]]*=/{sub(/^LIBS[[:space:]]*=[[:space:]]*/,""); print}' \
@@ -59,10 +68,10 @@ l2book-xeng: xeng.c book.c book.h
 	$(CC) $(CFLAGS) -o $@ xeng.c book.c
 
 l2book-flow: flow.c
-	$(CC) $(CFLAGS) -o $@ flow.c
+	$(CC) $(CFLAGS) -o $@ flow.c $(NETLIBS)
 
 l2book: $(VENUE_SRC) $(VENUE_HDR) $(XTC_BUILD)/libxtc.a
-	$(CC) $(CFLAGS) $(XTC_CINC) -o $@ $(VENUE_SRC) $(LIBXTC)
+	$(CC) $(CFLAGS) $(XTC_CINC) -o $@ $(VENUE_SRC) $(LIBXTC) $(NETLIBS)
 
 test_book: book.c book.h refbook.h test_book.c
 	$(CC) $(CFLAGS) -o $@ book.c test_book.c

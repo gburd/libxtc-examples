@@ -101,7 +101,7 @@ send_frame(int fd, const void *rec, uint32_t len)
 	    (unsigned char)(len >> 16), (unsigned char)(len >> 24) };
 	struct iovec v[2];
 	ssize_t r;
-	v[0].iov_base = hdr;
+	v[0].iov_base = (void *)hdr;
 	v[0].iov_len = 4;
 	v[1].iov_base = (void *)rec;
 	v[1].iov_len = len;
