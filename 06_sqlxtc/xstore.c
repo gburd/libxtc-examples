@@ -2288,17 +2288,12 @@ xstore_uniq_fail_inject(int n)
 	xtc_atomic_store_i32(&g_uniq_failinj, n, xtc_mo_relaxed);
 }
 
-/* Should this UNIQUE probe fail?  The test hook (xstore_uniq_fail_inject)
- * or, under the simulator with buggify on, a seeded draw: a probe can
- * meet a page it cannot read, and the write must then fail. */
+/* Should this UNIQUE probe fail (xstore_uniq_fail_inject)? */
 static int
 xs_uniq_fail_now(void)
 {
-	if (xtc_atomic_load_i32(&g_uniq_failinj, xtc_mo_relaxed) > 0 &&
-	    xtc_atomic_fetch_sub_i32(&g_uniq_failinj, 1, xtc_mo_relaxed) > 0)
-		return 1;
-	return XTC_SIM_BUGGIFY("xstore.uniq.probe_eio") &&
-	    xtc_sim_buggify_fault(100);
+	return xtc_atomic_load_i32(&g_uniq_failinj, xtc_mo_relaxed) > 0 &&
+	    xtc_atomic_fetch_sub_i32(&g_uniq_failinj, 1, xtc_mo_relaxed) > 0;
 }
 
 /*
