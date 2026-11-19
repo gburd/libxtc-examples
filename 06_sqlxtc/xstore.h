@@ -131,7 +131,8 @@ void xstore_set_clock(uint64_t v);
  * distributed engine; an alias over xstore_set_clock). */
 void xstore_clock_observe(uint64_t peer_ts);
 /* Test seam for deterministic simulation: put the commit clock and the
- * read horizon back to their process-start value (1), so a run's stamps
+ * read horizon back to their process-start value (1), and clear the
+ * per-table, per-row and per-UNIQUE-key commit stamps, so a run's stamps
  * do not continue from an earlier run's in the same process.  Only with
  * no store open and no commit in flight; never on a live store (the
  * clock must not run backwards under data it has stamped). */

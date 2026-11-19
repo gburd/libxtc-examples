@@ -433,6 +433,11 @@ xstore_clock_reset(void)
 	xs_commit_lock();
 	xtc_atomic_store_u64(&g_xclock, 1, xtc_mo_relaxed);
 	xtc_atomic_store_u64(&g_xvisible, 1, xtc_mo_seq_cst);
+	/* The stamps are commit times: left over from the earlier run, the
+	 * re-check skips below would compare them with the restarted clock. */
+	memset(g_tab_cts, 0, sizeof g_tab_cts);
+	memset(g_row_cts, 0, sizeof g_row_cts);
+	memset(g_uk_cts, 0, sizeof g_uk_cts);
 	xs_commit_unlock();
 }
 
