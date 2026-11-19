@@ -1968,6 +1968,10 @@ xs_idx_entkey(const struct xs_idx_rt *e, const uint8_t *tup, int tl,
     int64_t rowid, int with_rowid, uint8_t *out, int cap)
 {
 	int p = e->kmax - 21, n;
+#if XTC_DST_BUG(XTC_DST_BUG_LONGKEY)
+	if (with_rowid && tl - 5 > p)
+		return -1; /* planted 73: a long key gets no index entry */
+#endif
 	/* shortcut: pages under 512 bytes leave no room for a truncated
 	 * entry and do not index a long key; sqlxtc uses 4 KiB and up. */
 	if (p < 1)
@@ -2284,12 +2288,17 @@ xstore_uniq_fail_inject(int n)
 	xtc_atomic_store_i32(&g_uniq_failinj, n, xtc_mo_relaxed);
 }
 
-/* Should this UNIQUE probe fail (xstore_uniq_fail_inject)? */
+/* Should this UNIQUE probe fail?  The test hook (xstore_uniq_fail_inject)
+ * or, under the simulator with buggify on, a seeded draw: a probe can
+ * meet a page it cannot read, and the write must then fail. */
 static int
 xs_uniq_fail_now(void)
 {
-	return xtc_atomic_load_i32(&g_uniq_failinj, xtc_mo_relaxed) > 0 &&
-	    xtc_atomic_fetch_sub_i32(&g_uniq_failinj, 1, xtc_mo_relaxed) > 0;
+	if (xtc_atomic_load_i32(&g_uniq_failinj, xtc_mo_relaxed) > 0 &&
+	    xtc_atomic_fetch_sub_i32(&g_uniq_failinj, 1, xtc_mo_relaxed) > 0)
+		return 1;
+	return XTC_SIM_BUGGIFY("xstore.uniq.probe_eio") &&
+	    xtc_sim_buggify_fault(100);
 }
 
 /*
@@ -7863,8 +7872,8 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 		bt_cursor_close(cur);
 		rc = XTC_E_IO;
 	}
-	if (rc != XTC_OK)
-		return rc;
+	if (rc != XTC_OK) /* planted 72: the error reads as "no duplicate" */
+		return XTC_DST_BUG(XTC_DST_BUG_UNIQPROBE) ? 0 : rc;
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t kl = 0, vl = 0;
 		int64_t rid;
