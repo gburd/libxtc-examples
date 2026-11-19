@@ -570,6 +570,9 @@ uint64_t xstore_index_rebuild_count(void);
 int      xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale);
 /* Test hook: the next n index entry inserts fail (as bt_insert can). */
 void     xstore_index_fail_inject(int n);
+/* Test hook: the next n UNIQUE probes of the committed index fail with
+ * XTC_E_IO (as a page read can); the write or COMMIT must then fail. */
+void xstore_uniq_fail_inject(int n);
 
 /* xstore_recover that also reports where the log ends after recovery
  * (wal_scan_ex form; tail->valid = 0 if unknown), so the engine's

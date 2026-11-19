@@ -1647,6 +1647,7 @@ static uint64_t g_idx_rebuilds; /* full index rebuilds (metric) */
 static uint64_t g_idx_garbage;
 #define XS_IDX_GARBAGE_MAX (1u << 16)
 static int g_idx_failinj; /* test hook: inserts to fail */
+static int g_uniq_failinj; /* test hook: UNIQUE probes to fail */
 
 /* Catalog generation: bumped by every DDL entry point (tables, indexes,
  * views) and index rebuild, so a cached plan built at an older one is
@@ -2169,6 +2170,20 @@ xstore_index_fail_inject(int n)
 	xtc_atomic_store_i32(&g_idx_failinj, n, xtc_mo_relaxed);
 }
 
+void
+xstore_uniq_fail_inject(int n)
+{
+	xtc_atomic_store_i32(&g_uniq_failinj, n, xtc_mo_relaxed);
+}
+
+/* Should this UNIQUE probe fail (xstore_uniq_fail_inject)? */
+static int
+xs_uniq_fail_now(void)
+{
+	return xtc_atomic_load_i32(&g_uniq_failinj, xtc_mo_relaxed) > 0 &&
+	    xtc_atomic_fetch_sub_i32(&g_uniq_failinj, 1, xtc_mo_relaxed) > 0;
+}
+
 /*
  * Index maintenance for one committed base-row version (delete == 1 for
  * a tombstone), called after the version is in the tree.  oldrec is the
@@ -2225,6 +2240,7 @@ static int  xs_uniq_validate_locked(bt_t *bt, xstore_ctx_t *cx, uint32_t tid1,
     const struct xs_idx_rt *u, int nu, uint32_t *bad);
 static int  xs_idx_get(bt_t *bt, uint32_t idx_id, struct xs_idx_ent *e);
 static void xs_uniq_msg(const struct xs_idx_ent *e, char *out, size_t cap);
+static void xs_idx_err_msg(bt_t *bt, uint32_t idx, int rc, char *o, size_t n);
 static int  xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid,
     int64_t rowid, const uint8_t *rec, int reclen);
 
@@ -4681,7 +4697,9 @@ xs_key_live_locked(bt_t *bt, uint32_t tableid, int64_t rowid)
  * of it has finished) return SX_CONSTRAINT and write nothing.  The
  * check and the registration are one step under the commit lock.
  * vis: return only once the write is visible (the caller holds no
- * engine lock); else only once its in-flight entry is unlinked. */
+ * engine lock); else only once its in-flight entry is unlinked.
+ * A UNIQUE conflict returns SX_CONSTRAINT and a UNIQUE probe that could
+ * not run its negative XTC_E_* code, both with *ubad set to the index. */
 static int
 xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
     int deleted, uint64_t base, int insert, uint64_t *out_ts, uint32_t *ubad,
@@ -4719,11 +4737,15 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	}
 	/* UNIQUE indexes: the check and the in-flight registration are one
 	 * step, so two concurrent writers of one key cannot both pass. */
-	if (nuq > 0 && xs_uniq_validate_locked(bt, NULL, tableid, rowid,
-	    (const uint8_t *)blob, n, uq, nuq, &bad)) {
+	rc = 0;
+	if (nuq > 0)
+		rc = xs_uniq_validate_locked(bt, NULL, tableid, rowid,
+		    (const uint8_t *)blob, n, uq, nuq, &bad);
+	if (rc != 0) {
 		xs_commit_unlock();
 		if (ubad != NULL) *ubad = bad;
-		return SX_CONSTRAINT;
+		/* rc < 0: the probe's error */
+		return rc > 0 ? SX_CONSTRAINT : rc;
 	}
 	if (base != 0 && xs_ww_recheck_locked(bt, &probe, 1, v0)) {
 		xs_commit_unlock();
@@ -5423,6 +5445,11 @@ xs_put_pruned(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid, const void *blo
 		struct xs_idx_ent e;
 		if (xs_idx_get(cx->bt, ubad, &e))
 			xs_uniq_msg(&e, cx->uniq_err, sizeof cx->uniq_err);
+	} else if (rc < 0) {
+		if (ubad != 0)
+			xs_idx_err_msg(cx->bt, ubad, rc, cx->uniq_err,
+			    sizeof cx->uniq_err);
+		rc = SX_ERROR;
 	}
 	if (rc == SX_OK) {
 		cx->stmt_puts++;            /* an applied autocommit row */
@@ -5480,8 +5507,12 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		}
 		/* UNIQUE: against committed rows and this txn's own writes now;
 		 * the commit re-validates against concurrent committers. */
-		if (!deleted && xs_uniq_check_stmt(cx, tableid, rowid, rec, reclen))
-			return 1;
+		rc = 0;
+		if (!deleted)
+			rc =
+			    xs_uniq_check_stmt(cx, tableid, rowid, rec, reclen);
+		if (rc != 0)
+			return rc > 0 ? 1 : -1; /* -1: uniq_err says why */
 		rc = xs_buf_write(cx, tableid, rowid, deleted ? NULL : rec,
 		                  deleted ? 0 : reclen, deleted);
 		return rc == SX_OK ? 0 : -1;
@@ -6048,14 +6079,20 @@ xs_commit_ctx(xstore_ctx_t *cx)
 			(void)xs_rollback_ctx(cx);
 			return SX_BUSY;           /* serialization failure */
 		}
-		if (nuq > 0 && xs_uniq_validate_locked(cx->bt, cx, 0, 0, NULL, 0,
-		    uq, nuq, &ubad)) {
+		rc = 0;
+		if (nuq > 0)
+			rc = xs_uniq_validate_locked(cx->bt, cx, 0, 0, NULL, 0,
+			    uq, nuq, &ubad);
+		if (rc != 0) {
 			struct xs_idx_ent e;
 			xs_commit_unlock();
-			if (xs_idx_get(cx->bt, ubad, &e))
+			if (rc < 0)
+				xs_idx_err_msg(cx->bt, ubad, rc, cx->uniq_err,
+				    sizeof cx->uniq_err);
+			else if (xs_idx_get(cx->bt, ubad, &e))
 				xs_uniq_msg(&e, cx->uniq_err, sizeof cx->uniq_err);
 			(void)xs_rollback_ctx(cx);
-			return SX_CONSTRAINT;
+			return rc < 0 ? SX_ERROR : SX_CONSTRAINT;
 		}
 		/* Masked from here to the end: the in-flight entry is on this
 		 * stack, so a kill before xs_inflight_remove would leave it
@@ -6171,6 +6208,7 @@ xstore_commit(struct xsql *db)
 	if (cx == NULL) return 0;
 	if (cx->native_mode) cx->native_autocommit = 1;   /* end explicit txn */
 	if (!cx->in_txn) return 0;
+	cx->uniq_err[0] = '\0'; /* a failed commit's reason, if any */
 	{
 		int rc = xs_commit_ctx(cx);
 		if (rc == SX_OK) return 0;
@@ -7615,24 +7653,53 @@ xs_uniq_msg(const struct xs_idx_ent *e, char *out, size_t cap)
 		    i ? ", " : "", e->table, e->col[i]);
 }
 
+/* Format the error of a UNIQUE probe of index `idx_id` that failed with
+ * XTC_E_* code `rc`: "index error: cannot check UNIQUE t.a: <reason>".
+ * The engine passes a message with the "index error" prefix to the
+ * client unchanged. */
+static void
+xs_idx_err_msg(bt_t *bt, uint32_t idx_id, int rc, char *out, size_t cap)
+{
+	struct xs_idx_ent e;
+	if (xs_idx_get(bt, idx_id, &e))
+		snprintf(out, cap, "index error: cannot check UNIQUE %s.%s: %s",
+		    e.table, e.col[0], xtc_strerror(rc));
+	else
+		snprintf(out, cap, "index error: cannot check UNIQUE: %s",
+		    xtc_strerror(rc));
+}
+
 /* Does a live COMMITTED row other than `rowid` carry key tuple `key`
  * (no rowid suffix) in index `rt`?  The newest committed version of
  * each candidate decides; a candidate this transaction has a buffered
  * write for is skipped (`cx` non-NULL: the buffered state decides, and
- * the umap / statement check covers it). */
+ * the umap / statement check covers it).  Returns 1 (a duplicate), 0
+ * (none), or a negative XTC_E_* code when the probe could not run to
+ * the end of the key's entries: NB the caller must fail the write then,
+ * since a probe that stopped early has not proven the key absent. */
 static int
 xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
     int klen, int64_t rowid, xstore_ctx_t *cx)
 {
 	bt_cursor_t *cur = NULL;
 	uint8_t *rec = NULL, kk[XS_IDX_KMAX];
-	int dup = 0;
-	if (bt_cursor_open(bt, key, (uint16_t)klen, &cur) != XTC_OK) return 0;
+	int dup = 0, rc;
+	rc = bt_cursor_open(bt, key, (uint16_t)klen, &cur);
+	if (rc == XTC_OK && xs_uniq_fail_now()) {
+		bt_cursor_close(cur);
+		rc = XTC_E_IO;
+	}
+	if (rc != XTC_OK)
+		return rc;
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t kl = 0, vl = 0;
 		int64_t rid;
 		int rl, kl2;
-		if (bt_cursor_next(cur, &k, &kl, &vv, &vl) != XTC_OK) break;
+		if ((rc = bt_cursor_next(cur, &k, &kl, &vv, &vl)) != XTC_OK) {
+			if (rc != XTC_E_NOTFOUND) /* else: the end of the tree */
+				dup = rc;
+			break;
+		}
 		if (kl != klen + 8 || memcmp(k, key, (size_t)klen) != 0) break;
 		rid = (int64_t)(xs_get_be64((const uint8_t *)k + klen) ^
 		    0x8000000000000000ull);
@@ -7640,13 +7707,19 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 		if (cx != NULL && cx->in_txn && wbuf_find(cx, rt->tableid, rid) != NULL)
 			continue;
 		bt_cursor_park(cur);
-		if (rec == NULL && (rec = malloc(XS_VMAX)) == NULL) break;
+		if (rec == NULL && (rec = malloc(XS_VMAX)) == NULL) {
+			dup = XTC_E_NOMEM;
+			break;
+		}
 		rl = xs_read_rec(bt, rt->tableid, rid, rec, XS_VMAX);
 		if (rl > 0) {
 			kl2 = xs_idx_rowkey(rt, rec, rl, rid, 0, kk, (int)sizeof kk, NULL);
 			if (kl2 == klen && memcmp(kk, key, (size_t)klen) == 0) { dup = 1; break; }
 		}
-		if (bt_cursor_resume(cur) != XTC_OK) break;
+		if ((rc = bt_cursor_resume(cur)) != XTC_OK) {
+			dup = rc;
+			break;
+		}
 	}
 	bt_cursor_close(cur);
 	free(rec);
@@ -7686,8 +7759,9 @@ xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
  * on connection `cx`: every unique index's key tuple must not be carried
  * by another live committed row or another of this transaction's
  * buffered rows.  On a violation formats the SQLite message into
- * cx->uniq_err and returns 1; else 0.  The commit re-validates against
- * commits this check could not see.
+ * cx->uniq_err and returns 1; if the committed probe fails, formats an
+ * "index error" message there and returns -1; else 0.  The commit
+ * re-validates against commits this check could not see.
  */
 static int
 xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid,
@@ -7696,7 +7770,7 @@ xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid,
 	struct xs_idx_rt hits[16];
 	uint8_t key[XS_IDX_KMAX];
 	uint64_t vis;
-	int nh, i, klen, isnull;
+	int nh, i, klen, isnull, d;
 	if (g_idx_n == 0 || rec == NULL) return 0;
 	nh = xs_idx_for_table(cx->bt, tableid, hits, 16);
 	if (nh == 0) return 0;
@@ -7707,11 +7781,17 @@ xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid,
 		klen = xs_idx_rowkey(&hits[i], rec, reclen, rowid, 0, key,
 		    (int)sizeof key, &isnull);
 		if (klen < 0 || isnull) continue;
-		if (xs_uniq_buffered_dup(cx, &hits[i], key, klen, rowid) ||
-		    xs_uniq_committed_dup(cx->bt, &hits[i], key, klen, rowid, cx)) {
-			if (xs_idx_get(cx->bt, hits[i].idx_id, &e))
+		d = xs_uniq_buffered_dup(cx, &hits[i], key, klen, rowid);
+		if (d == 0)
+			d = xs_uniq_committed_dup(cx->bt, &hits[i], key, klen,
+			    rowid, cx);
+		if (d != 0) {
+			if (d < 0)
+				xs_idx_err_msg(cx->bt, hits[i].idx_id, d,
+				    cx->uniq_err, sizeof cx->uniq_err);
+			else if (xs_idx_get(cx->bt, hits[i].idx_id, &e))
 				xs_uniq_msg(&e, cx->uniq_err, sizeof cx->uniq_err);
-			return 1;
+			return d < 0 ? -1 : 1;
 		}
 	}
 	if (cx->in_txn && (cx->uniq_vis == 0 || vis < cx->uniq_vis)) {
@@ -7790,7 +7870,9 @@ xs_uniq_collect(bt_t *bt, const xstore_ctx_t *cx, uint32_t tid1,
  * commit has touched since the transaction's statement-time checks
  * (g_tab_cts <= uniq_vis, with no index created since) is skipped:
  * everything up to that horizon was applied when the checks ran.
- * Returns 1 with *bad set to the violated index on a conflict.
+ * Returns 1 with *bad set to the violated index on a conflict, or the
+ * probe's negative XTC_E_* code with *bad set to its index when the
+ * committed probe fails (the commit must fail: nothing is proven).
  */
 static int
 xs_uniq_validate_locked(bt_t *bt, xstore_ctx_t *cx, uint32_t tid1,
@@ -7799,7 +7881,7 @@ xs_uniq_validate_locked(bt_t *bt, xstore_ctx_t *cx, uint32_t tid1,
 {
 	uint8_t key[XS_IDX_KMAX];
 	int n = cx != NULL ? cx->wn : 1, wi, i, klen, isnull, rl = 0;
-	int skipok;
+	int skipok, d;
 	if (nu == 0) return 0;
 	skipok = cx != NULL && cx->uniq_vis != 0 &&
 	    cx->uniq_gen == xtc_atomic_load_u64(&g_idx_gen, xtc_mo_relaxed);
@@ -7827,10 +7909,14 @@ xs_uniq_validate_locked(bt_t *bt, xstore_ctx_t *cx, uint32_t tid1,
 			if (skipok && g_uk_cts[xs_uk_slot(u[i].idx_id, key, klen)] <=
 			    cx->uniq_vis)
 				continue;
-			if (xs_uniq_committed_dup(bt, &u[i], key, klen, rid, cx) ||
-			    xs_uniq_inflight_dup(&u[i], key, klen, rid, cx)) {
+			d = xs_uniq_committed_dup(bt, &u[i], key, klen, rid,
+			    cx);
+			if (d == 0)
+				d = xs_uniq_inflight_dup(&u[i], key, klen, rid,
+				    cx);
+			if (d != 0) {
 				*bad = u[i].idx_id;
-				return 1;
+				return d;
 			}
 		}
 	}
