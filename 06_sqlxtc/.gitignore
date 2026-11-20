@@ -138,6 +138,7 @@ test_dup_composite
 test_quack_range
 bench_btree_mixed
 bench_morsel_balance
+bench_point_iscan
 test_bg_idle
 test_ckpt_offloop
 test_bg_kill

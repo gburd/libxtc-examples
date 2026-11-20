@@ -179,7 +179,7 @@ clean:
 	rm -f test_btree
 	rm -f test_btree_loop
 	rm -f test_btree_mt
-	rm -f test_btree_stale_descent test_btree_limits test_btree_sample bench_morsel_balance
+	rm -f test_btree_stale_descent test_btree_limits test_btree_sample bench_morsel_balance bench_point_iscan
 	rm -f test_btree_seek test_btree_seek_latched test_point_read test_index_walk test_group_exact test_xs_ctr
 	rm -f test_xs_ctr test_bm_reuse_version test_kill_stmt test_cat_lock_shared test_conn_sup test_storage_sup
 	rm -f test_sql_results test_txn_fastpath test_wal_crc_once
@@ -558,6 +558,10 @@ bench_btree_mixed: bench_btree_mixed.c btree.c bufmgr.o btnode.c
 # split; rows per morsel and wall time).
 bench_morsel_balance: bench_morsel_balance.c $(ENGINE_NATIVE)
 	$(CC) $(CFLAGS) -o $@ bench_morsel_balance.c $(ENGINE_NATIVE) $(LDFLAGS)
+
+# The cost of an indexed point read (the equality index-scan open).
+bench_point_iscan: bench_point_iscan.c $(ENGINE_NATIVE)
+	$(CC) $(CFLAGS) -o $@ bench_point_iscan.c $(ENGINE_NATIVE) $(LDFLAGS)
 
 # ---- physiological redo apply (page-LSN gated image write) ----
 test_redo_page: test_redo_page.c bufmgr.o
