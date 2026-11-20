@@ -3552,6 +3552,65 @@ bt_seek_lt_n(bt_t *bt, const void *hi, uint16_t hlen, void *buf,
 	return XTC_E_INTERNAL;
 }
 
+/*
+ * Up to `max` keys >= `lo` from the leaf that holds `lo` (see btree.h).
+ * The leaf is reached by descend_shared, so it is latched shared and
+ * owns `lo`: every key of the tree in (lower fence, upper fence] is in
+ * it, and every key above the upper fence is in a leaf to the right.
+ * That is what lets an equality index probe end without a cursor: if
+ * the copy ran to the leaf's end and the fence sorts past the range,
+ * no key to the right can be in it.
+ */
+int
+bt_seek_ge_keys(bt_t *bt, const void *lo, uint16_t lolen, void *buf,
+    uint32_t bcap, uint32_t *off, uint16_t *lens, int max, int *n, int *more,
+    void *fence, uint16_t fcap, uint16_t *flen)
+{
+	bm_frame_t *f = NULL;
+	void *pg;
+	uint32_t used = 0;
+	int s, cnt, rc;
+	uint16_t kl;
+
+	if (bt == NULL || lo == NULL || buf == NULL || off == NULL ||
+	    lens == NULL || n == NULL || more == NULL || flen == NULL ||
+	    max < 1 || lolen > bt_key_max(bt))
+		return XTC_E_INVAL;
+	*n = 0;
+	*more = 0;
+	*flen = 0;
+	rc = descend_shared(bt, lo, lolen, &f);
+	if (rc != XTC_OK)
+		return rc;
+	pg = bm_page(f);
+	cnt = (int)btnode_count(pg);
+	/* Copy the keys from the first one >= lo. */
+	for (s = btnode_search(pg, lo, lolen, NULL); s < cnt; s++) {
+		uint32_t room = bcap - used;
+		if (*n == max ||
+		    btnode_full_key(pg, s, (uint8_t *)buf + used,
+		        (uint16_t)(room > 0xFFFF ? 0xFFFF : room), &kl) != 0) {
+			*more = 1; /* max reached, or the buffer is full */
+			break;
+		}
+		off[*n] = used;
+		lens[*n] = kl;
+		used += kl;
+		(*n)++;
+	}
+	/* The leaf is exhausted: hand back its upper fence.  A leaf with a
+	 * right sibling but no fence proves nothing, so it reads as more. */
+	if (!*more && btnode_right_sibling(pg) != 0) {
+		if (btnode_hi_fence(pg, fence, fcap, flen) != 0)
+			rc = XTC_E_INVAL;
+		else if (*flen == 0)
+			*more = 1;
+	}
+	bm_unlatch(f);
+	bm_unfix(bt->bm, f, 0);
+	return rc;
+}
+
 /* ---- key-distribution sample (RethinkDB get_distribution) ---------- */
 
 struct bt_sample {
