@@ -3552,45 +3552,57 @@ bt_seek_lt_n(bt_t *bt, const void *hi, uint16_t hlen, void *buf,
 	return XTC_E_INTERNAL;
 }
 
+/* Does key k (kl bytes) start with p (pl bytes)? */
+static int
+key_has_prefix(const uint8_t *k, uint16_t kl, const uint8_t *p, uint16_t pl)
+{
+	return kl >= pl && memcmp(k, p, pl) == 0;
+}
+
 /*
- * Up to `max` keys >= `lo` from the leaf that holds `lo` (see btree.h).
- * The leaf is reached by descend_shared, so it is latched shared and
- * owns `lo`: every key of the tree in (lower fence, upper fence] is in
- * it, and every key above the upper fence is in a leaf to the right.
- * That is what lets an equality index probe end without a cursor: if
- * the copy ran to the leaf's end and the fence sorts past the range,
- * no key to the right can be in it.
+ * Up to `max` keys >= `lo` with lo's `plen`-byte prefix, from the leaf
+ * that holds `lo` (see btree.h).  The leaf is reached by descend_shared,
+ * so it is latched shared and owns `lo`: every key of the tree in (lower
+ * fence, upper fence] is in it, and every key above the upper fence is
+ * in a leaf to the right.  So the prefix's keys end in this leaf if a
+ * key past the prefix follows them here, or if the upper fence itself
+ * sorts past every key with the prefix: it does not start with the
+ * prefix and sorts above it.  That is what lets an equality index probe
+ * finish without a cursor.
  */
 int
-bt_seek_ge_keys(bt_t *bt, const void *lo, uint16_t lolen, void *buf,
-    uint32_t bcap, uint32_t *off, uint16_t *lens, int max, int *n, int *more,
-    void *fence, uint16_t fcap, uint16_t *flen)
+bt_seek_ge_keys(bt_t *bt, const void *lo, uint16_t lolen, uint16_t plen,
+    void *buf, uint32_t bcap, uint32_t *off, uint16_t *lens, int max, int *n,
+    int *more)
 {
+	uint8_t hf[BT_MAX_KEY];
 	bm_frame_t *f = NULL;
 	void *pg;
 	uint32_t used = 0;
 	int s, cnt, rc;
-	uint16_t kl;
+	uint16_t kl, hfl = 0;
 
 	if (bt == NULL || lo == NULL || buf == NULL || off == NULL ||
-	    lens == NULL || n == NULL || more == NULL || flen == NULL ||
-	    max < 1 || lolen > bt_key_max(bt))
+	    lens == NULL || n == NULL || more == NULL || max < 1 ||
+	    plen > lolen || lolen > bt_key_max(bt))
 		return XTC_E_INVAL;
 	*n = 0;
-	*more = 0;
-	*flen = 0;
+	*more = 1;
 	rc = descend_shared(bt, lo, lolen, &f);
 	if (rc != XTC_OK)
 		return rc;
 	pg = bm_page(f);
 	cnt = (int)btnode_count(pg);
-	/* Copy the keys from the first one >= lo. */
+	/* Copy the prefix's keys from the first one >= lo. */
 	for (s = btnode_search(pg, lo, lolen, NULL); s < cnt; s++) {
+		uint8_t *k = (uint8_t *)buf + used;
 		uint32_t room = bcap - used;
 		if (*n == max ||
-		    btnode_full_key(pg, s, (uint8_t *)buf + used,
-		        (uint16_t)(room > 0xFFFF ? 0xFFFF : room), &kl) != 0) {
-			*more = 1; /* max reached, or the buffer is full */
+		    btnode_full_key(pg, s, k,
+		        (uint16_t)(room > 0xFFFF ? 0xFFFF : room), &kl) != 0)
+			break; /* max reached, or the buffer is full */
+		if (!key_has_prefix(k, kl, lo, plen)) {
+			*more = 0; /* past the prefix: its keys end here */
 			break;
 		}
 		off[*n] = used;
@@ -3598,17 +3610,19 @@ bt_seek_ge_keys(bt_t *bt, const void *lo, uint16_t lolen, void *buf,
 		used += kl;
 		(*n)++;
 	}
-	/* The leaf is exhausted: hand back its upper fence.  A leaf with a
-	 * right sibling but no fence proves nothing, so it reads as more. */
-	if (!*more && btnode_right_sibling(pg) != 0) {
-		if (btnode_hi_fence(pg, fence, fcap, flen) != 0)
-			rc = XTC_E_INVAL;
-		else if (*flen == 0)
-			*more = 1;
+	/* The leaf ran out first: its upper fence decides (+infinity for
+	 * the rightmost leaf, which has no right sibling). */
+	if (s == cnt) {
+		if (btnode_right_sibling(pg) == 0)
+			*more = 0;
+		else if (btnode_hi_fence(pg, hf, sizeof hf, &hfl) == 0 &&
+		    hfl > 0 && !key_has_prefix(hf, hfl, lo, plen) &&
+		    key_cmp(hf, hfl, lo, plen) > 0)
+			*more = 0;
 	}
 	bm_unlatch(f);
 	bm_unfix(bt->bm, f, 0);
-	return rc;
+	return XTC_OK;
 }
 
 /* ---- key-distribution sample (RethinkDB get_distribution) ---------- */

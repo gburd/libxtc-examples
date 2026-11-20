@@ -29,10 +29,11 @@
  *	    answer obeys S2's bounds and carries its own key's value.
  *	S5  bt_seek_ge_keys, the one-leaf read behind an equality index
  *	    probe: in S1 its keys are exactly the first live keys >= the
- *	    probe, and when it says the leaf ended (more == 0) the next live
- *	    key lies above the fence it returned; in the S2 churn its keys
- *	    are ascending and >= the probe, and every stable key from the
- *	    probe up to its last key (to the fence when more == 0) is there.
+ *	    probe that share its prefix, and when it says they are all
+ *	    (more == 0) no later live key has the prefix; in the S2 churn
+ *	    its keys ascend from the probe with the prefix, and every stable
+ *	    key with the prefix from the probe up to its last key (every one
+ *	    when more == 0) is there.
  *
  *	Built twice: test_btree_seek (the optimistic, version-validated
  *	path) and test_btree_seek_latched (-DBT_OLC_ENABLED=0: the latched
@@ -237,33 +238,34 @@ t_oracle(uint32_t ps)
 		    nwrong);
 	}
 
-	/* S5 (oracle half): every third probe, at most 1..40 keys. */
+	/* S5 (oracle half): every third probe, a prefix of 1..8 bytes of
+	 * it, at most 1..40 keys. */
 	{
 		static unsigned char kb[8192];
 		uint32_t ko[64];
-		uint16_t kls[64], fl = 0;
-		char fence[64];
+		uint16_t kls[64], pl;
 		int nk = 0, more = 0, nwrong = 0, ended = 0, m, j2, x;
 		for (i = 0; i < S1_N + 6; i += 3) {
 			uint16_t ql = (uint16_t)((i & 1) ? 9 : 8);
 			snprintf(q, sizeof q, "s%07d", i);
 			if (ql == 9)
 				q[8] = '!';
+			pl = (uint16_t)(1 + rnd(&s) % 8);
 			m = 1 + (int)(rnd(&s) % 40);
-			if (bt_seek_ge_keys(bt, q, ql, kb, sizeof kb, ko, kls,
-			        m, &nk, &more, fence, sizeof fence,
-			        &fl) != XTC_OK) {
+			if (bt_seek_ge_keys(bt, q, ql, pl, kb, sizeof kb, ko,
+			        kls, m, &nk, &more) != XTC_OK) {
 				nwrong++;
 				continue;
 			}
-			/* The first nk live keys >= q, in order. */
-			for (x = ql == 9 ? i + 1 : i, j2 = 0; j2 < nk;
-			     j2++, x++) {
+			/* The first nk live keys >= q, all with the prefix. */
+			x = ql == 9 ? i + 1 : i;
+			for (j2 = 0; j2 < nk; j2++, x++) {
 				while (x < S1_N && !live[x])
 					x++;
 				snprintf(k, sizeof k, "s%07d", x);
 				if (x >= S1_N || kls[j2] != 8 ||
-				    memcmp(kb + ko[j2], k, 8) != 0)
+				    memcmp(kb + ko[j2], k, 8) != 0 ||
+				    memcmp(k, q, pl) != 0)
 					break;
 			}
 			if (j2 < nk || nk > m) {
@@ -273,17 +275,16 @@ t_oracle(uint32_t ps)
 			if (more)
 				continue;
 			ended++;
-			/* The leaf ended: the next live key is past its fence.
-			 */
+			/* All of them: the next live key lacks the prefix. */
 			while (x < S1_N && !live[x])
 				x++;
 			snprintf(k, sizeof k, "s%07d", x);
-			if (x < S1_N && (fl == 0 || kcmp(k, 8, fence, fl) <= 0))
+			if (x < S1_N && memcmp(k, q, pl) == 0)
 				nwrong++;
 		}
 		CK(nwrong == 0 && ended > 0);
 		printf("  %s   S5 ps=%u: one-leaf key reads against the oracle "
-		       "(%d ended at a fence), %d wrong\n",
+		       "(%d complete), %d wrong\n",
 		    nwrong == 0 && ended > 0 ? "ok" : "FAIL", ps, ended,
 		    nwrong);
 	}
@@ -545,33 +546,31 @@ xtc_atomic_fetch_add_long(&g_lt_reads, n, xtc_mo_seq_cst);
 free(buf);
 }
 
-/* S5: one-leaf key reads (bt_seek_ge_keys) at a random bound.  The
- * keys must ascend from the bound, and no stable key (never deleted)
- * may be missing between the bound and the last key read, or, when
- * the read says the leaf ended, between the bound and the fence. */
+/* S5: one-leaf key reads (bt_seek_ge_keys) at a random bound and a
+ * prefix of it.  The keys must ascend from the bound and share the
+ * prefix, and no stable key (never deleted) with the prefix may be
+ * missing between the bound and the last key read, or anywhere past
+ * the bound when the read says it has them all. */
 static long g_ge_reads, g_ge_ended, g_ge_bad;
 
 static int
-s5_bad(const char *q, const uint8_t *buf, const uint32_t *off,
-    const uint16_t *lens, int got, int more, const char *fence, uint16_t fl)
+s5_bad(const char *q, uint16_t pl, const uint8_t *buf, const uint32_t *off,
+    const uint16_t *lens, int got, int more)
 {
 	int i = atoi(q + 1), j, t, hit, top;
 	char k[16];
 	for (j = 0; j < got; j++)
 		if (lens[j] != 8 || kcmp(buf + off[j], 8, q, 8) < 0 ||
+		    memcmp(buf + off[j], q, pl) != 0 ||
 		    (j > 0 && kcmp(buf + off[j], 8, buf + off[j - 1], 8) <= 0))
 			return 1;
-	/* The stable keys the read must hold: up to its last key, or up to
-	 * the fence (every key, for the rightmost leaf) if the leaf ended. */
 	top = got > 0 ? atoi((const char *)buf + off[got - 1] + 1) : i - 1;
 	if (!more)
 		top = S2_N - 1;
 	for (j = i; j <= top; j++) {
-		if (!STABLE(j))
-			continue;
 		s2_key(j, k);
-		if (!more && fl > 0 && kcmp(k, 8, fence, fl) > 0)
-			break; /* past the fence: not this leaf's */
+		if (!STABLE(j) || memcmp(k, q, pl) != 0)
+			continue;
 		for (t = 0, hit = 0; t < got && !hit; t++)
 			hit = memcmp(buf + off[t], k, 8) == 0;
 		if (!hit)
@@ -586,8 +585,8 @@ reader_ge(void *arg)
 	uint64_t s = (uint64_t)(uintptr_t)arg * 0x8CB92BA72F3D8DD7ull + 5;
 	uint8_t *buf = malloc(4096); /* per reader: a seek can park */
 	uint32_t off[64];
-	uint16_t lens[64], fl = 0;
-	char q[16], fence[64];
+	uint16_t lens[64], pl;
+	char q[16];
 	long n = 0, ended = 0, bad = 0;
 	int got, more;
 
@@ -597,10 +596,10 @@ reader_ge(void *arg)
 	}
 	while (xtc_atomic_load_i32(&g_active, xtc_mo_seq_cst) > 0 || n < 2000) {
 		s2_key((int)(rnd(&s) % S2_N), q);
-		if (bt_seek_ge_keys(g_bt, q, 8, buf, 4096, off, lens,
-		        1 + (int)(rnd(&s) % 64), &got, &more, fence,
-		        sizeof fence, &fl) != XTC_OK ||
-		    s5_bad(q, buf, off, lens, got, more, fence, fl))
+		pl = (uint16_t)(5 + rnd(&s) % 4); /* 1 to 1000 keys */
+		if (bt_seek_ge_keys(g_bt, q, 8, pl, buf, 4096, off, lens,
+		        1 + (int)(rnd(&s) % 64), &got, &more) != XTC_OK ||
+		    s5_bad(q, pl, buf, off, lens, got, more))
 			bad++;
 		ended += !more;
 		n++;
@@ -690,7 +689,7 @@ t_concurrent(void)
 	    xtc_atomic_load_long(&g_n_settled, xtc_mo_seq_cst),
 	    xtc_atomic_load_long(&g_n_bad, xtc_mo_seq_cst));
 	printf("  %s   S5: %ld concurrent one-leaf key reads (bt_seek_ge_keys) "
-	       "in the same churn, %ld ended at a fence: %ld wrong\n",
+	       "in the same churn, %ld complete: %ld wrong\n",
 	    xtc_atomic_load_long(&g_ge_bad, xtc_mo_seq_cst) ? "FAIL" : "ok",
 	    xtc_atomic_load_long(&g_ge_reads, xtc_mo_seq_cst),
 	    xtc_atomic_load_long(&g_ge_ended, xtc_mo_seq_cst),
