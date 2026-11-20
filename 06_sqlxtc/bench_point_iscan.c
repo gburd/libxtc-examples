@@ -193,9 +193,14 @@ main(int argc, char **argv)
 		unlink(path);
 		return 1;
 	}
-	/* Warm every page and the plan caches once, then measure. */
-	(void)cell_sql(db, "SELECT pad FROM t WHERE u = ?", rows, rows, 0, 7);
-	(void)cell_sql(db, "SELECT pad FROM t WHERE e = ?", rows, rows, 1, 0);
+	/* Warm every page and the plan caches once, then measure.  A named
+	 * cell skips it, so an instruction count holds that cell alone. */
+	if (only == NULL) {
+		(void)cell_sql(db, "SELECT pad FROM t WHERE u = ?", rows, rows,
+		    0, 7);
+		(void)cell_sql(db, "SELECT pad FROM t WHERE e = ?", rows, rows,
+		    1, 0);
+	}
 	if (only == NULL || strcmp(only, "iscan") == 0)
 		c[0] = cell_iscan(db, bt, rows, reads);
 	if (only == NULL || strcmp(only, "sql_u") == 0)
