@@ -19,7 +19,13 @@
  *	For A/B, build the binary at each commit and interleave the runs
  *	pinned to one CPU (taskset); compare medians.
  *
- *	usage: bench_point_iscan [rows] [reads]
+ *	Instruction counts under callgrind are steadier than wall time on
+ *	a shared host: name one cell as the third argument to run only
+ *	it, and collect around what it calls (--toggle-collect= each of
+ *	xstore_iscan_open, xstore_iscan_next and xstore_iscan_close, or
+ *	cell_sql).
+ *
+ *	usage: bench_point_iscan [rows] [reads] [iscan|sql_u|sql_e|sql_k]
  */
 
 #include <stdint.h>
@@ -163,12 +169,13 @@ main(int argc, char **argv)
 {
 	long rows = argc > 1 ? atol(argv[1]) : 200000;
 	long reads = argc > 2 ? atol(argv[2]) : 400000;
+	const char *only = argc > 3 ? argv[3] : NULL;
 	char path[256];
 	bm_opts_t bo = BM_OPTS_DEFAULT;
 	bm_t *bm = NULL;
 	bt_t *bt = NULL;
 	sx_db *db = NULL;
-	double c[4];
+	double c[4] = { 0, 0, 0, 0 };
 	int fd;
 
 	t_tmpl(path, sizeof path, "bench-point-iscan");
@@ -189,10 +196,17 @@ main(int argc, char **argv)
 	/* Warm every page and the plan caches once, then measure. */
 	(void)cell_sql(db, "SELECT pad FROM t WHERE u = ?", rows, rows, 0, 7);
 	(void)cell_sql(db, "SELECT pad FROM t WHERE e = ?", rows, rows, 1, 0);
-	c[0] = cell_iscan(db, bt, rows, reads);
-	c[1] = cell_sql(db, "SELECT pad FROM t WHERE u = ?", rows, reads, 0, 7);
-	c[2] = cell_sql(db, "SELECT pad FROM t WHERE e = ?", rows, reads, 1, 0);
-	c[3] = cell_sql(db, "SELECT pad FROM t WHERE k = ?", rows, reads, 0, 1);
+	if (only == NULL || strcmp(only, "iscan") == 0)
+		c[0] = cell_iscan(db, bt, rows, reads);
+	if (only == NULL || strcmp(only, "sql_u") == 0)
+		c[1] = cell_sql(db, "SELECT pad FROM t WHERE u = ?", rows,
+		    reads, 0, 7);
+	if (only == NULL || strcmp(only, "sql_e") == 0)
+		c[2] = cell_sql(db, "SELECT pad FROM t WHERE e = ?", rows,
+		    reads, 1, 0);
+	if (only == NULL || strcmp(only, "sql_k") == 0)
+		c[3] = cell_sql(db, "SELECT pad FROM t WHERE k = ?", rows,
+		    reads, 0, 1);
 	printf("rows=%ld reads=%ld iscan=%.1f sql_u=%.1f sql_e=%.1f "
 	    "sql_k=%.1f ns\n", rows, reads, c[0], c[1], c[2], c[3]);
 	sx_close(db);
