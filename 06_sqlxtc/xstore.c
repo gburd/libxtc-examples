@@ -1690,6 +1690,7 @@ static uint64_t g_idx_garbage;
 #define XS_IDX_GARBAGE_MAX (1u << 16)
 static int g_idx_failinj; /* test hook: inserts to fail */
 static int g_uniq_failinj; /* test hook: UNIQUE probes to fail */
+static int g_rd_failat;    /* test hook: the index read to fail, 1-based */
 
 /* Catalog generation: bumped by every DDL entry point (tables, indexes,
  * views) and index rebuild, so a cached plan built at an older one is
@@ -2027,9 +2028,10 @@ xs_idx_tuple_eq(const struct xs_idx_rt *e, const uint8_t *ra, int la,
 }
 
 /* Read the newest committed record for (tableid, rowid) into `rec`
- * (capacity `cap`).  Returns the record length (>= 1) on a live row, or
- * 0 if absent / tombstoned.  Used to fetch a row's pre-image for index
- * maintenance and its columns for a rebuild. */
+ * (capacity `cap`).  Returns the record length (>= 1) on a live row, 0
+ * if absent / tombstoned, or a negative XTC_E_* code if the tree could
+ * not be read.  Used to fetch a row's pre-image for index maintenance
+ * and a UNIQUE candidate's key. */
 static int
 xs_read_rec(bt_t *bt, uint32_t tableid, int64_t rowid, uint8_t *rec, int cap)
 {
@@ -2037,14 +2039,17 @@ xs_read_rec(bt_t *bt, uint32_t tableid, int64_t rowid, uint8_t *rec, int cap)
 	uint8_t startk[XS_VKLEN];
 	const void *k = NULL, *vv = NULL;
 	uint16_t klen = 0, vl = 0;
-	int out = 0;
+	int out = 0, rc;
 	enc_vkey(tableid, rowid, ~(uint64_t)0, startk);   /* newest first */
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) return 0;
-	if (bt_cursor_next(cur, &k, &klen, &vv, &vl) == XTC_OK &&
-	    klen == XS_VKLEN &&
+	if ((rc = bt_cursor_open(bt, startk, XS_VKLEN, &cur)) != XTC_OK)
+		return rc;
+	rc = bt_cursor_next(cur, &k, &klen, &vv, &vl);
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+		out = rc;
+	else if (rc == XTC_OK && klen == XS_VKLEN &&
 	    dec_tableid((const uint8_t *)k) == tableid &&
-	    dec_rowid((const uint8_t *)k) == rowid &&
-	    vl >= 1 && !(((const uint8_t *)vv)[0] & XS_F_DELETED)) {
+	    dec_rowid((const uint8_t *)k) == rowid && vl >= 1 &&
+	    !(((const uint8_t *)vv)[0] & XS_F_DELETED)) {
 		int n = (int)vl - 1;   /* strip the flag byte */
 		if (n > cap) n = cap;
 		if (n > 0) memcpy(rec, (const uint8_t *)vv + 1, (size_t)n);
@@ -2286,6 +2291,21 @@ void
 xstore_uniq_fail_inject(int n)
 {
 	xtc_atomic_store_i32(&g_uniq_failinj, n, xtc_mo_relaxed);
+}
+
+int
+xstore_index_read_fail_at(int n)
+{
+	return xtc_atomic_exchange_i32(&g_rd_failat, n, xtc_mo_relaxed);
+}
+
+/* Should this B-tree read of an index scan or a UNIQUE probe fail
+ * (xstore_index_read_fail_at)?  One relaxed load when disarmed. */
+static int
+xs_rd_fault(void)
+{
+	return xtc_atomic_load_i32(&g_rd_failat, xtc_mo_relaxed) > 0 &&
+	    xtc_atomic_fetch_sub_i32(&g_rd_failat, 1, xtc_mo_relaxed) == 1;
 }
 
 /* Should this UNIQUE probe fail (xstore_uniq_fail_inject)? */
@@ -2988,7 +3008,7 @@ xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
  * Returns 1 with *out, or 0 if the table has no live row (<= hi).
  */
 static int xs_point_get(bt_t *bt, uint32_t tid, int64_t rid, uint64_t snap,
-    uint8_t *out, int cap);
+    uint8_t *out, int cap, int *err);
 int
 xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
     int64_t hi, int has_hi, int64_t *out)
@@ -3050,7 +3070,8 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 		if (w != NULL)
 			live = !w->deleted;
 		else
-			live = xs_point_get(bt, tid, rid, snap, val, (int)sizeof val) != 0;
+			live = xs_point_get(bt, tid, rid, snap, val,
+			           (int)sizeof val, NULL) != 0;
 		if (live) {
 			*out = rid;
 			return 1;
@@ -3202,7 +3223,7 @@ xs_scan_point(xstore_scan_t *s)
 
 	s->c.visited++;
 	n = xs_point_get(s->c.bt, s->c.tableid, s->c.lo, s->c.snap, v,
-	    (int)sizeof v);
+	    (int)sizeof v, NULL);
 	if (n == 0)
 		return 0;
 	xs_stash(&s->c, s->c.lo, v, (uint16_t)(n < 0 ? 1 : n + 1));
@@ -7863,7 +7884,7 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 	uint8_t *rec = NULL, kk[XS_IDX_KMAX];
 	int dup = 0, rc;
 	rc = bt_cursor_open(bt, key, (uint16_t)klen, &cur);
-	if (rc == XTC_OK && xs_uniq_fail_now()) {
+	if (rc == XTC_OK && (xs_uniq_fail_now() || xs_rd_fault())) {
 		bt_cursor_close(cur);
 		rc = XTC_E_IO;
 	}
@@ -7889,7 +7910,14 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 			dup = XTC_E_NOMEM;
 			break;
 		}
-		rl = xs_read_rec(bt, rt->tableid, rid, rec, XS_VMAX);
+		if (xs_rd_fault())
+			rl = XTC_E_IO;
+		else
+			rl = xs_read_rec(bt, rt->tableid, rid, rec, XS_VMAX);
+		if (rl < 0) { /* the candidate is unknown, not absent */
+			dup = rl;
+			break;
+		}
 		if (rl > 0) {
 			kl2 = xs_idx_rowkey(rt, rec, rl, rid, 0, kk, (int)sizeof kk, NULL);
 			if (xs_uniq_same(rt, kk, kl2, key, klen, rec, rl, rid,
@@ -7898,7 +7926,10 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 				break;
 			}
 		}
-		if ((rc = bt_cursor_resume(cur)) != XTC_OK) {
+		rc = bt_cursor_resume(cur);
+		if (rc == XTC_OK && xs_rd_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK) {
 			dup = rc;
 			break;
 		}
@@ -7909,7 +7940,8 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 }
 
 /* Does a buffered row of this transaction other than `rowid` carry key
- * tuple `key` in index `rt`? */
+ * tuple `key` in index `rt`?  1, 0, or a negative XTC_E_* code if a
+ * buffered row could not be read. */
 static int
 xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
     const uint8_t *key, int klen, const struct xs_urow *w)
@@ -7926,10 +7958,11 @@ xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
 		if (c->umap[i].h != h || c->umap[i].idx_id != rt->idx_id) continue;
 		wi = c->umap[i].wi;
 		if (wi >= c->wn || c->wbuf[wi].rowid == rowid) continue;
-		if (!wbuf_is_newest(c, wi))
-			continue;                   /* superseded in this txn */
+		if (!wbuf_is_newest(c, wi) || c->wbuf[wi].deleted)
+			continue; /* superseded or deleted in this txn */
 		rec = xs_wrec_payload(c, wi, &rl);
-		if (rec == NULL) continue;
+		if (rec == NULL)
+			return XTC_E_IO; /* a spilled payload not read back */
 		kl2 = xs_idx_rowkey(rt, rec, rl, c->wbuf[wi].rowid, 0, kk,
 		    (int)sizeof kk, NULL);
 		if (xs_uniq_same(rt, kk, kl2, key, klen, rec, rl,
@@ -8192,6 +8225,7 @@ struct xstore_iscan {
 	uint64_t      snap;
 	int           reverse;
 	int           done;
+	int           err;               /* first read error (XTC_E_*), sticky */
 	/* bounds, in entry space (a long bound cut to its group) */
 	uint8_t       pfx[XS_IDX_KMAX];  int pfxlen;   /* ns + equality elems */
 	uint8_t       lo[XS_IDX_KMAX];   int lolen, lo_incl, has_lo;
@@ -8314,23 +8348,29 @@ xs_eff_snap(const xstore_ctx_t *ctx)
 /* The version of (tid, rid) visible at `snap`: copies its whole stored
  * value (the flag byte, then the payload) into buf (cap >= 1 + the
  * payload) and returns the payload length (>= 1; -1 for a live empty
- * record), 0 if no version is visible.  Ignores the write buffer (the
- * caller handles buffered rows).  One probe: version keys sort newest
- * first within a rowid (inverted commit_ts), so the first key >= the
- * key (tid, rid, snap) is the newest version with commit_ts <= snap --
- * no walk over newer versions, no cursor, and no latch on the OLC path
- * (bt_seek_ge). */
+ * record), 0 if no version is visible.  A tree that could not be read
+ * also returns 0, with the XTC_E_* code in *err if err is not NULL.
+ * Ignores the write buffer (the caller handles buffered rows).  One
+ * probe: version keys sort newest first within a rowid (inverted
+ * commit_ts), so the first key >= the key (tid, rid, snap) is the
+ * newest version with commit_ts <= snap -- no walk over newer versions,
+ * no cursor, and no latch on the OLC path (bt_seek_ge). */
 static int
-xs_point_get(bt_t *bt, uint32_t tid, int64_t rid, uint64_t snap,
-    uint8_t *buf, int cap)
+xs_point_get(bt_t *bt, uint32_t tid, int64_t rid, uint64_t snap, uint8_t *buf,
+    int cap, int *err)
 {
 	uint8_t probe[XS_VKLEN], k[XS_VKLEN + 8];
 	uint16_t kl = 0, vl = 0;
+	int rc;
 	enc_vkey(tid, rid, snap, probe);
-	if (bt_seek_ge(bt, probe, XS_VKLEN, k, (uint16_t)sizeof k, &kl, buf,
-	    (uint16_t)(cap > 0xFFFF ? 0xFFFF : cap), &vl) != XTC_OK ||
-	    kl != XS_VKLEN || dec_tableid(k) != tid || dec_rowid(k) != rid ||
-	    vl < 1 || (buf[0] & XS_F_DELETED))
+	rc = bt_seek_ge(bt, probe, XS_VKLEN, k, (uint16_t)sizeof k, &kl, buf,
+	    (uint16_t)(cap > 0xFFFF ? 0xFFFF : cap), &vl);
+	if (err != NULL && xs_rd_fault())
+		rc = XTC_E_IO;
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND && err != NULL)
+		*err = rc;
+	if (rc != XTC_OK || kl != XS_VKLEN || dec_tableid(k) != tid ||
+	    dec_rowid(k) != rid || vl < 1 || (buf[0] & XS_F_DELETED))
 		return 0;
 	if (vl > cap) vl = (uint16_t)cap;
 	return vl > 1 ? (int)vl - 1 : -1;   /* -1: live, empty record */
@@ -8521,7 +8561,10 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 			    !wbuf_is_newest(cx, wi))
 				continue;
 			rec = xs_wrec_payload(cx, wi, &rl);
-			if (rec == NULL) continue;
+			if (rec == NULL) { /* the first next fails */
+				s->err = XTC_E_IO;
+				break;
+			}
 			kl = xs_idx_rowkey(&s->e.rt, rec, rl, cx->wbuf[wi].rowid, 1, key,
 			    (int)sizeof key, NULL);
 			if (kl < 0 || xs_iscan_where(s, key, kl) != 1 ||
@@ -8568,19 +8611,33 @@ struct xs_ika {
 	uint8_t  buf[XS_IKA_BYTES + XS_IDX_KMAX];
 };
 
+/* Record the scan's first error (sticky: every later call fails too)
+ * and return -1. */
+static int
+xs_iscan_fail(xstore_iscan_t *s, int rc)
+{
+	if (s->err == 0)
+		s->err = rc;
+	return -1;
+}
+
 /* Refill the key batch with the next in-range entries in walk order.
- * Returns the count (0: the range is exhausted), or -1 on no memory. */
+ * Returns the count (0: the range is exhausted), or -1 when the batch
+ * cannot be allocated or the tree cannot be read (s->err). */
 static int
 xs_iscan_fill(xstore_iscan_t *s)
 {
 	const void *k = NULL, *vv = NULL;
 	uint16_t kl = 0, vl = 0;
 	uint32_t used = 0;
-	int w, n = 0;
+	int w, n = 0, rc;
 
 	s->kb_n = s->kb_i = 0;
+	if (s->err != 0)
+		return -1;
 	if (s->kb_end) return 0;
-	if (s->ka == NULL && (s->ka = malloc(sizeof *s->ka)) == NULL) return -1;
+	if (s->ka == NULL && (s->ka = malloc(sizeof *s->ka)) == NULL)
+		return xs_iscan_fail(s, XTC_E_NOMEM);
 	/* First batch: the hinted row count (LIMIT 20 is one batch, not
 	 * 16 then 32), else 16; then doubling. */
 	s->kb_want = s->kb_want == 0 ? (s->ra_left > 0 ? s->ra_left : 16) :
@@ -8590,19 +8647,22 @@ xs_iscan_fill(xstore_iscan_t *s)
 		if (s->cur == NULL) {
 			const uint8_t *st = s->has_lo ? s->lo : s->pfx;
 			int sl = s->has_lo ? s->lolen : s->pfxlen;
-			if (bt_cursor_open(s->bt, st, (uint16_t)sl, &s->cur) != XTC_OK) {
-				s->kb_end = 1;
-				return 0;
-			}
-		} else if (bt_cursor_resume(s->cur) != XTC_OK) {
-			s->kb_end = 1;
-			return 0;
+			rc = bt_cursor_open(s->bt, st, (uint16_t)sl, &s->cur);
+		} else {
+			rc = bt_cursor_resume(s->cur);
 		}
+		if (rc == XTC_OK && xs_rd_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK)
+			return xs_iscan_fail(s, rc);
 		while (n < s->kb_want && used <= XS_IKA_BYTES) {
-			if (bt_cursor_next(s->cur, &k, &kl, &vv, &vl) != XTC_OK) {
-				s->kb_end = 1;
+			rc = bt_cursor_next(s->cur, &k, &kl, &vv, &vl);
+			if (rc == XTC_E_NOTFOUND) {
+				s->kb_end = 1; /* the end of the tree */
 				break;
 			}
+			if (rc != XTC_OK)
+				return xs_iscan_fail(s, rc);
 			w = xs_iscan_where(s, k, kl);
 			if (w == 2) { s->kb_end = 1; break; }
 			if (w == 0) continue;
@@ -8637,9 +8697,14 @@ xs_iscan_fill(xstore_iscan_t *s)
 			memcpy(bound, s->pos, (size_t)s->poslen);
 			bl = s->poslen;
 		}
-		if (bt_seek_lt_n(s->bt, bound, (uint16_t)bl, s->ka->buf,
+		rc = bt_seek_lt_n(s->bt, bound, (uint16_t)bl, s->ka->buf,
 		    (uint32_t)sizeof s->ka->buf, s->ka->off, s->ka->len,
-		    s->kb_want, &got) != XTC_OK || got == 0) {
+		    s->kb_want, &got);
+		if (rc == XTC_OK && xs_rd_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK)
+			return xs_iscan_fail(s, rc);
+		if (got == 0) {
 			s->kb_end = 1;
 			return 0;
 		}
@@ -8661,7 +8726,7 @@ xs_iscan_fill(xstore_iscan_t *s)
 
 /* Advance the committed stream to its next in-range entry whose rowid
  * has no buffered write (s->ck / s->crid).  Returns 1, 0 at the end, or
- * -1 on no memory. */
+ * -1 on an error (s->err). */
 static int
 xs_iscan_committed(xstore_iscan_t *s)
 {
@@ -8706,7 +8771,7 @@ struct xs_ira {
  * at a time, or under a hint (xstore_iscan_hint) the rows it still
  * expects, then 2, 4, .. -- and read their visible versions with one
  * bt_seek_ge_n.  Returns the count (0: the committed stream is done),
- * or -1 on no memory. */
+ * or -1 on an error (s->err; rows already read are dropped with it). */
 static int
 xs_iscan_rows(xstore_iscan_t *s)
 {
@@ -8716,7 +8781,7 @@ xs_iscan_rows(xstore_iscan_t *s)
 	int i, n = 0, c = 0, want;
 
 	if (a == NULL && (a = s->ra = malloc(sizeof *a)) == NULL)
-		return -1;
+		return xs_iscan_fail(s, XTC_E_NOMEM);
 	/* A hinted walk reads exactly its budget first; past it (rows the
 	 * WHERE or the snapshot dropped) it starts small again. */
 	if (s->ra_left > 0) want = s->ra_left;
@@ -8736,8 +8801,10 @@ xs_iscan_rows(xstore_iscan_t *s)
 		pr[n].klen = XS_VKLEN;
 		n++;
 	}
+	if (c < 0)
+		return -1;
 	if (n == 0)
-		return c < 0 ? -1 : 0;
+		return 0;
 	if (s->ra_left > 0 && (s->ra_left -= n) <= 0)
 		s->ra_left = -1;
 	(void)bt_seek_ge_n(s->bt, pr, n, a->vbuf, (uint32_t)sizeof a->vbuf);
@@ -8771,7 +8838,7 @@ xstore_iscan_hint(xstore_iscan_t *s, int64_t nrows)
 }
 
 /* The next committed candidate from the row batch into s->ck / s->crid
- * (s->ra_i - 1 is its slot): 1, 0 at the end, -1 on no memory. */
+ * (s->ra_i - 1 is its slot): 1, 0 at the end, -1 on an error. */
 static int
 xs_iscan_cand(xstore_iscan_t *s)
 {
@@ -8797,8 +8864,8 @@ xs_iscan_cand(xstore_iscan_t *s)
 	}
 }
 
-/* The next verified row in entry order (1), 0 at the end, -1 on no
- * memory; s->lk / s->lkl is its entry key. */
+/* The next verified row in entry order (1), 0 at the end, -1 on an
+ * error (s->err); s->lk / s->lkl is its entry key. */
 static int
 xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
     int *reclen)
@@ -8807,10 +8874,13 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 	const uint8_t *v;
 	int c, rl, kl, vr;
 	for (;;) {
+		if (s->err != 0)
+			return -1;
 		if (s->done) return 0;
 		if (!s->have_ck) {
 			c = xs_iscan_cand(s);
-			if (c < 0) return -1;             /* no memory */
+			if (c < 0)
+				return -1;
 			s->have_ck = c ? 1 : -1;
 		}
 		/* Merge: take the buffered candidate when it sorts first. */
@@ -8828,9 +8898,12 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 				int wi = bw != NULL ? (int)(bw - s->cx->wbuf) : -1;
 				const uint8_t *p;
 				s->bci++;
-				if (wi < 0) continue;
+				if (wi < 0 || bw->deleted)
+					continue; /* deleted since the open */
 				p = xs_wrec_payload(s->cx, wi, &rl);
-				if (p == NULL) continue;
+				if (p ==
+				    NULL) /* a spilled payload not read back */
+					return xs_iscan_fail(s, XTC_E_IO);
 				if (rl > XS_VMAX) rl = XS_VMAX;
 				memcpy(s->rec + 1, p, (size_t)rl);
 				s->visited++;
@@ -8852,8 +8925,10 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 			if (rl > XS_VMAX) rl = XS_VMAX;
 		} else {
 			v = s->rec;
-			rl = xs_point_get(s->bt, s->e.rt.tableid, s->crid, s->snap,
-			    s->rec, (int)sizeof s->rec);
+			rl = xs_point_get(s->bt, s->e.rt.tableid, s->crid,
+			    s->snap, s->rec, (int)sizeof s->rec, &s->err);
+			if (s->err != 0)
+				return -1;
 			if (rl == 0) continue;
 			if (rl < 0) rl = 0;
 		}

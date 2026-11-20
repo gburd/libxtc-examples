@@ -31,6 +31,15 @@
  *	    their first 600 bytes it is built and enforced.
  *	(5) The SipHash-1-3 the long-key encoding uses (sx_siphash.h) matches
  *	    Rust's SipHasher13 for the reference key and messages.
+ *	(6) A B-tree read that fails inside an index scan or a UNIQUE probe
+ *	    is an error, never a missing row.  For each n, the n-th read
+ *	    fails (xstore_index_read_fail_at) until n passes the last read:
+ *	    an equality, range, and reverse index scan (autocommit and over
+ *	    the transaction's own writes) each fail or return the right
+ *	    count, and a duplicate long value is refused (a constraint error
+ *	    or an index error) at every n, never inserted.  Before the fix a
+ *	    failed candidate-row read made the probe say "no duplicate" and
+ *	    a failed cursor read ended the scan early.
  */
 
 #include <stdio.h>
@@ -290,19 +299,27 @@ t_long_order(sx_db *h)
 		       "value order\n");
 }
 
-/* Insert (k, s) into table u. */
+/* Insert (k, s) into table `tab` (its first two columns). */
 static int
-ins_u(sx_db *h, int64_t k, const char *s)
+ins_tab(sx_db *h, const char *tab, int64_t k, const char *s)
 {
 	sx_stmt *st = NULL;
+	char sql[64];
 	int rc;
-	if (sx_prepare(h, "INSERT INTO u VALUES(?, ?)", -1, &st, NULL) != SX_OK)
+	snprintf(sql, sizeof sql, "INSERT INTO %s(k, s) VALUES(?, ?)", tab);
+	if (sx_prepare(h, sql, -1, &st, NULL) != SX_OK)
 		return -1;
 	sx_bind_int64(st, 1, k);
 	sx_bind_text(st, 2, s, -1);
 	rc = sx_step(st);
 	sx_finalize(st);
 	return rc;
+}
+
+static int
+ins_u(sx_db *h, int64_t k, const char *s)
+{
+	return ins_tab(h, "u", k, s);
 }
 
 /* (4) */
@@ -363,6 +380,99 @@ t_siphash(void)
 		printf("  ok   SipHash-1-3 matches the reference\n");
 }
 
+/* Run `sql` (one text bind `v`, NULL for none) with the n-th index read
+ * failing, for n = 1, 2, .. until no read is left to fail.  Each run
+ * must fail or count `want` rows.  Returns how many runs failed. */
+static int
+sweep_count(sx_db *h, const char *sql, const char *v, int64_t want)
+{
+	sx_stmt *st = NULL;
+	int n, rc, errs = 0;
+	int64_t got;
+	for (n = 1; n < 1000; n++) {
+		got = -1;
+		CK(sx_prepare(h, sql, -1, &st, NULL) == SX_OK);
+		if (v != NULL)
+			sx_bind_text(st, 1, v, -1);
+		xstore_index_read_fail_at(n);
+		rc = sx_step(st);
+		if (rc == SX_ROW)
+			got = sx_column_int64(st, 0);
+		sx_finalize(st);
+		if (xstore_index_read_fail_at(0) > 0)
+			break; /* fewer than n reads: nothing failed */
+		if (rc == SX_ROW && got != want) {
+			fprintf(stderr,
+			    "  %s: read %d failed, count %lld, "
+			    "want %lld or an error\n",
+			    sql, n, (long long)got, (long long)want);
+			g_fail = 1;
+		}
+		errs += rc != SX_ROW;
+	}
+	CK(n > 1 && n < 1000);
+	return errs;
+}
+
+/* (6) */
+static void
+t_read_errors(sx_db *h)
+{
+	char *a = longval(699, 1), *b = longval(699, 2);
+	int n, rc, errs;
+	CK(sx_exec(h,
+	       "CREATE TABLE r(k INTEGER PRIMARY KEY, s TEXT UNIQUE, "
+	       "g INT)",
+	       NULL) == SX_OK);
+	CK(sx_exec(h, "CREATE INDEX r_g ON r(g)", NULL) == SX_OK);
+	for (n = 1; n <= 300; n++) {
+		sx_stmt *st = NULL;
+		char sv[16];
+		snprintf(sv, sizeof sv, "v%04d", n);
+		CK(sx_prepare(h, "INSERT INTO r VALUES(?, ?, ?)", -1, &st,
+		       NULL) == SX_OK);
+		sx_bind_int64(st, 1, n);
+		sx_bind_text(st, 2, n == 1 ? a : sv, -1);
+		sx_bind_int64(st, 3, n % 3);
+		CK(sx_step(st) == SX_DONE);
+		sx_finalize(st);
+	}
+	errs = sweep_count(h, "SELECT count(*) FROM r WHERE s = ?", a, 1);
+	errs += sweep_count(h, "SELECT count(*) FROM r WHERE g = 1", NULL, 100);
+	errs += sweep_count(h, "SELECT count(*) FROM r WHERE g > 0 AND g < 2",
+	    NULL, 100);
+	errs += sweep_count(h,
+	    "SELECT count(*) FROM (SELECT k FROM r "
+	    "WHERE g = 1 ORDER BY g DESC LIMIT 1000)",
+	    NULL, 100);
+	CK(sx_exec(h, "BEGIN", NULL) == SX_OK);
+	CK(sx_exec(h, "INSERT INTO r VALUES(1000, 'w', 1)", NULL) == SX_OK);
+	errs += sweep_count(h, "SELECT count(*) FROM r WHERE g = 1", NULL, 101);
+	CK(sx_exec(h, "ROLLBACK", NULL) == SX_OK);
+	CK(errs > 0);
+	/* A duplicate long value, then a new one: the duplicate never goes
+	 * in, the new one goes in or fails. */
+	for (n = 1; n < 1000; n++) {
+		xstore_index_read_fail_at(n);
+		rc = ins_tab(h, "r", 2000 + n, a);
+		if (xstore_index_read_fail_at(0) > 0)
+			break;
+		CK(rc != SX_DONE);
+	}
+	CK(n > 1 && n < 1000);
+	CK(ins_tab(h, "r", 2000, a) != SX_DONE);
+	CK(errmsg_is(h, "UNIQUE constraint failed: r.s"));
+	CK(one(h, "SELECT count(*) FROM r WHERE k >= 2000") == 0);
+	CK(ins_tab(h, "r", 2001, b) == SX_DONE);
+	CK(no_missing());
+	free(a);
+	free(b);
+	if (!g_fail)
+		printf(
+		    "  ok   a failed read in an index scan or a UNIQUE probe "
+		    "is an error\n");
+}
+
 int
 main(void)
 {
@@ -386,6 +496,7 @@ main(void)
 	t_long_order(h);
 	t_create_over_long(h);
 	t_siphash();
+	t_read_errors(h);
 	sx_close(b);
 	sx_close(h);
 	(void)sx_storage_close();
