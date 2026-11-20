@@ -48,6 +48,22 @@ typedef struct bm_frame  bm_frame_t;/* a resident page frame */
 
 #define BM_PID_NONE  ((bm_pid_t)0)
 
+/*
+ * A page id names a file and a page in it: (file:16, page:48).  File 0
+ * is the backing file of bm_opts.path, so a file-0 page id is the page
+ * number alone and every id the buffer manager issued before files
+ * existed means what it did.  Other files are attached with
+ * bm_file_attach (the row log's run files); bm_alloc_pid, bm_free_pid,
+ * the freelist and the superblock are file 0 only.
+ */
+#define BM_PID_FILE_SHIFT 48
+#define BM_PID_PAGE_MASK  ((((bm_pid_t)1) << BM_PID_FILE_SHIFT) - 1u)
+#define BM_PID_MAKE(file, page) \
+	(((bm_pid_t)(uint16_t)(file) << BM_PID_FILE_SHIFT) | \
+	 ((bm_pid_t)(page) & BM_PID_PAGE_MASK))
+#define BM_PID_FILE(pid)  ((uint16_t)((pid) >> BM_PID_FILE_SHIFT))
+#define BM_PID_PAGE(pid)  ((pid) & BM_PID_PAGE_MASK)
+
 typedef struct bm_opts {
 	const char *path;        /* backing file (created/truncated) */
 	uint32_t    page_size;   /* bytes per page (e.g. 4096, 16384) */
@@ -253,6 +269,27 @@ void bm_reclaim_quarantine(bm_t *bm);
  * so a subsequent bm_fix_pid is likely a hit.  Best-effort.  Requires a
  * provider (bm_provider_spawn) to do the warming. */
 int  bm_prefetch_pid(bm_t *bm, bm_pid_t pid);
+
+/*
+ * Extra files (page ids of file != 0).  bm_file_attach opens `path`
+ * (read-write, never created or truncated) as file `file` (1..65535):
+ * its pages are then fixed, cached, checksummed, evicted and, if a
+ * caller dirties one, written back like file-0 pages, at the page's
+ * offset in its own file.  XTC_E_INVAL for file 0, a file already
+ * attached, or a path that does not open.  bm_file_detach drops every
+ * resident frame of the file WITHOUT writing it and closes it.  NB: the
+ * caller guarantees no fix of the file is in flight or will be issued
+ * (the row log retires a run through RCU before it detaches it); a
+ * fix of a file that is not attached returns XTC_E_INVAL.
+ */
+int  bm_file_attach(bm_t *bm, uint16_t file, const char *path);
+int  bm_file_detach(bm_t *bm, uint16_t file);
+
+/* Seal `page` for page id `pid` exactly as a write-back does (the
+ * checksum slot at bm_opts.cksum_off; no-op without checksums), for a
+ * writer that builds a file's pages itself and writes them with xtc_aio
+ * (the run writer), so a later fix verifies them. */
+void bm_seal_page(const bm_t *bm, void *page, bm_pid_t pid);
 
 /* Release a frame fixed by bm_alloc_pid/bm_fix_pid.  mark_dirty != 0
  * records that the page was modified (so it is written before

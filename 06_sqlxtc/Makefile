@@ -168,6 +168,7 @@ clean:
 	rm -f test_wal_kill test_wal_tail test_wal_kill_engine test_uniq_commit test_uniq_long
 	rm -f test_steal_leaf test_cat_reopen test_ckpt_online test_wal_group_sync test_intents_thread test_torn_base test_snap_registry test_rowid_minmax test_btree_fill test_wal_bigtxn test_steal_reclaim test_dio_restart test_wal_prealloc
 	rm -f test_bufmgr test_bufmgr.o bufmgr.o test_bufmgr_dio test_bufmgr_dio.o
+	rm -f test_bm_files
 	rm -f test_bufmgr_mt
 	rm -f test_drop_reserved test_evict_revalidate_sampled
 	rm -f test_bg_idle test_bg_kill test_ckpt_offloop test_scan_resist test_sweep_bound test_evict_revalidate test_btree_late_load test_flush_pin test_trickler_select test_pp_slice test_pp_idle_writes test_tr_slice test_publication_pin test_private_frame test_pid_writeback bm_sweep_bench
@@ -530,6 +531,14 @@ test_bufmgr: test_bufmgr.c bufmgr.o
 
 test-bufmgr: test_bufmgr
 	./test_bufmgr
+
+# Multi-file page ids (row-log run files): STORAGE_DESIGN 3.4.
+test: test-bm-files
+test_bm_files: test_bm_files.c bufmgr.o wal.o
+	$(CC) $(CFLAGS) -o $@ test_bm_files.c bufmgr.o wal.o $(LDFLAGS)
+
+test-bm-files: test_bm_files
+	TMPDIR=$${TMPDIR:-/tmp} ./test_bm_files
 
 test_bufmgr_dio: test_bufmgr_dio.c bufmgr.o
 	$(CC) $(CFLAGS) -o $@ test_bufmgr_dio.c bufmgr.o $(LDFLAGS)
