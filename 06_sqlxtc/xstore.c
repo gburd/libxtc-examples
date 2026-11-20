@@ -8217,19 +8217,26 @@ struct xs_ifull {
 	struct xs_ibnd b;
 };
 
+/*
+ * An index scan.  The descriptor is small: the key buffers (pfx, lo, hi,
+ * pos, ck) hold one entry key each, rt.kmax = bt_max_key() bytes, and
+ * live in the same allocation after it (keys[]); the row buffer (rec)
+ * and the read-ahead batches are allocated when first needed.  Only the
+ * descriptor itself is zeroed at open.
+ */
 struct xstore_iscan {
 	struct xsql  *db;
 	xstore_ctx_t *cx;
 	bt_t         *bt;
-	struct xs_idx_ent e;
+	struct xs_idx_rt rt;
 	uint64_t      snap;
 	int           reverse;
 	int           done;
 	int           err;               /* first read error (XTC_E_*), sticky */
 	/* bounds, in entry space (a long bound cut to its group) */
-	uint8_t       pfx[XS_IDX_KMAX];  int pfxlen;   /* ns + equality elems */
-	uint8_t       lo[XS_IDX_KMAX];   int lolen, lo_incl, has_lo;
-	uint8_t       hi[XS_IDX_KMAX];   int hilen, hi_incl, has_hi;
+	uint8_t      *pfx;  int pfxlen;  /* ns + equality elems */
+	uint8_t      *lo;   int lolen, lo_incl, has_lo;
+	uint8_t      *hi;   int hilen, hi_incl, has_hi;
 	int           range;             /* a range on the next column */
 	struct xs_ibnd eb;               /* views of the bounds above */
 	struct xs_ifull *fb;             /* whole bounds, if a bound was cut */
@@ -8238,8 +8245,8 @@ struct xstore_iscan {
 	int           lkl;
 	/* committed stream */
 	bt_cursor_t  *cur;
-	uint8_t       pos[XS_IDX_KMAX];  int poslen, started;
-	uint8_t       ck[XS_IDX_KMAX];   int cklen, have_ck; int64_t crid;
+	uint8_t      *pos;  int poslen, started;
+	uint8_t      *ck;   int cklen, have_ck; int64_t crid;
 	/* Read-ahead of index keys (xs_iscan_fill): in-range entries copied
 	 * from one cursor resume (forward) or one descent (reverse) instead
 	 * of a resume or a whole bt_seek_lt descent per entry.  kb_end: the
@@ -8250,8 +8257,9 @@ struct xstore_iscan {
 	struct xs_icand *bc;
 	int           nbc, bci;
 	uint8_t      *bkeys;
-	/* output: the stored value, flag byte first (xs_point_get) */
-	uint8_t       rec[1 + XS_VMAX];
+	/* output: the stored value, flag byte first (xs_point_get), 1 +
+	 * XS_VMAX bytes once a row needs it (xs_iscan_rec) */
+	uint8_t      *rec;
 	uint64_t      visited;
 	/* Row read-ahead (xs_iscan_rows): the visible versions of the next
 	 * committed candidates, fetched by one batched seek (bt_seek_ge_n)
@@ -8261,7 +8269,18 @@ struct xstore_iscan {
 	struct xs_ira *ra;
 	int           ra_n, ra_i, ra_end;
 	int           ra_left;   /* hinted rows not yet read (0: no hint) */
+	uint8_t       keys[];    /* the key buffers: XS_ISCAN_NKEY x rt.kmax */
 };
+#define XS_ISCAN_NKEY 5
+
+/* The scan's row buffer (1 + XS_VMAX bytes), or NULL with s->err set. */
+static uint8_t *
+xs_iscan_rec(xstore_iscan_t *s)
+{
+	if (s->rec == NULL && (s->rec = malloc(1 + XS_VMAX)) == NULL)
+		s->err = XTC_E_NOMEM;
+	return s->rec;
+}
 
 /* Compare key k[0..kl) with bound b[0..bl) as a prefix: 0 if k starts
  * with b, else the sign of their first difference (a k that ends first
@@ -8319,7 +8338,7 @@ xs_iscan_row_ok(const struct xstore_iscan *s, const uint8_t *rec, int rl,
 	int tl;
 	if (s->fb == NULL)
 		return 1;
-	tl = xs_idx_tuple(&s->e.rt, rec, rl, rowid, tup, (int)sizeof tup, NULL);
+	tl = xs_idx_tuple(&s->rt, rec, rl, rowid, tup, (int)sizeof tup, NULL);
 	return tl >= 0 && xs_bnd_where(&s->fb->b, tup, tl) == 1;
 }
 
@@ -8465,7 +8484,7 @@ static int
 xs_iscan_bounds(xstore_iscan_t *s, const xstore_val_t *eq, int neq,
     const xstore_val_t *lo, int lo_incl, const xstore_val_t *hi, int hi_incl)
 {
-	const struct xs_idx_rt *rt = &s->e.rt;
+	const struct xs_idx_rt *rt = &s->rt;
 	struct xs_ifull *fb;
 	int p = rt->kmax - 21;
 	if (p < 1)
@@ -8519,17 +8538,24 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 {
 	bt_t *bt = xstore_bt_of(db);
 	xstore_iscan_t *s;
+	struct xs_idx_rt rt;
 	int i;
 	(void)table;
 	if (bt == NULL) return NULL;
-	s = calloc(1, sizeof *s);
-	if (s == NULL) return NULL;
-	if (!xs_idx_get(bt, idx_id, &s->e) || s->e.rt.tableid == 0 ||
-	    neq > s->e.rt.ncol || ((lo || hi) && neq >= s->e.rt.ncol) ||
-	    ((lo || hi) && ((s->e.rt.descmask >> neq) & 1u))) {
-		free(s);
+	if (!xs_idx_get_rt(bt, idx_id, &rt) || rt.tableid == 0 ||
+	    neq > rt.ncol || ((lo || hi) && neq >= rt.ncol) ||
+	    ((lo || hi) && ((rt.descmask >> neq) & 1u)))
 		return NULL;
-	}
+	s = malloc(sizeof *s + (size_t)XS_ISCAN_NKEY * (size_t)rt.kmax);
+	if (s == NULL)
+		return NULL;
+	memset(s, 0, sizeof *s);
+	s->rt = rt;
+	s->pfx = s->keys;
+	s->lo = s->pfx + rt.kmax;
+	s->hi = s->lo + rt.kmax;
+	s->pos = s->hi + rt.kmax;
+	s->ck = s->pos + rt.kmax;
 	s->db = db;
 	s->bt = bt;
 	s->cx = xstore_ctx_of(db);
@@ -8557,27 +8583,32 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 		int wi, rl, kl;
 		for (wi = 0; wi < cx->wn; wi++) {
 			const uint8_t *rec;
-			if (cx->wbuf[wi].tableid != s->e.rt.tableid || cx->wbuf[wi].deleted ||
-			    !wbuf_is_newest(cx, wi))
+			if (cx->wbuf[wi].tableid != s->rt.tableid ||
+			    cx->wbuf[wi].deleted || !wbuf_is_newest(cx, wi))
 				continue;
 			rec = xs_wrec_payload(cx, wi, &rl);
 			if (rec == NULL) { /* the first next fails */
 				s->err = XTC_E_IO;
 				break;
 			}
-			kl = xs_idx_rowkey(&s->e.rt, rec, rl, cx->wbuf[wi].rowid, 1, key,
-			    (int)sizeof key, NULL);
+			kl = xs_idx_rowkey(&s->rt, rec, rl, cx->wbuf[wi].rowid,
+			    1, key, (int)sizeof key, NULL);
 			if (kl < 0 || xs_iscan_where(s, key, kl) != 1 ||
 			    !xs_iscan_row_ok(s, rec, rl, cx->wbuf[wi].rowid))
 				continue;
 			if (s->nbc % 64 == 0) {
 				struct xs_icand *nb = realloc(s->bc, sizeof *nb * (size_t)(s->nbc + 64));
-				uint8_t *nk = realloc(s->bkeys, boff + (size_t)64 * XS_IDX_KMAX);
+				uint8_t *nk;
+				if (nb != NULL)
+					s->bc = nb;
+				nk = realloc(s->bkeys,
+				    boff + (size_t)64 * (size_t)s->rt.kmax);
+				if (nk != NULL)
+					s->bkeys = nk;
 				if (nb == NULL || nk == NULL) {
-					free(nb ? nb : s->bc); free(nk ? nk : s->bkeys);
-					free(s); return NULL;
+					xstore_iscan_close(s);
+					return NULL;
 				}
-				s->bc = nb; s->bkeys = nk;
 			}
 			memcpy(s->bkeys + boff, key, (size_t)kl);
 			s->bc[s->nbc].key = (uint8_t *)(uintptr_t)boff;
@@ -8608,7 +8639,7 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 struct xs_ika {
 	uint32_t off[XS_IKA_MAX];
 	uint16_t len[XS_IKA_MAX];
-	uint8_t  buf[XS_IKA_BYTES + XS_IDX_KMAX];
+	uint8_t  buf[];     /* XS_IKA_BYTES + rt.kmax */
 };
 
 /* Record the scan's first error (sticky: every later call fails too)
@@ -8636,8 +8667,11 @@ xs_iscan_fill(xstore_iscan_t *s)
 	if (s->err != 0)
 		return -1;
 	if (s->kb_end) return 0;
-	if (s->ka == NULL && (s->ka = malloc(sizeof *s->ka)) == NULL)
-		return xs_iscan_fail(s, XTC_E_NOMEM);
+	if (s->ka == NULL) {
+		s->ka = malloc(sizeof *s->ka + XS_IKA_BYTES + (size_t)s->rt.kmax);
+		if (s->ka == NULL)
+			return xs_iscan_fail(s, XTC_E_NOMEM);
+	}
 	/* First batch: the hinted row count (LIMIT 20 is one batch, not
 	 * 16 then 32), else 16; then doubling. */
 	s->kb_want = s->kb_want == 0 ? (s->ra_left > 0 ? s->ra_left : 16) :
@@ -8698,7 +8732,7 @@ xs_iscan_fill(xstore_iscan_t *s)
 			bl = s->poslen;
 		}
 		rc = bt_seek_lt_n(s->bt, bound, (uint16_t)bl, s->ka->buf,
-		    (uint32_t)sizeof s->ka->buf, s->ka->off, s->ka->len,
+		    XS_IKA_BYTES + (uint32_t)s->rt.kmax, s->ka->off, s->ka->len,
 		    s->kb_want, &got);
 		if (rc == XTC_OK && xs_rd_fault())
 			rc = XTC_E_IO;
@@ -8744,7 +8778,7 @@ xs_iscan_committed(xstore_iscan_t *s)
 		if (s->cklen < s->pfxlen + 8) continue;
 		s->crid = (int64_t)(xs_get_be64(s->ck + s->cklen - 8) ^ 0x8000000000000000ull);
 		if (s->cx != NULL && s->cx->in_txn &&
-		    wbuf_find(s->cx, s->e.rt.tableid, s->crid) != NULL)
+		    wbuf_find(s->cx, s->rt.tableid, s->crid) != NULL)
 			continue;                     /* the buffered write decides */
 		return 1;
 	}
@@ -8763,8 +8797,8 @@ struct xs_ira {
 	uint16_t vlen[XS_IRA_MAX];
 	uint16_t koff[XS_IRA_MAX], klen[XS_IRA_MAX];
 	uint8_t  probe[XS_IRA_MAX][XS_VKLEN];
-	uint8_t  kbuf[XS_IRA_KBYTES + XS_IDX_KMAX];
 	uint8_t  vbuf[16 * 1024];    /* a row that does not fit: xs_point_get */
+	uint8_t  kbuf[];             /* XS_IRA_KBYTES + rt.kmax */
 };
 
 /* Refill the row batch with the next committed candidates -- XS_IRA_MAX
@@ -8780,8 +8814,11 @@ xs_iscan_rows(xstore_iscan_t *s)
 	uint32_t ku = 0;
 	int i, n = 0, c = 0, want;
 
-	if (a == NULL && (a = s->ra = malloc(sizeof *a)) == NULL)
-		return xs_iscan_fail(s, XTC_E_NOMEM);
+	if (a == NULL) {
+		a = s->ra = malloc(sizeof *a + XS_IRA_KBYTES + (size_t)s->rt.kmax);
+		if (a == NULL)
+			return xs_iscan_fail(s, XTC_E_NOMEM);
+	}
 	/* A hinted walk reads exactly its budget first; past it (rows the
 	 * WHERE or the snapshot dropped) it starts small again. */
 	if (s->ra_left > 0) want = s->ra_left;
@@ -8796,7 +8833,7 @@ xs_iscan_rows(xstore_iscan_t *s)
 		a->klen[n] = (uint16_t)s->cklen;
 		ku += (uint32_t)s->cklen;
 		a->rid[n] = s->crid;
-		enc_vkey(s->e.rt.tableid, s->crid, s->snap, a->probe[n]);
+		enc_vkey(s->rt.tableid, s->crid, s->snap, a->probe[n]);
 		pr[n].key = a->probe[n];
 		pr[n].klen = XS_VKLEN;
 		n++;
@@ -8817,7 +8854,7 @@ xs_iscan_rows(xstore_iscan_t *s)
 		 * row's and not a tombstone. */
 		if (pr[i].rc == XTC_OK)
 			a->rc[i] = pr[i].kolen == XS_VKLEN &&
-			    dec_tableid(k) == s->e.rt.tableid &&
+			    dec_tableid(k) == s->rt.tableid &&
 			    dec_rowid(k) == a->rid[i] && pr[i].vlen >= 1 &&
 			    !(v[0] & XS_F_DELETED);
 		else
@@ -8855,7 +8892,7 @@ xs_iscan_cand(xstore_iscan_t *s)
 		/* The buffered write decides (checked again here: a write
 		 * since the batch was read must win, as it did per row). */
 		if (s->cx != NULL && s->cx->in_txn &&
-		    wbuf_find(s->cx, s->e.rt.tableid, s->ra->rid[i]) != NULL)
+		    wbuf_find(s->cx, s->rt.tableid, s->ra->rid[i]) != NULL)
 			continue;
 		s->cklen = s->ra->klen[i];
 		memcpy(s->ck, s->ra->kbuf + s->ra->koff[i], (size_t)s->cklen);
@@ -8894,16 +8931,19 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 				c = -1;
 			}
 			if (c < 0) {
-				const xs_wrec_t *bw = wbuf_find(s->cx, s->e.rt.tableid, b->rowid);
+				const xs_wrec_t *bw =
+				    wbuf_find(s->cx, s->rt.tableid, b->rowid);
 				int wi = bw != NULL ? (int)(bw - s->cx->wbuf) : -1;
 				const uint8_t *p;
 				s->bci++;
 				if (wi < 0 || bw->deleted)
 					continue; /* deleted since the open */
+				/* An unreadable spilled payload: an error. */
 				p = xs_wrec_payload(s->cx, wi, &rl);
-				if (p ==
-				    NULL) /* a spilled payload not read back */
+				if (p == NULL)
 					return xs_iscan_fail(s, XTC_E_IO);
+				if (xs_iscan_rec(s) == NULL)
+					return -1;
 				if (rl > XS_VMAX) rl = XS_VMAX;
 				memcpy(s->rec + 1, p, (size_t)rl);
 				s->visited++;
@@ -8924,23 +8964,24 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 			rl = (int)s->ra->vlen[s->ra_i - 1] - 1;
 			if (rl > XS_VMAX) rl = XS_VMAX;
 		} else {
-			v = s->rec;
-			rl = xs_point_get(s->bt, s->e.rt.tableid, s->crid,
-			    s->snap, s->rec, (int)sizeof s->rec, &s->err);
+			if ((v = xs_iscan_rec(s)) == NULL)
+				return -1;
+			rl = xs_point_get(s->bt, s->rt.tableid, s->crid,
+			    s->snap, s->rec, 1 + XS_VMAX, &s->err);
 			if (s->err != 0)
 				return -1;
 			if (rl == 0) continue;
 			if (rl < 0) rl = 0;
 		}
-		kl = xs_idx_rowkey(&s->e.rt, v + 1, rl, s->crid, 1, kk,
+		kl = xs_idx_rowkey(&s->rt, v + 1, rl, s->crid, 1, kk,
 		    (int)sizeof kk, NULL);
 		if (kl != s->cklen || memcmp(kk, s->ck, (size_t)kl) != 0)
 			continue;                     /* stale entry */
 		if (!xs_iscan_row_ok(s, v + 1, rl, s->crid))
 			continue; /* in a cut bound's group only */
 		if (s->cx != NULL && s->cx->in_txn && s->cx->serializable) {
-			rset_add(s->cx, s->e.rt.tableid, s->crid);
-			ssi_record_read(s->cx->ssi, s->e.rt.tableid, s->crid);
+			rset_add(s->cx, s->rt.tableid, s->crid);
+			ssi_record_read(s->cx->ssi, s->rt.tableid, s->crid);
 		}
 		s->lk = s->ck;
 		s->lkl = s->cklen;
@@ -8993,7 +9034,7 @@ xs_igrp_add(xstore_iscan_t *s, int64_t rid, const uint8_t *rec, int rl)
 	if ((b = malloc((size_t)rl + XS_IDX_TMAX)) == NULL)
 		return -1;
 	memcpy(b, rec, (size_t)rl);
-	tl = xs_idx_tuple(&s->e.rt, rec, rl, rid, b + rl, XS_IDX_TMAX, NULL);
+	tl = xs_idx_tuple(&s->rt, rec, rl, rid, b + rl, XS_IDX_TMAX, NULL);
 	w = &g->row[g->n++];
 	w->rid = rid;
 	w->rl = rl;
@@ -9029,7 +9070,7 @@ xs_iscan_group(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 {
 	struct xs_igrp *g = s->grp;
 	uint8_t gk[XS_IDX_KMAX];
-	int gl = s->e.rt.kmax - 16, i, r, rl, kl;
+	int gl = s->rt.kmax - 16, i, r, rl, kl;
 	int64_t rid;
 	const uint8_t *rc, *kp;
 	if (g == NULL && (g = s->grp = calloc(1, sizeof *g)) == NULL)
@@ -9046,7 +9087,7 @@ xs_iscan_group(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 			return -1;
 		if (r == 0)
 			break;
-		if (xs_idx_truncated(&s->e.rt, kl) &&
+		if (xs_idx_truncated(&s->rt, kl) &&
 		    memcmp(kp, gk, (size_t)gl) == 0) {
 			if (xs_igrp_add(s, rid, rc, rl) != 0)
 				return -1;
@@ -9092,7 +9133,7 @@ xstore_iscan_next(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 		return 1;
 	}
 	r = xs_iscan_take(s, rowid, rec, reclen, &k, &kl);
-	if (r != 1 || !xs_idx_truncated(&s->e.rt, kl))
+	if (r != 1 || !xs_idx_truncated(&s->rt, kl))
 		return r;
 	return xs_iscan_group(s, rowid, rec, reclen, k);
 }
@@ -9107,6 +9148,7 @@ xstore_iscan_close(xstore_iscan_t *s)
 	if (s->cur != NULL) bt_cursor_close(s->cur);
 	free(s->ka);
 	free(s->ra);
+	free(s->rec);
 	free(s->bc);
 	free(s->bkeys);
 	free(s->fb);
