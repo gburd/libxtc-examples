@@ -19,6 +19,9 @@
  *	  retry      a flush whose row source fails installs nothing and
  *	             leaves the delta frozen; mf_flush_frozen finishes it;
  *	             an empty delta installs nothing;
+ *	  reclaim    many flushes with no synchronize of the test's own:
+ *	             the live allocations do not grow (each flush reclaims
+ *	             its frozen delta and the old run set);
  *	  concurrent committer fibers on two loops keep adding rows while a
  *	             flusher fiber flushes many times (each flush parks on
  *	             its file work); afterwards every row is either in the
@@ -39,10 +42,12 @@
 #include "run.h"
 #include "wal.h"
 #include "xtc.h"
+#include "xtc_alloc_audit.h"
 #include "xtc_exec.h"
 #include "xtc_fs.h"
 #include "xtc_proc.h"
 #include "xtc_rcu.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define PS 4096
@@ -271,6 +276,50 @@ t_retry(void)
 	    "manifest alone; the retry installs it\n");
 }
 
+/* Live allocations after one flush of 2000 rows: the delta's keys and
+ * maps, the run set, and the new run.  Without reclamation each flush
+ * leaves its frozen delta behind, about 2000 allocations. */
+static size_t
+live_after_flush(manifest_t *m, keydir_t *kd, uint32_t round)
+{
+	size_t n = 0;
+	uint32_t i;
+
+	for (i = 0; i < 2000; i++)
+		CK(kd_delta_put(kd, 7, (int64_t)i, 40000 + round) == XTC_OK);
+	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_OK);
+	xtc_alloc_audit_stats(&n, NULL);
+	return n;
+}
+
+static void
+t_reclaim(void)
+{
+	manifest_t *m = NULL;
+	keydir_t *kd = NULL;
+	size_t first, last = 0;
+	bm_t *bm;
+	uint32_t r;
+
+	bm = open_bm();
+	CK(kd_create(4096, &kd) == XTC_OK);
+	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK);
+	if (m == NULL)
+		return;
+	CK(xtc_runtime_set_alloc_audit(1) == XTC_OK);
+	first = live_after_flush(m, kd, 0);
+	for (r = 1; r < 20; r++)
+		last = live_after_flush(m, kd, r);
+	CK(xtc_runtime_set_alloc_audit(0) == XTC_OK);
+	/* 19 more runs (a few allocations each), no retired delta. */
+	CK(last < first + 19u * 64u);
+	printf("  reclaim: 20 flushes, live allocations %zu after the first, "
+	    "%zu after the last\n", first, last);
+	mf_close(m);
+	kd_destroy(kd);
+	bm_destroy(bm);
+}
+
 /* ---- concurrent commits and flushes ---- */
 
 #define CC_FIBERS 4
@@ -372,6 +421,7 @@ main(void)
 	t_flush_reopen();
 	t_refuse();
 	t_retry();
+	t_reclaim();
 	t_concurrent();
 	if (xtc_fs_dir_open(g_dir, &d) == XTC_OK) {
 		while (xtc_fs_dir_next(d, &name) == XTC_OK && name != NULL) {

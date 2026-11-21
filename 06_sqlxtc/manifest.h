@@ -83,7 +83,10 @@ typedef int (*mf_row_fn)(void *ctx, uint32_t frame, run_row_t *row);
  * XTC_E_NOTFOUND (nothing installed) when the delta was empty.  On a
  * failed write or install the run file is removed, the manifest and the
  * run set are untouched and the delta stays frozen: a later flush
- * retries it (mf_flush_frozen).  The caller unpins the flushed frames
+ * retries it (mf_flush_frozen).  On success the frozen delta and the
+ * old run set are reclaimed before the return (xtc_rcu_synchronize, so
+ * the call waits for keydir readers to leave their read-sides: the
+ * flusher must not hold one).  The caller unpins the flushed frames
  * after it returns XTC_OK.
  */
 int  mf_flush(manifest_t *m, mf_row_fn row, void *row_ctx,

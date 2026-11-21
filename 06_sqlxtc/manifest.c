@@ -505,6 +505,7 @@ mf_flush_frozen(manifest_t *m, mf_row_fn rowfn, void *ctx)
 	xtc_rcu_read_unlock();
 	if (empty) {
 		kd_drop_frozen(m->kd);       /* nothing to write */
+		xtc_rcu_synchronize();
 		return XTC_E_NOTFOUND;
 	}
 	/* A fresh id, never one sharing a live run's file number; ids of
@@ -538,6 +539,10 @@ mf_flush_frozen(manifest_t *m, mf_row_fn rowfn, void *ctx)
 	    (rc = mf_publish(m)) != XTC_OK)
 		return rc;                   /* durable; the next open sees it */
 	kd_drop_frozen(m->kd);
+	/* Reclaim the frozen delta and the old run set now: libxtc's RCU
+	 * frees retired objects only in a synchronize (it parks a fiber
+	 * while readers drain), and nothing else in the engine calls it. */
+	xtc_rcu_synchronize();
 	return XTC_OK;
 close:
 	run_close(r);
