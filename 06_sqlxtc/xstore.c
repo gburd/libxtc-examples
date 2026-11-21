@@ -8751,6 +8751,8 @@ xs_iscan_fill(xstore_iscan_t *s)
 			return xs_iscan_fail(s, rc);
 		while (n < s->kb_want && used <= XS_IKA_BYTES) {
 			rc = bt_cursor_next(s->cur, &k, &kl, &vv, &vl);
+			if (rc == XTC_OK && xs_rd_fault())
+				rc = XTC_E_IO;
 			if (rc == XTC_E_NOTFOUND) {
 				s->kb_end = 1; /* the end of the tree */
 				break;
