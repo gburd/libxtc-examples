@@ -595,10 +595,11 @@ wal_foff(const wal_t *w, uint64_t pos)
  * COMPLETE record (a torn tail is excluded), *maxlsn_out := highest LSN
  * seen.  Used to resume appending to an existing log. */
 static void
-wal_scan_tail_from(int fd, off_t o, off_t *off_out, uint64_t *maxlsn_out)
+wal_scan_tail(int fd, off_t *off_out, uint64_t *maxlsn_out)
 {
 	struct wal_rd r;
 	const uint8_t *body;
+	off_t o = 0;
 	uint64_t maxlsn = 0, lsn;
 	uint32_t len;
 	wal_rd_init(&r, fd, 1);
@@ -609,12 +610,6 @@ wal_scan_tail_from(int fd, off_t o, off_t *off_out, uint64_t *maxlsn_out)
 	free(r.buf);
 	*off_out = o;
 	*maxlsn_out = maxlsn;
-}
-
-static void
-wal_scan_tail(int fd, off_t *off_out, uint64_t *maxlsn_out)
-{
-	wal_scan_tail_from(fd, 0, off_out, maxlsn_out);
 }
 
 /*
@@ -956,23 +951,157 @@ wal_seg_create(wal_t *w, uint32_t seg, uint64_t first_lsn, uint64_t base)
 }
 
 /*
+ * The segment chain, read the way recovery reads it.  wal_seg_walk
+ * walks segments [first, hi] of `dir` in order and checks that they form
+ * one log: every file is there, its header is intact and names it, the
+ * LSNs run on without a gap from frame to frame and from one segment's
+ * last frame to the next one's header, and every segment but the newest
+ * holds complete frames to its end (zeros past them).  Only the newest
+ * may end in a torn frame, and a newest segment with no header is a
+ * roll's create that crashed before it took a frame (the end of the
+ * log).  Each frame at or past from_wa goes to cb (NULL: none).
+ *
+ * XTC_OK when the walk reached the end of the newest segment or cb
+ * stopped it; XTC_E_IO, with the failing segment named on stderr, when
+ * the chain breaks before that: a lost or damaged older segment is
+ * corruption at rest, and every commit past it would be invisible to
+ * recovery.  *end gets the newest segment's append offset, *last the
+ * last LSN the chain has issued (the newest header's first LSN - 1 when
+ * no frame is left).
+ */
+struct wal_walk {
+	const char      *dir;
+	uint64_t         from_wa;
+	wal_replay_wa_cb cb;
+	void            *user;
+	uint64_t         last;     /* out: the last LSN issued */
+	off_t            end;      /* out: the newest segment's append offset */
+	int              stopped;  /* out: cb stopped the walk */
+	int              nohdr;    /* out: the newest segment has no header */
+};
+
+static int
+wal_walk_bad(const char *dir, uint32_t seg, const char *why)
+{
+	fprintf(stderr, "sqlxtc wal: " WAL_SEG_FMT ": %s: the log is "
+	    "damaged\n", dir, seg, why);
+	return XTC_E_IO;
+}
+
+/* Walk one segment (fd) of the chain: see wal_walk. */
+static int
+wal_walk_seg(struct wal_walk *k, int fd, uint32_t seg, int newest)
+{
+	struct wal_rd r;
+	struct wal_seg_hdr h;
+	const uint8_t *body;
+	uint8_t *buf = NULL;
+	size_t cap = 0;
+	off_t off = (off_t)WAL_SEG_HDR;
+	uint64_t lsn, wa;
+	uint32_t len;
+	int rc = XTC_OK;
+
+	if (!wal_seg_hdr_read(fd, seg, &h)) {
+		if (newest && wal_zero_from(fd, (off_t)WAL_SEG_HDR)) {
+			k->nohdr = 1;
+			return XTC_OK;
+		}
+		return wal_walk_bad(k->dir, seg, "no valid segment header");
+	}
+	if (k->last != UINT64_MAX && h.first_lsn != k->last + 1)
+		return wal_walk_bad(k->dir, seg, "its first LSN does not "
+		    "follow the previous segment");
+	k->last = h.first_lsn - 1;
+	wal_rd_init(&r, fd, 1);
+	while (wal_rd_frame(&r, off, &lsn, &len, &body)) {
+		if (lsn != k->last + 1) {
+			rc = wal_walk_bad(k->dir, seg, "a frame's LSN breaks the "
+			    "sequence");
+			break;
+		}
+		wa = WAL_WA(seg, (uint64_t)off + WAL_REC_HDR);
+		if (body == NULL && k->cb != NULL && wa >= k->from_wa) {
+			if (len > cap) {
+				uint8_t *nb = realloc(buf, len);
+				if (nb == NULL) {
+					rc = XTC_E_NOMEM;
+					break;
+				}
+				buf = nb;
+				cap = len;
+			}
+			if (len > 0 && pread(fd, buf, len,
+			    off + (off_t)WAL_REC_HDR) != (ssize_t)len) {
+				rc = XTC_E_IO;
+				break;
+			}
+			body = buf;
+		}
+		off += (off_t)WAL_REC_HDR + (off_t)len + (off_t)WAL_REC_CRC;
+		k->last = lsn;
+		if (k->cb != NULL && wa >= k->from_wa &&
+		    k->cb(lsn, wa, body, len, k->user) != 0) {
+			k->stopped = 1;
+			break;
+		}
+	}
+	free(r.buf);
+	free(buf);
+	k->end = off;
+	/* Only the newest segment may end before its last byte in anything
+	 * but zeros (a roll waits until the old segment is durable). */
+	if (rc == XTC_OK && !k->stopped && !newest && !wal_zero_from(fd, off))
+		rc = wal_walk_bad(k->dir, seg, "a damaged frame before the "
+		    "end of an older segment");
+	return rc;
+}
+
+static int
+wal_seg_walk(struct wal_walk *k, uint32_t first, uint32_t hi)
+{
+	char p[1200];
+	uint32_t s;
+	int fd, rc = XTC_OK;
+
+	k->last = UINT64_MAX;
+	k->end = (off_t)WAL_SEG_HDR;
+	k->stopped = k->nohdr = 0;
+	for (s = first; s <= hi && rc == XTC_OK && !k->stopped; s++) {
+		wal_seg_path(k->dir, s, p, sizeof p);
+		if ((fd = open(p, O_RDONLY)) < 0)
+			return wal_walk_bad(k->dir, s, "missing from the chain");
+		rc = wal_walk_seg(k, fd, s, s == hi);
+		close(fd);
+	}
+	if (k->last == UINT64_MAX)
+		k->last = 0;
+	return rc;
+}
+
+/*
  * Open the segment log for wal_open: create the directory, then either
  * start segment 1 (no segment, or not append: an existing log is
  * removed) or append to the newest segment after its last complete
- * frame.  Sets w->fd, seg, seg_lo and seg_base; *o is the log position
- * of the append point and *maxlsn the last LSN issued: the highest one
- * on disk, or the newest header's first LSN - 1 when no frame is left
- * (retention deleted every segment that held one).  A newest segment
- * with no intact header never took a frame (a roll writes the header
- * first): a crash in that roll left it, and it is removed.
+ * frame.  The whole chain is checked first, the way wal_scan_segs reads
+ * it (wal_seg_walk): appending past a point recovery stops at would make
+ * every later commit invisible to it, so a lost or damaged older
+ * segment refuses the open (XTC_E_IO).  Sets w->fd, seg, seg_lo and
+ * seg_base; *o is the log position of the append point and *maxlsn the
+ * last LSN issued: the highest one on disk, or the newest header's first
+ * LSN - 1 when no frame is left (retention deleted every segment that
+ * held one).  A newest segment with no header never took a frame (a
+ * roll writes the header first): a crash in that roll left it, and it
+ * is removed.
  */
 static int
 wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 {
+	struct wal_walk k;
 	struct wal_seg_hdr h;
 	char p[1200];
-	uint32_t lo, hi, k;
-	off_t end;
+	uint32_t lo, hi, s;
+	int rc;
 
 	if (opts->segment_bytes < 2u * WAL_SEG_HDR)
 		return XTC_E_INVAL;
@@ -983,52 +1112,51 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 	w->seg_bytes = opts->segment_bytes;
 	wal_seg_list(w->dir, &lo, &hi);
 	if (!opts->append && hi != 0) {
-		for (k = lo; k <= hi; k++) {
-			wal_seg_path(w->dir, k, p, sizeof p);
+		for (s = lo; s <= hi; s++) {
+			wal_seg_path(w->dir, s, p, sizeof p);
 			(void)unlink(p);
 		}
 		lo = hi = 0;
 	}
-	for (;;) {
-		if (hi == 0) {
-			if (wal_seg_create(w, 1, 1, 0) != 0)
-				return XTC_E_INTERNAL;
-			*o = (off_t)WAL_SEG_HDR;
-			*maxlsn = 0;
-			return XTC_OK;
-		}
+	memset(&k, 0, sizeof k);
+	k.dir = w->dir;
+	if (hi != 0 && (rc = wal_seg_walk(&k, lo, hi)) != XTC_OK)
+		return rc;
+	if (hi != 0 && k.nohdr) {
+		/* The roll's create that crashed: drop it, and append to the
+		 * segment before it (whose end the walk did not record). */
+		if (hi == lo && hi != 1)
+			return wal_walk_bad(w->dir, hi, "no segment before it "
+			    "carries the LSN");
 		wal_seg_path(w->dir, hi, p, sizeof p);
-		w->fd = wal_open_fd(p, O_RDWR, &w->dsync);
-		if (w->fd < 0)
-			return XTC_E_IO;
-		if (wal_seg_hdr_read(w->fd, hi, &h))
-			break;
-		/* No header: a roll's create that crashed.  It must hold
-		 * nothing, and an older segment must carry the LSN on. */
-		if (!wal_zero_from(w->fd, (off_t)WAL_SEG_HDR))
-			return XTC_E_IO;
-		close(w->fd);
-		w->fd = -1;
-		if (hi == 1) {
-			hi = 0;                  /* the first create: start over */
-			continue;
-		}
-		if (hi == lo)
-			return XTC_E_IO;         /* nothing names the next LSN */
 		(void)unlink(p);
 		wal_sync_dir(p);
-		hi--;
+		if (--hi < lo)
+			hi = 0;                  /* the first segment's create */
+		else if ((rc = wal_seg_walk(&k, hi, hi)) != XTC_OK)
+			return rc;
 	}
+	if (hi == 0) {
+		if (wal_seg_create(w, 1, 1, 0) != 0)
+			return XTC_E_INTERNAL;
+		*o = (off_t)WAL_SEG_HDR;
+		*maxlsn = 0;
+		return XTC_OK;
+	}
+	wal_seg_path(w->dir, hi, p, sizeof p);
+	w->fd = wal_open_fd(p, O_RDWR, &w->dsync);
+	if (w->fd < 0 || !wal_seg_hdr_read(w->fd, hi, &h))
+		return XTC_E_IO;
 	w->seg = hi;
 	w->seg_lo = lo;
 	w->seg_base = h.base;
-	wal_scan_tail_from(w->fd, (off_t)WAL_SEG_HDR, &end, maxlsn);
-	if (*maxlsn < h.first_lsn - 1)
-		*maxlsn = h.first_lsn - 1;
-	if (ftruncate(w->fd, end) != 0) {
+	if (k.last < h.first_lsn - 1 || k.end < (off_t)WAL_SEG_HDR)
+		return XTC_E_IO;
+	*maxlsn = k.last;
+	if (ftruncate(w->fd, k.end) != 0) {
 		/* non-fatal: appends overwrite the torn tail */
 	}
-	*o = (off_t)(h.base + (uint64_t)end);
+	*o = (off_t)(h.base + (uint64_t)k.end);
 	return XTC_OK;
 }
 
@@ -2578,69 +2706,12 @@ wal_scan(const char *path, wal_replay_cb cb, void *user)
 	return wal_scan_ex(path, cb, user, NULL);
 }
 
-/*
- * Replay one segment from its start: every complete frame whose body's
- * WAL address is at least from_wa goes to cb.  *stop is set when cb
- * stopped, a read failed or memory ran out; *clean when the frames end
- * at the end of the file or in zeros only (the preallocated region).
- */
-static int
-wal_scan_seg(int fd, uint32_t seg, uint64_t from_wa, wal_replay_wa_cb cb,
-    void *user, int *stop, int *clean)
-{
-	struct wal_rd r;
-	struct wal_seg_hdr h;
-	const uint8_t *body;
-	uint8_t *buf = NULL;
-	size_t cap = 0;
-	off_t off = (off_t)WAL_SEG_HDR;
-	uint64_t lsn, wa;
-	uint32_t len;
-	int rc = XTC_OK;
-
-	if (!wal_seg_hdr_read(fd, seg, &h)) {
-		*stop = 1;
-		*clean = 0;
-		return XTC_OK;
-	}
-	wal_rd_init(&r, fd, 1);
-	while (!*stop && wal_rd_frame(&r, off, &lsn, &len, &body)) {
-		wa = WAL_WA(seg, (uint64_t)off + WAL_REC_HDR);
-		if (body == NULL) {
-			if (len > cap) {
-				uint8_t *nb = realloc(buf, len);
-				if (nb == NULL) {
-					rc = XTC_E_NOMEM;
-					*stop = 1;
-					break;
-				}
-				buf = nb;
-				cap = len;
-			}
-			if (len > 0 && pread(fd, buf, len,
-			    off + (off_t)WAL_REC_HDR) != (ssize_t)len) {
-				*stop = 1;
-				break;
-			}
-			body = buf;
-		}
-		off += (off_t)WAL_REC_HDR + (off_t)len + (off_t)WAL_REC_CRC;
-		if (wa >= from_wa && cb(lsn, wa, body, len, user) != 0)
-			*stop = 1;
-	}
-	*clean = !*stop && wal_zero_from(fd, off);
-	free(r.buf);
-	free(buf);
-	return rc;
-}
-
 int
 wal_scan_segs(const char *dir, uint64_t from_wa, wal_replay_wa_cb cb,
     void *user)
 {
-	char p[1200];
-	uint32_t lo, hi, k, first;
-	int fd, rc = XTC_OK, stop = 0, clean = 1;
+	struct wal_walk k;
+	uint32_t lo, hi, first;
 
 	if (dir == NULL || cb == NULL)
 		return XTC_E_INVAL;
@@ -2650,18 +2721,12 @@ wal_scan_segs(const char *dir, uint64_t from_wa, wal_replay_wa_cb cb,
 	first = from_wa == 0 ? lo : WAL_WA_SEG(from_wa);
 	if (first < lo)
 		return XTC_E_NOTFOUND;       /* deleted by retention */
-	/* Consecutive segments only: a missing one ends the log, and so
-	 * does an older segment whose frames do not run to its end (only
-	 * the newest can have a torn tail: a roll waits until every byte
-	 * of the old segment is durable). */
-	for (k = first; k <= hi && !stop && clean && rc == XTC_OK; k++) {
-		wal_seg_path(dir, k, p, sizeof p);
-		if ((fd = open(p, O_RDONLY)) < 0)
-			break;
-		rc = wal_scan_seg(fd, k, from_wa, cb, user, &stop, &clean);
-		close(fd);
-	}
-	return rc;
+	memset(&k, 0, sizeof k);
+	k.dir = dir;
+	k.from_wa = from_wa;
+	k.cb = cb;
+	k.user = user;
+	return wal_seg_walk(&k, first, hi);
 }
 
 int

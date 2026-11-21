@@ -77,7 +77,10 @@ typedef struct wal_opts {
 	                            * segment rolls before a frame would take
 	                            * it past this size (a frame never spans
 	                            * two; one larger than this gets a segment
-	                            * of its own).  See "Segments" below. */
+	                            * of its own).  See "Segments" below.
+	                            * An append open checks the segment
+	                            * chain and refuses a damaged one
+	                            * (XTC_E_IO, as wal_scan_segs). */
 } wal_opts_t;
 
 typedef struct wal_stats {
@@ -297,12 +300,17 @@ int  wal_roll(wal_t *w);
 /*
  * Replay a segmented log in <dir> from the segment holding from_wa (0:
  * the oldest on disk) through the last, calling cb with every complete
- * frame and the WAL address of its body.  Segments must be consecutive:
- * the scan ends at a gap, at a torn frame, or at a segment whose frames
- * end in anything but zeros or the end of the file (a frame lost
- * mid-log).  XTC_E_NOTFOUND if from_wa's segment is gone (deleted by
- * retention), XTC_OK otherwise; cb returns non-zero to stop.  Reads the
- * files directly: run it before the log is opened for append.
+ * frame and the WAL address of its body.  The chain must be whole:
+ * consecutive segments, each with an intact header that names it, LSNs
+ * without a gap, and every segment but the newest complete to its end.
+ * Only the newest may end in a torn frame (the end of the log).
+ * XTC_E_NOTFOUND if from_wa's segment is gone (deleted by retention);
+ * XTC_E_IO, naming the segment on stderr, if the chain breaks before
+ * the newest segment's end (a missing or damaged older segment: the
+ * open refuses such a log too, so no commit is acknowledged past a
+ * point recovery cannot read); XTC_OK otherwise.  cb returns non-zero
+ * to stop.  Reads the files directly: run it before the log is opened
+ * for append.
  */
 typedef int (*wal_replay_wa_cb)(uint64_t lsn, uint64_t wa, const void *rec,
     uint32_t len, void *user);

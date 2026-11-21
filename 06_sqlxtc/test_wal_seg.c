@@ -24,6 +24,10 @@
  *	             end plus a roll, a reopen and another roll (no segment
  *	             holds a frame), and not after a crash between a roll's
  *	             unlink and the new segment's first frame;
+ *	  chain      a damaged frame in an older segment, or a missing
+ *	             middle segment, refuses both the append open and the
+ *	             scan (XTC_E_IO): no commit is acknowledged past a point
+ *	             recovery cannot read;
  *	  refuse     wal_checkpoint, the online checkpoint and wal_truncate
  *	             refuse a segmented log; a one-file log reports wa 0.
  */
@@ -380,6 +384,83 @@ t_lsn(void)
 }
 
 static int
+count_cb(uint64_t lsn, uint64_t wa, const void *rec, uint32_t len, void *u)
+{
+	(void)lsn;
+	(void)wa;
+	(void)rec;
+	(void)len;
+	(*(int *)u)++;
+	return 0;
+}
+
+/* 30 commits over three segments (10 in 1, 10 in 2, 10 in 3); *mid is
+ * the WAL address of a record in segment 2. */
+static void
+three_segs(uint64_t *mid)
+{
+	uint64_t lsn = 0, wa = 0;
+	wal_t *w;
+	int i;
+
+	w = open_log(0);
+	if (w == NULL)
+		return;
+	for (i = 0; i < 30; i++) {
+		CK(wal_commit_wa(w, "abcdefgh", 8, &lsn, &wa) == XTC_OK);
+		if (i == 15)
+			*mid = wa;
+		if (i == 9 || i == 19)
+			CK(wal_roll(w) == XTC_OK);
+	}
+	wal_close(w);
+}
+
+/*
+ * The append open agrees with recovery (review B2): a frame of an older
+ * segment damaged (probe p_gap's byte flip), or a middle segment gone,
+ * refuses both, so no commit can be acknowledged past the point a scan
+ * stops at.  The intact chain still opens and scans all 30.
+ */
+static void
+t_chain(void)
+{
+	wal_opts_t wo = { 0 };
+	uint64_t mid = 0;
+	char p[300], q[310];
+	wal_t *w = NULL;
+	int fd, n = 0;
+
+	three_segs(&mid);
+	CK(WAL_WA_SEG(mid) == 2);
+	CK(wal_scan_segs(g_dir, 0, count_cb, &n) == XTC_OK && n == 30);
+	seg_path(2, p, sizeof p);
+	CK((fd = open(p, O_RDWR)) >= 0);
+	CK(pwrite(fd, "X", 1, (off_t)WAL_WA_OFF(mid)) == 1);
+	close(fd);
+	wo.path = g_dir;
+	wo.append = 1;
+	wo.segment_bytes = SEG_BYTES;
+	CK(wal_open(&wo, &w) == XTC_E_IO);
+	n = 0;
+	CK(wal_scan_segs(g_dir, 0, count_cb, &n) == XTC_E_IO);
+	/* A missing middle segment. */
+	three_segs(&mid);
+	seg_path(2, p, sizeof p);
+	snprintf(q, sizeof q, "%s.away", p);
+	CK(rename(p, q) == 0);
+	CK(wal_open(&wo, &w) == XTC_E_IO);
+	CK(wal_scan_segs(g_dir, 0, count_cb, &n) == XTC_E_IO);
+	CK(rename(q, p) == 0);
+	n = 0;
+	CK(wal_scan_segs(g_dir, 0, count_cb, &n) == XTC_OK && n == 30);
+	CK(wal_open(&wo, &w) == XTC_OK);
+	wal_close(w);
+	printf("  chain: a damaged older segment or a missing middle one "
+	    "refuses the open and the scan\n");
+}
+
+static int
 dump_one(wal_emit_fn emit, void *ctx, void *user)
 {
 	(void)user;
@@ -443,6 +524,7 @@ main(void)
 	t_big_and_release();
 	t_reopen();
 	t_lsn();
+	t_chain();
 	t_refuse();
 	cleanup();
 	if (!g_fail)
