@@ -8275,6 +8275,10 @@ struct xstore_iscan {
 	int           lkl;
 	/* committed stream */
 	bt_cursor_t  *cur;
+	/* started: forward, the equality probe was tried (xs_iscan_point,
+	 * once per scan); reverse, the first batch was read.  pos: the
+	 * walk's position (forward, the probe's hand-off key; reverse, the
+	 * last key read). */
 	uint8_t      *pos;  int poslen, started;
 	uint8_t      *ck;   int cklen, have_ck; int64_t crid;
 	/* Read-ahead of index keys (xs_iscan_fill): in-range entries copied

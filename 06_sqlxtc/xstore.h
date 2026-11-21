@@ -581,7 +581,10 @@ void xstore_uniq_fail_inject(int n);
 /* Test hook: the n-th B-tree read (1-based) of an index scan or a UNIQUE
  * probe from now fails with XTC_E_IO, as a page read can; 0 disarms.
  * The scan's xstore_iscan_next, or the write, must then fail.  Returns
- * the previous setting: still positive when fewer reads ran. */
+ * the previous setting: still positive when fewer reads ran.  Note that
+ * the count is one for the process: the n-th read of any connection
+ * fails.  Under real threads the count can go below 0, which is
+ * harmless (only the step from 1 fails a read). */
 int xstore_index_read_fail_at(int n);
 
 /* xstore_recover that also reports where the log ends after recovery

@@ -3611,7 +3611,10 @@ bt_seek_ge_keys(bt_t *bt, const void *lo, uint16_t lolen, uint16_t plen,
 		(*n)++;
 	}
 	/* The leaf ran out first: its upper fence decides (+infinity for
-	 * the rightmost leaf, which has no right sibling). */
+	 * the rightmost leaf, which has no right sibling).  Note that the
+	 * key_cmp() clause is a guard only: the leaf owns lo, so its fence
+	 * is >= lo, and a fence >= lo without lo's prefix already sorts
+	 * past every key with it. */
 	if (s == cnt) {
 		if (btnode_right_sibling(pg) == 0 ||
 		    XTC_DST_BUG(XTC_DST_BUG_POINTEND))
