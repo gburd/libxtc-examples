@@ -47,11 +47,15 @@ extern "C" {
 typedef struct manifest manifest_t;
 
 /*
- * Open the manifest of directory `dir` (created empty if absent: next
- * run 1, boundary 0, no run), open every run it names through bm into
- * kd's run set, and delete the run files it does not name.  A manifest
- * whose CRC fails, or that names a run that fails run_open, is XTC_E_IO
- * and nothing is deleted.  File work runs under xtc_blocking_run.
+ * Open the manifest of directory `dir`, open every run it names through
+ * bm into kd's run set, and delete the run files it does not name.  A
+ * directory with no MANIFEST and no run file is a new store: an empty
+ * manifest (next run 1, boundary 0, no run) is installed at once, so a
+ * missing MANIFEST later is always damage.  XTC_E_IO, deleting nothing
+ * and naming the problem on stderr: a MANIFEST that cannot be read
+ * (anything but "absent"), whose CRC fails, or that names a run that
+ * fails run_open, and a missing MANIFEST beside run files.  File work
+ * runs under xtc_blocking_run.
  */
 int  mf_open(const char *dir, bm_t *bm, keydir_t *kd, manifest_t **out);
 

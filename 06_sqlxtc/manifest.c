@@ -72,8 +72,10 @@ struct mf_job {
 	size_t      len;
 	char       *out;              /* read: malloc'd contents, or NULL */
 	size_t      outlen;
-	int         op;               /* 0 read, 1 write, 2 unlink */
+	int         op;               /* 0 read, 1 write, 2 unlink, 3 list */
 	const char *name;             /* 2: the file in dir to unlink */
+	char      **names;            /* 3: out, malloc'd, nnames of them */
+	uint32_t    nnames;
 	int         renamed;          /* 1: out, the rename was done */
 };
 
@@ -106,10 +108,10 @@ mf_read_file(struct mf_job *j)
 
 	snprintf(p, sizeof p, "%s/%s", j->dir, MF_NAME);
 	j->out = NULL;
-	if (!xtc_fs_exists(p))
-		return XTC_E_NOTFOUND;
+	/* Opened directly: only ENOENT is "absent"; EACCES, EIO and the
+	 * rest are errors, never a new store. */
 	if ((rc = xtc_fs_open(p, XTC_FS_READ, &fd)) != XTC_OK)
-		return rc;
+		return rc == XTC_E_NOTFOUND ? rc : XTC_E_IO;
 	rc = xtc_fs_fsize(fd, &sz);
 	if (rc == XTC_OK && (sz <= 0 || (uint64_t)sz > MF_MAXLEN))
 		rc = XTC_E_IO;
@@ -162,6 +164,53 @@ mf_write_file(struct mf_job *j)
 	return MF_RENAMED_SYNC(j->dir);
 }
 
+/* The names of the row log's files in j->dir (rl-*.run and
+ * MANIFEST.tmp) into j->names. */
+static int
+mf_list_dir(struct mf_job *j)
+{
+	xtc_fs_dir_t *d = NULL;
+	const char *name;
+	char **nv;
+	uint64_t id;
+	char tail;
+	int rc;
+
+	j->names = NULL;
+	j->nnames = 0;
+	if ((rc = xtc_fs_dir_open(j->dir, &d)) != XTC_OK)
+		return XTC_E_IO;
+	while ((rc = xtc_fs_dir_next(d, &name)) == XTC_OK && name != NULL) {
+		if (strcmp(name, MF_TMP) != 0 &&
+		    (sscanf(name, "rl-%" SCNu64 ".ru%c", &id, &tail) != 2 ||
+		    tail != 'n'))
+			continue;
+		if ((nv = realloc(j->names, (j->nnames + 1u) * sizeof *nv)) ==
+		    NULL || (nv[j->nnames] = strdup(name)) == NULL) {
+			if (nv != NULL)
+				j->names = nv;
+			rc = XTC_E_NOMEM;
+			break;
+		}
+		j->names = nv;
+		j->nnames++;
+	}
+	xtc_fs_dir_close(d);
+	return rc;
+}
+
+static void
+mf_names_free(struct mf_job *j)
+{
+	uint32_t i;
+
+	for (i = 0; i < j->nnames; i++)
+		free(j->names[i]);
+	free(j->names);
+	j->names = NULL;
+	j->nnames = 0;
+}
+
 static int
 mf_job_run(void *arg)
 {
@@ -172,6 +221,8 @@ mf_job_run(void *arg)
 		return mf_read_file(j);
 	if (j->op == 1)
 		return mf_write_file(j);
+	if (j->op == 3)
+		return mf_list_dir(j);
 	snprintf(p, sizeof p, "%s/%s", j->dir, j->name);
 	return xtc_fs_unlink(p);
 }
@@ -315,48 +366,88 @@ mf_file_busy(const manifest_t *m, uint64_t id)
 	return 0;
 }
 
-/* Delete rl-*.run files of `dir` that no run in m names, and a stale
- * MANIFEST.tmp. */
+/* Delete rl-*.run files of `dir` that the durable manifest (m, just
+ * read) does not name, and a stale MANIFEST.tmp: a flush that died
+ * before its rename left them, and nothing durable refers to them (a
+ * flush's boundary reaches the WAL only after mf_flush returns XTC_OK).
+ * The directory walk and the unlinks run under xtc_blocking_run. */
 static void
 mf_sweep(manifest_t *m)
 {
-	struct mf_job j;
-	xtc_fs_dir_t *d = NULL;
-	const char *name;
-	char **dead = NULL, **nd;
-	uint32_t nn = 0, i, k;
+	struct mf_job j, u;
+	uint32_t i, k;
 	uint64_t id;
 	char tail;
+	int named;
 
-	if (xtc_fs_dir_open(m->dir, &d) != XTC_OK)
+	memset(&j, 0, sizeof j);
+	j.dir = m->dir;
+	j.op = 3;
+	if (mf_job(&j) != XTC_OK) {
+		mf_names_free(&j);
 		return;
-	while (xtc_fs_dir_next(d, &name) == XTC_OK && name != NULL) {
-		int named = 0;
-		if (strcmp(name, MF_TMP) != 0) {
-			if (sscanf(name, "rl-%" SCNu64 ".ru%c", &id, &tail) !=
-			    2 || tail != 'n')
-				continue;
+	}
+	for (i = 0; i < j.nnames; i++) {
+		named = 0;
+		if (sscanf(j.names[i], "rl-%" SCNu64 ".ru%c", &id, &tail) ==
+		    2)
 			for (k = 0; k < m->n && !named; k++)
 				named = m->runs[k].meta.runid == id;
-			if (named)
-				continue;
-		}
-		if ((nd = realloc(dead, (nn + 1u) * sizeof *nd)) == NULL)
-			break;
-		dead = nd;
-		if ((dead[nn] = strdup(name)) != NULL)
-			nn++;
+		if (named)
+			continue;
+		memset(&u, 0, sizeof u);
+		u.dir = m->dir;
+		u.op = 2;
+		u.name = j.names[i];
+		(void)mf_job(&u);
 	}
-	xtc_fs_dir_close(d);
-	for (i = 0; i < nn; i++) {
-		memset(&j, 0, sizeof j);
-		j.dir = m->dir;
-		j.op = 2;
-		j.name = dead[i];
-		(void)mf_job(&j);
-		free(dead[i]);
+	mf_names_free(&j);
+}
+
+/*
+ * No MANIFEST in `dir`: a new store, unless the directory holds run
+ * files, which only a store that had a manifest can have (a store's
+ * first manifest is written when it is created, before any flush).
+ * Then MANIFEST was lost or removed, and opening it as a new store
+ * would delete every flushed row: refuse, naming the problem.  A lone
+ * MANIFEST.tmp is a create that crashed before its rename.  On a new
+ * store, the empty manifest (next 1, boundary 0) is installed now.
+ */
+static int
+mf_create(manifest_t *m)
+{
+	struct mf_job j;
+	uint32_t i, runs = 0;
+	size_t len;
+	char *text;
+	int rc;
+
+	memset(&j, 0, sizeof j);
+	j.dir = m->dir;
+	j.op = 3;
+	rc = mf_job(&j);
+	for (i = 0; rc == XTC_OK && i < j.nnames; i++)
+		runs += strcmp(j.names[i], MF_TMP) != 0;
+	mf_names_free(&j);
+	if (rc != XTC_OK)
+		return rc;
+	if (runs > 0) {
+		fprintf(stderr, "sqlxtc row log: %s/%s is missing but the "
+		    "directory holds %u run file%s: the store is damaged and "
+		    "is not opened\n", m->dir, MF_NAME, runs, runs == 1 ? "" :
+		    "s");
+		return XTC_E_IO;
 	}
-	free(dead);
+	if ((text = mf_text(m, NULL, m->next, m->boundary, &len)) == NULL)
+		return XTC_E_NOMEM;
+	memset(&j, 0, sizeof j);
+	j.dir = m->dir;
+	j.text = text;
+	j.len = len;
+	j.op = 1;
+	rc = mf_job(&j);
+	free(text);
+	return rc;
 }
 
 int
@@ -389,7 +480,10 @@ mf_open(const char *dir, bm_t *bm, keydir_t *kd, manifest_t **out)
 		rc = mf_parse(j.out, j.outlen, &m->next, &m->boundary, &v, &n);
 		free(j.out);
 	} else if (rc == XTC_E_NOTFOUND) {
-		rc = XTC_OK;                 /* a new store */
+		rc = mf_create(m);
+	} else {
+		fprintf(stderr, "sqlxtc row log: %s/%s cannot be read: the "
+		    "store is not opened\n", dir, MF_NAME);
 	}
 	/* Every named run must open, or the store is not usable. */
 	for (i = 0; rc == XTC_OK && i < n; i++) {

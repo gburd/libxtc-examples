@@ -16,6 +16,9 @@
  *	             install) and a MANIFEST.tmp are deleted;
  *	  refuse     a manifest with a bad CRC, or naming a run whose header
  *	             does not match, refuses the open and deletes nothing;
+ *	  missing    a MANIFEST that is gone while run files remain, or that
+ *	             cannot be read, refuses the open and deletes nothing:
+ *	             never "a new store";
  *	  retry      a flush whose row source fails installs nothing and
  *	             leaves the delta frozen; mf_flush_frozen finishes it;
  *	             an empty delta installs nothing;
@@ -154,7 +157,8 @@ t_flush_reopen(void)
 	CK(bm != NULL && kd != NULL && mf_open(g_dir, bm, kd, &m) == XTC_OK);
 	if (m == NULL)
 		return;
-	CK(mf_nruns(m) == 0 && mf_boundary(m) == 0 && exists("MANIFEST") == 0);
+	/* A new store installs its empty manifest at once (review S4). */
+	CK(mf_nruns(m) == 0 && mf_boundary(m) == 0 && exists("MANIFEST"));
 	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_E_NOTFOUND);
 	/* Two flushes of 1000 rows over three tables; the second updates
 	 * half of the first's rows. */
@@ -248,6 +252,48 @@ t_refuse(void)
 	bm_destroy(bm);
 	printf("  refuse: a bad CRC or a mismatched run refuses the open, "
 	    "nothing deleted\n");
+}
+
+/* Rename MANIFEST away (or back): 0 on success. */
+static int
+mf_move(const char *from, const char *to)
+{
+	char a[300], b[300];
+
+	snprintf(a, sizeof a, "%s/%s", g_dir, from);
+	snprintf(b, sizeof b, "%s/%s", g_dir, to);
+	return rename(a, b);
+}
+
+static void
+t_missing(void)
+{
+	manifest_t *m = NULL;
+	keydir_t *kd = NULL;
+	char p[300];
+	bm_t *bm;
+
+	bm = open_bm();
+	CK(kd_create(4096, &kd) == XTC_OK);
+	CK(mf_move("MANIFEST", "MANIFEST.away") == 0);
+	CK(mf_open(g_dir, bm, kd, &m) == XTC_E_IO && m == NULL);
+	CK(exists("rl-1.run") && exists("rl-2.run") && exists("rl-3.run"));
+	CK(!exists("MANIFEST"));
+	CK(mf_move("MANIFEST.away", "MANIFEST") == 0);
+	/* Unreadable (root reads anything: then only the absent case). */
+	snprintf(p, sizeof p, "%s/MANIFEST", g_dir);
+	if (geteuid() != 0) {
+		CK(chmod(p, 0) == 0);
+		CK(mf_open(g_dir, bm, kd, &m) == XTC_E_IO && m == NULL);
+		CK(exists("rl-1.run") && exists("rl-3.run"));
+		CK(chmod(p, 0600) == 0);
+	}
+	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK && mf_nruns(m) == 3);
+	mf_close(m);
+	kd_destroy(kd);
+	bm_destroy(bm);
+	printf("  missing: a lost or unreadable MANIFEST beside run files "
+	    "refuses the open, nothing deleted\n");
 }
 
 static void
@@ -481,6 +527,7 @@ main(void)
 	}
 	t_flush_reopen();
 	t_refuse();
+	t_missing();
 	t_retry();
 	t_renamed();
 	t_reclaim();
