@@ -2474,6 +2474,8 @@ bm_unfix(bm_t *bm, bm_frame_t *frame, int mark_dirty)
 void
 bm_predirty(bm_t *bm, bm_frame_t *frame)
 {
+	bm_pid_t pid;
+
 	if (bm == NULL || frame == NULL)
 		return;
 	/*
@@ -2486,9 +2488,11 @@ bm_predirty(bm_t *bm, bm_frame_t *frame)
 	 * to the latest change folded into the image, or recovery's page-LSN
 	 * gate would refuse a newer image.  Then take the normal dirty edge
 	 * so recLSN/dirty bookkeeping is set if this is the first touch.
+	 * A run frame (file != 0) is read-only: its bytes are not stamped,
+	 * and the edge only counts the refusal.
 	 */
-	if (bm->lsn_off >= 0 &&
-	    xtc_atomic_load_u64(&frame->pid, xtc_mo_seq_cst) != 0) {
+	pid = xtc_atomic_load_u64(&frame->pid, xtc_mo_seq_cst);
+	if (bm->lsn_off >= 0 && pid != 0 && BM_PID_FILE(pid) == 0) {
 		uint64_t lsn =
 		    xtc_atomic_load_u64(&bm->cur_lsn, xtc_mo_relaxed);
 		memcpy((uint8_t *)frame->page + bm->lsn_off, &lsn, sizeof lsn);

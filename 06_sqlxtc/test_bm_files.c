@@ -235,6 +235,45 @@ ring_has_other(const char *dwb)
 	return found;
 }
 
+/* bm_predirty on a run frame, with page LSNs on, leaves its bytes as
+ * they are on disk (REREVIEW-sbf N1): read-only means its bytes too. */
+static void
+t_readonly_predirty(void)
+{
+	bm_opts_t o = BM_OPTS_DEFAULT;
+	char p0[300], p2[300];
+	uint8_t before[PS];
+	bm_frame_t *f;
+	bm_t *bm = NULL;
+
+	path_of(p0, sizeof p0, "pages-lsn");
+	path_of(p2, sizeof p2, "run2-lsn");
+	o.path = p0;
+	o.page_size = PS;
+	o.n_frames = 8;
+	o.cksum_off = BTNODE_CKSUM_OFF;
+	o.cksum = wal_crc32c;
+	o.lsn_off = 16;                    /* zeros in fill()'s pages */
+	CK(bm_create(&o, &bm) == XTC_OK);
+	if (bm == NULL)
+		return;
+	make_file(bm, p2, 2);
+	CK(bm_file_attach(bm, 2, p2) == XTC_OK);
+	bm_set_lsn(bm, 42);
+	CK(bm_fix_pid(bm, BM_PID_MAKE(2, 1), &f) == XTC_OK);
+	if (f != NULL) {
+		memcpy(before, bm_page(f), PS);
+		bm_predirty(bm, f);
+		CK(memcmp(before, bm_page(f), PS) == 0);
+		bm_unfix(bm, f, 0);
+	}
+	CK(bm_ro_dirty_refused(bm) == 1);
+	CK(bm_file_detach(bm, 2) == XTC_OK);
+	bm_destroy(bm);
+	unlink(p0);
+	unlink(p2);
+}
+
 static void
 t_readonly_detach(void)
 {
@@ -261,6 +300,7 @@ t_readonly_detach(void)
 	bm_predirty(bm, f);
 	bm_unfix(bm, f, 1);
 	CK(bm_ro_dirty_refused(bm) == 2);
+	t_readonly_predirty();
 	/* Churn the 4-frame pool so the frame is evicted, then checkpoint:
 	 * nothing reaches file 1, and the ring never takes a file-1 page. */
 	for (i = 0; i < 12; i++) {
