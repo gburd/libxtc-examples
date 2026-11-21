@@ -2550,6 +2550,7 @@ typedef struct xstore_cursor {
 	uint16_t     vlen;
 	bt_cursor_t *btc;            /* persistent scan cursor, parked between calls */
 	uint64_t     visited;        /* version keys examined (metric, flushed at close) */
+	int          err;            /* XTC_E_* that ended the walk, or 0 */
 } xstore_cursor_t;
 
 /*
@@ -2784,12 +2785,32 @@ xs_stash(xstore_cursor_t *c, int64_t rowid, const uint8_t *val, uint16_t vl)
 	if (c->vlen) memcpy(c->val, val + 1, c->vlen);
 }
 
+static int g_scan_failat;   /* test hook: the scan read to fail, 1-based */
+
+/* Should this cursor read of a base-table scan fail
+ * (xstore_scan_read_fail_at)?  One relaxed load when disarmed. */
+static int
+xs_scan_fault(void)
+{
+	return xtc_atomic_load_i32(&g_scan_failat, xtc_mo_relaxed) > 0 &&
+	    xtc_atomic_fetch_sub_i32(&g_scan_failat, 1, xtc_mo_relaxed) == 1;
+}
+
+int
+xstore_scan_read_fail_at(int n)
+{
+	return xtc_atomic_exchange_i32(&g_scan_failat, n, xtc_mo_relaxed);
+}
+
 /* Position the scan's B-tree cursor for the next step: open it (one
  * descent to the table's first key, or the lo bound) or resume it past
- * the last key consumed.  0, or -1 at the end (c->eof set). */
+ * the last key consumed.  0, or -1 at the end (c->eof set); a cursor
+ * that could not be opened or resumed also leaves its error in c->err. */
 static int
 xs_cur_resume(xstore_cursor_t *c)
 {
+	int rc;
+
 	if (c->btc == NULL) {
 		uint8_t startbuf[XS_VKLEN];
 		const uint8_t *start;
@@ -2803,11 +2824,14 @@ xs_cur_resume(xstore_cursor_t *c)
 			    ~(uint64_t)0, startbuf);
 			start = startbuf;
 		}
-		if (bt_cursor_open(c->bt, start, XS_VKLEN, &c->btc) != XTC_OK) {
-			c->eof = 1;
-			return -1;
-		}
-	} else if (bt_cursor_resume(c->btc) != XTC_OK) {
+		rc = bt_cursor_open(c->bt, start, XS_VKLEN, &c->btc);
+	} else {
+		rc = bt_cursor_resume(c->btc);
+	}
+	if (rc == XTC_OK && xs_scan_fault())
+		rc = XTC_E_IO;
+	if (rc != XTC_OK) {
+		c->err = rc;
 		c->eof = 1;
 		return -1;
 	}
@@ -2817,8 +2841,10 @@ xs_cur_resume(xstore_cursor_t *c)
 /* One step of the visibility walk on a positioned cursor (latch held):
  * 1 with the next visible row -- its rowid and stored value (flag byte
  * first; valid until the next cursor call) -- or 0 at the end (c->eof
- * set).  Visible = the newest non-tombstone version of each rowid with
- * commit_ts <= snap (PostgreSQL HeapTupleSatisfiesMVCC). */
+ * set).  A cursor read error also ends the walk, with c->err set: the
+ * rows not read are unknown, not absent.  Visible = the newest
+ * non-tombstone version of each rowid with commit_ts <= snap
+ * (PostgreSQL HeapTupleSatisfiesMVCC). */
 static int
 xs_cur_step(xstore_cursor_t *c, int64_t *rid_out, const uint8_t **val,
     uint16_t *vlen)
@@ -2836,9 +2862,14 @@ xs_cur_step(xstore_cursor_t *c, int64_t *rid_out, const uint8_t **val,
 		const uint8_t *kb, *vb;
 		int64_t rid;
 		uint64_t ts;
+		int rc;
 
-		if (bt_cursor_next(c->btc, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN) {
+		rc = bt_cursor_next(c->btc, &k, &klen, &vv, &vl);
+		if (rc == XTC_OK && xs_scan_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+			c->err = rc;
+		if (rc != XTC_OK || klen != XS_VKLEN) {
 			c->eof = 1;
 			return 0;
 		}
@@ -3130,16 +3161,35 @@ xstore_scan_open_txn(struct xsql *db, const char *table, uint64_t snap,
 	return s;
 }
 
+/* Copy buffered write `w`'s payload into the scan's staging buffer,
+ * first bringing it back from the STEAL staging area if it was spilled.
+ * 0, or -1 with s->c.err set when the spilled payload cannot be read:
+ * the row is unknown, so the scan must fail rather than return it. */
+static int
+xs_scan_load_buffered(xstore_scan_t *s, const xs_wrec_t *w)
+{
+	int rc;
+	if (w->spilled && xs_scan_fault())
+		rc = SX_ERROR;
+	else
+		rc = xs_wrec_ensure(s->ryw_ctx, (xs_wrec_t *)w);
+	if (rc != SX_OK) {
+		s->c.err = rc == SX_NOMEM ? XTC_E_NOMEM : XTC_E_IO;
+		return -1;
+	}
+	if (w->len && w->data) memcpy(s->ryw_val, w->data, w->len);
+	return 0;
+}
+
 /* Return buffered row `rowid` (its newest write) through the scan outs;
- * 0 if that write is a delete. */
+ * 0 if that write is a delete, -1 if its payload cannot be read. */
 static int
 xs_scan_emit_buffered(xstore_scan_t *s, int64_t rid, int64_t *rowid,
     const uint8_t **rec, int *reclen)
 {
 	const xs_wrec_t *w = wbuf_find(s->ryw_ctx, s->c.tableid, rid);
 	if (w == NULL || w->deleted) return 0;
-	(void)xs_wrec_ensure(s->ryw_ctx, (xs_wrec_t *)w);
-	if (w->len && w->data) memcpy(s->ryw_val, w->data, w->len);
+	if (xs_scan_load_buffered(s, w) != 0) return -1;
 	if (rowid) *rowid = rid;
 	if (rec) *rec = s->ryw_val;
 	if (reclen) *reclen = (int)w->len;
@@ -3209,12 +3259,24 @@ xs_scan_point(xstore_scan_t *s)
 	return 1;
 }
 
+/* End scan `s`: 0 at the true end, or -1 (on this call and every later
+ * one) if a read failed, so a caller never takes a short walk for the
+ * whole table. */
+static int
+xs_scan_end(xstore_scan_t *s)
+{
+	s->done = 1;
+	return s->c.err != 0 ? -1 : 0;
+}
+
 int
 xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
                  const uint8_t **rec, int *reclen)
 {
+	int r;
+
 	if (s == NULL) return -1;
-	if (s->done) return 0;
+	if (s->done) return xs_scan_end(s);
 
 	/* Plain committed scan: no txn, or a txn that needs neither the
 	 * write-buffer overlay nor SSI read tracking. */
@@ -3239,16 +3301,18 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 			s->ra_want = 16;
 			s->c.eof = 0;
 			xs_advance(&s->c);
-			if (s->c.eof) { s->done = 1; return 0; }
+			if (s->c.eof) return xs_scan_end(s);
 			if (rowid) *rowid = s->c.rowid;
 			if (rec) *rec = s->c.val;
 			if (reclen) *reclen = (int)s->c.vlen;
 			return 1;
 		}
-		if (s->c.eof) { s->done = 1; return 0; }
+		if (s->c.eof) return xs_scan_end(s);
 		switch (xs_scan_fill(s)) {
-		case -1: return -1;                   /* no memory for a batch */
-		case 0: s->done = 1; return 0;
+		case -1:                              /* no memory for a batch */
+			s->c.err = XTC_E_NOMEM;
+			return xs_scan_end(s);
+		case 0: return xs_scan_end(s);
 		default: break;
 		}
 		s->ra_i = 1;
@@ -3268,6 +3332,7 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 			if (!s->ryw_held) {
 				s->c.eof = 0;
 				xs_advance(&s->c);
+				if (s->c.err != 0) return xs_scan_end(s);
 				if (s->c.eof) { s->ryw_phase = 1; break; }
 				s->ryw_held = 1;
 				if (s->ryw_track) {
@@ -3276,9 +3341,10 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 				}
 			}
 			if (s->ryw_ii < s->ryw_nins && s->ryw_ins[s->ryw_ii] < s->c.rowid) {
-				if (xs_scan_emit_buffered(s, s->ryw_ins[s->ryw_ii++], rowid,
-				    rec, reclen))
-					return 1;
+				r = xs_scan_emit_buffered(s, s->ryw_ins[s->ryw_ii++], rowid,
+				    rec, reclen);
+				if (r < 0) return xs_scan_end(s);
+				if (r > 0) return 1;
 				continue;
 			}
 			while (s->ryw_ii < s->ryw_nins && s->ryw_ins[s->ryw_ii] == s->c.rowid)
@@ -3294,8 +3360,7 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 			}
 			if (w->deleted) continue;        /* buffered DELETE: hide it */
 			/* buffered UPDATE: return the buffered payload. */
-			(void)xs_wrec_ensure(s->ryw_ctx, (xs_wrec_t *)w);
-			if (w->len && w->data) memcpy(s->ryw_val, w->data, w->len);
+			if (xs_scan_load_buffered(s, w) != 0) return xs_scan_end(s);
 			if (rowid) *rowid = s->c.rowid;
 			if (rec) *rec = s->ryw_val;
 			if (reclen) *reclen = (int)w->len;
@@ -3304,12 +3369,13 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 	}
 
 	/* Phase 1: the buffered rows past the last committed row, in order. */
-	while (s->ryw_ii < s->ryw_nins)
-		if (xs_scan_emit_buffered(s, s->ryw_ins[s->ryw_ii++], rowid, rec,
-		    reclen))
-			return 1;
-	s->done = 1;
-	return 0;
+	while (s->ryw_ii < s->ryw_nins) {
+		r = xs_scan_emit_buffered(s, s->ryw_ins[s->ryw_ii++], rowid, rec,
+		    reclen);
+		if (r < 0) return xs_scan_end(s);
+		if (r > 0) return 1;
+	}
+	return xs_scan_end(s);
 }
 
 /* Base-table version keys examined by storage scans (the rows-visited
@@ -7140,7 +7206,11 @@ xs_kbuf_cmp(const void *pa, const void *pb)
  * sorted order (sequential leaf fills, no cursor open while inserting).
  * For a UNIQUE index, two live rows with the same non-NULL key tuple
  * fail the build: returns -1 (CREATE UNIQUE INDEX over duplicates is a
- * UNIQUE constraint error in SQLite) and inserts nothing.  0 on success.
+ * UNIQUE constraint error in SQLite) and inserts nothing.  A build that
+ * cannot see every row (the scan failed a read, or memory ran out)
+ * also inserts nothing and returns the XTC_E_* code, which is below -1:
+ * an index built from part of the table would answer short.  0 on
+ * success.
  */
 static int
 xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
@@ -7150,32 +7220,35 @@ xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
 	int64_t rowid; const uint8_t *rec; int reclen;
 	uint8_t key[XS_IDX_KMAX];
 	size_t *ord = NULL, i;
-	int rc = 0, klen, isnull;
+	int rc = 0, klen, isnull, step;
 	char *nullf = NULL;
 	if (e->rt.tableid == 0) return 0;
 	memset(&kb, 0, sizeof kb);
 	s = xstore_scan_open(bt, e->table, 0, 0, 0, 0, 0);
-	if (s == NULL) return 0;
-	while (xstore_scan_next(s, &rowid, &rec, &reclen) == 1) {
+	if (s == NULL) return XTC_E_NOMEM;   /* the table resolved: no memory */
+	while ((step = xstore_scan_next(s, &rowid, &rec, &reclen)) == 1) {
 		klen = xs_idx_rowkey(&e->rt, rec, reclen, rowid, 1, key,
 		    (int)sizeof key, &isnull);
-		if (klen < 0) { /* a page too small: built short */
-			rc = -2;
+		if (klen < 0) { /* a page too small for the key */
+			rc = XTC_E_INTERNAL;
 			break;
 		}
 		/* Carry the NULL flag in the key's slot via a side array. */
-		if (xs_kbuf_add(&kb, key, klen) != 0) { rc = -2; break; }
+		if (xs_kbuf_add(&kb, key, klen) != 0) { rc = XTC_E_NOMEM; break; }
 		if (e->rt.unique) {
 			char *nf = realloc(nullf, kb.ncap);
-			if (nf == NULL) { rc = -2; break; }
+			if (nf == NULL) { rc = XTC_E_NOMEM; break; }
 			nullf = nf;
 			nullf[kb.n - 1] = (char)isnull;
 		}
 	}
+	/* The scan's own error has no code of its own: a failed read. */
+	if (rc == 0 && step < 0)
+		rc = XTC_E_IO;
 	xstore_scan_close(s);
 	if (rc == 0 && kb.n > 0) {
 		ord = malloc(kb.n * sizeof *ord);
-		if (ord == NULL) rc = -2;
+		if (ord == NULL) rc = XTC_E_NOMEM;
 	}
 	if (rc == 0 && kb.n > 0) {
 		for (i = 0; i < kb.n; i++) ord[i] = i;
@@ -7199,9 +7272,7 @@ xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
 	}
 	free(ord); free(nullf);
 	free(kb.bytes); free(kb.off); free(kb.len);
-	if (rc == -2)                      /* out of memory: built short */
-		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
-	return rc == -1 ? -1 : 0;
+	return rc;
 }
 
 /*
@@ -7233,7 +7304,10 @@ xs_rb_worker(void *arg)
 		if (j->n > 1 && i == j->n - 1)
 			continue;               /* planted: one index never rebuilt */
 #endif
-		if (xs_idx_build_one(j->bt, &j->e[i]) != 0)   /* UNIQUE dup: empty */
+		/* A UNIQUE duplicate builds nothing; a failed read or no
+		 * memory builds nothing either.  Either way the index is
+		 * incomplete: not trusted at the next open. */
+		if (xs_idx_build_one(j->bt, &j->e[i]) != 0)
 			xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	}
 	xtc_atomic_fetch_sub_i32(&j->left, 1, xtc_mo_acq_rel);
@@ -7472,8 +7546,9 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) { e = g_idx[i]; break; }
 	xs_cat_unlock();
 	rc = xs_idx_build_one(bt, &e);
-	if (rc == -1) {
-		/* Duplicates: undo (SQLite refuses the index). */
+	if (rc != 0) {
+		/* Duplicates (SQLite refuses the index), or the table could not
+		 * be read whole: undo, so no index is left behind. */
 		xs_cat_lock();
 		for (i = 0; i < g_idx_n; i++)
 			if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
@@ -7483,7 +7558,7 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 			}
 		xs_cat_unlock();
 		xs_idx_clear(bt, idx_id);
-		return -1;
+		return rc;
 	}
 	if (xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf, (int)off, 0) != SX_OK)
 		return 0;

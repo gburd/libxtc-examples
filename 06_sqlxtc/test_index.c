@@ -21,6 +21,16 @@
  *	     a deleted row disappears from the seek).
  *	  4. Crash/recover: after reopening the base (WAL replay) the index
  *	     is rebuilt and the seek still returns the correct rows.
+ *	  5. A base-table scan that cannot read the table is an error, never
+ *	     a short table: with the n-th scan read failing
+ *	     (xstore_scan_read_fail_at), for every n until no read is left,
+ *	     CREATE INDEX fails and leaves no index (or succeeds whole),
+ *	     count(*) fails or counts every row, and an UPDATE over a scan
+ *	     fails or changes every row it should.  The same for a
+ *	     transaction whose buffered rows were spilled to the STEAL
+ *	     staging area.  Before
+ *	     the fix a failed read ended the scan as if the table ended, and
+ *	     CREATE INDEX built a short index and reported success.
  */
 
 #include <assert.h>
@@ -257,11 +267,152 @@ scenario_recover(void)
 	return 0;
 }
 
+/* Sweep the n-th base-scan read failing over `sql` (no binds): each run
+ * must fail with SX_ERROR, or return `want`: the first column of its
+ * first row, or the rows a write changed.  A run with no failed read
+ * ends the sweep.  Returns how many runs failed; *ok_n counts the runs
+ * that succeeded. */
+static int
+sweep(sx_db *db, const char *sql, int64_t want, int *ok_n)
+{
+	int n, rc, errs = 0;
+	for (n = 1; n < 100000; n++) {
+		sx_stmt *st = NULL;
+		int64_t got = -1;
+		xstore_scan_read_fail_at(n);
+		rc = sx_prepare(db, sql, -1, &st, NULL);
+		if (rc == SX_OK) rc = sx_step(st);
+		if (rc == SX_ROW) got = sx_column_int64(st, 0);
+		if (rc == SX_DONE) got = sx_stmt_changes(st);
+		sx_finalize(st);
+		if (xstore_scan_read_fail_at(0) > 0) {   /* nothing failed */
+			if (!((rc == SX_DONE || rc == SX_ROW) && got == want)) {
+				fprintf(stderr, "  %s: no read failed, rc %d got %lld "
+				    "want %lld (%s)\n", sql, rc, (long long)got,
+				    (long long)want, sx_errmsg(db));
+				g_fail = 1;
+			}
+			break;
+		}
+		if (rc == SX_ERROR) {
+			errs++;
+			continue;
+		}
+		(*ok_n)++;
+		if (!((rc == SX_DONE || rc == SX_ROW) && got == want)) {
+			fprintf(stderr, "  %s: read %d failed, rc %d got %lld want "
+			    "%lld\n", sql, n, rc, (long long)got, (long long)want);
+			g_fail = 1;
+		}
+	}
+	CK(n > 1 && n < 100000);
+	return errs;
+}
+
+/* 5: a failed read in a base-table scan is an error, not the end. */
+static int
+scenario_scan_error(void)
+{
+	bm_t *bm = NULL;
+	bt_t *bt = NULL;
+	sx_db *db = NULL;
+	sx_stmt *st = NULL;
+	bm_opts_t bo = BM_OPTS_DEFAULT;
+	char path[256], logp[300], pad[1001];
+	wal_t *wal = NULL;
+	wal_opts_t wo;
+	xstore_index_info_t ix[4];
+	int fd, i, n, ok = 0, errs;
+
+	t_tmpl(path, sizeof path, "sqlxtc-index-scanerr");
+	fd = mkstemp(path); if (fd < 0) return 1; close(fd);
+	/* A log, so a large transaction spills to the staging area. */
+	snprintf(logp, sizeof logp, "%s-wal", path);
+	memset(&wo, 0, sizeof wo);
+	wo.path = logp; wo.window_ns = 500000; wo.max_batch = 256;
+	if (wal_open(&wo, &wal) != XTC_OK) return 1;
+	bo.path = path; bo.page_size = PAGE_SZ; bo.n_frames = 256;
+	CK(bm_create(&bo, &bm) == XTC_OK);
+	CK(bt_open(bm, &bt) == XTC_OK);
+	xstore_set_wal((struct wal *)wal);
+	CK(sx_open_bt(bt, &db) == SX_OK);
+	CK(sx_exec(db, "CREATE TABLE t(k INTEGER PRIMARY KEY, grp INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_prepare(db, "INSERT INTO t(k,grp) VALUES(?,?)", -1, &st,
+	    NULL) == SX_OK);
+	for (i = 1; i <= 2000; i++) {
+		sx_bind_int64(st, 1, i);
+		sx_bind_int64(st, 2, i % 10);
+		CK(sx_step(st) == SX_DONE);
+		sx_reset(st);
+	}
+	sx_finalize(st); st = NULL;
+
+	/* CREATE INDEX: a failed build leaves no index (the next CREATE of
+	 * the name builds one, not "already exists"), and the build that
+	 * succeeds is whole: every group seeks its 200 rows. */
+	errs = 0;
+	for (n = 1; n < 100000; n++) {
+		xstore_scan_read_fail_at(n);
+		i = sx_exec(db, "CREATE INDEX t_grp ON t(grp)", NULL);
+		if (xstore_scan_read_fail_at(0) > 0) break;
+		CK(i == SX_ERROR);
+		CK(i != SX_ERROR || strncmp(sx_errmsg(db),
+		    "index error: cannot build index t_grp on t: ", 44) == 0);
+		CK(xstore_index_list(bt, "t", ix, 4) == 0);
+		errs++;
+	}
+	CK(n > 1 && errs == n - 1);
+	CK(i == SX_OK && xstore_index_list(bt, "t", ix, 4) == 1);
+	for (i = 0; i < 10; i++)
+		CK(count_rows_i(db, "SELECT k FROM t WHERE grp = ?", i) == 200);
+	printf("  ok   index: CREATE INDEX with each of %d scan reads failing "
+	    "fails and leaves no index\n", errs);
+
+	errs = sweep(db, "SELECT count(*) FROM t", 2000, &ok);
+	CK(errs > 0);
+	/* A failed UPDATE changes nothing; each that runs moves group 3. */
+	errs += sweep(db, "UPDATE t SET grp = grp + 10 WHERE grp % 10 = 3", 200,
+	    &ok);
+	CK(count_rows_i(db, "SELECT k FROM t WHERE grp = ?", 3) == 0);
+
+	/* A transaction's rows spilled to the staging area: bringing one
+	 * back is a scan read too, and a failed one fails the scan. */
+	memset(pad, 'p', sizeof pad - 1);
+	pad[sizeof pad - 1] = '\0';
+	CK(sx_exec(db, "CREATE TABLE s(k INTEGER PRIMARY KEY, pad TEXT)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "BEGIN", NULL) == SX_OK);
+	CK(sx_prepare(db, "INSERT INTO s VALUES(?, ?)", -1, &st, NULL) == SX_OK);
+	for (i = 1; i <= 400; i++) {       /* 400 KB: past the spill mark */
+		sx_bind_int64(st, 1, i);
+		sx_bind_text(st, 2, pad, -1);
+		CK(sx_step(st) == SX_DONE);
+		sx_reset(st);
+	}
+	sx_finalize(st); st = NULL;
+	n = sweep(db, "SELECT count(*) FROM s WHERE length(pad) = 1000", 400,
+	    &ok);
+	CK(n > 2);             /* more than the cursor's open and step */
+	errs += n;
+	CK(sx_exec(db, "COMMIT", NULL) == SX_OK);
+	printf("  ok   index: %d statements with a failed scan read failed, "
+	    "%d ran whole\n", errs, ok);
+
+	sx_close(db);
+	xstore_set_wal(NULL);
+	bt_close(bt); bm_destroy(bm);
+	wal_close(wal);
+	unlink(path); unlink(logp);
+	return g_fail;
+}
+
 int
 main(void)
 {
 	if (scenario_index() != 0) return 1;
 	if (scenario_recover() != 0) return 1;
+	if (scenario_scan_error() != 0) return 1;
 	printf("test_index: OK\n");
 	return 0;
 }

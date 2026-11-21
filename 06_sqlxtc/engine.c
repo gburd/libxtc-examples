@@ -1806,6 +1806,12 @@ nat_create_index(struct sx_stmt *st, const char *name, const char *table,
 	rc = xstore_create_index_ex(st->db, name, table, (const char *const *)cols,
 	    n, descmask, unique, kind);
 	if (rc == 1) return SX_DONE;
+	if (rc < -1) {
+		char m[256];
+		snprintf(m, sizeof m, "index error: cannot build index %s on %s: %s",
+		    name, table, xtc_strerror(rc));
+		return nat_set_err(st->db, m, SX_ERROR);
+	}
 	if (rc < 0) {
 		char m[400];
 		size_t off;
