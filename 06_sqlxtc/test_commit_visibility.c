@@ -40,6 +40,21 @@
 #include "xtc_proc.h"
 #include "t_tmp.h"
 
+/* AddressSanitizer pads every frame with redzones: vx_run_write_ast()
+ * alone takes 58 KB under ASan (28 KB natively), past the 64 KiB
+ * default fiber stack.  ASan builds give the SQL fibers the server's
+ * 512 KiB stack (main.c); other builds keep the default. */
+#if defined(__SANITIZE_ADDRESS__)
+#define T_SQL_STACK (512u * 1024u)
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define T_SQL_STACK (512u * 1024u)
+#endif
+#endif
+#ifndef T_SQL_STACK
+#define T_SQL_STACK 0u   /* the runtime default */
+#endif
+
 #define ROWS    8
 #define TXNS    150
 #define READERS 6
@@ -178,7 +193,8 @@ main(void)
 	bm_t *bm = NULL;
 	sx_db *ddl = NULL;
 	xtc_exec_t *ex = NULL;
-	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "cv" };
+	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "cv",
+	    .stack_size = T_SQL_STACK };
 	xtc_pid_t pid;
 	int fd, i, nloops;
 

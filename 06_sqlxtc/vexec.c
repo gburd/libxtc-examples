@@ -9048,11 +9048,13 @@ static int
 read_one_row(struct xsql *db, bt_t *bt, const char *table, int64_t rowid, uint8_t *buf, int cap)
 {
 	xstore_scan_t *s;
-	int64_t rid; const uint8_t *rec; int reclen, got = 0;
+	int64_t rid; const uint8_t *rec; int reclen, got = 0, step;
 	(void)bt;
 	s = xstore_scan_open_txn(db, table, 0, rowid, 1, rowid, 1);
 	if (s == NULL) return -1;
-	if (xstore_scan_next(s, &rid, &rec, &reclen) == 1 && rid == rowid) {
+	step = xstore_scan_next(s, &rid, &rec, &reclen);
+	if (step < 0) got = -1;   /* the row is unknown, not absent */
+	if (step == 1 && rid == rowid) {
 		if (reclen > cap) { xstore_scan_close(s); return -1; }
 		memcpy(buf, rec, (size_t)reclen);
 		got = reclen;

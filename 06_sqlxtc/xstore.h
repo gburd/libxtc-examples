@@ -188,6 +188,13 @@ xstore_scan_t *xstore_scan_open_txn(struct xsql *db, const char *table,
  * The table's resolved id is 0 (not found) -> open returns NULL. */
 int xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
                      const uint8_t **rec, int *reclen);
+/* Test hook: the n-th cursor read (1-based) of a base-table scan from
+ * now fails with XTC_E_IO, as a page read can; 0 disarms.  A read is a
+ * cursor open, resume or step, or bringing back a spilled payload.  The
+ * scan's xstore_scan_next must then return < 0.  Returns the previous
+ * setting: still positive when fewer reads ran.  Note that the count is
+ * one for the process. */
+int xstore_scan_read_fail_at(int n);
 
 void xstore_scan_close(xstore_scan_t *s);
 
@@ -439,9 +446,10 @@ int xstore_drop_view(struct xsql *db, const char *name);
  * descmask, unique 0/1, kind 'i' (CREATE INDEX) / 'p' (PRIMARY KEY) /
  * 'u' (UNIQUE constraint).  Persists the catalog row and builds entries
  * from the existing rows.  Returns 1 on success (also when an index of
- * that name exists), 0 on failure (unknown table / column), or -1 when
- * a UNIQUE index cannot be built because existing rows duplicate a key
- * (nothing is created). */
+ * that name exists), 0 on failure (unknown table / column), -1 when a
+ * UNIQUE index cannot be built because existing rows duplicate a key,
+ * or an XTC_E_* code (below -1) when the table could not be read whole
+ * or memory ran out.  Nothing is created on -1 or below. */
 int xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
                            const char *const *cols, int ncol, uint32_t descmask,
                            int unique, int kind);
