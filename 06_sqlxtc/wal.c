@@ -1135,7 +1135,9 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 		return XTC_E_INVAL;          /* must fit the offset field */
 	if ((w->dir = strdup(opts->path)) == NULL)
 		return XTC_E_NOMEM;
-	if (mkdir(w->dir, 0700) != 0 && errno != EEXIST)
+	if (mkdir(w->dir, 0700) == 0)
+		wal_sync_dir(w->dir);        /* the new directory's own name */
+	else if (errno != EEXIST)
 		return XTC_E_INTERNAL;
 	w->seg_bytes = opts->segment_bytes;
 	wal_seg_list(w->dir, &lo, &hi);

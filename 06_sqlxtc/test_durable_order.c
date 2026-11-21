@@ -7,7 +7,8 @@
  * examples/06_sqlxtc/test_durable_order.c
  *	The row log's fsync ordering, checked at every point where a crash
  *	would expose it.  The test interposes open, close, pwrite, pwritev,
- *	ftruncate, fsync, fdatasync, rename and unlink, and models what a
+ *	ftruncate, mkdir, fsync, fdatasync, rename and unlink, and models
+ *	what a
  *	crash keeps: a file's bytes are durable after an fsync or fdatasync
  *	of it (or at once on an O_DSYNC descriptor), a created or renamed
  *	name after an fsync of its directory, and a truncate that cut
@@ -22,6 +23,8 @@
  *	  retention  when a WAL segment is unlinked, a newer segment exists
  *	             with a durable name and a durable header (the LSN
  *	             survives: STORAGE_DESIGN 6.2, review B1);
+ *	  open       when wal_open returns, the WAL directory's own name is
+ *	             durable (a commit then lives in a durable directory);
  *	  commit     when wal_commit_wa returns, the segment holding the
  *	             record is durable with a durable name;
  *	  older      when a segment is created, no older segment has a
@@ -95,6 +98,7 @@ static int (*r_fdatasync)(int);
 static int (*r_rename)(const char *, const char *);
 static int (*r_unlink)(const char *);
 static int (*r_ftruncate)(int, off_t);
+static int (*r_mkdir)(const char *, mode_t);
 
 /* The next definition of `name` (dlsym returns an object pointer; ISO C
  * has no cast from it to a function pointer, so copy the bits). */
@@ -120,6 +124,7 @@ init_syms(void)
 	next_sym("rename", &r_rename, sizeof r_rename);
 	next_sym("unlink", &r_unlink, sizeof r_unlink);
 	next_sym("ftruncate", &r_ftruncate, sizeof r_ftruncate);
+	next_sym("mkdir", &r_mkdir, sizeof r_mkdir);
 }
 
 static int
@@ -426,6 +431,20 @@ fdatasync(int fd)
 	return rc;
 }
 
+/* A new directory: its name is durable after an fsync of its parent. */
+int
+mkdir(const char *path, mode_t mode)
+{
+	int pi;
+
+	init_syms();
+	if (r_mkdir(path, mode) != 0)
+		return -1;
+	if (g_on && in_dir(path) && (pi = path_add(path)) >= 0)
+		g_p[pi].name_pending = 1;
+	return 0;
+}
+
 /* A truncate that cuts nonzero bytes: they come back in a crash until
  * the file is synced. */
 int
@@ -523,6 +542,9 @@ open_wal(int append)
 	wo.append = append;
 	wo.segment_bytes = 64u * 1024u;
 	CK(wal_open(&wo, &w) == XTC_OK);
+	if (!durable(p))
+		violation("wal_open returned before the WAL directory's name "
+		    "is durable", p);
 	return w;
 }
 
