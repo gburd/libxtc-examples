@@ -1189,7 +1189,8 @@ typedef struct xstore_vtab {
  * the id in decimal), so no name lookup matches it, and a store written
  * this way stays readable by a release that does not know the row.  The
  * index catalog keeps the same row for index ids.  GC and the dump keep
- * a tombstone the mark does not cover (a DROP by an older release).
+ * a tombstone the mark does not cover (a DROP by an older release), in
+ * either catalog.
  * One case is not covered: a store on which an older release already
  * collected a dropped index's tombstone can hand that index id out
  * again (tables have the data probe, xs_data_max_id; indexes have
@@ -5031,7 +5032,9 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 	uint32_t prev_tableid = 0;
 	int in_group = 0, survivor_found = 0;
 	struct xs_dropset dropped = { NULL, 0, 0 };
-	uint32_t mark = 0;                 /* the table catalog's high-water row */
+	/* The catalogs' high-water rows: [0] tables, [1] indexes. */
+	uint32_t mark[2] = { 0, 0 };
+	const uint8_t past = XS_IDX_LEAD + 1;
 
 	for (;;) {
 		bt_cursor_t *cur = NULL;
@@ -5050,13 +5053,24 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			uint16_t klen = 0, vl = 0;
 			int64_t rid; uint64_t ts; int deleted, first_in_group;
 			uint32_t tid;
+			int is_cat;
 
-			/* The tables end at the index namespace; an index key can
-			 * be 20 bytes long too, so stop on its lead byte, not only
-			 * on the first key of another length. */
-			if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-			    klen != XS_VKLEN ||
-			    ((const uint8_t *)k)[0] == XS_IDX_LEAD)
+			if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK)
+				break;
+			/* The tables end at the index namespace (index entries
+			 * are not versions, and one can be 20 bytes long too).
+			 * The index catalog sorts after it, so seek past the
+			 * namespace, as xs_dump_tree does, rather than stop:
+			 * otherwise GC reached the index catalog only when the
+			 * store held no index entry at all. */
+			if (klen >= 1 && ((const uint8_t *)k)[0] == XS_IDX_LEAD) {
+				bt_cursor_close(cur);
+				cur = NULL;
+				if (bt_cursor_open(bt, &past, 1, &cur) != XTC_OK)
+					break;
+				continue;
+			}
+			if (klen != XS_VKLEN)
 				break;
 			/* Skip the resume key itself (already processed). */
 			if (have_resume && memcmp(k, resume, XS_VKLEN) == 0)
@@ -5066,6 +5080,7 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			ts = dec_ts((const uint8_t *)k);
 			if (tid == XS_STAGE_TID)
 				continue;          /* STEAL staging area: not GC's concern */
+			is_cat = (tid == XS_CAT_TABLEID || tid == XS_IDXCAT_TABLEID);
 			deleted = (vl >= 1 && (((const uint8_t *)vv)[0] & XS_F_DELETED));
 			/* A logical row is (tableid, rowid): a group boundary is
 			 * either changing. */
@@ -5074,12 +5089,12 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			if (first_in_group) {
 				prev_rowid = rid; prev_tableid = tid;
 				in_group = 1; survivor_found = 0;
-				if (tid == XS_CAT_TABLEID && rid == 0)
-					mark = xs_hw_of(vv, vl);
+				if (is_cat && rid == 0)
+					mark[tid == XS_IDXCAT_TABLEID] = xs_hw_of(vv, vl);
 				/* A table dropped below the horizon: no snapshot
 				 * can reach it, so its rows go with its tombstone. */
 				if (tid == XS_CAT_TABLEID && rid > 0 && deleted &&
-				    ts <= horizon && (uint32_t)rid <= mark)
+				    ts <= horizon && (uint32_t)rid <= mark[0])
 					xs_dropset_add(&dropped, (uint32_t)rid);
 			}
 			if (tid != XS_CAT_TABLEID && xs_dropset_has(&dropped, tid)) {
@@ -5087,11 +5102,12 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			} else if (!survivor_found) {
 				if (ts <= horizon) {
 					survivor_found = 1;
-					/* An unmarked catalog tombstone stays: it alone
-					 * keeps its id from being handed out again. */
+					/* An unmarked tombstone in either catalog
+					 * stays: it alone keeps its id from being
+					 * handed out again. */
 					if (deleted && first_in_group &&
-					    !(tid == XS_CAT_TABLEID && rid > 0 &&
-					    (uint32_t)rid > mark))
+					    !(is_cat && rid > 0 && (uint32_t)rid >
+					    mark[tid == XS_IDXCAT_TABLEID]))
 						memcpy(dead[ndead++], k, XS_VKLEN);
 				}
 				/* else ts > horizon: keep (newer than horizon). */

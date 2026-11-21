@@ -13,17 +13,17 @@
  *	tombstone.  The next CREATE then took the dropped id and read the
  *	dropped table's rows as its own.
  *
- *	Six cases, each on a fresh store: a clean close and reopen; a
+ *	Seven cases, each on a fresh store: a clean close and reopen; a
  *	crash after a log compaction (the rebuild replays the dump); a
  *	crash with the whole log (the rebuild replays the DROP itself);
  *	and a store that already lost a dropped table's tombstone while
  *	its rows stayed (what an older release leaves), whose next CREATE
  *	must still get a fresh id; and a tombstone written without the
  *	high-water row (a DROP by an older release), which neither a crash
- *	rebuild nor GC may forget; and a scan of a transaction that began
- *	before the DROP, which GC must leave whole.  The first three also
- *	check that the dropped table's rows are gone once the store has
- *	closed cleanly.
+ *	rebuild nor GC may forget, with and without index entries in the
+ *	store; and a scan of a transaction that began before the DROP,
+ *	which GC must leave whole.  The first three also check that the
+ *	dropped table's rows are gone once the store has closed cleanly.
  *	Off a loop.
  */
 
@@ -206,13 +206,15 @@ orphan_case(void)
  * tombstone the mark does not cover, here written directly.  The store
  * then goes through a clean close (GC, which runs because the tombstones
  * were logged), a crash rebuild (the log dump) and another clean close.
- * Table a keeps a row, so the store holds index entries.  None of them
- * may drop the tombstone or the rows (the mark would not record the
- * id), so the next CREATE takes a fresh id; once a later DROP raises the
- * mark past it, the rows go.
+ * With `live_a`, table a keeps a row, so the store holds index entries;
+ * without, it holds none, and GC must still reach the index catalog
+ * (it sorts after the index entries).  None of them may drop either
+ * tombstone or b's rows (the mark would not record the id), so the next
+ * CREATE takes a fresh id; once a later DROP raises the mark past it,
+ * the rows go.
  */
 static void
-unmarked_case(void)
+unmarked_case(int live_a)
 {
 	char path[256];
 	sx_db *h = NULL;
@@ -226,7 +228,9 @@ unmarked_case(void)
 	CK(sx_open(":memory:", &h) == SX_OK);
 	CK(sx_exec(h, "CREATE TABLE a(k INTEGER PRIMARY KEY, v TEXT)", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE TABLE b(k INTEGER PRIMARY KEY, v TEXT)", NULL) == SX_OK);
-	CK(sx_exec(h, "INSERT INTO a VALUES(1, 'live-a-row')", NULL) == SX_OK);
+	if (live_a)
+		CK(sx_exec(h, "INSERT INTO a VALUES(1, 'live-a-row')", NULL) ==
+		    SX_OK);
 	CK(sx_exec(h, "INSERT INTO b VALUES(1, 'old-b-row')", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE INDEX a_v ON a(v)", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE INDEX a_k ON a(k)", NULL) == SX_OK);
@@ -244,7 +248,8 @@ unmarked_case(void)
 	td = table_id("d");
 	inew = index_id("a", "a_k2");
 	printf("  %-24s dropped table %u, index %u; new table %u, index %u\n",
-	    "unmarked tombstone", tb, ix, td, inew);
+	    live_a ? "unmarked tombstone" : "unmarked, no index entry",
+	    tb, ix, td, inew);
 	CK(td > tb);
 	CK(inew > ix);
 	CK(one(h, "SELECT count(*) FROM d") == 0);
@@ -317,7 +322,8 @@ main(void)
 	drop_case(REOPEN_CRASH_DUMP);
 	drop_case(REOPEN_CRASH_LOG);
 	orphan_case();
-	unmarked_case();
+	unmarked_case(1);
+	unmarked_case(0);
 	snapshot_case();
 	if (g_fail) { fprintf(stderr, "FAIL: test_drop_id\n"); return 1; }
 	printf("  ok   a dropped table's or index's id is never reused\n");
