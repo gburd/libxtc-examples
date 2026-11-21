@@ -2140,10 +2140,11 @@ wal_commit_any(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
 
 	if (w == NULL || (record == NULL && len != 0))
 		return XTC_E_INVAL;
-	/* In a segmented log every byte of the body must have an address:
-	 * a record alone in its segment starts after the header. */
-	if (w->seg_bytes != 0 &&
-	    (uint64_t)WAL_SEG_HDR + WAL_REC_HDR + len > WAL_WA_OFF_MASK + 1u)
+	/* In a segmented log every byte of the frame must have an address
+	 * (else wal_end_wa past it would wrap): a record alone in its
+	 * segment starts after the header. */
+	if (w->seg_bytes != 0 && (uint64_t)WAL_SEG_HDR + WAL_REC_HDR + len +
+	    WAL_REC_CRC > WAL_WA_OFF_MASK + 1u)
 		return XTC_E_INVAL;
 	/*
 	 * A kill (xtc_exit_pid, a linked exit) raised at a park point below

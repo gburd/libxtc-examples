@@ -179,11 +179,15 @@ t_limits(void)
 		return;
 	CK(wal_commit_wa(w, "x", 1, &lsn, &wa) == XTC_OK &&
 	    WAL_WA_SEG(wa) == WAL_WA_MAX_SEG && lsn == 7);
+	/* A record whose trailer would end past offset 2^32 - 1 cannot be
+	 * addressed (checked before the record is read). */
+	CK(wal_commit_wa(w, "z", (uint32_t)(WAL_WA_OFF_MASK + 1u -
+	    WAL_SEG_HDR - 12u - 8u + 1u), &lsn, &wa) == XTC_E_INVAL);
 	CK(wal_roll(w) == XTC_E_IO && wal_failed(w));
 	CK(wal_commit_wa(w, "y", 1, &lsn, &wa) != XTC_OK);
 	wal_close(w);
-	printf("  limits: segment_bytes past the offset field refused; segment "
-	    "2^32 - 1 never rolls\n");
+	printf("  limits: segment_bytes past the offset field refused; a frame "
+	    "ending past 2^32 refused; segment 2^32 - 1 never rolls\n");
 }
 
 /* Remove the files in d (and d/lim), then d. */
