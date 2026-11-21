@@ -29,5 +29,6 @@
 #define XTC_DST_BUG_GCBATCH    23  /* xstore.c: version GC forgets its row at a batch boundary */
 #define XTC_DST_BUG_UNIQPROBE  72  /* xstore.c: a failed UNIQUE probe reads as "no duplicate" */
 #define XTC_DST_BUG_LONGKEY    73  /* xstore.c: a key longer than a B-tree key is not indexed */
+#define XTC_DST_BUG_IDREUSE    79  /* xstore.c: a new table / index takes a dropped one's id */
 
 #endif /* SQLXTC_SX_DST_H */
