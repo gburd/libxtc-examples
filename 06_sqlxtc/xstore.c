@@ -8380,7 +8380,9 @@ static int
 xs_point_get(bt_t *bt, uint32_t tid, int64_t rid, uint64_t snap, uint8_t *buf,
     int cap, int *err)
 {
-	uint8_t probe[XS_VKLEN], k[XS_VKLEN + 8];
+	/* The first key >= the probe can belong to the next table or to the
+	 * index namespace, so k holds the longest key there is. */
+	uint8_t probe[XS_VKLEN], k[XS_IDX_KMAX];
 	uint16_t kl = 0, vl = 0;
 	int rc;
 	enc_vkey(tid, rid, snap, probe);

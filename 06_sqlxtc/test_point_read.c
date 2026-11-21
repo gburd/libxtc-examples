@@ -23,6 +23,10 @@
  *	    N snapshots, returns that snapshot's version; after an update
  *	    of the indexed column the old entry returns nothing at the
  *	    latest snapshot, the new one the row; a deleted row is gone.
+ *	P5  a snapshot older than the newest row of the newest table reads
+ *	    that row through an index and gets no row and no error, though
+ *	    the key after the row's versions is an index entry longer than
+ *	    a version key (the point read's key buffer must hold it).
  */
 
 #include <stdint.h>
@@ -48,6 +52,9 @@
 #define T_OLC 0
 #endif
 #endif
+#if !defined(T_OLC) && defined(BT_OLC_ENABLED)
+#define T_OLC BT_OLC_ENABLED
+#endif
 #ifndef T_OLC
 #define T_OLC 1
 #endif
@@ -58,19 +65,19 @@
 #define N_VER    6
 
 /* The v column of the rows `sql` (one int parameter) returns, joined
- * with ','; the row count, or -1 on a prepare error. */
+ * with ','; the row count, or -1 on a prepare or step error. */
 static int
 rows_v(sx_db *db, const char *sql, int64_t p1, char *out, size_t cap)
 {
 	sx_stmt *st = NULL;
 	size_t used = 0;
-	int n = 0;
+	int n = 0, rc;
 
 	out[0] = '\0';
 	if (sx_prepare(db, sql, -1, &st, NULL) != SX_OK)
 		return -1;
 	sx_bind_int64(st, 1, p1);
-	while (sx_step(st) == SX_ROW) {
+	while ((rc = sx_step(st)) == SX_ROW) {
 		const char *t = (const char *)sx_column_text(st, 0);
 		int len = sx_column_bytes(st, 0);
 		if (t != NULL && used + (size_t)len + 2 < cap) {
@@ -82,7 +89,7 @@ rows_v(sx_db *db, const char *sql, int64_t p1, char *out, size_t cap)
 		n++;
 	}
 	sx_finalize(st);
-	return n;
+	return rc == SX_DONE ? n : -1;
 }
 
 int
@@ -253,6 +260,34 @@ main(void)
 		    "and its rowid at each snapshot; a moved row found by its new "
 		    "key only; a deleted row gone; a txn reads its own write\n",
 		    N_VER);
+
+	/* P5: the newest table, one tail row per round, read through an
+	 * index at a snapshot taken just before the row's INSERT.  The
+	 * table's version keys are the last ones, so the first key past the
+	 * row is the first index entry; t_grp's entries are short, so drop
+	 * it and let u_v's 40-byte entries come first. */
+	CK(sx_exec(db, "DROP INDEX t_grp", NULL) == SX_OK);
+	CK(sx_exec(db, "CREATE TABLE u(k INTEGER PRIMARY KEY, v TEXT)", NULL)
+	    == SX_OK);
+	CK(sx_exec(db, "CREATE INDEX u_v ON u(v)", NULL) == SX_OK);
+	ok = 1;
+	for (i = 1; i <= 200; i++) {
+		int64_t before = xstore_clock_now();
+		snprintf(sql, sizeof sql,
+		    "INSERT INTO u VALUES(%d, 'value-%06d-xxxxxxxxxxxxxxxx')", i, i);
+		CK(sx_exec(db, sql, NULL) == SX_OK);
+		snprintf(sql, sizeof sql,
+		    "SELECT v FROM u WHERE v = 'value-%06d-xxxxxxxxxxxxxxxx'", i);
+		(void)xstore_as_of(db, before);
+		if (rows_v(db, sql, 0, got, sizeof got) != 0)
+			ok = 0;
+		(void)xstore_as_of(db, 0);
+		if (rows_v(db, sql, 0, got, sizeof got) != 1)
+			ok = 0;
+	}
+	CK(ok);
+	printf("  %s   P5: 200 index reads of a newer tail row at an older "
+	    "snapshot: no row, no error\n", ok ? "ok" : "FAIL");
 
 	sx_close(db);
 	bt_close(bt);
