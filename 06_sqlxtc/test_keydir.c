@@ -397,6 +397,7 @@ t_lookup(bm_t *bm)
 /* ---- threads ---- */
 
 #define TK 4096
+#define TS 512                      /* stable keys: never deleted */
 static keydir_t *g_kd;
 static int g_tbad, g_tstop;
 
@@ -434,6 +435,13 @@ reader(void *arg)
 
 	while (!xtc_atomic_load_i32(&g_tstop, xtc_mo_acquire)) {
 		k = (k * 1103515245u + 12345u) % TK;
+		/* A stable key is always there, with its one frame: a miss
+		 * or another frame is a torn read (a backward shift moved it
+		 * under the reader). */
+		f = 0;
+		if (!kd_res_get(g_kd, 10, (int64_t)(k % TS), &f) ||
+		    f != fr_of(k % TS, 9))
+			xtc_atomic_store_i32(&g_tbad, 1, xtc_mo_relaxed);
 		f = 0;
 		if (!kd_res_get(g_kd, 9, (int64_t)k, &f))
 			continue;
@@ -454,6 +462,8 @@ t_threads(void)
 	CK(kd_create(TK, &g_kd) == XTC_OK);
 	if (g_kd == NULL)
 		return;
+	for (i = 0; i < TS; i++)
+		CK(kd_res_put(g_kd, 10, i, fr_of((uint32_t)i, 9)) == XTC_OK);
 	for (i = 0; i < 2; i++) {
 		CK(pthread_create(&w[i], NULL, writer, (void *)(uintptr_t)i) ==
 		    0);
@@ -468,7 +478,7 @@ t_threads(void)
 	CK(!g_tbad);
 	kd_destroy(g_kd);
 	printf("  threads: 2 writers x 300k puts/deletes against 2 lock-free "
-	    "readers, no torn read\n");
+	    "readers, no torn read, no stable key missed\n");
 }
 
 /* ---- costs ---- */
@@ -579,6 +589,13 @@ bc_at_freeze(void *ctx)
 	uint32_t i;
 
 	(void)ctx;
+	/* Now and then, wait before reading (the flusher's loop thread
+	 * sleeps; commits on the other loop run on).  Under the freeze's
+	 * exclusive lock they cannot finish a put meanwhile; a boundary
+	 * read after that lock is dropped would miss the commits that
+	 * landed in the new delta and left the registry in the gap. */
+	if (g_nfz % 8u == 0)
+		(void)xtc_thrd_sleep_ns(300000);
 	(void)pthread_mutex_lock(&g_reg_mu);
 	if (g_old_rule) {
 		b = wal_end_wa(g_bwal);

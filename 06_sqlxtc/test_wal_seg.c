@@ -394,6 +394,21 @@ count_cb(uint64_t lsn, uint64_t wa, const void *rec, uint32_t len, void *u)
 	return 0;
 }
 
+/* The path of segment seg and the file offset of its last frame (each
+ * frame of three_segs is 12 + 8 + 8 bytes): 0, or -1. */
+static int
+wal_commit_wa_last(uint32_t seg, char *p, size_t cap, off_t *off)
+{
+	struct stat sb;
+
+	seg_path(seg, p, cap);
+	if (stat(p, &sb) != 0)
+		return -1;
+	/* three_segs puts 10 frames in segment 2, from the header block. */
+	*off = (off_t)WAL_SEG_HDR + 9 * (12 + 8 + 8);
+	return 0;
+}
+
 /* 30 commits over three segments (10 in 1, 10 in 2, 10 in 3); *mid is
  * the WAL address of a record in segment 2. */
 static void
@@ -428,6 +443,8 @@ t_chain(void)
 	wal_opts_t wo = { 0 };
 	uint64_t mid = 0;
 	char p[300], q[310];
+	uint8_t junk[64];
+	off_t off = 0;
 	wal_t *w = NULL;
 	int fd, n = 0;
 
@@ -456,8 +473,29 @@ t_chain(void)
 	CK(wal_scan_segs(g_dir, 0, count_cb, &n) == XTC_OK && n == 30);
 	CK(wal_open(&wo, &w) == XTC_OK);
 	wal_close(w);
-	printf("  chain: a damaged older segment or a missing middle one "
-	    "refuses the open and the scan\n");
+	/* Segment 2's last frame zeroed: what follows its frames is clean,
+	 * so only the LSN step to segment 3's header shows the loss. */
+	three_segs(&mid);
+	CK(wal_commit_wa_last(2, p, sizeof p, &off) == 0);
+	CK((fd = open(p, O_RDWR)) >= 0);
+	memset(junk, 0, sizeof junk);
+	CK(pwrite(fd, junk, 12 + 8 + 8, off) == 12 + 8 + 8);
+	close(fd);
+	CK(wal_open(&wo, &w) == XTC_E_IO);
+	CK(wal_scan_segs(g_dir, 0, count_cb, &n) == XTC_E_IO);
+	/* Every frame of segment 2 intact, junk after them: only the
+	 * clean-to-the-end check shows it. */
+	three_segs(&mid);
+	CK(wal_commit_wa_last(2, p, sizeof p, &off) == 0);
+	CK((fd = open(p, O_RDWR)) >= 0);
+	memset(junk, 0x5A, sizeof junk);
+	CK(pwrite(fd, junk, sizeof junk, off + 12 + 8 + 8) ==
+	    (ssize_t)sizeof junk);
+	close(fd);
+	CK(wal_open(&wo, &w) == XTC_E_IO);
+	CK(wal_scan_segs(g_dir, 0, count_cb, &n) == XTC_E_IO);
+	printf("  chain: a damaged, short or dirty older segment, or a missing "
+	    "middle one, refuses the open and the scan\n");
 }
 
 static int

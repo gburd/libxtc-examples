@@ -1157,8 +1157,8 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 	w->seg = hi;
 	w->seg_lo = lo;
 	w->seg_base = h.base;
-	if (k.last < h.first_lsn - 1 || k.end < (off_t)WAL_SEG_HDR)
-		return XTC_E_IO;
+	/* k.last is at least the newest header's first LSN - 1 (the walk
+	 * starts each segment from its header). */
 	*maxlsn = k.last;
 	if (ftruncate(w->fd, k.end) != 0) {
 		/* non-fatal: appends overwrite the torn tail */

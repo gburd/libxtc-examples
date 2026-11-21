@@ -220,6 +220,14 @@ t_flush_reopen(void)
 	CK(kd_delta_put(kd, 9, 1, 5) == XTC_OK);
 	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_OK);
 	CK(exists("rl-3.run") && mf_nruns(m) == 3);
+	/* Ids 65535 past live runs 1..3 share their buffer-manager file
+	 * numbers: the flush skips 65536..65538 and writes 65539. */
+	m->next = 1u + 65535u;
+	CK(kd_delta_put(kd, 9, 2, 6) == XTC_OK);
+	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_OK);
+	CK(mf_nruns(m) == 4 && !exists("rl-65536.run") &&
+	    !exists("rl-65538.run") && exists("rl-65539.run"));
+	CK(found_as(kd, 9, 2, 6));
 	mf_close(m);
 	kd_destroy(kd);
 	bm_destroy(bm);
@@ -271,7 +279,7 @@ t_refuse(void)
 	CK(unlink(p) == 0);
 	snprintf(q, sizeof q, "%s/rl-2.keep", g_dir);
 	CK(rename(q, p) == 0);
-	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK && mf_nruns(m) == 3);
+	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK && mf_nruns(m) == 4);
 	mf_close(m);
 	free(t);
 	kd_destroy(kd);
@@ -314,7 +322,7 @@ t_missing(void)
 		CK(exists("rl-1.run") && exists("rl-3.run"));
 		CK(chmod(p, 0600) == 0);
 	}
-	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK && mf_nruns(m) == 3);
+	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK && mf_nruns(m) == 4);
 	mf_close(m);
 	kd_destroy(kd);
 	bm_destroy(bm);
