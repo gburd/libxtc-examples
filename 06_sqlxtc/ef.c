@@ -196,7 +196,8 @@ ef_chunk_build(const int64_t *rid, const uint32_t *page, uint32_t n,
 			uint32_t k;
 			for (k = 0; k < l; k++, at++)
 				if ((lb >> k) & 1u)
-					lo[at / 8u] |= (uint8_t)(1u << (at % 8u));
+					lo[at / 8u] |=
+					    (uint8_t)(1u << (at % 8u));
 		}
 		if (i > 0 && page[i] != page[i - 1]) {
 			step = page[i] - page[i - 1] - 1u;

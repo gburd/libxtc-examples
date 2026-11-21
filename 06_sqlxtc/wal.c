@@ -1023,8 +1023,8 @@ wal_walk_seg(struct wal_walk *k, int fd, uint32_t seg, int newest)
 	wal_rd_init(&r, fd, 1);
 	while (wal_rd_frame(&r, off, &lsn, &len, &body)) {
 		if (lsn != k->last + 1) {
-			rc = wal_walk_bad(k->dir, seg, "a frame's LSN breaks the "
-			    "sequence");
+			rc = wal_walk_bad(k->dir, seg,
+			    "a frame's LSN breaks the sequence");
 			break;
 		}
 		wa = WAL_WA(seg, (uint64_t)off + WAL_REC_HDR);
@@ -1872,7 +1872,7 @@ wal_roll_if(wal_t *w, uint64_t need, int force)
 			rc = XTC_E_IO;
 		} else {
 			wal_roll_swap(w, &j);
-			/* Best-effort (a failure leaves the segment buffered). */
+			/* Best-effort (a failure leaves it buffered). */
 			(void)xtc_blocking_run(wal_dio_job, w, &res);
 		}
 		wal_lock(&w->fl_mu);
@@ -2413,7 +2413,7 @@ wal_checkpoint(wal_t *w, const char *path,
 	if (w == NULL || path == NULL || dump == NULL)
 		return XTC_E_INVAL;
 	if ((int)strlen(path) + 9 >= (int)sizeof tmp || w->seg_bytes != 0)
-		return XTC_E_INVAL;          /* a segmented log is never compacted */
+		return XTC_E_INVAL;  /* a segmented log is never compacted */
 	if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire))
 		return XTC_E_IO;
 	snprintf(tmp, sizeof tmp, "%s.compact", path);

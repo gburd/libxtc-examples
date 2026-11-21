@@ -351,7 +351,7 @@ rw_put(run_writer_t *w, const run_row_t *r)
 	int rc;
 
 	if (head > room)
-		head = room;                 /* continues: room >= RUN_ROW_HDR */
+		head = room;           /* continues: room >= RUN_ROW_HDR */
 	w->cur_lo -= head;
 	rec = pg + w->cur_lo;
 	p64(rec, (uint64_t)r->rowid);

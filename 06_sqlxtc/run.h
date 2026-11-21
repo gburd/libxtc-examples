@@ -96,8 +96,8 @@ typedef struct run_writer run_writer_t;
  * bm's page size and sealed with bm's checksum (bm_seal_page); bm is
  * not otherwise touched.  XTC_E_INVAL unless page_size is bm's and bm
  * checksums at BTNODE_CKSUM_OFF: the seal is the run format's only
- * torn- and misdirected-write check.  The file must not exist.  I/O goes through
- * xtc_aio (a fiber parks), the open and the unlink through
+ * torn- and misdirected-write check.  The file must not exist.  I/O
+ * goes through xtc_aio (a fiber parks), the open and the unlink through
  * xtc_blocking_run.
  */
 int run_writer_open(bm_t *bm, uint32_t page_size, const char *path,

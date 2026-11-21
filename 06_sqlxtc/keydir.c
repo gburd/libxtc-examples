@@ -141,7 +141,8 @@ kd_res_get(keydir_t *kd, uint32_t tid, int64_t rid, uint32_t *frame)
 			continue;
 		}
 		found = 0;
-		for (i = (uint32_t)(h >> 8) & s->mask;; i = (i + 1u) & s->mask) {
+		for (i = (uint32_t)(h >> 8) & s->mask;;
+		    i = (i + 1u) & s->mask) {
 			a = xtc_atomic_load_u64(&s->slot[i].a, xtc_mo_acquire);
 			if (a == 0)
 				break;
