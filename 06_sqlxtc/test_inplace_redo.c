@@ -91,7 +91,7 @@ sel_v(sx_db *db, int k, char *out, size_t cap)
 		return -1;
 	sx_bind_int64(st, 1, k);
 	if (sx_step(st) == SX_ROW) {
-		const unsigned char *t = sx_column_text(st, 0);
+		const char *t = sx_column_text(st, 0);
 		size_t n = (size_t)sx_column_bytes(st, 0);
 		if (n >= cap) n = cap - 1;
 		if (t) memcpy(out, t, n);
