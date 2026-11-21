@@ -3276,7 +3276,8 @@ xs_scan_fill(xstore_scan_t *s)
  * xs_advance would open a B-tree cursor (an allocation, a latched
  * descent, a close) and walk the row's newer versions.  Kept out of
  * line: its value buffer is a page, and the per-row scan path should
- * not carry that frame.  Fills s->c (rowid, val); 0 at none. */
+ * not carry that frame.  Fills s->c (rowid, val); 0 at none, or when
+ * the row could not be read, with s->c.err set. */
 #if defined(__GNUC__) || defined(__clang__)
 #define XS_NOINLINE __attribute__((noinline))
 #else
@@ -3290,8 +3291,10 @@ xs_scan_point(xstore_scan_t *s)
 
 	s->c.visited++;
 	n = xs_point_get(s->c.bt, s->c.tableid, s->c.lo, s->c.snap, v,
-	    (int)sizeof v, NULL);
-	if (n == 0)
+	    (int)sizeof v, &s->c.err);
+	if (s->c.err == 0 && xs_scan_fault())
+		s->c.err = XTC_E_IO;
+	if (n == 0 || s->c.err != 0)
 		return 0;
 	xs_stash(&s->c, s->c.lo, v, (uint16_t)(n < 0 ? 1 : n + 1));
 	return 1;
@@ -3335,7 +3338,7 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 		if (s->ra_want == 0 && s->c.has_lo && s->c.has_hi &&
 		    s->c.lo == s->c.hi) {             /* a point: one seek */
 			s->done = 1;                     /* the only row */
-			if (!xs_scan_point(s)) return 0;
+			if (!xs_scan_point(s)) return xs_scan_end(s);
 			if (rowid) *rowid = s->c.rowid;
 			if (rec) *rec = s->c.val;
 			if (reclen) *reclen = (int)s->c.vlen;

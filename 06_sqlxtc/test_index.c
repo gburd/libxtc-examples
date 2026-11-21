@@ -276,21 +276,23 @@ scenario_recover(void)
  * first row, or the rows a write changed.  A run with no failed read
  * ends the sweep.  A failed run must report the table it could not
  * read.  Returns how many runs failed; *ok_n counts the runs that
- * succeeded. */
+ * succeeded.  Reads past `limit` are not failed (the run then ends the
+ * sweep). */
 static int
-sweep(sx_db *db, const char *sql, int64_t want, int *ok_n)
+sweep_to(sx_db *db, const char *sql, int64_t want, int *ok_n, int limit)
 {
 	int n, rc, errs = 0;
 	for (n = 1; n < 100000; n++) {
 		sx_stmt *st = NULL;
 		int64_t got = -1;
-		xstore_scan_read_fail_at(n);
+		int armed = n < limit ? n : 0;
+		xstore_scan_read_fail_at(armed);
 		rc = sx_prepare(db, sql, -1, &st, NULL);
 		if (rc == SX_OK) rc = sx_step(st);
 		if (rc == SX_ROW) got = sx_column_int64(st, 0);
 		if (rc == SX_DONE) got = sx_stmt_changes(st);
 		sx_finalize(st);
-		if (xstore_scan_read_fail_at(0) > 0) {   /* nothing failed */
+		if (xstore_scan_read_fail_at(0) > 0 || armed == 0) {   /* none failed */
 			if (!((rc == SX_DONE || rc == SX_ROW) && got == want)) {
 				fprintf(stderr, "  %s: no read failed, rc %d got %lld "
 				    "want %lld (%s)\n", sql, rc, (long long)got,
@@ -318,6 +320,13 @@ sweep(sx_db *db, const char *sql, int64_t want, int *ok_n)
 	}
 	CK(n > 1 && n < 100000);
 	return errs;
+}
+
+/* sweep_to() over every read the statement makes. */
+static int
+sweep(sx_db *db, const char *sql, int64_t want, int *ok_n)
+{
+	return sweep_to(db, sql, want, ok_n, 100000);
 }
 
 /* 5: a failed read in a base-table scan is an error, not the end. */
@@ -382,9 +391,17 @@ scenario_scan_error(void)
 
 	errs = sweep(db, "SELECT count(*) FROM t", 2000, &ok);
 	CK(errs > 0);
-	/* A failed UPDATE changes nothing; each that runs moves group 3. */
-	errs += sweep(db, "UPDATE t SET grp = grp + 10 WHERE grp % 10 = 3", 200,
-	    &ok);
+	/* A point read by rowid, outside a transaction: one seek. */
+	n = sweep(db, "SELECT grp FROM t WHERE k = 5", 5, &ok);
+	CK(n > 0);
+	errs += n;
+	/* A failed UPDATE changes nothing; each that runs moves group 3.  It
+	 * reads each matched row again by rowid, and a failure there comes
+	 * after rows were written and undone, which adds versions, so the
+	 * next run reads more: sweep the reads of the first run, then run it
+	 * whole. */
+	errs += sweep_to(db, "UPDATE t SET grp = grp + 10 WHERE grp % 10 = 3",
+	    200, &ok, 2400);
 	CK(count_rows_i(db, "SELECT k FROM t WHERE grp = ?", 3) == 0);
 
 	/* A transaction's rows spilled to the staging area: bringing one
