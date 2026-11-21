@@ -32,6 +32,7 @@
 #include "run.h"
 #include "wal.h"
 #include "xtc.h"
+#include "xtc_atomic.h"
 #include "xtc_loop.h"
 #include "xtc_proc.h"
 #include "xtc_rcu.h"
@@ -48,12 +49,12 @@ static const char *const g_name[7] = { "open", "close", "unlink",
 static void
 hit(int k)
 {
-	if (!__atomic_load_n(&g_watch, __ATOMIC_ACQUIRE))
+	if (!xtc_atomic_load_i32(&g_watch, xtc_mo_acquire))
 		return;
 	if (pthread_equal(pthread_self(), g_loop_thr))
-		__atomic_fetch_add(&g_hits[k], 1, __ATOMIC_RELAXED);
+		(void)xtc_atomic_fetch_add_i32(&g_hits[k], 1, xtc_mo_relaxed);
 	else
-		__atomic_fetch_add(&g_off, 1, __ATOMIC_RELAXED);
+		(void)xtc_atomic_fetch_add_i32(&g_off, 1, xtc_mo_relaxed);
 }
 
 /* The next definition of `name` (dlsym returns an object pointer; ISO C
@@ -187,7 +188,7 @@ worker(void *arg)
 
 	(void)arg;
 	g_loop_thr = pthread_self();
-	__atomic_store_n(&g_watch, 1, __ATOMIC_RELEASE);
+	xtc_atomic_store_i32(&g_watch, 1, xtc_mo_release);
 	snprintf(p, sizeof p, "%s/wal", g_dir);
 	wo.path = p;
 	wo.segment_bytes = 64u * 1024u;
@@ -214,7 +215,7 @@ worker(void *arg)
 	CK(mf_open(g_dir, g_bm, kd, &m) == XTC_OK && mf_nruns(m) == 4);
 	mf_close(m);
 out:
-	__atomic_store_n(&g_watch, 0, __ATOMIC_RELEASE);
+	xtc_atomic_store_i32(&g_watch, 0, xtc_mo_release);
 	kd_destroy(kd);
 }
 
