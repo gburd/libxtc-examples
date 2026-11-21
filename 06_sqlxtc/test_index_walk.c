@@ -50,6 +50,9 @@
 #define T_OLC 0
 #endif
 #endif
+#if !defined(T_OLC) && defined(BT_OLC_ENABLED)
+#define T_OLC BT_OLC_ENABLED
+#endif
 #ifndef T_OLC
 #define T_OLC 1
 #endif

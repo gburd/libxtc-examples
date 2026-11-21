@@ -484,8 +484,13 @@ pf_trim(bm_t *bm)
 	if (xtc_atomic_load_u64(&bm->pre_end, xtc_mo_relaxed) <= keep)
 		return;                   /* nothing preallocated past the pages */
 	end = lseek(bm->fd, 0, SEEK_END);
-	if (end > 0 && (uint64_t)end > keep)
-		(void)ftruncate(bm->fd, (off_t)keep);   /* a failure keeps the tail */
+	if (end <= 0 || (uint64_t)end <= keep)
+		return;
+	/* Retry an interrupted call.  Any other failure keeps the tail: the
+	 * file is then larger than its pages, and a reopen resumes page-id
+	 * allocation past the tail (bm_create), as after a crash. */
+	while (ftruncate(bm->fd, (off_t)keep) != 0 && errno == EINTR)
+		;
 }
 
 /* ---- page I/O via libxtc async file ops (xtc_aio): native io_uring

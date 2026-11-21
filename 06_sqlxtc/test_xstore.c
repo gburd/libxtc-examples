@@ -197,7 +197,7 @@ sel_v(sx_db *db, int64_t k, char *out, size_t cap)
 		return -1;
 	sx_bind_int64(st, 1, k);
 	if (sx_step(st) == SX_ROW) {
-		const unsigned char *t = sx_column_text(st, 0);
+		const char *t = sx_column_text(st, 0);
 		size_t n = (size_t)sx_column_bytes(st, 0);
 		if (n >= cap) n = cap - 1;
 		if (t) memcpy(out, t, n);
@@ -223,19 +223,6 @@ eval_int(sx_db *db, const char *sql)
 	return v;
 }
 
-/* Like eval_int but 64-bit, for commit timestamps (HLC stamps far
- * exceed 32 bits). */
-static int64_t
-eval_int64(sx_db *db, const char *sql)
-{
-	sx_stmt *st = NULL;
-	int64_t v = -1;
-	if (sx_prepare(db, sql, -1, &st, NULL) != SX_OK) return -1;
-	if (sx_step(st) == SX_ROW) v = sx_column_int64(st, 0);
-	sx_finalize(st);
-	return v;
-}
-
 static int
 scenario_mvcc(void)
 {
@@ -244,7 +231,6 @@ scenario_mvcc(void)
 	bm_opts_t bo = BM_OPTS_DEFAULT;
 	char path[256]; t_tmpl(path, sizeof path, "sqlxtc-xstore3");
 	sx_db *db = NULL;
-	sx_stmt *st = NULL;
 	int64_t ts_mid = 0;
 	char b[32];
 	int fd;
@@ -298,7 +284,6 @@ scenario_txn(void)
 	bm_opts_t bo = BM_OPTS_DEFAULT;
 	char path[256]; t_tmpl(path, sizeof path, "sqlxtc-xstore4");
 	sx_db *db = NULL;
-	sx_stmt *st = NULL;
 	int64_t ts_pre = 0, commit_ts = 0;
 	char b[32];
 	int fd;
@@ -819,8 +804,8 @@ scenario_multicol(void)
 	CK(sx_column_int64(st, 0) == 42);
 	CK(sx_column_double(st, 1) == 3.5);
 	{
-		const unsigned char *s = sx_column_text(st, 2);
-		CK(s != NULL && strcmp((const char *)s, "hello") == 0);
+		const char *s = sx_column_text(st, 2);
+		CK(s != NULL && strcmp(s, "hello") == 0);
 	}
 	{
 		const unsigned char *b = sx_column_blob(st, 3);

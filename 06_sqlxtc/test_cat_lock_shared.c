@@ -45,7 +45,7 @@ static int g_fail;
 	g_fail = 1; } } while (0)
 
 static int
-round(sx_db **h, sx_stmt **upd, sx_stmt **ins, sx_stmt **sel, int r)
+run_round(sx_db **h, sx_stmt **upd, sx_stmt **ins, sx_stmt **sel, int r)
 {
 	int i, rc = 0;
 	for (i = 0; i < NC; i++) {
@@ -98,10 +98,10 @@ main(void)
 		CK(sx_prepare(h[i], "SELECT v FROM t WHERE id = ?", -1, &sel[i], NULL) == SX_OK);
 	}
 	/* Warm: each connection's statements planned once. */
-	CK(round(h, upd, ins, sel, 0) == 0);
+	CK(run_round(h, upd, ins, sel, 0) == 0);
 	l0 = xstore_cat_lock_count();
 	for (r = 1; r <= 20; r++)
-		CK(round(h, upd, ins, sel, r) == 0);
+		CK(run_round(h, upd, ins, sel, r) == 0);
 	locks = xstore_cat_lock_count() - l0;
 	printf("  %d connections on one thread, 20 interleaved rounds: "
 	    "catalog-lock acquisitions %llu\n", NC, (unsigned long long)locks);

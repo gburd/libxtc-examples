@@ -177,6 +177,19 @@ int  bt_seek_lt_n(bt_t *bt, const void *hi, uint16_t hlen, void *buf,
                   uint32_t bcap, uint32_t *off, uint16_t *lens, int max,
                   int *n);
 
+/* Up to `max` keys >= `lo` that start with lo's first `plen` bytes,
+ * ascending, from the one leaf that holds `lo`: one descent, no cursor.
+ * Key i goes to buf + off[i], its length to lens[i] (copies stop before
+ * `bcap` bytes would be exceeded); *n is the count.  Values are not
+ * returned.  *more is 0 when the keys copied are every such key in the
+ * tree (the copy reached a key past the prefix, or the leaf's upper
+ * fence sorts past every key with the prefix), else 1 (max or bcap
+ * stopped the copy, or the prefix may go on in the next leaf).  XTC_OK,
+ * XTC_E_INVAL (bad arguments, plen > lolen), or an error. */
+int  bt_seek_ge_keys(bt_t *bt, const void *lo, uint16_t lolen,
+                     uint16_t plen, void *buf, uint32_t bcap, uint32_t *off,
+                     uint16_t *lens, int max, int *n, int *more);
+
 /* First key >= `key`: key copied to kout/kcap (*kolen), value to
  * val/vcap (*vlen; whole even when out of line; val/vlen may be NULL).
  * The common case reads optimistically -- no content latch, no cursor --

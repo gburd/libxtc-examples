@@ -25,10 +25,18 @@ static int n_fail = 0;
 	else      { n_fail++; printf("  FAIL %s\n", name); }            \
 } while (0)
 
+/* quack_parse decodes escapes in place, so it gets a writable copy of
+ * the line; the message points into that copy until the next call. */
 static int
 parse(const char *line, quack_msg_t *m)
 {
-	return quack_parse(line, strlen(line), m);
+	static char *buf;
+	size_t n = strlen(line);
+	free(buf);
+	if ((buf = malloc(n + 1)) == NULL)
+		return -1;
+	memcpy(buf, line, n + 1);
+	return quack_parse(buf, n, m);
 }
 
 /* REAL +-Inf goes out as an over-range JSON number (read back as +-inf,

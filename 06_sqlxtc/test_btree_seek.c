@@ -27,6 +27,13 @@
  *	    fetches: in S1 every settled answer equals the oracle's and most
  *	    probes are settled by the batch; in the S2 churn every settled
  *	    answer obeys S2's bounds and carries its own key's value.
+ *	S5  bt_seek_ge_keys, the one-leaf read behind an equality index
+ *	    probe: in S1 its keys are exactly the first live keys >= the
+ *	    probe that share its prefix, and when it says they are all
+ *	    (more == 0) no later live key has the prefix; in the S2 churn
+ *	    its keys ascend from the probe with the prefix, and every stable
+ *	    key with the prefix from the probe up to its last key (every one
+ *	    when more == 0) is there.
  *
  *	Built twice: test_btree_seek (the optimistic, version-validated
  *	path) and test_btree_seek_latched (-DBT_OLC_ENABLED=0: the latched
@@ -108,6 +115,16 @@ done(bt_t *bt, bm_t *bm, const char *p)
 	(void)unlink(p);
 	snprintf(wal, sizeof wal, "%s-wal", p);
 	(void)unlink(wal);
+}
+
+/* Byte order of two keys, as the tree sorts them. */
+static int
+kcmp(const void *a, uint16_t al, const void *b, uint16_t bl)
+{
+	int r = memcmp(a, b, al < bl ? al : bl);
+	if (r != 0)
+		return r;
+	return (int)al - (int)bl;
 }
 
 /* ---- S1: oracle ---------------------------------------------------- */
@@ -218,6 +235,57 @@ t_oracle(uint32_t ps)
 		printf("  %s   S4 ps=%u: %d batched probes, %d settled by the "
 		    "batch, %d wrong\n", nwrong == 0 && (!T_OLC ||
 		    settled * 2 >= total) ? "ok" : "FAIL", ps, total, settled,
+		    nwrong);
+	}
+
+	/* S5 (oracle half): every third probe, a prefix of 1..8 bytes of
+	 * it, at most 1..40 keys. */
+	{
+		static unsigned char kb[8192];
+		uint32_t ko[64];
+		uint16_t kls[64], pl;
+		int nk = 0, more = 0, nwrong = 0, ended = 0, m, j2, x;
+		for (i = 0; i < S1_N + 6; i += 3) {
+			uint16_t ql = (uint16_t)((i & 1) ? 9 : 8);
+			snprintf(q, sizeof q, "s%07d", i);
+			if (ql == 9)
+				q[8] = '!';
+			pl = (uint16_t)(1 + rnd(&s) % 8);
+			m = 1 + (int)(rnd(&s) % 40);
+			if (bt_seek_ge_keys(bt, q, ql, pl, kb, sizeof kb, ko,
+			        kls, m, &nk, &more) != XTC_OK) {
+				nwrong++;
+				continue;
+			}
+			/* The first nk live keys >= q, all with the prefix. */
+			x = ql == 9 ? i + 1 : i;
+			for (j2 = 0; j2 < nk; j2++, x++) {
+				while (x < S1_N && !live[x])
+					x++;
+				snprintf(k, sizeof k, "s%07d", x);
+				if (x >= S1_N || kls[j2] != 8 ||
+				    memcmp(kb + ko[j2], k, 8) != 0 ||
+				    memcmp(k, q, pl) != 0)
+					break;
+			}
+			if (j2 < nk || nk > m) {
+				nwrong++;
+				continue;
+			}
+			if (more)
+				continue;
+			ended++;
+			/* All of them: the next live key lacks the prefix. */
+			while (x < S1_N && !live[x])
+				x++;
+			snprintf(k, sizeof k, "s%07d", x);
+			if (x < S1_N && memcmp(k, q, pl) == 0)
+				nwrong++;
+		}
+		CK(nwrong == 0 && ended > 0);
+		printf("  %s   S5 ps=%u: one-leaf key reads against the oracle "
+		       "(%d complete), %d wrong\n",
+		    nwrong == 0 && ended > 0 ? "ok" : "FAIL", ps, ended,
 		    nwrong);
 	}
 
@@ -478,6 +546,72 @@ xtc_atomic_fetch_add_long(&g_lt_reads, n, xtc_mo_seq_cst);
 free(buf);
 }
 
+/* S5: one-leaf key reads (bt_seek_ge_keys) at a random bound and a
+ * prefix of it.  The keys must ascend from the bound and share the
+ * prefix, and no stable key (never deleted) with the prefix may be
+ * missing between the bound and the last key read, or anywhere past
+ * the bound when the read says it has them all. */
+static long g_ge_reads, g_ge_ended, g_ge_bad;
+
+static int
+s5_bad(const char *q, uint16_t pl, const uint8_t *buf, const uint32_t *off,
+    const uint16_t *lens, int got, int more)
+{
+	int i = atoi(q + 1), j, t, hit, top;
+	char k[16];
+	for (j = 0; j < got; j++)
+		if (lens[j] != 8 || kcmp(buf + off[j], 8, q, 8) < 0 ||
+		    memcmp(buf + off[j], q, pl) != 0 ||
+		    (j > 0 && kcmp(buf + off[j], 8, buf + off[j - 1], 8) <= 0))
+			return 1;
+	top = got > 0 ? atoi((const char *)buf + off[got - 1] + 1) : i - 1;
+	if (!more)
+		top = S2_N - 1;
+	for (j = i; j <= top; j++) {
+		s2_key(j, k);
+		if (!STABLE(j) || memcmp(k, q, pl) != 0)
+			continue;
+		for (t = 0, hit = 0; t < got && !hit; t++)
+			hit = memcmp(buf + off[t], k, 8) == 0;
+		if (!hit)
+			return 1;
+	}
+	return 0;
+}
+
+static void
+reader_ge(void *arg)
+{
+	uint64_t s = (uint64_t)(uintptr_t)arg * 0x8CB92BA72F3D8DD7ull + 5;
+	uint8_t *buf = malloc(4096); /* per reader: a seek can park */
+	uint32_t off[64];
+	uint16_t lens[64], pl;
+	char q[16];
+	long n = 0, ended = 0, bad = 0;
+	int got, more;
+
+	if (buf == NULL) {
+		xtc_atomic_fetch_add_long(&g_ge_bad, 1, xtc_mo_seq_cst);
+		return;
+	}
+	while (xtc_atomic_load_i32(&g_active, xtc_mo_seq_cst) > 0 || n < 2000) {
+		s2_key((int)(rnd(&s) % S2_N), q);
+		pl = (uint16_t)(5 + rnd(&s) % 4); /* 1 to 1000 keys */
+		if (bt_seek_ge_keys(g_bt, q, 8, pl, buf, 4096, off, lens,
+		        1 + (int)(rnd(&s) % 64), &got, &more) != XTC_OK ||
+		    s5_bad(q, pl, buf, off, lens, got, more))
+			bad++;
+		ended += !more;
+		n++;
+		if ((n & 15) == 0)
+			xtc_yield();
+	}
+	xtc_atomic_fetch_add_long(&g_ge_reads, n, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_long(&g_ge_ended, ended, xtc_mo_seq_cst);
+	xtc_atomic_fetch_add_long(&g_ge_bad, bad, xtc_mo_seq_cst);
+	free(buf);
+}
+
 static void
 t_concurrent(void)
 {
@@ -513,6 +647,9 @@ t_concurrent(void)
 	for (r = 0; r < N_READERS; r++)
 		CK(xtc_proc_spawn(xtc_exec_loop(ex, (int)((r + 3) % N_LOOPS)),
 		    reader_n, (void *)(r + 1), NULL, NULL) == XTC_OK);
+	for (r = 0; r < N_READERS; r++)
+		CK(xtc_proc_spawn(xtc_exec_loop(ex, (int)(r % N_LOOPS)),
+		       reader_ge, (void *)(r + 1), NULL, NULL) == XTC_OK);
 	CK(xtc_exec_run(ex) == XTC_OK);
 	bm_provider_stop(g_bm);
 	xtc_exec_destroy(ex);
@@ -524,6 +661,8 @@ t_concurrent(void)
 	CK(xtc_atomic_load_long(&g_bad_rc, xtc_mo_seq_cst) == 0);
 	CK(xtc_atomic_load_long(&g_lt_bad, xtc_mo_seq_cst) == 0);
 	CK(xtc_atomic_load_long(&g_n_bad, xtc_mo_seq_cst) == 0);
+	CK(xtc_atomic_load_long(&g_ge_bad, xtc_mo_seq_cst) == 0);
+	CK(xtc_atomic_load_long(&g_ge_ended, xtc_mo_seq_cst) > 0);
 	CK(ts.splits > 0 && ts.merges > 0);           /* both SMOs raced */
 	printf(
 	    "  %s   S2: %ld concurrent seeks vs %d churners on %d threads "
@@ -549,6 +688,12 @@ t_concurrent(void)
 	    xtc_atomic_load_long(&g_n_reads, xtc_mo_seq_cst),
 	    xtc_atomic_load_long(&g_n_settled, xtc_mo_seq_cst),
 	    xtc_atomic_load_long(&g_n_bad, xtc_mo_seq_cst));
+	printf("  %s   S5: %ld concurrent one-leaf key reads (bt_seek_ge_keys) "
+	       "in the same churn, %ld complete: %ld wrong\n",
+	    xtc_atomic_load_long(&g_ge_bad, xtc_mo_seq_cst) ? "FAIL" : "ok",
+	    xtc_atomic_load_long(&g_ge_reads, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_ge_ended, xtc_mo_seq_cst),
+	    xtc_atomic_load_long(&g_ge_bad, xtc_mo_seq_cst));
 	done(g_bt, g_bm, p);
 }
 

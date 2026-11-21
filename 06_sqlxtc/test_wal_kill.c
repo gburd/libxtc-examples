@@ -397,7 +397,13 @@ scan_diag(const char *path)
 		n++;
 	}
 	memset(hdr, 0, sizeof hdr);
-	(void)pread(fd, hdr, sizeof hdr, o);
+	if (pread(fd, hdr, sizeof hdr, o) < 0) {
+		fprintf(stderr,
+		    "  scan: stops at %lld; cannot read there: %s\n",
+		    (long long)o, strerror(errno));
+		close(fd);
+		return;
+	}
 	memcpy(&lsn, hdr, 8);
 	memcpy(&len, hdr + 8, 4);
 	fprintf(stderr, "  scan: %llu frames, stops at %lld of %lld (log end %llu); "
@@ -408,7 +414,12 @@ scan_diag(const char *path)
 	if (len > 8 && len < 4096) {
 		uint8_t b[4096 + 32];
 		uint32_t sl, sq, i, bad = 0;
-		(void)pread(fd, b, len + WAL_REC_HDR + WAL_REC_CRC, o);
+		if (pread(fd, b, len + WAL_REC_HDR + WAL_REC_CRC, o) < 0) {
+			fprintf(stderr, "    cannot read the frame: %s\n",
+			    strerror(errno));
+			close(fd);
+			return;
+		}
 		memcpy(&sl, b + 12, 4);
 		memcpy(&sq, b + 16, 4);
 		for (i = 8; i < len; i++)

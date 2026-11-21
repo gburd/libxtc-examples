@@ -1680,6 +1680,7 @@ nat_select_run(struct sx_stmt *st)
 	uint64_t ck0;
 	int rc;
 	if (st->ran) return st->vres != NULL;
+	xstore_read_err_clear((struct xsql *)st->db);
 	if (nat_aborted(st->db)) return 0;   /* sx_step reports it */
 	ck0 = g_xbm != NULL ? bm_cksum_failures(g_xbm, NULL) : 0;
 	if (st->nkind == SXN_PRAGMA_TABLE_INFO) {
@@ -1772,6 +1773,9 @@ nat_set_run_error(struct sx_stmt *st)
 		return nat_set_err(st->db, tab, SX_ERROR);
 	if (xstore_wal_failed())
 		return nat_set_err(st->db, SX_MSG_WAL_IO, SX_ERROR);
+	if (xstore_read_err((struct xsql *)st->db)[0] != '\0')
+		return nat_set_err(st->db,
+		    xstore_read_err((struct xsql *)st->db), SX_ERROR);
 	nd = (struct sx_native_db *)st->db;
 	free(nd->errmsg);
 	/* A first unresolved base table name -> "no such table: NAME". */
@@ -1904,6 +1908,7 @@ sx_step_body(sx_stmt *st)
 		}
 		if (st->ran) return SX_DONE;   /* one-shot kinds */
 		st->ran = 1;
+		xstore_read_err_clear((struct xsql *)st->db);
 		switch (st->nkind) {
 		case SXN_WRITE: {
 			int64_t nch = 0;

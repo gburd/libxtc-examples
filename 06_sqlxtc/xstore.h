@@ -509,6 +509,15 @@ void xstore_iscan_hint(xstore_iscan_t *s, int64_t nrows);
 /* The connection's last UNIQUE-index violation message ("UNIQUE
  * constraint failed: t.a, t.b"), "" if none (a rowid-key conflict). */
 const char *xstore_uniq_err(struct xsql *db);
+/* The current statement's first index scan read error ("index error:
+ * cannot read index t_g on t: I/O error"), "" if none.  Cleared when a
+ * statement starts (xstore_read_err_clear, xstore_stmt_begin,
+ * xstore_stmt_pin). */
+const char *xstore_read_err(struct xsql *db);
+/* Forget the last statement's index read error.  The engine calls it
+ * when any statement starts, so a statement that never reaches the store
+ * (PRAGMA table_info) cannot report an earlier one's. */
+void xstore_read_err_clear(struct xsql *db);
 
 /* Statement atomicity in a transaction: mark the write buffer before a
  * statement; undo back to the mark if the statement fails (the
@@ -574,6 +583,17 @@ void     xstore_index_fail_inject(int n);
 /* Test hook: the next n UNIQUE probes of the committed index fail with
  * XTC_E_IO (as a page read can); the write or COMMIT must then fail. */
 void xstore_uniq_fail_inject(int n);
+/* Test hook: the n-th B-tree read (1-based) of an index scan or a UNIQUE
+ * probe from now fails with XTC_E_IO, as a page read can; 0 disarms.
+ * The scan's xstore_iscan_next, or the write, must then fail.  Returns
+ * the previous setting: still positive when fewer reads ran.  Note that
+ * the count is one for the process: the n-th read of any connection
+ * fails.  Under real threads the count can go below 0, which is
+ * harmless (only the step from 1 fails a read). */
+int xstore_index_read_fail_at(int n);
+/* Test hook: how many reads xstore_index_read_fail_at has failed so far,
+ * so a test can tell its injected fault from any other read error. */
+int xstore_index_read_faults(void);
 
 /* xstore_recover that also reports where the log ends after recovery
  * (wal_scan_ex form; tail->valid = 0 if unknown), so the engine's
