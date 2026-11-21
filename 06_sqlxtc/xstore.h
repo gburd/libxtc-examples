@@ -509,6 +509,10 @@ void xstore_iscan_hint(xstore_iscan_t *s, int64_t nrows);
 /* The connection's last UNIQUE-index violation message ("UNIQUE
  * constraint failed: t.a, t.b"), "" if none (a rowid-key conflict). */
 const char *xstore_uniq_err(struct xsql *db);
+/* The current statement's first index scan read error ("index error:
+ * cannot read index t_g on t: I/O error"), "" if none.  Cleared when a
+ * statement starts (xstore_stmt_begin, xstore_stmt_pin). */
+const char *xstore_read_err(struct xsql *db);
 
 /* Statement atomicity in a transaction: mark the write buffer before a
  * statement; undo back to the mark if the statement fails (the

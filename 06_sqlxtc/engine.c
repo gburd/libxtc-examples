@@ -1772,6 +1772,9 @@ nat_set_run_error(struct sx_stmt *st)
 		return nat_set_err(st->db, tab, SX_ERROR);
 	if (xstore_wal_failed())
 		return nat_set_err(st->db, SX_MSG_WAL_IO, SX_ERROR);
+	if (xstore_read_err((struct xsql *)st->db)[0] != '\0')
+		return nat_set_err(st->db,
+		    xstore_read_err((struct xsql *)st->db), SX_ERROR);
 	nd = (struct sx_native_db *)st->db;
 	free(nd->errmsg);
 	/* A first unresolved base table name -> "no such table: NAME". */

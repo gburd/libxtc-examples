@@ -40,7 +40,9 @@
  *	    count, and a duplicate long value is refused (a constraint error
  *	    or an index error) at every n, never inserted.  Before the fix a
  *	    failed candidate-row read made the probe say "no duplicate" and
- *	    a failed cursor read ended the scan early.
+ *	    a failed cursor read ended the scan early.  A failed scan says
+ *	    so ("index error: cannot read index r_g on r: I/O error"), not
+ *	    "unsupported SQL (native engine)".
  *	(7) The same for a transaction whose buffered rows were spilled to
  *	    the STEAL staging area: the n-th read fails, and the first n of
  *	    them are the staging area's (bringing a spilled payload back).
@@ -76,6 +78,7 @@
 	} while (0)
 
 #define PROBE_ERR "index error: cannot check UNIQUE t.s: I/O error"
+#define RD_ERR    "index error: cannot read index "
 
 static int64_t
 one(sx_db *h, const char *sql)
@@ -391,7 +394,8 @@ t_siphash(void)
 
 /* Run `sql` (one text bind `v`, NULL for none) with the n-th index read
  * failing, for n = 1, 2, .. until no read is left to fail.  Each run
- * must fail or count `want` rows.  Returns how many runs failed. */
+ * must fail, saying it could not read the index, or count `want` rows.
+ * Returns how many runs failed. */
 static int
 sweep_count(sx_db *h, const char *sql, const char *v, int64_t want)
 {
@@ -415,6 +419,12 @@ sweep_count(sx_db *h, const char *sql, const char *v, int64_t want)
 			    "  %s: read %d failed, count %lld, "
 			    "want %lld or an error\n",
 			    sql, n, (long long)got, (long long)want);
+			g_fail = 1;
+		}
+		if (rc != SX_ROW &&
+		    strncmp(sx_errmsg(h), RD_ERR, sizeof RD_ERR - 1) != 0) {
+			fprintf(stderr, "  %s: read %d failed, error \"%s\"\n",
+			    sql, n, sx_errmsg(h));
 			g_fail = 1;
 		}
 		errs += rc != SX_ROW;

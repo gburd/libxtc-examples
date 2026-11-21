@@ -570,6 +570,7 @@ typedef struct xstore_ctx {
 	uint64_t         uniq_vis;    /* horizon of the txn's UNIQUE checks */
 	uint64_t         uniq_gen;    /* index generation at those checks */
 	char             uniq_err[192]; /* last UNIQUE violation message */
+	char             rd_err[192];   /* this statement's index read error */
 	/* Largest buffered rowid per table (xstore_max_rowid_txn), kept by
 	 * wbuf_add; a truncate/clear invalidates it (wmax_ok = 0) and the
 	 * next query rebuilds it with one pass. */
@@ -5722,6 +5723,15 @@ xstore_uniq_err(struct xsql *db)
 	return cx != NULL ? cx->uniq_err : "";
 }
 
+/* The current statement's first index read error ("index error: cannot
+ * read index t_g on t: I/O error"), or "" if none. */
+const char *
+xstore_read_err(struct xsql *db)
+{
+	xstore_ctx_t *cx = xstore_ctx_of(db);
+	return cx != NULL ? cx->rd_err : "";
+}
+
 /* Statement atomicity inside a transaction: a failed statement undoes
  * its own buffered writes and leaves the transaction open (SQLite).
  * stmt_mark returns the buffer position to undo to (-1 outside a txn). */
@@ -5832,6 +5842,7 @@ xs_stmt_pin(xstore_ctx_t *cx, struct xsql *db)
 {
 	xs_enter_ctx(cx, db);
 	cx->stmt_puts = 0;
+	cx->rd_err[0] = '\0';
 	if (!cx->in_txn &&
 	    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed) == 0)
 		return snap_pin_visible(&cx->snap_slot);
@@ -9191,6 +9202,25 @@ xs_iscan_group(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 	return 1;
 }
 
+/* Leave the scan's error in the connection's rd_err (the first one of
+ * the statement), for the engine to report (xstore_read_err).  A group
+ * allocation failure is the one error without s->err. */
+static void
+xs_iscan_err_msg(xstore_iscan_t *s)
+{
+	struct xs_idx_ent e;
+	int rc = s->err != 0 ? s->err : XTC_E_NOMEM;
+	if (s->cx == NULL || s->cx->rd_err[0] != '\0')
+		return;
+	if (xs_idx_get(s->bt, s->rt.idx_id, &e))
+		snprintf(s->cx->rd_err, sizeof s->cx->rd_err,
+		    "index error: cannot read index %s on %s: %s", e.name,
+		    e.table, xtc_strerror(rc));
+	else
+		snprintf(s->cx->rd_err, sizeof s->cx->rd_err,
+		    "index error: cannot read an index: %s", xtc_strerror(rc));
+}
+
 int
 xstore_iscan_next(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
     int *reclen)
@@ -9209,9 +9239,11 @@ xstore_iscan_next(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 		return 1;
 	}
 	r = xs_iscan_take(s, rowid, rec, reclen, &k, &kl);
-	if (r != 1 || !xs_idx_truncated(&s->rt, kl))
-		return r;
-	return xs_iscan_group(s, rowid, rec, reclen, k);
+	if (r == 1 && xs_idx_truncated(&s->rt, kl))
+		r = xs_iscan_group(s, rowid, rec, reclen, k);
+	if (r < 0)
+		xs_iscan_err_msg(s);
+	return r;
 }
 
 void
@@ -9639,6 +9671,7 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 	ctx->umap = NULL; ctx->umap_n = ctx->umap_cap = 0;
 	ctx->uniq_vis = ctx->uniq_gen = 0;
 	ctx->uniq_err[0] = '\0';
+	ctx->rd_err[0] = '\0';
 	return ctx;
 }
 
