@@ -853,6 +853,27 @@ run_find(run_t *r, uint32_t tableid, int64_t rowid, uint64_t *rank,
 	return XTC_OK;
 }
 
+/* 1 if the n-slot array of data page p is well formed: it fits, and
+ * every offset leaves room for a row header between the array's end
+ * and the previous record's start (the page end for slot 0), so the
+ * offsets strictly fall.  run_read checks it before its search, which
+ * would otherwise compare garbage rowids and miss a damaged page. */
+static int
+rr_slots_ok(const uint8_t *p, uint32_t n, uint32_t ps)
+{
+	uint32_t i, off, end = ps;
+
+	if (n == 0 || RUN_PG_HDR + 2u * n > ps)
+		return 0;
+	for (i = 0; i < n; i++) {
+		off = g16(p + RUN_PG_HDR + 2u * i);
+		if (off < RUN_PG_HDR + 2u * n || off + RUN_ROW_HDR > end)
+			return 0;
+		end = off;
+	}
+	return 1;
+}
+
 /* Decode the row at slot i of a fixed data page into *out, copying up
  * to cap record bytes (reading its continuation pages if needed).
  * The page stays fixed; the caller unfixes it. */
@@ -860,20 +881,27 @@ static int
 rr_row(run_t *r, uint32_t pgno, const uint8_t *p, uint32_t i, run_row_t *out,
     uint8_t *buf, size_t cap)
 {
-	uint32_t n = g16(p + 28), off, len, have, k, at;
+	uint32_t n = g16(p + 28), off, end, len, have, k, at;
 	const uint8_t *rec;
 	bm_frame_t *f;
 	int rc;
 
+	/* The slot array and the record must lie in the page: slots are
+	 * read only once i < n and the array fits, and record i ends where
+	 * record i - 1 starts (slot 0's at the page end), so offsets must
+	 * strictly fall with the slot index and leave room for the row
+	 * header.  A malformed page is an error, never a read outside it. */
+	if (i >= n || RUN_PG_HDR + 2u * n > r->ps)
+		return XTC_E_IO;
 	off = g16(p + RUN_PG_HDR + 2u * i);
-	if (i >= n || off < RUN_PG_HDR + 2u * n || off + RUN_ROW_HDR > r->ps)
+	end = i == 0 ? r->ps : g16(p + RUN_PG_HDR + 2u * (i - 1u));
+	if (off < RUN_PG_HDR + 2u * n || end > r->ps ||
+	    off + RUN_ROW_HDR > end)
 		return XTC_E_IO;
 	rec = p + off;
 	len = g16(rec + 25);
-	/* Only the page's last row may continue; it ends at the page end
-	 * (or at the next row's start). */
-	have = (i == 0 ? r->ps : g16(p + RUN_PG_HDR + 2u * (i - 1u))) - off -
-	    RUN_ROW_HDR;
+	/* Only the page's last row may continue past its end. */
+	have = end - off - RUN_ROW_HDR;
 	if (have > len)
 		have = len;
 	if (have < len && !(i + 1u == n && (g16(p + 30) & 1u)))
@@ -921,7 +949,7 @@ run_read(run_t *r, uint32_t page, uint32_t tableid, int64_t rowid,
 		return rc;
 	p = bm_page(f);
 	n = g16(p + 28);
-	if (n == 0 || RUN_PG_HDR + 2u * n > r->ps) {
+	if (!rr_slots_ok(p, n, r->ps)) {
 		bm_unfix(r->bm, f, 0);
 		return XTC_E_IO;
 	}
@@ -937,10 +965,6 @@ run_read(run_t *r, uint32_t page, uint32_t tableid, int64_t rowid,
 		uint32_t m = lo + (hi - lo) / 2, off;
 		int64_t v;
 		off = g16(p + RUN_PG_HDR + 2u * m);
-		if (off + 8u > r->ps) {
-			rc = XTC_E_IO;
-			break;
-		}
 		v = (int64_t)g64(p + off);
 		if (v < rowid) {
 			lo = m + 1;

@@ -19,7 +19,12 @@
  *	  seal       a page of another run (same file number, same offset)
  *	             is refused: by the run-id check, and a page of the
  *	             page file at that offset by the file-number seal;
- *	  empty      a run of no rows is refused and leaves no file.
+ *	  empty      a run of no rows is refused and leaves no file;
+ *	  malformed  a data page resealed with a bad slot array (slot count
+ *	             past the page, a slot below the array, offsets that
+ *	             rise, a record past the page end) is XTC_E_IO from
+ *	             run_get and from run_iter_next, never a read outside
+ *	             the page (run under ASan).
  *	Runs off a loop (xtc_aio and xtc_blocking_run are inline there).
  */
 
@@ -353,10 +358,93 @@ t_manifest_seal(void)
 	    "are refused\n");
 }
 
+static uint16_t
+g16le(const uint8_t *p)
+{
+	return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static void
+p16le(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+}
+
+/*
+ * One malformation of data page 1 (a copy in pg, from the good page in
+ * good): 0 slot count past the page; 1 slot 1 below the slot array;
+ * 2 slot 1 above slot 0 (offsets must fall); 3 slot 0 within 10 bytes
+ * of the page end, so its row header runs past it.  Page header bytes
+ * 28..29 are the slot count, slots start at byte 48.
+ */
+static void
+malform(uint8_t *pg, const uint8_t *good, int how)
+{
+	memcpy(pg, good, PS);
+	if (how == 0)
+		p16le(pg + 28, PS);
+	else if (how == 1)
+		p16le(pg + 48 + 2, 48);
+	else if (how == 2)
+		p16le(pg + 48 + 2, g16le(pg + 48) + 4u);
+	else
+		p16le(pg + 48, PS - 10);
+}
+
+static void
+t_malformed(void)
+{
+	static uint8_t good[PS], pg[PS], buf[RUN_REC_MAX];
+	char path[300];
+	run_iter_t *it = NULL;
+	run_meta_t m;
+	run_t *r = NULL;
+	run_row_t o;
+	bm_t *bm;
+	int fd, how, rc, k;
+
+	bm = open_bm("pages4", 16);
+	if (bm == NULL)
+		return;
+	run_path(g_dir, 44, path, sizeof path);
+	CK(write_run(bm, path, 44, 300, &m) == XTC_OK);
+	CK((fd = open(path, O_RDWR)) >= 0);
+	CK(pread(fd, good, PS, PS) == PS);
+	CK(g16le(good + 28) >= 2);
+	for (how = 0; how < 4; how++) {
+		malform(pg, good, how);
+		bm_seal_page(bm, pg, BM_PID_MAKE(RUN_FILE(44), 1));
+		CK(pwrite(fd, pg, PS, PS) == PS);
+		CK(run_open(bm, path, &m, &r) == XTC_OK);
+		if (r == NULL)
+			break;
+		/* Slot 0 for cases 0 and 3, slot 1 for 1 and 2. */
+		k = how == 1 || how == 2 ? 1 : 0;
+		rc = run_get(r, g_rows[k].tid, g_rows[k].rid, &o, buf,
+		    sizeof buf);
+		CK(rc == XTC_E_IO);
+		CK(run_iter_open(r, &it) == XTC_OK);
+		rc = XTC_OK;
+		while (it != NULL && rc == XTC_OK)
+			rc = run_iter_next(it, &o, buf, sizeof buf);
+		CK(rc == XTC_E_IO);
+		run_iter_close(it);
+		it = NULL;
+		run_close(r);
+		r = NULL;
+	}
+	close(fd);
+	bm_destroy(bm);
+	unlink(path);
+	printf("  malformed: a bad slot array is XTC_E_IO from run_get and "
+	    "the iterator, no read outside the page\n");
+}
+
 int
 main(void)
 {
-	static const char *junk[] = { "pages", "pages2", "pages3" };
+	static const char *junk[] = { "pages", "pages2", "pages3", "pages4" };
 	char p[300];
 	unsigned i;
 
@@ -368,6 +456,7 @@ main(void)
 	t_roundtrip();
 	t_order();
 	t_manifest_seal();
+	t_malformed();
 	for (i = 0; i < sizeof junk / sizeof junk[0]; i++) {
 		snprintf(p, sizeof p, "%s/%s", g_dir, junk[i]);
 		(void)unlink(p);
