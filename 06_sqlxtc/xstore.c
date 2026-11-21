@@ -4924,6 +4924,48 @@ xs_newest_ts(bt_t *bt, uint32_t tableid, int64_t rowid)
 }
 
 /*
+ * The ids of dropped tables, collected by a pass over the tree (version
+ * GC, the log dump) from the table catalog, which sorts before every
+ * table: an id whose catalog row's newest version (the one the pass
+ * keeps) is a tombstone.  The pass then drops that table's rows, which
+ * DROP TABLE leaves behind.  Only a tombstoned id counts, never an id
+ * with no catalog row: a caller may write rows under an id it never put
+ * in the catalog.  If the set cannot grow, the rows stay (a leak, never
+ * a loss).
+ */
+struct xs_dropset {
+	uint32_t *id;      /* ascending: the catalog is scanned in order */
+	int       n, cap;
+};
+
+static void
+xs_dropset_add(struct xs_dropset *d, uint32_t id)
+{
+	uint32_t *nv;
+	if (d->n == d->cap) {
+		int nc = d->cap ? d->cap * 2 : 64;
+		if ((nv = realloc(d->id, (size_t)nc * sizeof *nv)) == NULL)
+			return;
+		d->id = nv;
+		d->cap = nc;
+	}
+	d->id[d->n++] = id;
+}
+
+static int
+xs_dropset_has(const struct xs_dropset *d, uint32_t id)
+{
+	int lo = 0, hi = d->n - 1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		if (d->id[mid] == id) return 1;
+		if (d->id[mid] < id) lo = mid + 1;
+		else hi = mid - 1;
+	}
+	return 0;
+}
+
+/*
  * Version GC (MVCC vacuum).  Reclaims versions no live snapshot can
  * reach: scanning in key order the cursor sees each rowid's versions
  * newest-first (commit_ts descending), so for each rowid we keep every
@@ -4931,7 +4973,8 @@ xs_newest_ts(bt_t *bt, uint32_t tableid, int64_t rowid)
  * `horizon` (the survivor that snapshots at the horizon still need),
  * and delete the rest.  A survivor that is a tombstone with nothing
  * newer is itself unreachable and is dropped, so a deleted row
- * eventually leaves no trace.
+ * eventually leaves no trace.  A table whose catalog row is such a
+ * tombstone (DROP TABLE below the horizon) loses every row with it.
  *
  * Latches must not span the vtable/btree boundary, and bt_delete
  * wants the exclusive latch a live cursor would hold, so this collects
@@ -4963,6 +5006,7 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 	int64_t prev_rowid = 0;
 	uint32_t prev_tableid = 0;
 	int in_group = 0, survivor_found = 0;
+	struct xs_dropset dropped = { NULL, 0, 0 };
 
 	for (;;) {
 		bt_cursor_t *cur = NULL;
@@ -5005,8 +5049,15 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			if (first_in_group) {
 				prev_rowid = rid; prev_tableid = tid;
 				in_group = 1; survivor_found = 0;
+				/* A table dropped below the horizon: no snapshot
+				 * can reach it, so its rows go with its tombstone. */
+				if (tid == XS_CAT_TABLEID && rid > 0 && deleted &&
+				    ts <= horizon)
+					xs_dropset_add(&dropped, (uint32_t)rid);
 			}
-			if (!survivor_found) {
+			if (tid != XS_CAT_TABLEID && xs_dropset_has(&dropped, tid)) {
+				memcpy(dead[ndead++], k, XS_VKLEN);
+			} else if (!survivor_found) {
 				if (ts <= horizon) {
 					survivor_found = 1;
 					if (deleted && first_in_group)
@@ -5029,6 +5080,7 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 		if (ndead < g_gc_batch)
 			break;     /* scanned to the end */
 	}
+	free(dropped.id);
 	if (out_reclaimed != NULL) *out_reclaimed = reclaimed;
 	return rc;
 }
@@ -10039,7 +10091,9 @@ xstore_recover_inplace(bt_t *bt, bm_t *bm, const char *wal_path,
  * included) and for each (tableid, rowid) emits only the NEWEST version
  * (versions sort newest-first within a key) as a one-version
  * transaction frame [XL_UPDATE][XL_COMMIT], skipping tombstones and all
- * superseded versions.  This is the compaction that bounds the log:
+ * superseded versions, and every row of a dropped table (its catalog
+ * row's newest version is a tombstone).  This is the compaction that
+ * bounds the log:
  * regardless of how much churn preceded it, the dump -- and the log it
  * replaces -- is proportional to the live row count.  Safe only at a
  * quiesced checkpoint.  Original commit timestamps are preserved. */
@@ -10058,6 +10112,7 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 	uint8_t ck[XL_HDR_LEN + 16];
 	uint32_t last_tid = 0; int64_t last_rid = 0; int have_last = 0;
 	int cn;
+	struct xs_dropset dropped = { NULL, 0, 0 };
 
 	if ((cn = xl_enc_checkpoint(ck, sizeof ck, dc->clock, 0)) > 0)
 		emit(ectx, ck, (uint32_t)cn);
@@ -10117,6 +10172,7 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 			cur = NULL;
 			if (bt_cursor_open(bt, &past, 1, &cur) != XTC_OK) {
 				dc->cancelled = 1;    /* a truncated image: not swapped in */
+				free(dropped.id);
 				return XTC_E_IO;
 			}
 			continue;
@@ -10134,8 +10190,15 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 			continue;                  /* committed after the snapshot */
 		last_tid = tableid; last_rid = rowid; have_last = 1;
 		flags = (vl >= 1) ? ((const uint8_t *)vv)[0] : 0;
+		/* A dropped table (xs_dropset): its rows leave the log with
+		 * its catalog row, so a rebuild does not bring them back. */
+		if (tableid == XS_CAT_TABLEID && rowid > 0 &&
+		    (flags & XS_F_DELETED))
+			xs_dropset_add(&dropped, (uint32_t)rowid);
 		if (flags & XS_F_DELETED)
 			continue;                  /* newest is a tombstone: row is gone */
+		if (tableid != XS_CAT_TABLEID && xs_dropset_has(&dropped, tableid))
+			continue;
 
 		payl = (vl >= 1) ? (uint16_t)(vl - 1) : 0;
 		if (payl > XS_VMAX) payl = XS_VMAX;
@@ -10154,6 +10217,7 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 		emit(ectx, rec, (uint32_t)(p - rec));
 	}
 	bt_cursor_close(cur);
+	free(dropped.id);
 	return dc->cancelled ? XTC_E_IO : XTC_OK;
 }
 

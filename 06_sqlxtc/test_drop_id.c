@@ -18,7 +18,8 @@
  *	crash with the whole log (the rebuild replays the DROP itself);
  *	and a store that already lost a dropped table's tombstone while
  *	its rows stayed (what an older release leaves), whose next CREATE
- *	must still get a fresh id.
+ *	must still get a fresh id.  The first three also check that the
+ *	dropped table's rows are gone once the store has closed cleanly.
  *	Off a loop.
  */
 
@@ -141,6 +142,12 @@ drop_case(int mode)
 	CK(one(h, "SELECT count(*) FROM d") == 0);
 	CK(one(h, "SELECT count(*) FROM b") == -2);
 	sx_close(h);
+	/* Space: once the store has closed cleanly, the dropped table's
+	 * rows are gone with its catalog row (GC), and so are they from the
+	 * log the close compacted. */
+	CK(sx_storage_close() == SX_OK);
+	CK(sx_storage_open(path, 256) == SX_OK);
+	CK(xstore_max_rowid(sx_storage_bt(), tb) == 0);
 	CK(sx_storage_close() == SX_OK);
 	unlink_store(path);
 }
@@ -148,7 +155,8 @@ drop_case(int mode)
 /*
  * A store whose dropped table already lost its tombstone with its rows
  * left behind: rows under an id the catalog does not name.  The next
- * CREATE must not take that id.
+ * CREATE must not take that id, and GC must not remove the rows (no
+ * tombstone says the table was dropped).
  */
 static void
 orphan_case(void)
@@ -178,6 +186,7 @@ orphan_case(void)
 	CK(td > ta + 4);
 	CK(one(h, "SELECT count(*) FROM d") == 0);
 	sx_close(h);
+	CK(xstore_max_rowid(sx_storage_bt(), ta + 4) == 1);
 	CK(sx_storage_close() == SX_OK);
 	unlink_store(path);
 }
