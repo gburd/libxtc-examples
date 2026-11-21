@@ -35,7 +35,8 @@
  *	    is an error, never a missing row.  For each n, the n-th read
  *	    fails (xstore_index_read_fail_at) until n passes the last read:
  *	    an equality, range, and reverse index scan (autocommit and over
- *	    the transaction's own writes) each fail or return the right
+ *	    the transaction's own writes, and over rows too wide for a leaf,
+ *	    which only the point read fetches) each fail or return the right
  *	    count, and a duplicate long value is refused (a constraint error
  *	    or an index error) at every n, never inserted.  Before the fix a
  *	    failed candidate-row read made the probe say "no duplicate" and
@@ -419,6 +420,7 @@ static void
 t_read_errors(sx_db *h)
 {
 	char *a = longval(699, 1), *b = longval(699, 2);
+	char *wide = longval(2000, 3); /* over bt_max_inline on 4 KiB pages */
 	int n, rc, errs;
 	CK(sx_exec(h,
 	       "CREATE TABLE r(k INTEGER PRIMARY KEY, s TEXT UNIQUE, "
@@ -449,6 +451,23 @@ t_read_errors(sx_db *h)
 	CK(sx_exec(h, "INSERT INTO r VALUES(1000, 'w', 1)", NULL) == SX_OK);
 	errs += sweep_count(h, "SELECT count(*) FROM r WHERE g = 1", NULL, 101);
 	CK(sx_exec(h, "ROLLBACK", NULL) == SX_OK);
+	/* Rows too wide for a leaf: their values are out of line, which the
+	 * batched row read never settles, so every row is read by the point
+	 * read the batch falls back to (xs_point_get). */
+	CK(sx_exec(h, "CREATE TABLE w(k INTEGER PRIMARY KEY, g INT, pad TEXT)",
+	       NULL) == SX_OK);
+	CK(sx_exec(h, "CREATE INDEX w_g ON w(g)", NULL) == SX_OK);
+	for (n = 1; n <= 30; n++) {
+		sx_stmt *st = NULL;
+		CK(sx_prepare(h, "INSERT INTO w VALUES(?, ?, ?)", -1, &st,
+		       NULL) == SX_OK);
+		sx_bind_int64(st, 1, n);
+		sx_bind_int64(st, 2, n % 3);
+		sx_bind_text(st, 3, wide, -1);
+		CK(sx_step(st) == SX_DONE);
+		sx_finalize(st);
+	}
+	errs += sweep_count(h, "SELECT count(*) FROM w WHERE g = 1", NULL, 10);
 	CK(errs > 0);
 	/* A duplicate long value, then a new one: the duplicate never goes
 	 * in, the new one goes in or fails. */
@@ -467,6 +486,7 @@ t_read_errors(sx_db *h)
 	CK(no_missing());
 	free(a);
 	free(b);
+	free(wide);
 	if (!g_fail)
 		printf(
 		    "  ok   a failed read in an index scan or a UNIQUE probe "
