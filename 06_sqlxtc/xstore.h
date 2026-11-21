@@ -591,6 +591,9 @@ void xstore_uniq_fail_inject(int n);
  * fails.  Under real threads the count can go below 0, which is
  * harmless (only the step from 1 fails a read). */
 int xstore_index_read_fail_at(int n);
+/* Test hook: how many reads xstore_index_read_fail_at has failed so far,
+ * so a test can tell its injected fault from any other read error. */
+int xstore_index_read_faults(void);
 
 /* xstore_recover that also reports where the log ends after recovery
  * (wal_scan_ex form; tail->valid = 0 if unknown), so the engine's

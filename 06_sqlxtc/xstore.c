@@ -1692,6 +1692,7 @@ static uint64_t g_idx_garbage;
 static int g_idx_failinj; /* test hook: inserts to fail */
 static int g_uniq_failinj; /* test hook: UNIQUE probes to fail */
 static int g_rd_failat;    /* test hook: the index read to fail, 1-based */
+static int g_rd_faults;    /* test hook: reads it has failed */
 
 /* Catalog generation: bumped by every DDL entry point (tables, indexes,
  * views) and index rebuild, so a cached plan built at an older one is
@@ -2300,13 +2301,22 @@ xstore_index_read_fail_at(int n)
 	return xtc_atomic_exchange_i32(&g_rd_failat, n, xtc_mo_relaxed);
 }
 
+int
+xstore_index_read_faults(void)
+{
+	return xtc_atomic_load_i32(&g_rd_faults, xtc_mo_relaxed);
+}
+
 /* Should this B-tree read of an index scan or a UNIQUE probe fail
  * (xstore_index_read_fail_at)?  One relaxed load when disarmed. */
 static int
 xs_rd_fault(void)
 {
-	return xtc_atomic_load_i32(&g_rd_failat, xtc_mo_relaxed) > 0 &&
-	    xtc_atomic_fetch_sub_i32(&g_rd_failat, 1, xtc_mo_relaxed) == 1;
+	if (xtc_atomic_load_i32(&g_rd_failat, xtc_mo_relaxed) <= 0 ||
+	    xtc_atomic_fetch_sub_i32(&g_rd_failat, 1, xtc_mo_relaxed) != 1)
+		return 0;
+	(void)xtc_atomic_fetch_add_i32(&g_rd_faults, 1, xtc_mo_relaxed);
+	return 1;
 }
 
 /* Should this UNIQUE probe fail (xstore_uniq_fail_inject)? */
