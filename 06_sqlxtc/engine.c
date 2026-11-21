@@ -2168,6 +2168,21 @@ sx_finalize(sx_stmt *st)
 	free(st);
 }
 
+#ifdef SQLXTC_HAVE_LIME
+/* Free the bytes a TEXT or BLOB bind holds in slot idx (1-based), so a
+ * rebind of the slot, of any type, does not leak them.  A compiled plan
+ * copies bind bytes into its own arena, so nothing still points here. */
+static void
+bind_slot_release(sx_stmt *st, int idx)
+{
+	vx_cell_t *c = &st->binds[idx - 1];
+
+	if ((c->type == VX_TEXT || c->type == VX_BLOB) && c->bytes != NULL)
+		free((void *)c->bytes);
+	c->bytes = NULL;
+}
+#endif
+
 int
 sx_bind_count(sx_stmt *st)
 {
@@ -2182,6 +2197,7 @@ sx_bind_int64(sx_stmt *st, int idx, int64_t v)
 #ifdef SQLXTC_HAVE_LIME
 	if (st->native) {
 		if (idx < 1 || idx > 32) return SX_ERROR;
+		bind_slot_release(st, idx);
 		st->binds[idx-1].type = VX_INT; st->binds[idx-1].i = v;
 		if (idx > st->nbind) st->nbind = idx;
 		return SX_OK;
@@ -2195,6 +2211,7 @@ sx_bind_double(sx_stmt *st, int idx, double v)
 #ifdef SQLXTC_HAVE_LIME
 	if (st->native) {
 		if (idx < 1 || idx > 32) return SX_ERROR;
+		bind_slot_release(st, idx);
 		st->binds[idx-1].type = VX_REAL; st->binds[idx-1].r = v;
 		if (idx > st->nbind) st->nbind = idx;
 		return SX_OK;
@@ -2212,10 +2229,11 @@ sx_bind_text(sx_stmt *st, int idx, const char *s, int n)
 		if (n < 0) n = s ? (int)strlen(s) : 0;
 		p = (uint8_t *)malloc((size_t)n + 1);
 		if (p == NULL) return SX_NOMEM;
+		bind_slot_release(st, idx);
 		if (n && s) memcpy(p, s, (size_t)n);
 		p[n] = '\0';
-		/* The bind buffer is owned by the cell and freed on finalize/
-		 * reset/clear (see bind cleanup). */
+		/* The cell owns the buffer until a rebind, sx_clear_bindings()
+		 * or sx_finalize(). */
 		st->binds[idx-1].type = VX_TEXT; st->binds[idx-1].bytes = p;
 		st->binds[idx-1].nbytes = (uint32_t)n;
 		if (idx > st->nbind) st->nbind = idx;
@@ -2234,6 +2252,7 @@ sx_bind_blob(sx_stmt *st, int idx, const void *p, int n)
 		if (n < 0) n = 0;
 		b = (uint8_t *)malloc((size_t)n + 1);
 		if (b == NULL) return SX_NOMEM;
+		bind_slot_release(st, idx);
 		if (n && p) memcpy(b, p, (size_t)n);
 		b[n] = '\0';
 		st->binds[idx-1].type = VX_BLOB; st->binds[idx-1].bytes = b;
@@ -2250,6 +2269,7 @@ sx_bind_null(sx_stmt *st, int idx)
 #ifdef SQLXTC_HAVE_LIME
 	if (st->native) {
 		if (idx < 1 || idx > 32) return SX_ERROR;
+		bind_slot_release(st, idx);
 		st->binds[idx-1].type = VX_NULL; st->binds[idx-1].nbytes = 0;
 		if (idx > st->nbind) st->nbind = idx;
 		return SX_OK;
