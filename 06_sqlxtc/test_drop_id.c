@@ -123,6 +123,7 @@ drop_case(int mode)
 	CK(sx_open(":memory:", &h) == SX_OK);
 	CK(sx_exec(h, "CREATE TABLE a(k INTEGER PRIMARY KEY, v TEXT)", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE TABLE b(k INTEGER PRIMARY KEY, v TEXT)", NULL) == SX_OK);
+	CK(sx_exec(h, "INSERT INTO a VALUES(1, 'live-a-row')", NULL) == SX_OK);
 	CK(sx_exec(h, "INSERT INTO b VALUES(1, 'old-b-row')", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE INDEX a_v ON a(v)", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE INDEX b_v ON b(v)", NULL) == SX_OK);
@@ -147,13 +148,15 @@ drop_case(int mode)
 	CK(inew > ix);
 	CK(one(h, "SELECT count(*) FROM d") == 0);
 	CK(one(h, "SELECT count(*) FROM b") == -2);
+	CK(one(h, "SELECT count(*) FROM a") == 1);
 	sx_close(h);
 	/* Space: once the store has closed cleanly, the dropped table's
 	 * rows are gone with its catalog row (GC), and so are they from the
-	 * log the close compacted. */
+	 * log the close compacted.  The live table keeps its row. */
 	CK(sx_storage_close() == SX_OK);
 	CK(sx_storage_open(path, 256) == SX_OK);
 	CK(xstore_max_rowid(sx_storage_bt(), tb) == 0);
+	CK(xstore_max_rowid(sx_storage_bt(), ta) == 1);
 	CK(sx_storage_close() == SX_OK);
 	unlink_store(path);
 }
