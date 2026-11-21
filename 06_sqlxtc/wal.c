@@ -1915,6 +1915,36 @@ wal_roll_if(wal_t *w, uint64_t need, int force)
 	return rc;
 }
 
+/* Write a big record's frame (header, body, trailer) at log position
+ * start, straight to the file: 1 if every byte was written.  The caller
+ * holds the direct flag and the leadership (wal_append_direct). */
+static int
+wal_write_big(wal_t *w, uint64_t start, uint64_t lsn, const void *record,
+    uint32_t len)
+{
+	uint8_t hdr[WAL_REC_HDR], trl[WAL_REC_CRC];
+	uint64_t crc;
+	uint32_t done, k;
+	int ok;
+
+	memcpy(hdr, &lsn, 8);
+	memcpy(hdr + 8, &len, 4);
+	crc = wal_rec_crc(lsn, len, record);
+	memcpy(trl, &crc, WAL_REC_CRC);
+	if (w->dio)
+		return wal_write_big_dio(w, start, hdr, record, len, trl);
+	ok = xtc_aio_pwrite(w->fd, hdr, WAL_REC_HDR, wal_foff(w, start)) ==
+	    (int)WAL_REC_HDR;
+	/* The body in pieces of at most 16 MiB per aio. */
+	for (done = 0; ok && done < len; done += k) {
+		k = len - done < (1u << 24) ? len - done : (1u << 24);
+		ok = xtc_aio_pwrite(w->fd, (const uint8_t *)record + done, k,
+		    wal_foff(w, start + WAL_REC_HDR + done)) == (int)k;
+	}
+	return ok && xtc_aio_pwrite(w->fd, trl, WAL_REC_CRC,
+	    wal_foff(w, start + WAL_REC_HDR + len)) == (int)WAL_REC_CRC;
+}
+
 /*
  * A record bigger than a quarter of the log buffer (a bulk transaction)
  * is written straight to the file, as JE writes an oversized entry and
@@ -1931,11 +1961,9 @@ static uint64_t
 wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
     uint64_t *wa, int *rc)
 {
-	uint64_t need = (uint64_t)WAL_REC_HDR + len + WAL_REC_CRC, start, lsn, crc;
+	uint64_t need = (uint64_t)WAL_REC_HDR + len + WAL_REC_CRC, start, lsn;
 	uint64_t target;
-	uint8_t hdr[WAL_REC_HDR], trl[WAL_REC_CRC];
 	struct wal_slot *s;
-	uint32_t done;
 	int ok;
 
 	for (;;) {                       /* one direct writer at a time */
@@ -1985,24 +2013,7 @@ wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
 	xtc_atomic_store_u64(&w->off, w->res_pos, xtc_mo_relaxed);
 	wal_unlock(&w->res_mu);
 
-	memcpy(hdr, &lsn, 8);
-	memcpy(hdr + 8, &len, 4);
-	crc = wal_rec_crc(lsn, len, record);
-	memcpy(trl, &crc, WAL_REC_CRC);
-	if (w->dio) {
-		ok = wal_write_big_dio(w, start, hdr, record, len, trl);
-	} else {
-		ok = xtc_aio_pwrite(w->fd, hdr, WAL_REC_HDR,
-		    wal_foff(w, start)) == (int)WAL_REC_HDR;
-		for (done = 0; ok && done < len; ) {
-			uint32_t k = len - done < (1u << 24) ? len - done : (1u << 24);
-			ok = xtc_aio_pwrite(w->fd, (const uint8_t *)record + done, k,
-			    wal_foff(w, start + WAL_REC_HDR + done)) == (int)k;
-			done += k;
-		}
-		ok = ok && xtc_aio_pwrite(w->fd, trl, WAL_REC_CRC,
-		    wal_foff(w, start + WAL_REC_HDR + len)) == (int)WAL_REC_CRC;
-	}
+	ok = wal_write_big(w, start, lsn, record, len);
 	if (start + need > w->pre_end)   /* the record grew the file */
 		w->pre_end = w->dio ? (start + need + WAL_BLK - 1) &
 		    ~(uint64_t)(WAL_BLK - 1) : start + need;
