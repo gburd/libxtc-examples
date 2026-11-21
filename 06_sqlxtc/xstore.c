@@ -8720,6 +8720,19 @@ xs_iscan_point(xstore_iscan_t *s)
 	return got;
 }
 
+/* DST pessimal point at the hand-off from the equality probe's batch to
+ * the cursor walk: under the simulator with buggify on, stall the scan
+ * 1 ms (virtual) on a seeded coin, so writes to the group (entries in
+ * and out of it, splits and merges of its leaves) land between the batch
+ * and the cursor's open.  A single relaxed load in production. */
+static void
+xs_iscan_yield(void)
+{
+	if (XTC_SIM_BUGGIFY("xstore.iscan.handoff") &&
+	    xtc_sim_buggify_fault(500) && !xtc_pid_is_none(xtc_self()))
+		(void)xtc_proc_sleep(1000LL * 1000);
+}
+
 /*
  * The forward cursor walk: open the scan's cursor (at the equality
  * probe's last key, or at the range's start) or resume it, and copy up
@@ -8739,6 +8752,7 @@ xs_iscan_fwd(xstore_iscan_t *s)
 	if (s->cur == NULL && s->poslen > 0) {
 		/* After the equality probe's batch: its last key, if still
 		 * there, is the cursor's first and is skipped. */
+		xs_iscan_yield();
 		rc = bt_cursor_open(s->bt, s->pos, (uint16_t)s->poslen, &s->cur);
 	} else if (s->cur == NULL) {
 		const uint8_t *st = s->has_lo ? s->lo : s->pfx;
