@@ -111,8 +111,8 @@ int run_writer_open(bm_t *bm, uint32_t page_size, const char *path,
 int run_writer_add(run_writer_t *w, const run_row_t *row);
 
 /*
- * Write the footer and the header, fsync the file, close it and free
- * the writer.  *meta gets the manifest line (slot 0).  A run of zero
+ * Write the footer and the header, fsync the file and its directory,
+ * close it and free the writer.  *meta gets the manifest line (slot 0).  A run of zero
  * rows is XTC_E_INVAL (the caller installs nothing).  On any error the
  * file is removed and the writer freed.
  */

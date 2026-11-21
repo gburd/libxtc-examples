@@ -157,3 +157,4 @@ test_run
 test_keydir
 test_manifest
 test_onloop_io
+test_durable_order

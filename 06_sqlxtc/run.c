@@ -140,8 +140,28 @@ struct run_fs_job {
 	const char *path;
 	uint32_t    flags;
 	int         fd;
-	int         op;              /* 0 open, 1 unlink, 2 close */
+	int         op;              /* 0 open, 1 unlink, 2 close, 3 sync dir */
 };
+
+/* fsync the directory holding `path`, so a file created in it keeps its
+ * name across a crash. */
+static int
+run_sync_dir(const char *path)
+{
+	char d[1100];
+	const char *s = strrchr(path, '/');
+	int fd, rc;
+
+	if (s == NULL)
+		snprintf(d, sizeof d, ".");
+	else
+		snprintf(d, sizeof d, "%.*s", (int)(s - path), path);
+	if ((rc = xtc_fs_open(d, XTC_FS_READ, &fd)) != XTC_OK)
+		return rc;
+	rc = xtc_fs_fsync(fd);
+	(void)xtc_fs_close(fd);
+	return rc;
+}
 
 static int
 run_fs_do(void *arg)
@@ -152,6 +172,8 @@ run_fs_do(void *arg)
 		return xtc_fs_open(j->path, j->flags, &j->fd);
 	if (j->op == 1)
 		return xtc_fs_unlink(j->path);
+	if (j->op == 3)
+		return run_sync_dir(j->path);
 	return xtc_fs_close(j->fd);
 }
 
@@ -563,6 +585,10 @@ run_writer_finish(run_writer_t *w, run_meta_t *meta)
 		rc = XTC_E_IO;
 		goto fail;
 	}
+	/* The file's name too: a manifest that names the run must never
+	 * outlive it in a crash. */
+	if ((rc = run_fs(3, w->path, 0, NULL)) != XTC_OK)
+		goto fail;
 	memset(meta, 0, sizeof *meta);
 	meta->runid = w->runid;
 	meta->level = w->level;
