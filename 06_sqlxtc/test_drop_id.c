@@ -21,8 +21,9 @@
  *	must still get a fresh id; and a tombstone written without the
  *	high-water row (a DROP by an older release), which neither a crash
  *	rebuild nor GC may forget; and a scan of a transaction that began
- *	before the DROP, which GC must leave whole.  The first three also check that the
- *	dropped table's rows are gone once the store has closed cleanly.
+ *	before the DROP, which GC must leave whole.  The first three also
+ *	check that the dropped table's rows are gone once the store has
+ *	closed cleanly.
  *	Off a loop.
  */
 
@@ -203,10 +204,12 @@ orphan_case(void)
 /*
  * A DROP made by a release without the high-water row: a catalog
  * tombstone the mark does not cover, here written directly.  The store
- * then goes through a crash rebuild (the log dump) and a clean close
- * (GC).  Neither may drop the tombstone or the rows (the mark would not
- * record the id), so the next CREATE takes a fresh id; once a later DROP
- * raises the mark past it, the rows go.
+ * then goes through a clean close (GC, which runs because the tombstones
+ * were logged), a crash rebuild (the log dump) and another clean close.
+ * Table a keeps a row, so the store holds index entries.  None of them
+ * may drop the tombstone or the rows (the mark would not record the
+ * id), so the next CREATE takes a fresh id; once a later DROP raises the
+ * mark past it, the rows go.
  */
 static void
 unmarked_case(void)
@@ -223,6 +226,7 @@ unmarked_case(void)
 	CK(sx_open(":memory:", &h) == SX_OK);
 	CK(sx_exec(h, "CREATE TABLE a(k INTEGER PRIMARY KEY, v TEXT)", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE TABLE b(k INTEGER PRIMARY KEY, v TEXT)", NULL) == SX_OK);
+	CK(sx_exec(h, "INSERT INTO a VALUES(1, 'live-a-row')", NULL) == SX_OK);
 	CK(sx_exec(h, "INSERT INTO b VALUES(1, 'old-b-row')", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE INDEX a_v ON a(v)", NULL) == SX_OK);
 	CK(sx_exec(h, "CREATE INDEX a_k ON a(k)", NULL) == SX_OK);
@@ -231,6 +235,7 @@ unmarked_case(void)
 	CK(xstore_delete_rec(sx_storage_bt(), 0, (int64_t)tb) == 0);
 	CK(xstore_delete_rec(sx_storage_bt(), IDXCAT, (int64_t)ix) == 0);
 	sx_close(h);
+	reopen(path, REOPEN_CLEAN);
 	reopen(path, REOPEN_CRASH_DUMP);
 	reopen(path, REOPEN_CLEAN);
 	CK(sx_open(":memory:", &h) == SX_OK);
