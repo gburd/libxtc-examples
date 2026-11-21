@@ -2062,38 +2062,77 @@ bm_destroy(bm_t *bm)
 
 static int drop_resident(bm_t *bm, bm_pid_t pid);
 
+/* An attached file's open or close, run off the loop (xtc_blocking_run;
+ * inline off a loop) so a fiber parks instead of blocking its thread. */
+struct bm_xf_job {
+	const char *path;           /* open: the file; NULL: close fd */
+	int         fd;
+};
+
+static int
+bm_xf_io(void *arg)
+{
+	struct bm_xf_job *j = arg;
+
+	if (j->path == NULL)
+		return close(j->fd);
+	j->fd = open(j->path, O_RDONLY);
+	return j->fd < 0 ? -1 : 0;
+}
+
+static int
+bm_xf_run(struct bm_xf_job *j)
+{
+	int rc, res = -1;
+
+	while ((rc = xtc_blocking_run(bm_xf_io, j, &res)) == XTC_E_AGAIN)
+		xtc_yield();
+	return rc == XTC_OK ? res : -1;
+}
+
 int
 bm_file_attach(bm_t *bm, uint16_t file, const char *path)
 {
+	struct bm_xf_job j;
 	int32_t *x;
-	int fd, rc = XTC_OK;
+	int rc = XTC_OK;
 
 	if (bm == NULL || file == 0 || path == NULL)
 		return XTC_E_INVAL;
+	j.path = path;
+	j.fd = -1;
+	if (bm_xf_run(&j) != 0)
+		return XTC_E_INVAL;          /* does not open */
 	(void)pthread_mutex_lock(&bm->xf_mu);
 	x = bm->xfd;
 	if (x == NULL) {
 		/* One slot per possible file number: 256 KiB, once. */
 		if ((x = xtc_calloc(0x10000u, sizeof *x)) == NULL) {
 			(void)pthread_mutex_unlock(&bm->xf_mu);
+			j.path = NULL;
+			(void)bm_xf_run(&j);
 			return XTC_E_NOMEM;
 		}
 		xtc_atomic_store_ptr(&bm->xfd, x, xtc_mo_release);
 	}
 	if (xtc_atomic_load_i32(&x[file], xtc_mo_relaxed) != 0) {
 		rc = XTC_E_INVAL;            /* already attached */
-	} else if ((fd = open(path, O_RDONLY)) < 0) {
-		rc = XTC_E_INVAL;
 	} else {
-		xtc_atomic_store_i32(&x[file], fd + 1, xtc_mo_release);
+		xtc_atomic_store_i32(&x[file], j.fd + 1, xtc_mo_release);
+		j.fd = -1;
 	}
 	(void)pthread_mutex_unlock(&bm->xf_mu);
+	if (j.fd >= 0) {
+		j.path = NULL;
+		(void)bm_xf_run(&j);
+	}
 	return rc;
 }
 
 int
 bm_file_detach(bm_t *bm, uint16_t file)
 {
+	struct bm_xf_job j;
 	uint32_t i;
 	int32_t v;
 
@@ -2117,7 +2156,9 @@ bm_file_detach(bm_t *bm, uint16_t file)
 		if (pid != BM_PID_NONE && BM_PID_FILE(pid) == file)
 			(void)drop_resident(bm, pid);
 	}
-	close(v - 1);
+	j.path = NULL;
+	j.fd = v - 1;
+	(void)bm_xf_run(&j);
 	return XTC_OK;
 }
 

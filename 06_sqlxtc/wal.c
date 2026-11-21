@@ -914,9 +914,16 @@ wal_roll_io(void *arg)
 	h.seg = j->seg;
 	h.first_lsn = j->first_lsn;
 	h.base = j->base;
-	if (wal_seg_hdr_write(j->fd, &h) != 0)
+	if (wal_seg_hdr_write(j->fd, &h) != 0) {
+		(void)close(j->fd);
+		j->fd = -1;
 		return -1;
+	}
 	wal_sync_dir(p);
+	/* The old segment is durable and nobody writes it (the roll holds
+	 * the leadership and the direct flag): close it here, off the loop;
+	 * wal_roll_swap installs the new fd. */
+	(void)close(j->w->fd);
 	/* Oldest first, so what is left is always one contiguous range. */
 	for (k = j->w->seg_lo; k < j->del_upto; k++) {
 		wal_seg_path(j->w->dir, k, p, sizeof p);
@@ -1160,6 +1167,47 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 	return XTC_OK;
 }
 
+/* wal_open_segs as one blocking job: its directory walk, opens,
+ * unlinks and chain read run off the loop (xtc_blocking_run; inline
+ * off a loop). */
+static void wal_nap(void);
+
+struct wal_open_job {
+	wal_t            *w;
+	const wal_opts_t *opts;
+	off_t             o;
+	uint64_t          maxlsn;
+};
+
+static int
+wal_open_segs_job(void *arg)
+{
+	struct wal_open_job *j = arg;
+
+	return wal_open_segs(j->w, j->opts, &j->o, &j->maxlsn);
+}
+
+static int
+wal_open_segs_off(wal_t *w, const wal_opts_t *opts, off_t *o,
+    uint64_t *maxlsn)
+{
+	struct wal_open_job j;
+	int rc, res = XTC_E_INTERNAL;
+
+	j.w = w;
+	j.opts = opts;
+	j.o = 0;
+	j.maxlsn = 0;
+	while ((rc = xtc_blocking_run(wal_open_segs_job, &j, &res)) ==
+	    XTC_E_AGAIN)
+		wal_nap();
+	if (rc != XTC_OK)
+		return rc;
+	*o = j.o;
+	*maxlsn = j.maxlsn;
+	return res;
+}
+
 int
 wal_open(const wal_opts_t *opts, wal_t **out)
 {
@@ -1174,7 +1222,7 @@ wal_open(const wal_opts_t *opts, wal_t **out)
 		return XTC_E_NOMEM;
 	w->fd = -1;
 	if (opts->segment_bytes != 0) {
-		int rc = wal_open_segs(w, opts, &o, &maxlsn);
+		int rc = wal_open_segs_off(w, opts, &o, &maxlsn);
 		if (rc != XTC_OK) {
 			if (w->fd >= 0)
 				close(w->fd);
@@ -1732,7 +1780,6 @@ wal_roll_swap(wal_t *w, const struct wal_roll_job *j)
 {
 	wal_lock(&w->res_mu);
 	wal_lock(&w->fl_mu);
-	close(w->fd);
 	w->fd = j->fd;
 	w->dsync = j->dsync;
 	w->seg = j->seg;
@@ -1819,8 +1866,8 @@ wal_roll_if(wal_t *w, uint64_t need, int force)
 		    xtc_blocking_run(wal_roll_io, &j, &res)) == XTC_E_AGAIN)
 			wal_nap();
 		if (rc != XTC_OK || res != 0) {
-			if (j.fd >= 0)
-				close(j.fd);
+			/* The job closed what it opened; the old segment
+			 * stays open and full. */
 			xtc_atomic_store_i32(&w->failed, 1, xtc_mo_release);
 			rc = XTC_E_IO;
 		} else {
