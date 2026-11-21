@@ -7,9 +7,9 @@
  * examples/06_sqlxtc/test_manifest.c
  *	The MANIFEST (STORAGE_DESIGN 7.2) and the nursery flush (9.2):
  *	  flush      commits into the delta, a flush: a run at level n0 is
- *	             named by a durable manifest with the boundary the
- *	             freeze read, and the keydir finds every flushed row in
- *	             it once its frame is gone;
+ *	             named by a durable manifest with the boundary read
+ *	             before the freeze, and the keydir finds every flushed
+ *	             row in it once its frame is gone;
  *	  reopen     the manifest restores the runs, the boundary and the
  *	             next run id; every row is found; a run file the
  *	             manifest does not name (a flush that died before its
@@ -96,6 +96,17 @@ boundary(void *ctx)
 {
 	(void)ctx;
 	return ++g_bnd * 1000u;
+}
+
+/* A boundary source that checks it runs before the switch (SF3): the
+ * rows are still in the active delta and nothing is frozen. */
+static uint64_t
+pre_boundary(void *ctx)
+{
+	keydir_t *kd = ctx;
+
+	CK(!kd_has_frozen(kd) && kd_delta_rows(kd) > 0);
+	return boundary(NULL);
 }
 
 /* A broken boundary source: below every installed boundary. */
@@ -186,7 +197,7 @@ t_flush_reopen(void)
 	for (i = 0; i < 1000; i++)
 		CK(kd_delta_put(kd, 1 + i % 3, (int64_t)i, 10000 + i) ==
 		    XTC_OK);
-	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_OK);
+	CK(mf_flush(m, row_of, NULL, pre_boundary, kd) == XTC_OK);
 	CK(mf_nruns(m) == 1 && mf_boundary(m) == g_bnd * 1000u);
 	for (i = 0; i < 1000; i += 2)
 		CK(kd_delta_put(kd, 1 + i % 3, (int64_t)i, 20000 + i) ==

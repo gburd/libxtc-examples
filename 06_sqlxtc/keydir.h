@@ -96,15 +96,9 @@ uint64_t kd_delta_rows(keydir_t *kd);
  * Freeze the active delta for a flush and start an empty one.
  * XTC_E_AGAIN while a frozen delta exists (back-pressure, 9.2).  If
  * at_freeze is not NULL it runs at the switch, while no commit is
- * between the start and the end of a kd_delta_put: the flush boundary
- * (9.2 step 2) is computed there, with kd_flush_boundary.  NB: that is
- * only sound if a commit enters the caller's in-flight registry, and
- * records wal_end_wa() in its entry, before its wal_commit_wa (the two
- * atomic with respect to the boundary computation: the registry's
- * lock), and leaves the registry only after its kd_delta_put.  A commit
- * inside wal_commit_wa has a frame the registry cannot see yet; its
- * entry's recorded address is below that frame, so the boundary is too.
- * at_freeze must not park or call into the keydir.
+ * between the start and the end of a kd_delta_put; it must not park or
+ * call into the keydir.  The flush boundary is not computed there: see
+ * kd_flush_boundary.
  */
 int  kd_freeze(keydir_t *kd, void (*at_freeze)(void *ctx), void *ctx);
 
@@ -115,6 +109,20 @@ int  kd_freeze(keydir_t *kd, void (*at_freeze)(void *ctx), void *ctx);
  * in flight.  Every commit whose frame is below B finished its
  * kd_delta_put before the freeze.  Phase (b) callers then take the
  * minimum with the steal low-water mark before wal_set_release.
+ * NB: B is computed BEFORE kd_freeze, in one step under the in-flight
+ * registry's lock: the entries and wal_end_wa() are both read while
+ * that lock is held (the lock may park; this runs on the flusher, not
+ * in at_freeze).  A commit links its entry, with wal_end_wa() recorded,
+ * under that same lock before its wal_commit_wa, and leaves only after
+ * its kd_delta_put.  Then a commit with a frame below B was not in the
+ * registry at the read (B would be at or below its entry, which is at
+ * or below its frame) and did not enter after it (its frame would be
+ * at or past that WAL end): it had left, so its put came before the
+ * switch and is in the frozen delta.  Reading the two at different
+ * times is unsound: a commit that enters and writes in between is in
+ * neither the copy nor past the earlier end.  So is reading after the
+ * switch: a commit that put into the new delta and left meanwhile is
+ * below the later end.
  */
 uint64_t kd_flush_boundary(const uint64_t *entry_wa, uint32_t n,
              uint64_t wal_end);

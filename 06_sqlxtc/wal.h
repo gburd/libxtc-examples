@@ -303,7 +303,8 @@ int  wal_commit_wa(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
  * reserved later has a body address above it, wherever it lands (a
  * roll only moves it up).  A commit reads it when it enters the
  * caller's in-flight registry, before its wal_commit_wa, and the flush
- * boundary is the minimum of those values (mf_flush_boundary).
+ * boundary is the minimum of those values and this one, read under the
+ * registry's lock (kd_flush_boundary).
  */
 uint64_t wal_end_wa(wal_t *w);
 

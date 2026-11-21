@@ -76,20 +76,21 @@ uint32_t mf_nruns(const manifest_t *m);
 typedef int (*mf_row_fn)(void *ctx, uint32_t frame, run_row_t *row);
 
 /*
- * Flush the nursery: freeze kd's active delta, setting the flush
- * boundary at the switch (*boundary_fn(ctx) is called from kd_freeze's
- * at-freeze hook and returns kd_flush_boundary over the addresses the
- * commits in flight recorded on entry, or wal_end_wa(); see kd_freeze's
- * NB), write the frozen rows into a new
- * run at level MF_LEVEL_N0, fsync it, install a manifest that adds the
- * run and sets the boundary, publish the new run set in kd, and drop
- * the frozen delta.  XTC_E_AGAIN if a frozen delta exists already;
- * XTC_E_NOTFOUND (nothing installed) when the delta was empty.  On a
- * failed write or a failed install before the manifest's rename, the
- * run file is removed, the manifest and the run set are untouched and
- * the delta stays frozen: a later flush retries it (mf_flush_frozen).
- * XTC_E_INVAL, writing nothing, if the boundary the freeze read is
- * below the installed one (it only rises).
+ * Flush the nursery: compute the flush boundary, *boundary_fn(ctx), and
+ * then freeze kd's active delta.  boundary_fn runs on the caller before
+ * the switch and may park; it returns kd_flush_boundary over the
+ * addresses the commits in flight recorded on entry and wal_end_wa(),
+ * all read under the registry's lock (see kd_flush_boundary's NB).
+ * Then write the frozen rows into a new run at level MF_LEVEL_N0, fsync
+ * it, install a manifest that adds the run and sets the boundary,
+ * publish the new run set in kd, and drop the frozen delta.
+ * XTC_E_AGAIN, before boundary_fn is called, if a frozen delta exists
+ * already; XTC_E_NOTFOUND (nothing installed) when the delta was empty.
+ * On a failed write or a failed install before the manifest's rename,
+ * the run file is removed, the manifest and the run set are untouched
+ * and the delta stays frozen: a later flush retries it
+ * (mf_flush_frozen).  XTC_E_INVAL, writing nothing, if the freeze's
+ * boundary is below the installed one (it only rises).
  * NB: a failure after the rename (the directory fsync) returns
  * XTC_E_IO with the run installed in memory and kept on disk, and
  * fail-stops the manifest: every later flush returns XTC_E_IO, and the

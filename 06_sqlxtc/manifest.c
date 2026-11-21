@@ -43,9 +43,7 @@ struct manifest {
 	keydir_t      *kd;
 	uint64_t       next;          /* next run id */
 	uint64_t       boundary;      /* of the durable manifest */
-	uint64_t       frz_boundary;  /* set at the last freeze */
-	uint64_t     (*bfn)(void *);  /* the freeze's boundary source */
-	void          *bctx;
+	uint64_t       frz_boundary;  /* of the frozen delta */
 	struct mf_run *runs;          /* oldest first */
 	uint32_t       n, cap;
 	int            failed;        /* fail-stopped: see mf_flush */
@@ -570,15 +568,6 @@ mf_nruns(const manifest_t *m)
 
 /* ---- flush ---- */
 
-/* kd_freeze's at-freeze hook: the boundary, read at the switch. */
-static void
-mf_at_freeze(void *arg)
-{
-	manifest_t *m = arg;
-
-	m->frz_boundary = m->bfn(m->bctx);
-}
-
 /* Write the frozen delta into run `id`: XTC_OK with the run's meta. */
 static int
 mf_write_run(manifest_t *m, uint64_t id, mf_row_fn rowfn, void *ctx,
@@ -725,13 +714,20 @@ int
 mf_flush(manifest_t *m, mf_row_fn rowfn, void *ctx,
     uint64_t (*boundary_fn)(void *ctx), void *bctx)
 {
+	uint64_t b;
 	int rc;
 
 	if (m == NULL || rowfn == NULL || boundary_fn == NULL)
 		return XTC_E_INVAL;
-	m->bfn = boundary_fn;
-	m->bctx = bctx;
-	if ((rc = kd_freeze(m->kd, mf_at_freeze, m)) != XTC_OK)
+	/* Back-pressure first: the flusher is the only freezer, so a frozen
+	 * delta seen here is still there at the freeze, and its boundary
+	 * must stay.  Then the boundary, then the switch: any time before
+	 * the switch is sound (kd_flush_boundary's NB), after it is not. */
+	if (kd_has_frozen(m->kd))
+		return XTC_E_AGAIN;
+	b = boundary_fn(bctx);
+	if ((rc = kd_freeze(m->kd, NULL, NULL)) != XTC_OK)
 		return rc;
+	m->frz_boundary = b;
 	return mf_flush_frozen(m, rowfn, ctx);
 }

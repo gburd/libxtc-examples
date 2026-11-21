@@ -30,9 +30,17 @@
  *	             (wal_commit_wa) and put while a flusher freezes over and
  *	             over; every commit whose frame is below a freeze's
  *	             boundary is in that freeze.  The old rule ("a commit not
- *	             yet written counts as the WAL end") must break this, the
- *	             recorded-on-entry rule (wal_end_wa, kd_flush_boundary)
- *	             never.
+ *	             yet written counts as the WAL end") must break this; the
+ *	             recorded-on-entry rule (wal_end_wa, kd_flush_boundary),
+ *	             read under the registry's lock before the switch (and,
+ *	             equally sound, at it), never;
+ *	  shapes     every interleaving of one commit's steps with a
+ *	             flusher's, run on the real WAL and keydir: the boundary
+ *	             read in one step under the registry's lock, before or at
+ *	             the switch, never loses the commit; the registry and the
+ *	             WAL end read at different times (REREVIEW N10), a read
+ *	             after the switch, and the old rule each do, in a named
+ *	             interleaving.
  *	Prints the resident-map hit cost and the miss cost over N runs
  *	(5.5), and the static stage's bytes per row (5.3).
  */
@@ -578,36 +586,50 @@ static uint64_t        g_bwa[BC_ROWS];     /* each commit's frame */
 static uint32_t        g_bfz[BC_ROWS];     /* the freeze that took it */
 static uint64_t        g_bb[BC_FREEZE];    /* each freeze's boundary */
 static uint32_t        g_nfz;
-static int             g_bleft, g_old_rule;
+static int             g_bleft, g_old_rule, g_before;
 
-/* The boundary, read at the switch.  The old rule skips a commit that
- * has not learned its address yet (it "counts as the WAL end"). */
+/* The boundary over the registry and the WAL end; g_reg_mu held.  The
+ * old rule skips a commit that has not learned its address yet (it
+ * "counts as the WAL end"). */
+static uint64_t
+bc_bound_locked(void)
+{
+	uint64_t b;
+	uint32_t i;
+
+	if (!g_old_rule)
+		return kd_flush_boundary(g_reg, BC_FIBERS, wal_end_wa(g_bwal));
+	b = wal_end_wa(g_bwal);
+	for (i = 0; i < BC_FIBERS; i++)
+		if (g_reg[i] != 0 && g_reg[i] != BC_NONE && g_reg[i] < b)
+			b = g_reg[i];
+	return b;
+}
+
+/* The boundary in one step: both reads under the registry's lock. */
+static uint64_t
+bc_bound(void)
+{
+	uint64_t b;
+
+	(void)pthread_mutex_lock(&g_reg_mu);
+	b = bc_bound_locked();
+	(void)pthread_mutex_unlock(&g_reg_mu);
+	return b;
+}
+
+/* The boundary, read at the switch.  Now and then it waits first (the
+ * flusher's loop thread sleeps; commits on the other loop run on).
+ * Under the freeze's exclusive lock they cannot finish a put meanwhile;
+ * a boundary read after that lock is dropped would miss the commits
+ * that landed in the new delta and left the registry in the gap. */
 static void
 bc_at_freeze(void *ctx)
 {
-	uint64_t b = BC_NONE;
-	uint32_t i;
-
 	(void)ctx;
-	/* Now and then, wait before reading (the flusher's loop thread
-	 * sleeps; commits on the other loop run on).  Under the freeze's
-	 * exclusive lock they cannot finish a put meanwhile; a boundary
-	 * read after that lock is dropped would miss the commits that
-	 * landed in the new delta and left the registry in the gap. */
 	if (g_nfz % 8u == 0)
 		(void)xtc_thrd_sleep_ns(300000);
-	(void)pthread_mutex_lock(&g_reg_mu);
-	if (g_old_rule) {
-		b = wal_end_wa(g_bwal);
-		for (i = 0; i < BC_FIBERS; i++)
-			if (g_reg[i] != 0 && g_reg[i] != BC_NONE &&
-			    g_reg[i] < b)
-				b = g_reg[i];
-	} else {
-		b = kd_flush_boundary(g_reg, BC_FIBERS, wal_end_wa(g_bwal));
-	}
-	(void)pthread_mutex_unlock(&g_reg_mu);
-	g_bb[g_nfz] = b;
+	g_bb[g_nfz] = bc_bound();
 }
 
 static void
@@ -644,11 +666,26 @@ bc_flusher(void *arg)
 {
 	uint32_t tid, frame;
 	int64_t rid;
+	uint64_t b = 0;
+	int rc;
 
 	(void)arg;
 	while (xtc_atomic_load_i32(&g_bleft, xtc_mo_seq_cst) > 0 &&
 	    g_nfz < BC_FREEZE) {
-		if (kd_freeze(g_bkd, bc_at_freeze, NULL) == XTC_OK) {
+		/* The mf_flush shape (SF3): the boundary before the switch,
+		 * with a wait now and then between the two, during which
+		 * commits finish into the delta about to be frozen. */
+		if (g_before) {
+			b = bc_bound();
+			if (g_nfz % 8u == 0)
+				(void)xtc_thrd_sleep_ns(300000);
+			rc = kd_freeze(g_bkd, NULL, NULL);
+			if (rc == XTC_OK)
+				g_bb[g_nfz] = b;
+		} else {
+			rc = kd_freeze(g_bkd, bc_at_freeze, NULL);
+		}
+		if (rc == XTC_OK) {
 			/* Number the frozen rows by this freeze. */
 			tid = 0;
 			rid = INT64_MIN;
@@ -721,21 +758,209 @@ bc_run(void)
 static void
 t_boundary(void)
 {
-	uint32_t old_bad = 0, bad = 0, n;
+	uint32_t old_bad = 0, at = 0, before = 0, n;
 
 	/* The old rule must lose a commit (a few rounds, as the window is a
-	 * real fsync); the new one never does. */
+	 * real fsync); the new one never does, read at the switch or before
+	 * it. */
 	g_old_rule = 1;
 	for (n = 0; n < 8 && old_bad == 0; n++)
 		old_bad = bc_run();
 	CK(old_bad > 0);
 	g_old_rule = 0;
 	for (n = 0; n < 3; n++)
-		bad += bc_run();
-	CK(bad == 0);
+		at += bc_run();
+	CK(at == 0);
+	g_before = 1;
+	for (n = 0; n < 3; n++)
+		before += bc_run();
+	CK(before == 0);
+	g_before = 0;
 	printf("  boundary: old rule lost %u commits behind a freeze; "
-	    "recorded-on-entry rule lost %u (over 3 runs, %u freezes last)\n",
-	    old_bad, bad, g_nfz);
+	    "recorded-on-entry rule lost %u at the switch, %u before it "
+	    "(3 runs each, %u freezes last)\n", old_bad, at, before, g_nfz);
+}
+
+/* ---- the boundary's shapes, every interleaving (N10) ---- */
+
+/* One commit's steps and the flusher's, as ops.  A flusher reads the
+ * registry (SH_REG), the WAL end (SH_END), or both under the lock in one
+ * step (SH_BOTH); freezes (SH_FRZ), or freezes with the boundary read
+ * in the at-freeze hook (SH_FRZ_AT).  A commit enters the registry,
+ * writes its WAL record, (old rule only) records the address it got,
+ * puts, and leaves. */
+enum { SH_REG, SH_END, SH_BOTH, SH_FRZ, SH_FRZ_AT,
+       SC_ENTER, SC_WRITE, SC_RECORD, SC_PUT, SC_LEAVE };
+
+struct sh_shape {
+	const char *name;
+	int         old_rule;
+	int         must_lose;
+	uint32_t    nf;
+	int         f[3];
+};
+
+static const struct sh_shape g_shapes[] = {
+	{ "one step under the lock, before the switch", 0, 0, 2,
+	    { SH_BOTH, SH_FRZ } },
+	{ "one step under the lock, at the switch", 0, 0, 1,
+	    { SH_FRZ_AT } },
+	{ "registry and WAL end read at different times", 0, 1, 3,
+	    { SH_REG, SH_END, SH_FRZ } },
+	{ "one step, after the switch", 0, 1, 2, { SH_FRZ, SH_BOTH } },
+	{ "old rule, before the switch", 1, 1, 2, { SH_BOTH, SH_FRZ } },
+};
+
+static uint64_t g_sh_copy, g_sh_b;
+
+/* SH_FRZ_AT's hook. */
+static void
+sh_at_freeze(void *ctx)
+{
+	(void)ctx;
+	g_sh_b = bc_bound();
+}
+
+/* Run one op of the flusher or the commit. */
+static void
+sh_op(int op, int64_t rid, uint64_t *wa)
+{
+	uint64_t lsn;
+
+	switch (op) {
+	case SH_REG:
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_sh_copy = g_reg[0];
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		break;
+	case SH_END:
+		g_sh_b = kd_flush_boundary(&g_sh_copy, 1, wal_end_wa(g_bwal));
+		break;
+	case SH_BOTH:
+		g_sh_b = bc_bound();
+		break;
+	case SH_FRZ:
+	case SH_FRZ_AT:
+		CK(kd_freeze(g_bkd, op == SH_FRZ_AT ? sh_at_freeze : NULL,
+		    NULL) == XTC_OK);
+		break;
+	case SC_ENTER:
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[0] = g_old_rule ? BC_NONE : wal_end_wa(g_bwal);
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		break;
+	case SC_WRITE:
+		CK(wal_commit_wa(g_bwal, "commit", 6, &lsn, wa) == XTC_OK);
+		break;
+	case SC_RECORD:
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[0] = *wa;
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		break;
+	case SC_PUT:
+		CK(kd_delta_put(g_bkd, 1, rid, 7) == XTC_OK);
+		break;
+	default:
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[0] = 0;
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		break;
+	}
+}
+
+/* Every interleaving of shape s with one commit: the number that lose
+ * the commit (its frame below the boundary, its row not in the frozen
+ * delta), and the first such interleaving in *first (a bit per step,
+ * 1 = a commit step). */
+static uint32_t
+sh_shape_run(const struct sh_shape *s, uint32_t *first)
+{
+	static const int cnew[] = { SC_ENTER, SC_WRITE, SC_PUT, SC_LEAVE };
+	static const int cold[] = { SC_ENTER, SC_WRITE, SC_RECORD, SC_PUT,
+	    SC_LEAVE };
+	const int *c = s->old_rule ? cold : cnew;
+	uint32_t nc = s->old_rule ? 5u : 4u, n = nc + s->nf;
+	uint32_t mask, i, fi, ci, lost = 0, f;
+	int64_t rid = 0, r;
+	uint64_t wa;
+	int in;
+
+	g_old_rule = s->old_rule;
+	for (mask = 0; mask < (1u << n); mask++) {
+		if ((uint32_t)__builtin_popcount(mask) != nc)
+			continue;
+		CK(kd_create(64, &g_bkd) == XTC_OK);
+		if (g_bkd == NULL)
+			break;
+		g_reg[0] = 0;
+		wa = 0;
+		rid++;
+		for (i = 0, fi = 0, ci = 0; i < n; i++)
+			sh_op(mask >> i & 1u ? c[ci++] : s->f[fi++], rid, &wa);
+		f = 0;
+		r = rid;
+		xtc_rcu_read_lock();
+		in = kd_delta_next(g_bkd, 1, &(uint32_t){ 1 }, &r, &f) &&
+		    r == rid;
+		xtc_rcu_read_unlock();
+		if (wa < g_sh_b && !in && lost++ == 0)
+			*first = mask;
+		kd_drop_frozen(g_bkd);
+		kd_destroy(g_bkd);
+	}
+	g_old_rule = 0;
+	return lost;
+}
+
+static void
+sh_proc(void *arg)
+{
+	uint32_t i, lost, first = 0;
+
+	(void)arg;
+	for (i = 0; i < sizeof g_shapes / sizeof g_shapes[0]; i++) {
+		lost = sh_shape_run(&g_shapes[i], &first);
+		if (g_shapes[i].must_lose ? lost == 0 : lost != 0) {
+			fprintf(stderr, "FAIL shape \"%s\": %u interleavings "
+			    "lose the commit (first 0x%x)\n", g_shapes[i].name,
+			    lost, first);
+			g_fail = 1;
+		}
+	}
+}
+
+static void
+t_shapes(void)
+{
+	wal_opts_t wo = { 0 };
+	xtc_exec_t *ex = NULL;
+	xtc_proc_opts_t po = XTC_PROC_OPTS_INIT;
+	xtc_pid_t pid;
+	char p[300];
+	uint32_t i;
+
+	snprintf(p, sizeof p, "%s/swal", g_dir);
+	wo.path = p;
+	wo.segment_bytes = 64u * 1024u;
+	CK(wal_open(&wo, &g_bwal) == XTC_OK);
+	CK(xtc_exec_create(&(xtc_exec_opts_t){ .size = sizeof(xtc_exec_opts_t),
+	    .n_loops = 1 }, &ex) == XTC_OK);
+	if (g_bwal == NULL || ex == NULL)
+		return;
+	CK(xtc_proc_spawn(xtc_exec_loop(ex, 0), sh_proc, NULL, &po, &pid) ==
+	    XTC_OK);
+	CK(xtc_exec_run(ex) == XTC_OK);
+	xtc_exec_destroy(ex);
+	wal_close(g_bwal);
+	for (i = 1; i < 16; i++) {
+		snprintf(p, sizeof p, "%s/swal/wal-%08u.log", g_dir, i);
+		(void)unlink(p);
+	}
+	snprintf(p, sizeof p, "%s/swal", g_dir);
+	(void)rmdir(p);
+	printf("  shapes: every interleaving of a commit with the flusher: one "
+	    "step under the lock, before or at the switch, loses none; a split "
+	    "read, a read after the switch, the old rule each lose one\n");
 }
 
 int
@@ -770,6 +995,7 @@ main(void)
 	}
 	t_threads();
 	t_boundary();
+	t_shapes();
 	unlink(p);
 	for (i = 1; i <= LRUNS; i++) {
 		run_path(g_dir, (uint64_t)i, p, sizeof p);
