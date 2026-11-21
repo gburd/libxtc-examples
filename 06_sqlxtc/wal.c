@@ -20,6 +20,7 @@
 
 #include "xtc_aio.h"
 #include "xtc_async.h"    /* xtc_yield */
+#include "xtc_blocking.h" /* xtc_blocking_run: a segment roll's open/unlink */
 #include "xtc_proc.h"
 #include "xtc_sync.h"     /* xtc_notify: waiters park (fiber) or block (thread) */
 #include "xtc_sim.h"      /* XTC_SIM_BUGGIFY -- DST pessimal batching (no-op in prod) */
@@ -27,8 +28,10 @@
 #include "xtc_io.h"       /* xtc_io_backend_name */
 #include "xtc_fs.h"       /* xtc_fs_dio_align */
 
+#include <dirent.h>     /* wal_seg_list */
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>   /* mkdir */
 #include <pthread.h>
 #include "xtc_atomic.h"
 #include "xtc_runtime.h"
@@ -508,6 +511,20 @@ struct wal_waiter {
 
 struct wal {
 	int        fd;
+	/* Segments (wal_opts_t.segment_bytes != 0; all zero for one file).
+	 * The current segment is seg; its file offset 0 is log position
+	 * seg_base, a multiple of WAL_BLK, so positions keep rising across a
+	 * roll and a waiter's target never goes backwards.  seg_lo is the
+	 * oldest segment still on disk, release the retention boundary (a
+	 * wa: segments below WAL_WA_SEG(release) may go).  All of these
+	 * change only at open and in wal_roll, which holds the leadership
+	 * and the direct flag, so a writer sees them stable. */
+	uint64_t   seg_bytes;
+	uint32_t   seg;
+	uint32_t   seg_lo;
+	uint64_t   seg_base;
+	uint64_t   release;
+	char      *dir;
 	int        dsync;            /* fd is O_DSYNC: see wal_open_fd */
 	int        dio;              /* ... and O_DIRECT: see wal_dio_setup */
 	uint8_t   *stage;            /* dio: WAL_STAGE aligned bytes, leader
@@ -566,6 +583,13 @@ struct wal {
 	uint64_t s_maxbatch;
 	uint64_t s_failed;            /* commits refused by a failed log write */
 };
+
+/* The file offset of log position pos in the current segment. */
+static inline int64_t
+wal_foff(const wal_t *w, uint64_t pos)
+{
+	return (int64_t)(pos - w->seg_base);
+}
 
 /* Scan an open log fd to its end: *off_out := offset just past the last
  * COMPLETE record (a torn tail is excluded), *maxlsn_out := highest LSN
@@ -708,7 +732,7 @@ wal_dio_setup(wal_t *w)
 	a = w->res_pos & ~(uint64_t)(WAL_BLK - 1);
 	n = (size_t)(w->res_pos - a);
 	if (n > 0 && pread(w->fd, w->ring + (a & (WAL_RING - 1)), n,
-	    (off_t)a) != (ssize_t)n)
+	    (off_t)wal_foff(w, a)) != (ssize_t)n)
 		return;
 	if ((fl = fcntl(w->fd, F_GETFL)) < 0 ||
 	    fcntl(w->fd, F_SETFL, fl | O_DIRECT) != 0)
@@ -718,7 +742,8 @@ wal_dio_setup(wal_t *w)
 	 * but not the writes stays buffered instead of fail-stopping. */
 	memcpy(w->stage, w->ring + (a & (WAL_RING - 1)), n);
 	memset(w->stage + n, 0, WAL_BLK - n);
-	if (pwrite(w->fd, w->stage, WAL_BLK, (off_t)a) != (ssize_t)WAL_BLK) {
+	if (pwrite(w->fd, w->stage, WAL_BLK, (off_t)wal_foff(w, a)) !=
+	    (ssize_t)WAL_BLK) {
 		(void)fcntl(w->fd, F_SETFL, fl);
 		return;
 	}
@@ -728,6 +753,155 @@ wal_dio_setup(wal_t *w)
 #else
 	w->dio = 0;
 #endif
+}
+
+/* ---- segments (wal_opts_t.segment_bytes) ---- */
+
+static void wal_sync_dir(const char *path);
+
+#define WAL_SEG_FMT "%s/wal-%08u.log"
+
+/* The path of segment `seg` of the log in `dir`. */
+static void
+wal_seg_path(const char *dir, uint32_t seg, char *out, size_t cap)
+{
+	snprintf(out, cap, WAL_SEG_FMT, dir, seg);
+}
+
+/* The lowest and highest segment numbers in `dir` (both 0 if there is
+ * none).  Other files are ignored. */
+static void
+wal_seg_list(const char *dir, uint32_t *lo, uint32_t *hi)
+{
+	DIR *d;
+	struct dirent *e;
+	unsigned v;
+	char tail;
+
+	*lo = *hi = 0;
+	if ((d = opendir(dir)) == NULL)
+		return;
+	while ((e = readdir(d)) != NULL) {
+		if (sscanf(e->d_name, "wal-%8u.lo%c", &v, &tail) != 2 ||
+		    tail != 'g' || strlen(e->d_name) != 16 || v == 0 ||
+		    v > WAL_WA_MAX_SEG)
+			continue;
+		if (*lo == 0 || v < *lo)
+			*lo = v;
+		if (v > *hi)
+			*hi = v;
+	}
+	(void)closedir(d);
+}
+
+/* 1 if the bytes of fd from `off` to the end are all zero (the
+ * preallocated region past the last frame), 0 otherwise. */
+static int
+wal_zero_from(int fd, off_t off)
+{
+	uint8_t buf[64 * 1024];
+	ssize_t n, i;
+
+	for (;;) {
+		n = pread(fd, buf, sizeof buf, off);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return n == 0;
+		for (i = 0; i < n; i++)
+			if (buf[i] != 0)
+				return 0;
+		off += n;
+	}
+}
+
+/* The work of a roll that blocks the OS thread (open, unlink, directory
+ * fsync), run under xtc_blocking_run so a fiber parks instead. */
+struct wal_roll_job {
+	wal_t   *w;
+	uint32_t seg;            /* the new segment */
+	uint32_t del_upto;       /* unlink segments [w->seg_lo, del_upto) */
+	int      fd;             /* out: the new segment's fd, or -1 */
+	int      dsync;          /* out */
+};
+
+static int
+wal_roll_io(void *arg)
+{
+	struct wal_roll_job *j = arg;
+	char p[1200];
+	uint32_t k;
+
+	wal_seg_path(j->w->dir, j->seg, p, sizeof p);
+	j->fd = wal_open_fd(p, O_RDWR | O_CREAT | O_TRUNC, &j->dsync);
+	if (j->fd < 0)
+		return -1;
+	/* Oldest first, so what is left is always one contiguous range. */
+	for (k = j->w->seg_lo; k < j->del_upto; k++) {
+		wal_seg_path(j->w->dir, k, p, sizeof p);
+		(void)unlink(p);
+	}
+	/* The new segment's name must be durable before a commit in it is
+	 * acknowledged. */
+	wal_sync_dir(p);
+	return 0;
+}
+
+/* Open the segment log for wal_open: create the directory, then either
+ * start segment 1 (no segment, or not append: an existing log is
+ * removed) or append to the newest segment after its last complete
+ * frame.  Sets w->fd, seg, seg_lo; *o and *maxlsn as the one-file open
+ * does.  The positions start at 0 in the current segment. */
+static int
+wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
+{
+	char p[1200];
+	uint32_t lo, hi, k;
+	off_t junk;
+
+	if ((w->dir = strdup(opts->path)) == NULL)
+		return XTC_E_NOMEM;
+	if (mkdir(w->dir, 0700) != 0 && errno != EEXIST)
+		return XTC_E_INTERNAL;
+	w->seg_bytes = opts->segment_bytes;
+	wal_seg_list(w->dir, &lo, &hi);
+	if (!opts->append && hi != 0) {
+		for (k = lo; k <= hi; k++) {
+			wal_seg_path(w->dir, k, p, sizeof p);
+			(void)unlink(p);
+		}
+		lo = hi = 0;
+	}
+	if (hi == 0) {
+		w->seg = w->seg_lo = 1;
+		wal_seg_path(w->dir, 1, p, sizeof p);
+		w->fd = wal_open_fd(p, O_RDWR | O_CREAT | O_TRUNC, &w->dsync);
+		if (w->fd < 0)
+			return XTC_E_INTERNAL;
+		wal_sync_dir(p);
+		return XTC_OK;
+	}
+	w->seg = hi;
+	w->seg_lo = lo;
+	wal_seg_path(w->dir, hi, p, sizeof p);
+	w->fd = wal_open_fd(p, O_RDWR | O_CREAT, &w->dsync);
+	if (w->fd < 0)
+		return XTC_E_INTERNAL;
+	wal_scan_tail(w->fd, o, maxlsn);
+	if (ftruncate(w->fd, *o) != 0) {
+		/* non-fatal: appends overwrite the torn tail */
+	}
+	/* A roll that crashed right after creating the newest segment left
+	 * it empty: the highest LSN is in an older one. */
+	for (k = hi; *maxlsn == 0 && k > lo; k--) {
+		int fd;
+		wal_seg_path(w->dir, k - 1, p, sizeof p);
+		if ((fd = open(p, O_RDONLY)) < 0)
+			break;
+		wal_scan_tail(fd, &junk, maxlsn);
+		close(fd);
+	}
+	return XTC_OK;
 }
 
 int
@@ -742,13 +916,22 @@ wal_open(const wal_opts_t *opts, wal_t **out)
 	w = calloc(1, sizeof *w);
 	if (w == NULL)
 		return XTC_E_NOMEM;
-	w->fd = wal_open_fd(opts->path,
-	    O_RDWR | O_CREAT | (opts->append ? 0 : O_TRUNC), &w->dsync);
-	if (w->fd < 0) {
+	w->fd = -1;
+	if (opts->segment_bytes != 0) {
+		int rc = wal_open_segs(w, opts, &o, &maxlsn);
+		if (rc != XTC_OK) {
+			if (w->fd >= 0)
+				close(w->fd);
+			free(w->dir);
+			free(w);
+			return rc;
+		}
+	} else if ((w->fd = wal_open_fd(opts->path,
+	    O_RDWR | O_CREAT | (opts->append ? 0 : O_TRUNC), &w->dsync)) < 0) {
 		free(w);
 		return XTC_E_INTERNAL;   /* no XTC_E_IO in the core enum -- see gaps ledger */
 	}
-	if (opts->append) {
+	if (opts->append && opts->segment_bytes == 0) {
 		/* Continue an existing log: resume LSNs past the highest on
 		 * disk, and append after the last COMPLETE record (a torn tail
 		 * from a crash mid-append is dropped). */
@@ -769,7 +952,8 @@ wal_open(const wal_opts_t *opts, wal_t **out)
 	w->ring = xtc_aligned_alloc(WAL_BLK, WAL_RING);
 	w->slot = calloc(WAL_SLOTS, sizeof *w->slot);
 	if (w->ring == NULL || w->slot == NULL) {
-		xtc_aligned_free(w->ring); free(w->slot); close(w->fd); free(w);
+		xtc_aligned_free(w->ring); free(w->slot); close(w->fd);
+		free(w->dir); free(w);
 		return XTC_E_NOMEM;
 	}
 	(void)pthread_mutex_init(&w->res_mu, NULL);
@@ -800,6 +984,7 @@ wal_close(wal_t *w)
 	xtc_aligned_free(w->ring);
 	xtc_aligned_free(w->stage);
 	free(w->slot);
+	free(w->dir);
 	free(w);
 }
 
@@ -966,14 +1151,21 @@ wal_prealloc(wal_t *w, uint64_t upto)
 	if (w->dio)                      /* blocks past upto's: no live byte */
 		at = (at + WAL_BLK - 1) & ~(uint64_t)(WAL_BLK - 1);
 	end = at + WAL_PRE_CHUNK;
-	WAL_ZERO_TEST_HOOK(end - at);
-	while (at < end) {
-		if (xtc_aio_pwrite(w->fd, zeros, (uint32_t)sizeof zeros,
-		    (int64_t)at) != (int)sizeof zeros)
+	if (w->seg_bytes != 0) {
+		/* No zeros past the segment's end: the next frame that would
+		 * cross it goes to a new segment (wal_roll_if). */
+		uint64_t lim = w->seg_base +
+		    ((w->seg_bytes + WAL_BLK - 1) & ~(uint64_t)(WAL_BLK - 1));
+		if (at >= lim)
 			return;
-		at += sizeof zeros;
-		w->pre_end = at;
+		if (end > lim)
+			end = lim;
 	}
+	WAL_ZERO_TEST_HOOK(end - at);
+	if (xtc_aio_pwrite(w->fd, zeros, (uint32_t)(end - at),
+	    wal_foff(w, at)) != (int)(end - at))
+		return;
+	w->pre_end = end;
 }
 
 /* Leader: write ring bytes [from, upto) to the same file offsets. */
@@ -984,11 +1176,11 @@ wal_write_ring(wal_t *w, uint64_t from, uint64_t upto)
 	size_t n = (size_t)(upto - from), k = WAL_RING - at;
 	if (n <= k)
 		return xtc_aio_pwrite(w->fd, w->ring + at, (uint32_t)n,
-		    (int64_t)from) == (int)n;
+		    wal_foff(w, from)) == (int)n;
 	return xtc_aio_pwrite(w->fd, w->ring + at, (uint32_t)k,
-	    (int64_t)from) == (int)k &&
+	    wal_foff(w, from)) == (int)k &&
 	    xtc_aio_pwrite(w->fd, w->ring, (uint32_t)(n - k),
-	    (int64_t)(from + k)) == (int)(n - k);
+	    wal_foff(w, from + k)) == (int)(n - k);
 }
 
 /* Leader, direct I/O (wal_dio_setup): write [from, upto) as the whole
@@ -1025,7 +1217,7 @@ wal_write_dio(wal_t *w, uint64_t from, uint64_t upto)
 	}
 	for (i = 0; i < ni; i++)
 		tot += iv[i].iov_len;
-	return xtc_aio_pwritev(w->fd, iv, ni, (int64_t)fa) == (int)tot;
+	return xtc_aio_pwritev(w->fd, iv, ni, wal_foff(w, fa)) == (int)tot;
 }
 
 /* fl_mu held on entry and exit, w->flushing set by the caller: write
@@ -1212,7 +1404,7 @@ wal_big_put(wal_t *w, size_t *fill, uint64_t *at, const void *src, size_t n)
 		n -= k;
 		if (*fill == WAL_STAGE) {
 			if (xtc_aio_pwrite(w->fd, w->stage, WAL_STAGE,
-			    (int64_t)*at) != (int)WAL_STAGE)
+			    wal_foff(w, *at)) != (int)WAL_STAGE)
 				return 0;
 			*at += WAL_STAGE;
 			*fill = 0;
@@ -1247,8 +1439,8 @@ wal_write_big_dio(wal_t *w, uint64_t start, const uint8_t *hdr,
 	if (fill > 0) {
 		k = (fill + WAL_BLK - 1) & ~(size_t)(WAL_BLK - 1);
 		memset(w->stage + fill, 0, k - fill);
-		if (xtc_aio_pwrite(w->fd, w->stage, (uint32_t)k, (int64_t)at) !=
-		    (int)k)
+		if (xtc_aio_pwrite(w->fd, w->stage, (uint32_t)k,
+		    wal_foff(w, at)) != (int)k)
 			return 0;
 	}
 	/* Its partial tail block [ea, end) into the ring, for the next
@@ -1262,6 +1454,133 @@ wal_write_big_dio(wal_t *w, uint64_t start, const uint8_t *hdr,
 		w->ring[b & (WAL_RING - 1)] = c;
 	}
 	return 1;
+}
+
+/* res_mu held: 1 if a frame of `need` bytes must go to a new segment
+ * (the current one has a frame and this one would take it past
+ * segment_bytes). */
+static int
+wal_seg_full(const wal_t *w, uint64_t need)
+{
+	return w->seg_bytes != 0 && w->res_pos > w->seg_base &&
+	    w->res_pos - w->seg_base + need > w->seg_bytes;
+}
+
+/* Swap the handle onto the segment job->seg opened: everything reserved
+ * is durable and this caller holds the direct flag and the leadership,
+ * so no frame is in the ring.  The new segment's position 0 is the old
+ * end rounded up to WAL_BLK, so a direct-I/O flush stays aligned. */
+static void
+wal_roll_swap(wal_t *w, const struct wal_roll_job *j)
+{
+	uint64_t base = (w->res_pos + WAL_BLK - 1) & ~(uint64_t)(WAL_BLK - 1);
+
+	wal_lock(&w->res_mu);
+	wal_lock(&w->fl_mu);
+	close(w->fd);
+	w->fd = j->fd;
+	w->dsync = j->dsync;
+	w->seg = j->seg;
+	if (j->del_upto > w->seg_lo)
+		w->seg_lo = j->del_upto;
+	w->seg_base = base;
+	wal_reset_marks(w, base, w->next_lsn);
+	xtc_atomic_fetch_add_u64(&w->gen, 1, xtc_mo_acq_rel);
+	wal_unlock(&w->fl_mu);
+	wal_unlock(&w->res_mu);
+}
+
+static int
+wal_dio_job(void *arg)
+{
+	wal_dio_setup(arg);
+	return 0;
+}
+
+/*
+ * Start a new segment if a frame of `need` bytes no longer fits in the
+ * current one (force: always), deleting the old segments the retention
+ * boundary allows.  Called with no lock held, before a reservation; the
+ * caller re-checks after (another committer may fill the new segment
+ * first).  The roll takes the direct flag, which holds off every new
+ * reservation, waits until everything reserved is durable, takes the
+ * leadership, and then opens the new file and unlinks the old ones off
+ * the loop (xtc_blocking_run).  A failed open fail-stops the log: the
+ * old segment is full, so no commit could be written anywhere.
+ */
+static int
+wal_roll_if(wal_t *w, uint64_t need, int force)
+{
+	struct wal_roll_job j;
+	uint64_t target;
+	uint32_t rel;
+	int rc, res = -1;
+
+	for (;;) {
+		wal_lock(&w->res_mu);
+		if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire)) {
+			wal_unlock(&w->res_mu);
+			return XTC_E_IO;
+		}
+		if (!force && !wal_seg_full(w, need)) {
+			wal_unlock(&w->res_mu);
+			return XTC_OK;
+		}
+		if (!w->direct)
+			break;
+		wal_unlock(&w->res_mu);
+		wal_nap();
+	}
+	w->direct = 1;
+	target = w->res_pos;
+	wal_unlock(&w->res_mu);
+
+	/* Everything reserved durable, then the leadership: as the direct
+	 * writer (wal_append_direct) does. */
+	wal_lock(&w->fl_mu);
+	rc = wal_durable_locked(w, target);
+	while (rc == XTC_OK && w->flushing) {
+		wal_unlock(&w->fl_mu);
+		wal_nap();
+		wal_lock(&w->fl_mu);
+	}
+	if (rc == XTC_OK)
+		w->flushing = 1;
+	wal_unlock(&w->fl_mu);
+	if (rc == XTC_OK) {
+		wal_buggify_yield("wal.roll.durable_yield");
+		memset(&j, 0, sizeof j);
+		j.w = w;
+		j.seg = w->seg + 1;
+		rel = WAL_WA_SEG(xtc_atomic_load_u64(&w->release,
+		    xtc_mo_acquire));
+		j.del_upto = rel < j.seg ? rel : j.seg;
+		j.fd = -1;
+		/* A full offload queue did not run the job: wait and retry. */
+		while ((rc = j.seg > WAL_WA_MAX_SEG ? XTC_E_RESOURCE :
+		    xtc_blocking_run(wal_roll_io, &j, &res)) == XTC_E_AGAIN)
+			wal_nap();
+		if (rc != XTC_OK || res != 0) {
+			if (j.fd >= 0)
+				close(j.fd);
+			xtc_atomic_store_i32(&w->failed, 1, xtc_mo_release);
+			rc = XTC_E_IO;
+		} else {
+			wal_roll_swap(w, &j);
+			/* Best-effort (a failure leaves the segment buffered). */
+			(void)xtc_blocking_run(wal_dio_job, w, &res);
+		}
+		wal_lock(&w->fl_mu);
+		w->flushing = 0;
+		wal_wake_locked(w, rc == XTC_OK ?
+		    xtc_atomic_load_u64(&w->durable_off, xtc_mo_relaxed) :
+		    UINT64_MAX, 1);
+		wal_unlock(&w->fl_mu);
+	}
+	wal_lock(&w->res_mu);
+	w->direct = 0;
+	wal_unlock(&w->res_mu);
+	return rc;
 }
 
 /*
@@ -1278,7 +1597,7 @@ wal_write_big_dio(wal_t *w, uint64_t start, const uint8_t *hdr,
  */
 static uint64_t
 wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
-    int *rc)
+    uint64_t *wa, int *rc)
 {
 	uint64_t need = (uint64_t)WAL_REC_HDR + len + WAL_REC_CRC, start, lsn, crc;
 	uint64_t target;
@@ -1289,6 +1608,12 @@ wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
 
 	for (;;) {                       /* one direct writer at a time */
 		wal_lock(&w->res_mu);
+		if (!w->direct && wal_seg_full(w, need)) {
+			wal_unlock(&w->res_mu);
+			if ((*rc = wal_roll_if(w, need, 0)) != XTC_OK)
+				return 0;
+			continue;
+		}
 		if (!w->direct)
 			break;
 		wal_unlock(&w->res_mu);
@@ -1321,6 +1646,8 @@ wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
 	}
 	lsn = ++w->next_lsn;
 	start = w->res_pos;              /* == target: nobody reserved since */
+	*wa = w->seg_bytes == 0 ? 0 :
+	    WAL_WA(w->seg, start - w->seg_base + WAL_REC_HDR);
 	w->last_pos = start;
 	w->res_pos = start + need;
 	xtc_atomic_store_u64(&w->off, w->res_pos, xtc_mo_relaxed);
@@ -1333,16 +1660,16 @@ wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
 	if (w->dio) {
 		ok = wal_write_big_dio(w, start, hdr, record, len, trl);
 	} else {
-		ok = xtc_aio_pwrite(w->fd, hdr, WAL_REC_HDR, (int64_t)start) ==
-		    (int)WAL_REC_HDR;
+		ok = xtc_aio_pwrite(w->fd, hdr, WAL_REC_HDR,
+		    wal_foff(w, start)) == (int)WAL_REC_HDR;
 		for (done = 0; ok && done < len; ) {
 			uint32_t k = len - done < (1u << 24) ? len - done : (1u << 24);
 			ok = xtc_aio_pwrite(w->fd, (const uint8_t *)record + done, k,
-			    (int64_t)(start + WAL_REC_HDR + done)) == (int)k;
+			    wal_foff(w, start + WAL_REC_HDR + done)) == (int)k;
 			done += k;
 		}
 		ok = ok && xtc_aio_pwrite(w->fd, trl, WAL_REC_CRC,
-		    (int64_t)(start + WAL_REC_HDR + len)) == (int)WAL_REC_CRC;
+		    wal_foff(w, start + WAL_REC_HDR + len)) == (int)WAL_REC_CRC;
 	}
 	if (start + need > w->pre_end)   /* the record grew the file */
 		w->pre_end = w->dio ? (start + need + WAL_BLK - 1) &
@@ -1383,14 +1710,15 @@ wal_append_direct(wal_t *w, const void *record, uint32_t len, uint64_t *end,
 /* Reserve room for one record and copy it in.  Returns its LSN and end
  * position, or 0 (*rc set) on failure.  Never holds a lock while copying. */
 static uint64_t
-wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end, int *rc)
+wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end,
+    uint64_t *wa, int *rc)
 {
 	uint64_t need = (uint64_t)WAL_REC_HDR + len + WAL_REC_CRC, start, lsn, crc;
 	uint8_t hdr[WAL_REC_HDR], trl[WAL_REC_CRC];
 	struct wal_slot *s;
 
 	if (need > WAL_RING / 4)
-		return wal_append_direct(w, record, len, end, rc);
+		return wal_append_direct(w, record, len, end, wa, rc);
 	for (;;) {
 		wal_lock(&w->res_mu);
 		if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire)) {
@@ -1401,6 +1729,12 @@ wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end, int *rc)
 		if (w->direct) {             /* a big record is being written */
 			wal_unlock(&w->res_mu);
 			wal_nap();
+			continue;
+		}
+		if (wal_seg_full(w, need)) {
+			wal_unlock(&w->res_mu);
+			if ((*rc = wal_roll_if(w, need, 0)) != XTC_OK)
+				return 0;
 			continue;
 		}
 		/* Room in the ring (the oldest unwritten byte must not be
@@ -1429,6 +1763,8 @@ wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end, int *rc)
 	}
 	lsn = ++w->next_lsn;
 	start = w->res_pos;
+	*wa = w->seg_bytes == 0 ? 0 :
+	    WAL_WA(w->seg, start - w->seg_base + WAL_REC_HDR);
 	w->last_pos = start;
 	w->res_pos += need;
 	xtc_atomic_store_u64(&w->off, w->res_pos, xtc_mo_relaxed);
@@ -1453,9 +1789,10 @@ wal_append(wal_t *w, const void *record, uint32_t len, uint64_t *end, int *rc)
 }
 
 static int
-wal_commit_any(wal_t *w, const void *record, uint32_t len, uint64_t *lsn)
+wal_commit_any(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
+    uint64_t *wa)
 {
-	uint64_t my_lsn, end = 0;
+	uint64_t my_lsn, end = 0, my_wa = 0;
 	int rc;
 
 	if (w == NULL || (record == NULL && len != 0))
@@ -1474,7 +1811,7 @@ wal_commit_any(wal_t *w, const void *record, uint32_t len, uint64_t *lsn)
 #if !XTC_DST_BUG(XTC_DST_BUG_WALKILL)       /* planted bug: unmasked */
 	(void)xtc_mask_enter();
 #endif
-	if ((my_lsn = wal_append(w, record, len, &end, &rc)) != 0) {
+	if ((my_lsn = wal_append(w, record, len, &end, &my_wa, &rc)) != 0) {
 		wal_lock(&w->fl_mu);
 		rc = wal_durable_locked(w, end);
 		wal_unlock(&w->fl_mu);
@@ -1484,6 +1821,8 @@ wal_commit_any(wal_t *w, const void *record, uint32_t len, uint64_t *lsn)
 #endif
 	if (rc == XTC_OK && lsn != NULL)
 		*lsn = my_lsn;
+	if (rc == XTC_OK && wa != NULL)
+		*wa = my_wa;
 	return rc;
 }
 
@@ -1558,13 +1897,65 @@ wal_writer_pid(const wal_t *w)
 int
 wal_commit(wal_t *w, const void *record, uint32_t len, uint64_t *lsn)
 {
-	return wal_commit_any(w, record, len, lsn);
+	return wal_commit_any(w, record, len, lsn, NULL);
 }
 
 int
 wal_commit_sync(wal_t *w, const void *record, uint32_t len, uint64_t *lsn)
 {
-	return wal_commit_any(w, record, len, lsn);
+	return wal_commit_any(w, record, len, lsn, NULL);
+}
+
+int
+wal_commit_wa(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
+    uint64_t *wa)
+{
+	return wal_commit_any(w, record, len, lsn, wa);
+}
+
+void
+wal_set_release(wal_t *w, uint64_t wa)
+{
+	uint64_t cur;
+
+	if (w == NULL)
+		return;
+	cur = xtc_atomic_load_u64(&w->release, xtc_mo_relaxed);
+	while (wa > cur &&
+	    !xtc_atomic_cas_weak_u64(&w->release, &cur, wa, xtc_mo_release,
+	        xtc_mo_relaxed))
+		;
+}
+
+void
+wal_seg_range(wal_t *w, uint32_t *lo, uint32_t *cur)
+{
+	uint32_t a = 0, b = 0;
+
+	if (w != NULL) {
+		wal_lock(&w->res_mu);
+		a = w->seg_lo;
+		b = w->seg;
+		wal_unlock(&w->res_mu);
+	}
+	if (lo != NULL)
+		*lo = a;
+	if (cur != NULL)
+		*cur = b;
+}
+
+int
+wal_roll(wal_t *w)
+{
+	int rc, masked;
+
+	if (w == NULL || w->seg_bytes == 0)
+		return XTC_E_INVAL;
+	masked = xtc_mask_enter() == XTC_OK;   /* as wal_commit_any */
+	rc = wal_roll_if(w, 0, 1);
+	if (masked)
+		(void)xtc_mask_leave();
+	return rc;
 }
 
 void
@@ -1703,8 +2094,8 @@ wal_checkpoint(wal_t *w, const char *path,
 
 	if (w == NULL || path == NULL || dump == NULL)
 		return XTC_E_INVAL;
-	if ((int)strlen(path) + 9 >= (int)sizeof tmp)
-		return XTC_E_INVAL;
+	if ((int)strlen(path) + 9 >= (int)sizeof tmp || w->seg_bytes != 0)
+		return XTC_E_INVAL;          /* a segmented log is never compacted */
 	if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire))
 		return XTC_E_IO;
 	snprintf(tmp, sizeof tmp, "%s.compact", path);
@@ -1804,7 +2195,7 @@ wal_ockpt_begin(wal_t *w, const char *path, wal_ock_t **out)
 {
 	wal_ock_t *k;
 	if (w == NULL || path == NULL || out == NULL ||
-	    (int)strlen(path) + 9 >= (int)sizeof k->tmp)
+	    (int)strlen(path) + 9 >= (int)sizeof k->tmp || w->seg_bytes != 0)
 		return XTC_E_INVAL;
 	if (xtc_atomic_load_i32(&w->failed, xtc_mo_acquire))
 		return XTC_E_IO;
@@ -2057,10 +2448,90 @@ wal_scan(const char *path, wal_replay_cb cb, void *user)
 	return wal_scan_ex(path, cb, user, NULL);
 }
 
+/*
+ * Replay one segment from its start: every complete frame whose body's
+ * WAL address is at least from_wa goes to cb.  *stop is set when cb
+ * stopped, a read failed or memory ran out; *clean when the frames end
+ * at the end of the file or in zeros only (the preallocated region).
+ */
+static int
+wal_scan_seg(int fd, uint32_t seg, uint64_t from_wa, wal_replay_wa_cb cb,
+    void *user, int *stop, int *clean)
+{
+	struct wal_rd r;
+	const uint8_t *body;
+	uint8_t *buf = NULL;
+	size_t cap = 0;
+	off_t off = 0;
+	uint64_t lsn, wa;
+	uint32_t len;
+	int rc = XTC_OK;
+
+	wal_rd_init(&r, fd, 1);
+	while (!*stop && wal_rd_frame(&r, off, &lsn, &len, &body)) {
+		wa = WAL_WA(seg, (uint64_t)off + WAL_REC_HDR);
+		if (body == NULL) {
+			if (len > cap) {
+				uint8_t *nb = realloc(buf, len);
+				if (nb == NULL) {
+					rc = XTC_E_NOMEM;
+					*stop = 1;
+					break;
+				}
+				buf = nb;
+				cap = len;
+			}
+			if (len > 0 && pread(fd, buf, len,
+			    off + (off_t)WAL_REC_HDR) != (ssize_t)len) {
+				*stop = 1;
+				break;
+			}
+			body = buf;
+		}
+		off += (off_t)WAL_REC_HDR + (off_t)len + (off_t)WAL_REC_CRC;
+		if (wa >= from_wa && cb(lsn, wa, body, len, user) != 0)
+			*stop = 1;
+	}
+	*clean = !*stop && wal_zero_from(fd, off);
+	free(r.buf);
+	free(buf);
+	return rc;
+}
+
+int
+wal_scan_segs(const char *dir, uint64_t from_wa, wal_replay_wa_cb cb,
+    void *user)
+{
+	char p[1200];
+	uint32_t lo, hi, k, first;
+	int fd, rc = XTC_OK, stop = 0, clean = 1;
+
+	if (dir == NULL || cb == NULL)
+		return XTC_E_INVAL;
+	wal_seg_list(dir, &lo, &hi);
+	if (hi == 0)
+		return from_wa == 0 ? XTC_OK : XTC_E_NOTFOUND;
+	first = from_wa == 0 ? lo : WAL_WA_SEG(from_wa);
+	if (first < lo)
+		return XTC_E_NOTFOUND;       /* deleted by retention */
+	/* Consecutive segments only: a missing one ends the log, and so
+	 * does an older segment whose frames do not run to its end (only
+	 * the newest can have a torn tail: a roll waits until every byte
+	 * of the old segment is durable). */
+	for (k = first; k <= hi && !stop && clean && rc == XTC_OK; k++) {
+		wal_seg_path(dir, k, p, sizeof p);
+		if ((fd = open(p, O_RDONLY)) < 0)
+			break;
+		rc = wal_scan_seg(fd, k, from_wa, cb, user, &stop, &clean);
+		close(fd);
+	}
+	return rc;
+}
+
 int
 wal_truncate(wal_t *w)
 {
-	if (w == NULL)
+	if (w == NULL || w->seg_bytes != 0)
 		return XTC_E_INVAL;
 	wal_lock(&w->res_mu);
 	wal_lock(&w->fl_mu);
@@ -2103,7 +2574,8 @@ wal_get_tail(wal_t *w, wal_tail_t *out)
 	wal_lock(&w->fl_mu);
 	/* Quiesced only: every reserved byte durable, no direct write, not
 	 * failed -- then the file holds exactly the frames in [0, res_pos). */
-	if (!w->direct && !w->flushing && w->last_pos != UINT64_MAX &&
+	if (w->seg_bytes == 0 && !w->direct && !w->flushing &&
+	    w->last_pos != UINT64_MAX &&
 	    !xtc_atomic_load_i32(&w->failed, xtc_mo_acquire) &&
 	    xtc_atomic_load_u64(&w->durable_off, xtc_mo_acquire) ==
 	        w->res_pos) {

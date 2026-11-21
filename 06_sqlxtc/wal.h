@@ -68,7 +68,16 @@ typedef struct wal_opts {
 	                            * (the frame at last_off checksums, ends at
 	                            * end and carries max_lsn; no frame starts
 	                            * at end), else the full scan runs.  NULL
-	                            * or !valid: scan, as before. */
+	                            * or !valid: scan, as before.  Ignored by
+	                            * a segmented log. */
+	uint64_t    segment_bytes; /* 0: one file at path (compacted in place,
+	                            * wal_checkpoint).  Else a segmented log:
+	                            * path is a directory (created if missing)
+	                            * of segment files wal-<seg>.log, and a
+	                            * segment rolls before a frame would take
+	                            * it past this size (a frame never spans
+	                            * two; one larger than this gets a segment
+	                            * of its own).  See "Segments" below. */
 } wal_opts_t;
 
 typedef struct wal_stats {
@@ -233,6 +242,66 @@ int  wal_ockpt_catchup(wal_ock_t *k, uint64_t *left);
 int  wal_ockpt_finish(wal_ock_t *k);
 void wal_ockpt_abort(wal_ock_t *k);
 uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
+
+/*
+ * Segments (wal_opts_t.segment_bytes != 0).  The log is a sequence of
+ * files <dir>/wal-<seg>.log, seg counting up from 1 and never reused.
+ * The frame format, the LSNs (still a frame counter across segments),
+ * group commit and fail-stop are those of the one-file log.  A WAL
+ * address names a frame's body in a segment:
+ *
+ *     wa = seg (24 bits) | byte offset in the segment (40 bits)
+ *
+ * so wa 0 is "none", and wa order is log order.  A record's sub-record
+ * at byte k of the body the committer built is at wa + k.
+ *
+ * Retention: wal_set_release(w, wa) says every frame below wa is no
+ * longer needed (the caller owns the rule: STORAGE_DESIGN 6.4); a
+ * segment roll then unlinks, oldest first, every segment whose number
+ * is below WAL_WA_SEG(wa), never the current one.  The boundary only
+ * rises.  wal_checkpoint, the online checkpoint and wal_truncate refuse
+ * a segmented log (XTC_E_INVAL): it is bounded by deletion instead.
+ */
+#define WAL_WA_SEG_BITS 24
+#define WAL_WA_OFF_BITS 40
+#define WAL_WA_MAX_SEG  ((1u << WAL_WA_SEG_BITS) - 1u)
+#define WAL_WA(seg, off) \
+	(((uint64_t)(seg) << WAL_WA_OFF_BITS) | \
+	 ((uint64_t)(off) & ((1ull << WAL_WA_OFF_BITS) - 1u)))
+#define WAL_WA_SEG(wa)   ((uint32_t)((wa) >> WAL_WA_OFF_BITS))
+#define WAL_WA_OFF(wa)   ((wa) & ((1ull << WAL_WA_OFF_BITS) - 1u))
+
+/* wal_commit that also returns the WAL address of the record's body in
+ * *wa (0 for a one-file log).  The address is assigned with the LSN. */
+int  wal_commit_wa(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
+         uint64_t *wa);
+
+/* Raise the retention boundary (see above).  A lower wa is ignored. */
+void wal_set_release(wal_t *w, uint64_t wa);
+
+/* The oldest and the current segment numbers (both 0 for a one-file
+ * log).  Segments in [*lo, *cur] are on disk. */
+void wal_seg_range(wal_t *w, uint32_t *lo, uint32_t *cur);
+
+/* Make the next commit start a new segment (it rolls, and deletes what
+ * the boundary allows, first).  For tests and a clean close that wants
+ * the retention applied; XTC_E_INVAL on a one-file log. */
+int  wal_roll(wal_t *w);
+
+/*
+ * Replay a segmented log in <dir> from the segment holding from_wa (0:
+ * the oldest on disk) through the last, calling cb with every complete
+ * frame and the WAL address of its body.  Segments must be consecutive:
+ * the scan ends at a gap, at a torn frame, or at a segment whose frames
+ * end in anything but zeros or the end of the file (a frame lost
+ * mid-log).  XTC_E_NOTFOUND if from_wa's segment is gone (deleted by
+ * retention), XTC_OK otherwise; cb returns non-zero to stop.  Reads the
+ * files directly: run it before the log is opened for append.
+ */
+typedef int (*wal_replay_wa_cb)(uint64_t lsn, uint64_t wa, const void *rec,
+    uint32_t len, void *user);
+int  wal_scan_segs(const char *dir, uint64_t from_wa, wal_replay_wa_cb cb,
+         void *user);
 
 /* Ask the writer to flush any pending batch and exit.  Call once all
  * committers are done so the loop can drain. */

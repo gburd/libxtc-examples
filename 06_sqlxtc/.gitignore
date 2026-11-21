@@ -151,3 +151,4 @@ test_freelist_persist
 test_order_limit
 test_qsel
 test_bm_files
+test_wal_seg
