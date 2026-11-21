@@ -41,6 +41,14 @@
  *	    or an index error) at every n, never inserted.  Before the fix a
  *	    failed candidate-row read made the probe say "no duplicate" and
  *	    a failed cursor read ended the scan early.
+ *	(7) The same for a transaction whose buffered rows were spilled to
+ *	    the STEAL staging area: the n-th read fails, and the first n of
+ *	    them are the staging area's (bringing a spilled payload back).
+ *	    An index scan over the transaction's own rows fails or counts
+ *	    them all (also when a row is spilled again while the scan is
+ *	    open), and a duplicate of a spilled row's UNIQUE value is
+ *	    refused at every n.  Before the fix an unreadable spilled row
+ *	    was skipped: the scan came up short and the duplicate went in.
  */
 
 #include <stdio.h>
@@ -493,6 +501,82 @@ t_read_errors(sx_db *h)
 		    "is an error\n");
 }
 
+/* (7) */
+static void
+t_spilled_reads(sx_db *h)
+{
+	char *pad = longval(1000, 4), sv[16];
+	const uint8_t *rec;
+	xstore_iscan_t *sc;
+	xstore_val_t v;
+	uint32_t idx = 0;
+	int64_t rid;
+	int i, n, rc, rl, errs;
+	CK(sx_exec(h,
+	       "CREATE TABLE sp(k INTEGER PRIMARY KEY, s TEXT UNIQUE, g INT, "
+	       "pad TEXT)",
+	       NULL) == SX_OK);
+	CK(sx_exec(h, "CREATE INDEX sp_g ON sp(g)", NULL) == SX_OK);
+	/* 400 rows of 1 KB: past the 256 KB high-water mark, so the oldest
+	 * buffered payloads (rows 1 to about 330) go to the staging area. */
+	CK(sx_exec(h, "BEGIN", NULL) == SX_OK);
+	for (n = 1; n <= 400; n++) {
+		sx_stmt *st = NULL;
+		snprintf(sv, sizeof sv, "s%04d", n);
+		CK(sx_prepare(h, "INSERT INTO sp VALUES(?, ?, ?, ?)", -1, &st,
+		       NULL) == SX_OK);
+		sx_bind_int64(st, 1, n);
+		sx_bind_text(st, 2, sv, -1);
+		sx_bind_int64(st, 3, n % 4);
+		sx_bind_text(st, 4, pad, -1);
+		CK(sx_step(st) == SX_DONE);
+		sx_finalize(st);
+	}
+	/* A read brings a spilled payload back for good, and the scan's
+	 * open reads every buffered row of the table, so the probe goes
+	 * first and reads row 2 (g = 2) alone; row 1 (g = 1) is then the
+	 * first spilled row the scan reads. */
+	for (n = 1; n < 1000; n++) {
+		xstore_index_read_fail_at(n);
+		rc = ins_tab(h, "sp", 1000 + n, "s0002");
+		if (xstore_index_read_fail_at(0) > 0)
+			break;
+		CK(rc != SX_DONE);
+	}
+	CK(n > 1 && n < 1000);
+	errs = sweep_count(h, "SELECT count(*) FROM sp WHERE g = 1", NULL, 100);
+	CK(errs > 0);
+	CK(one(h, "SELECT count(*) FROM sp WHERE k > 400 AND k < 500") == 0);
+	/* A payload spilled again while a scan is open (a write between
+	 * the open, which read every buffered row, and the rows' turn),
+	 * with the n-th read of the walk failing. */
+	CK(xstore_index_lookup(sx_storage_bt(), "sp", "g", &idx));
+	memset(&v, 0, sizeof v);
+	v.cls = XSTORE_C_INT;
+	v.i = 1;
+	for (i = 1; i < 1000; i++) {
+		sc = xstore_iscan_open((struct xsql *)h, "sp", idx, &v, 1, NULL,
+		    0, NULL, 0, 0);
+		CK(sc != NULL);
+		snprintf(sv, sizeof sv, "t%04d", i);
+		CK(ins_tab(h, "sp", 500 + i, sv) == SX_DONE);
+		xstore_index_read_fail_at(i);
+		n = 0;
+		while ((rc = xstore_iscan_next(sc, &rid, &rec, &rl)) == 1)
+			n++;
+		xstore_iscan_close(sc);
+		if (xstore_index_read_fail_at(0) > 0)
+			break;
+		CK(rc < 0 || n == 100);
+	}
+	CK(i > 1 && i < 1000);
+	CK(sx_exec(h, "ROLLBACK", NULL) == SX_OK);
+	free(pad);
+	if (!g_fail)
+		printf("  ok   a spilled row that cannot be read back is an "
+		       "error\n");
+}
+
 int
 main(void)
 {
@@ -517,6 +601,7 @@ main(void)
 	t_create_over_long(h);
 	t_siphash();
 	t_read_errors(h);
+	t_spilled_reads(h);
 	sx_close(b);
 	sx_close(h);
 	(void)sx_storage_close();

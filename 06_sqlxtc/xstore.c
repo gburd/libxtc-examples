@@ -7781,16 +7781,23 @@ xstore_index_seek_count(void)
 /* ---- UNIQUE enforcement ----------------------------------------- */
 
 
-/* Payload record of buffered entry `wi` (bringing a spilled payload
- * back), or NULL for a delete. */
-static const uint8_t *
-xs_wrec_payload(xstore_ctx_t *c, int wi, int *len)
+/* The payload of buffered entry `wi` (not a delete) into *rec and
+ * *len, bringing a spilled payload back first.  XTC_OK, XTC_E_NOMEM, or
+ * XTC_E_IO when the staging area cannot be read back (a read of the
+ * index-read fault hook, xstore_index_read_fail_at, when spilled). */
+static int
+xs_wrec_payload(xstore_ctx_t *c, int wi, const uint8_t **rec, int *len)
 {
 	xs_wrec_t *w = &c->wbuf[wi];
-	if (w->deleted) return NULL;
-	if (xs_wrec_ensure(c, w) != SX_OK) return NULL;
+	int rc;
+	if (w->spilled && xs_rd_fault())
+		return XTC_E_IO;
+	rc = xs_wrec_ensure(c, w);
+	if (rc != SX_OK)
+		return rc == SX_NOMEM ? XTC_E_NOMEM : XTC_E_IO;
+	*rec = w->data;
 	*len = (int)w->len;
-	return w->data;
+	return XTC_OK;
 }
 
 /* The row a UNIQUE check is for: its record and rowid. */
@@ -7951,7 +7958,7 @@ xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
 	int64_t rowid = w->rowid;
 	uint8_t kk[XS_IDX_KMAX];
 	uint64_t h;
-	int i, m, wi, rl, kl2;
+	int i, m, wi, rl, kl2, rc;
 	const uint8_t *rec;
 	if (!c->in_txn || c->umap_cap == 0) return 0;
 	h = xs_bytes_hash(key, klen);
@@ -7962,9 +7969,9 @@ xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
 		if (wi >= c->wn || c->wbuf[wi].rowid == rowid) continue;
 		if (!wbuf_is_newest(c, wi) || c->wbuf[wi].deleted)
 			continue; /* superseded or deleted in this txn */
-		rec = xs_wrec_payload(c, wi, &rl);
-		if (rec == NULL)
-			return XTC_E_IO; /* a spilled payload not read back */
+		rc = xs_wrec_payload(c, wi, &rec, &rl);
+		if (rc != XTC_OK)
+			return rc; /* a spilled payload not read back */
 		kl2 = xs_idx_rowkey(rt, rec, rl, c->wbuf[wi].rowid, 0, kk,
 		    (int)sizeof kk, NULL);
 		if (xs_uniq_same(rt, kk, kl2, key, klen, rec, rl,
@@ -8584,15 +8591,15 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 		xstore_ctx_t *cx = s->cx;
 		uint8_t key[XS_IDX_KMAX];
 		size_t boff = 0;
-		int wi, rl, kl;
+		int wi, rl, kl, rc;
 		for (wi = 0; wi < cx->wn; wi++) {
 			const uint8_t *rec;
 			if (cx->wbuf[wi].tableid != s->rt.tableid ||
 			    cx->wbuf[wi].deleted || !wbuf_is_newest(cx, wi))
 				continue;
-			rec = xs_wrec_payload(cx, wi, &rl);
-			if (rec == NULL) { /* the first next fails */
-				s->err = XTC_E_IO;
+			rc = xs_wrec_payload(cx, wi, &rec, &rl);
+			if (rc != XTC_OK) { /* the first next fails */
+				s->err = rc;
 				break;
 			}
 			kl = xs_idx_rowkey(&s->rt, rec, rl, cx->wbuf[wi].rowid,
@@ -8978,7 +8985,7 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 {
 	uint8_t kk[XS_IDX_KMAX];
 	const uint8_t *v;
-	int c, rl, kl, vr;
+	int c, rl, kl, vr, r;
 	for (;;) {
 		if (s->err != 0)
 			return -1;
@@ -9008,9 +9015,9 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 				if (wi < 0 || bw->deleted)
 					continue; /* deleted since the open */
 				/* An unreadable spilled payload: an error. */
-				p = xs_wrec_payload(s->cx, wi, &rl);
-				if (p == NULL)
-					return xs_iscan_fail(s, XTC_E_IO);
+				r = xs_wrec_payload(s->cx, wi, &p, &rl);
+				if (r != XTC_OK)
+					return xs_iscan_fail(s, r);
 				if (xs_iscan_rec(s) == NULL)
 					return -1;
 				if (rl > XS_VMAX) rl = XS_VMAX;
