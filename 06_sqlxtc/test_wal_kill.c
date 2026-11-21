@@ -398,7 +398,8 @@ scan_diag(const char *path)
 	}
 	memset(hdr, 0, sizeof hdr);
 	if (pread(fd, hdr, sizeof hdr, o) < 0) {
-		fprintf(stderr, "  scan: stops at %lld; cannot read there: %s\n",
+		fprintf(stderr,
+		    "  scan: stops at %lld; cannot read there: %s\n",
 		    (long long)o, strerror(errno));
 		close(fd);
 		return;

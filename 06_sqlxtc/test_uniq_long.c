@@ -434,19 +434,74 @@ sweep_count(sx_db *h, const char *sql, const char *v, int64_t want)
 	return errs;
 }
 
-/* (6) */
+/* (6), part 1.  A scan that failed, left open, holds no latch: a write
+ * into the leaf it stopped in goes through (it hung when the failed
+ * cursor kept the leaf latched). */
 static void
-t_read_errors(sx_db *h)
+t_failed_scan_unlatched(sx_db *h)
 {
-	char *a = longval(699, 1), *b = longval(699, 2);
-	char *wide = longval(2000, 3); /* over bt_max_inline on 4 KiB pages */
 	const uint8_t *rec;
 	char sv[16];
 	xstore_iscan_t *sc;
 	xstore_val_t lo, hi;
 	uint32_t idx = 0;
 	int64_t rid;
-	int n, rc, rl, errs;
+	int n, rc, rl;
+	CK(xstore_index_lookup(sx_storage_bt(), "r", "g", &idx));
+	memset(&lo, 0, sizeof lo);
+	lo.cls = XSTORE_C_INT;
+	hi = lo;
+	hi.i = 2;
+	for (n = 1; n <= 3; n++) {
+		sc = xstore_iscan_open((struct xsql *)h, "r", idx, NULL, 0, &lo,
+		    0, &hi, 0, 0);
+		CK(sc != NULL);
+		xstore_index_read_fail_at(n);
+		while ((rc = xstore_iscan_next(sc, &rid, &rec, &rl)) == 1)
+			;
+		CK(rc < 0);
+		snprintf(sv, sizeof sv, "latch%d", n);
+		CK(ins_tab(h, "r", 3000 + n, sv) == SX_DONE);
+		xstore_iscan_close(sc);
+	}
+	xstore_index_read_fail_at(0);
+	CK(sx_exec(h, "DELETE FROM r WHERE k >= 3000", NULL) == SX_OK);
+}
+
+/* (6), part 2.  Rows too wide for a leaf: their values are out of line,
+ * which the batched row read never settles, so every row is read by the
+ * point read the batch falls back to (xs_point_get).  Returns how many
+ * runs of the sweep failed. */
+static int
+t_wide_rows(sx_db *h)
+{
+	char *wide = longval(2000, 3); /* over bt_max_inline on 4 KiB pages */
+	int n, errs;
+	CK(sx_exec(h, "CREATE TABLE w(k INTEGER PRIMARY KEY, g INT, pad TEXT)",
+	       NULL) == SX_OK);
+	CK(sx_exec(h, "CREATE INDEX w_g ON w(g)", NULL) == SX_OK);
+	for (n = 1; n <= 30; n++) {
+		sx_stmt *st = NULL;
+		CK(sx_prepare(h, "INSERT INTO w VALUES(?, ?, ?)", -1, &st,
+		       NULL) == SX_OK);
+		sx_bind_int64(st, 1, n);
+		sx_bind_int64(st, 2, n % 3);
+		sx_bind_text(st, 3, wide, -1);
+		CK(sx_step(st) == SX_DONE);
+		sx_finalize(st);
+	}
+	errs = sweep_count(h, "SELECT count(*) FROM w WHERE g = 1", NULL, 10);
+	free(wide);
+	return errs;
+}
+
+/* (6) */
+static void
+t_read_errors(sx_db *h)
+{
+	char *a = longval(699, 1), *b = longval(699, 2);
+	char sv[16];
+	int n, rc, errs;
 	CK(sx_exec(h,
 	       "CREATE TABLE r(k INTEGER PRIMARY KEY, s TEXT UNIQUE, "
 	       "g INT)",
@@ -475,45 +530,8 @@ t_read_errors(sx_db *h)
 	CK(sx_exec(h, "INSERT INTO r VALUES(1000, 'w', 1)", NULL) == SX_OK);
 	errs += sweep_count(h, "SELECT count(*) FROM r WHERE g = 1", NULL, 101);
 	CK(sx_exec(h, "ROLLBACK", NULL) == SX_OK);
-	/* A scan that failed, left open, holds no latch: a write into the
-	 * leaf it stopped in goes through (it hung when the failed cursor
-	 * kept the leaf latched). */
-	CK(xstore_index_lookup(sx_storage_bt(), "r", "g", &idx));
-	memset(&lo, 0, sizeof lo);
-	lo.cls = XSTORE_C_INT;
-	hi = lo;
-	hi.i = 2;
-	for (n = 1; n <= 3; n++) {
-		sc = xstore_iscan_open((struct xsql *)h, "r", idx, NULL, 0, &lo,
-		    0, &hi, 0, 0);
-		CK(sc != NULL);
-		xstore_index_read_fail_at(n);
-		while ((rc = xstore_iscan_next(sc, &rid, &rec, &rl)) == 1)
-			;
-		CK(rc < 0);
-		snprintf(sv, sizeof sv, "latch%d", n);
-		CK(ins_tab(h, "r", 3000 + n, sv) == SX_DONE);
-		xstore_iscan_close(sc);
-	}
-	xstore_index_read_fail_at(0);
-	CK(sx_exec(h, "DELETE FROM r WHERE k >= 3000", NULL) == SX_OK);
-	/* Rows too wide for a leaf: their values are out of line, which the
-	 * batched row read never settles, so every row is read by the point
-	 * read the batch falls back to (xs_point_get). */
-	CK(sx_exec(h, "CREATE TABLE w(k INTEGER PRIMARY KEY, g INT, pad TEXT)",
-	       NULL) == SX_OK);
-	CK(sx_exec(h, "CREATE INDEX w_g ON w(g)", NULL) == SX_OK);
-	for (n = 1; n <= 30; n++) {
-		sx_stmt *st = NULL;
-		CK(sx_prepare(h, "INSERT INTO w VALUES(?, ?, ?)", -1, &st,
-		       NULL) == SX_OK);
-		sx_bind_int64(st, 1, n);
-		sx_bind_int64(st, 2, n % 3);
-		sx_bind_text(st, 3, wide, -1);
-		CK(sx_step(st) == SX_DONE);
-		sx_finalize(st);
-	}
-	errs += sweep_count(h, "SELECT count(*) FROM w WHERE g = 1", NULL, 10);
+	t_failed_scan_unlatched(h);
+	errs += t_wide_rows(h);
 	CK(errs > 0);
 	/* A duplicate long value, then a new one: the duplicate never goes
 	 * in, the new one goes in or fails. */
@@ -532,7 +550,6 @@ t_read_errors(sx_db *h)
 	CK(no_missing());
 	free(a);
 	free(b);
-	free(wide);
 	if (!g_fail)
 		printf(
 		    "  ok   a failed read in an index scan or a UNIQUE probe "

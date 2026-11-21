@@ -274,10 +274,14 @@ main(void)
 	for (i = 1; i <= 200; i++) {
 		int64_t before = xstore_clock_now();
 		snprintf(sql, sizeof sql,
-		    "INSERT INTO u VALUES(%d, 'value-%06d-xxxxxxxxxxxxxxxx')", i, i);
+		    "INSERT INTO u VALUES(%d, "
+		    "'value-%06d-xxxxxxxxxxxxxxxx')",
+		    i, i);
 		CK(sx_exec(db, sql, NULL) == SX_OK);
 		snprintf(sql, sizeof sql,
-		    "SELECT v FROM u WHERE v = 'value-%06d-xxxxxxxxxxxxxxxx'", i);
+		    "SELECT v FROM u WHERE v = "
+		    "'value-%06d-xxxxxxxxxxxxxxxx'",
+		    i);
 		(void)xstore_as_of(db, before);
 		if (rows_v(db, sql, 0, got, sizeof got) != 0)
 			ok = 0;

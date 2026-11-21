@@ -8767,7 +8767,8 @@ xs_iscan_fwd(xstore_iscan_t *s)
 		/* After the equality probe's batch: its last key, if still
 		 * there, is the cursor's first and is skipped. */
 		xs_iscan_yield();
-		rc = bt_cursor_open(s->bt, s->pos, (uint16_t)s->poslen, &s->cur);
+		rc = bt_cursor_open(s->bt, s->pos, (uint16_t)s->poslen,
+		    &s->cur);
 	} else if (s->cur == NULL) {
 		const uint8_t *st = s->has_lo ? s->lo : s->pfx;
 		int sl = s->has_lo ? s->lolen : s->pfxlen;
@@ -8791,7 +8792,8 @@ xs_iscan_fwd(xstore_iscan_t *s)
 		if (rc != XTC_OK)
 			return xs_iscan_fail(s, rc);
 		if (s->poslen > 0) {
-			int same = kl == s->poslen && memcmp(k, s->pos, kl) == 0;
+			int same = kl == s->poslen &&
+			    memcmp(k, s->pos, kl) == 0;
 			s->poslen = 0;
 			if (same)
 				continue;
