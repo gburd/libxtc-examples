@@ -29,6 +29,7 @@
 #define XTC_DST_BUG_GCBATCH    23  /* xstore.c: version GC forgets its row at a batch boundary */
 #define XTC_DST_BUG_UNIQPROBE  72  /* xstore.c: a failed UNIQUE probe reads as "no duplicate" */
 #define XTC_DST_BUG_LONGKEY    73  /* xstore.c: a key longer than a B-tree key is not indexed */
+#define XTC_DST_BUG_IDREUSE    79  /* xstore.c: a new table / index takes a dropped one's id */
 #define XTC_DST_BUG_UNIQREAD   80  /* xstore.c: a UNIQUE candidate row that cannot be read reads as absent */
 #define XTC_DST_BUG_POINTEND   81  /* btree.c: a key prefix "ends" with its leaf, fence unchecked */
 

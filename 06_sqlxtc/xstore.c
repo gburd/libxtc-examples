@@ -1180,6 +1180,22 @@ typedef struct xstore_vtab {
  * by B-tree + name) shortcuts the catalog scan for tables already seen
  * in this process, and reserves a just-allocated id so a concurrent
  * allocator on another connection picks a higher one.
+ *
+ * An id is never reused.  DROP TABLE tombstones the catalog row, and
+ * version GC and the log dump remove a tombstone once no snapshot needs
+ * it (taking the dropped table's rows with it), so the catalog alone
+ * forgets a dropped id.  The catalog therefore also holds a HIGH-WATER
+ * row at rowid 0 (xs_hw_*): the largest id a DROP removed, raised before
+ * the tombstone is written.  Its value has an empty name (a NUL, then
+ * the id in decimal), so no name lookup matches it, and a store written
+ * this way stays readable by a release that does not know the row.  The
+ * index catalog keeps the same row for index ids.  GC and the dump keep
+ * a tombstone the mark does not cover (a DROP by an older release), in
+ * either catalog.
+ * One case is not covered: a store on which an older release already
+ * collected a dropped index's tombstone can hand that index id out
+ * again (tables have the data probe, xs_data_max_id; indexes have
+ * nothing to probe).  That is harmless: the DROP cleared the entries.
  */
 #define XS_CAT_TABLEID 0u
 #define XS_CAT_MAX 256
@@ -1400,37 +1416,9 @@ xs_cat_prime(bt_t *bt, const char *name, uint32_t id)
 	xs_cat_unlock();
 }
 
-/* The largest table-id present in the catalog (table-id 0), or 0 if it
- * is empty.  Used to allocate the next id; covers ids recovered from
- * the WAL, since the catalog is replayed before any connect. */
 static int xs_put(bt_t *bt, uint32_t tableid, int64_t rowid,
     const void *blob, int n, int deleted);   /* defined below */
-static uint32_t
-xs_cat_max_id(bt_t *bt)
-{
-	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
-	uint32_t maxid = 0;
-
-	enc_vkey(XS_CAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
-	for (;;) {
-		const void *k = NULL, *vv = NULL;
-		uint16_t klen = 0, vl = 0;
-		int64_t rid;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN)
-			break;
-		if (dec_tableid((const uint8_t *)k) != XS_CAT_TABLEID)
-			break;                       /* past the catalog */
-		rid = dec_rowid((const uint8_t *)k);
-		if (rid > 0 && (uint32_t)rid > maxid)
-			maxid = (uint32_t)rid;
-	}
-	bt_cursor_close(cur);
-	return maxid;
-}
+static uint32_t xs_cat_high(bt_t *bt, uint32_t cat);   /* defined below */
 
 /* Map (bt, name) to its allocated table-id: the in-process cache, then
  * the persisted catalog, else allocate a fresh dense id and persist it.
@@ -1452,7 +1440,7 @@ xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs)
 	if (id == 0) {
 		/* New table: allocate past both the persisted high-water id
 		 * and any id reserved in-process but not yet written. */
-		maxid = xs_cat_max_id(bt);
+		maxid = xs_cat_high(bt, XS_CAT_TABLEID);
 		for (i = 0; i < g_cat_n; i++)
 			if (g_cat[i].bt == bt && g_cat[i].tableid > maxid)
 				maxid = g_cat[i].tableid;
@@ -4984,6 +4972,67 @@ xs_newest_ts(bt_t *bt, uint32_t tableid, int64_t rowid)
 }
 
 /*
+ * The ids of dropped tables, collected by a pass over the tree (version
+ * GC, the log dump) from the table catalog, which sorts before every
+ * table: an id whose catalog row's newest version (the one the pass
+ * keeps) is a tombstone.  The pass then drops that table's rows, which
+ * DROP TABLE leaves behind.  Only a tombstoned id counts, never an id
+ * with no catalog row: a caller may write rows under an id it never put
+ * in the catalog.  If the set cannot grow, the rows stay (a leak, never
+ * a loss).
+ */
+struct xs_dropset {
+	uint32_t *id;      /* ascending: the catalog is scanned in order */
+	int       n, cap;
+};
+
+static uint32_t xs_hw_parse(const uint8_t *p, int n);   /* defined below */
+
+/*
+ * The high-water mark a catalog version (key value `vv`, `vl` bytes,
+ * flag byte first) records, or 0 for a tombstone.  A pass that drops
+ * tombstoned ids reads the mark from rowid 0, which sorts before every
+ * catalog row, and drops an id only if the mark covers it: a tombstone
+ * above the mark (a DROP by a release without the mark) is kept, so its
+ * id still counts as handed out and its rows stay.
+ */
+static uint32_t
+xs_hw_of(const void *vv, uint16_t vl)
+{
+	const uint8_t *v = vv;
+	if (vl < 1 || (v[0] & XS_F_DELETED))
+		return 0;
+	return xs_hw_parse(v + 1, (int)vl - 1);
+}
+
+static void
+xs_dropset_add(struct xs_dropset *d, uint32_t id)
+{
+	uint32_t *nv;
+	if (d->n == d->cap) {
+		int nc = d->cap ? d->cap * 2 : 64;
+		if ((nv = realloc(d->id, (size_t)nc * sizeof *nv)) == NULL)
+			return;
+		d->id = nv;
+		d->cap = nc;
+	}
+	d->id[d->n++] = id;
+}
+
+static int
+xs_dropset_has(const struct xs_dropset *d, uint32_t id)
+{
+	int lo = 0, hi = d->n - 1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		if (d->id[mid] == id) return 1;
+		if (d->id[mid] < id) lo = mid + 1;
+		else hi = mid - 1;
+	}
+	return 0;
+}
+
+/*
  * Version GC (MVCC vacuum).  Reclaims versions no live snapshot can
  * reach: scanning in key order the cursor sees each rowid's versions
  * newest-first (commit_ts descending), so for each rowid we keep every
@@ -4991,7 +5040,8 @@ xs_newest_ts(bt_t *bt, uint32_t tableid, int64_t rowid)
  * `horizon` (the survivor that snapshots at the horizon still need),
  * and delete the rest.  A survivor that is a tombstone with nothing
  * newer is itself unreachable and is dropped, so a deleted row
- * eventually leaves no trace.
+ * eventually leaves no trace.  A table whose catalog row is such a
+ * tombstone (DROP TABLE below the horizon) loses every row with it.
  *
  * Latches must not span the vtable/btree boundary, and bt_delete
  * wants the exclusive latch a live cursor would hold, so this collects
@@ -5023,6 +5073,10 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 	int64_t prev_rowid = 0;
 	uint32_t prev_tableid = 0;
 	int in_group = 0, survivor_found = 0;
+	struct xs_dropset dropped = { NULL, 0, 0 };
+	/* The catalogs' high-water rows: [0] tables, [1] indexes. */
+	uint32_t mark[2] = { 0, 0 };
+	const uint8_t past = XS_IDX_LEAD + 1;
 
 	for (;;) {
 		bt_cursor_t *cur = NULL;
@@ -5041,13 +5095,24 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			uint16_t klen = 0, vl = 0;
 			int64_t rid; uint64_t ts; int deleted, first_in_group;
 			uint32_t tid;
+			int is_cat;
 
-			/* The tables end at the index namespace; an index key can
-			 * be 20 bytes long too, so stop on its lead byte, not only
-			 * on the first key of another length. */
-			if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-			    klen != XS_VKLEN ||
-			    ((const uint8_t *)k)[0] == XS_IDX_LEAD)
+			if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK)
+				break;
+			/* The tables end at the index namespace (index entries
+			 * are not versions, and one can be 20 bytes long too).
+			 * The index catalog sorts after it, so seek past the
+			 * namespace, as xs_dump_tree does, rather than stop:
+			 * otherwise GC reached the index catalog only when the
+			 * store held no index entry at all. */
+			if (klen >= 1 && ((const uint8_t *)k)[0] == XS_IDX_LEAD) {
+				bt_cursor_close(cur);
+				cur = NULL;
+				if (bt_cursor_open(bt, &past, 1, &cur) != XTC_OK)
+					break;
+				continue;
+			}
+			if (klen != XS_VKLEN)
 				break;
 			/* Skip the resume key itself (already processed). */
 			if (have_resume && memcmp(k, resume, XS_VKLEN) == 0)
@@ -5057,6 +5122,7 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			ts = dec_ts((const uint8_t *)k);
 			if (tid == XS_STAGE_TID)
 				continue;          /* STEAL staging area: not GC's concern */
+			is_cat = (tid == XS_CAT_TABLEID || tid == XS_IDXCAT_TABLEID);
 			deleted = (vl >= 1 && (((const uint8_t *)vv)[0] & XS_F_DELETED));
 			/* A logical row is (tableid, rowid): a group boundary is
 			 * either changing. */
@@ -5065,11 +5131,25 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			if (first_in_group) {
 				prev_rowid = rid; prev_tableid = tid;
 				in_group = 1; survivor_found = 0;
+				if (is_cat && rid == 0)
+					mark[tid == XS_IDXCAT_TABLEID] = xs_hw_of(vv, vl);
+				/* A table dropped below the horizon: no snapshot
+				 * can reach it, so its rows go with its tombstone. */
+				if (tid == XS_CAT_TABLEID && rid > 0 && deleted &&
+				    ts <= horizon && (uint32_t)rid <= mark[0])
+					xs_dropset_add(&dropped, (uint32_t)rid);
 			}
-			if (!survivor_found) {
+			if (tid != XS_CAT_TABLEID && xs_dropset_has(&dropped, tid)) {
+				memcpy(dead[ndead++], k, XS_VKLEN);
+			} else if (!survivor_found) {
 				if (ts <= horizon) {
 					survivor_found = 1;
-					if (deleted && first_in_group)
+					/* An unmarked tombstone in either catalog
+					 * stays: it alone keeps its id from being
+					 * handed out again. */
+					if (deleted && first_in_group &&
+					    !(is_cat && rid > 0 && (uint32_t)rid >
+					    mark[tid == XS_IDXCAT_TABLEID]))
 						memcpy(dead[ndead++], k, XS_VKLEN);
 				}
 				/* else ts > horizon: keep (newer than horizon). */
@@ -5089,6 +5169,7 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 		if (ndead < g_gc_batch)
 			break;     /* scanned to the end */
 	}
+	free(dropped.id);
 	if (out_reclaimed != NULL) *out_reclaimed = reclaimed;
 	return rc;
 }
@@ -6915,29 +6996,133 @@ xstore_drop_view(struct xsql *db, const char *name)
 
 /* ---- secondary-index catalog + API ------------------------------- */
 
-/* Largest index-catalog rowid (index id) present, or 0.  Used to
- * allocate the next dense index id, covering recovered ids (tombstoned
- * rows count, so an id is never reused). */
+/*
+ * The id in a high-water row's payload ("\0<decimal>"), or 0 if the
+ * payload is not one.  The catalog scans see the payload with its flag
+ * byte in front; xs_read_rec strips it.
+ */
 static uint32_t
-xs_idxcat_max_id(bt_t *bt)
+xs_hw_parse(const uint8_t *p, int n)
+{
+	char num[16];
+	if (n < 2 || n - 1 >= (int)sizeof num || p[0] != 0)
+		return 0;
+	memcpy(num, p + 1, (size_t)(n - 1));
+	num[n - 1] = '\0';
+	return (uint32_t)strtoul(num, NULL, 10);
+}
+
+/*
+ * Raise the high-water row of catalog `cat` (XS_CAT_TABLEID or
+ * XS_IDXCAT_TABLEID) to at least `id`.  Called by a DROP before it
+ * writes its tombstone, so a crash between the two leaves the object in
+ * place and the mark already past it.  Holds the cat lock across the
+ * read and the write, so two DROPs cannot lower the mark.  Returns
+ * SX_OK, or the xs_put error (the DROP must then fail).
+ */
+static int
+xs_hw_raise(bt_t *bt, uint32_t cat, uint32_t id)
+{
+	uint8_t cur[16], val[16];
+	int n, rc = SX_OK;
+	xs_cat_lock();
+	n = xs_read_rec(bt, cat, 0, cur, (int)sizeof cur);
+	if (xs_hw_parse(cur, n) < id) {
+		val[0] = 0;
+		n = 1 + snprintf((char *)val + 1, sizeof val - 1, "%u",
+		    (unsigned)id);
+		rc = xs_put(bt, cat, 0, val, n, 0);
+	}
+	xs_cat_unlock();
+	return rc;
+}
+
+/*
+ * DST crash point between a DROP's high-water mark and its tombstone:
+ * under the simulator with buggify on, 1 on the site's seeded coin, and
+ * the DROP then stops there as if the tombstone's write had failed (the
+ * test crashes the store next).  The object must survive, and its id
+ * stay handed out.  A single relaxed load in production.
+ */
+static int
+xs_drop_gap(const char *site)
+{
+	return XTC_SIM_BUGGIFY(site) && xtc_sim_buggify_fault(1000);
+}
+
+/*
+ * The largest table id that still has a row version in the tree, or 0.
+ * Version keys of the user tables sort below the index namespace
+ * (XS_IDX_LEAD), so this is the key just below it: one descent.  It
+ * covers a store from before the high-water row, where GC already
+ * removed a dropped table's tombstone and left its rows.
+ */
+static uint32_t
+xs_data_max_id(bt_t *bt)
+{
+	uint8_t hi[1] = { XS_IDX_LEAD }, k[XS_VKLEN + 8];
+	uint16_t klen = 0;
+	if (bt_seek_lt(bt, hi, 1, k, (uint16_t)sizeof k, &klen, NULL, 0,
+	    NULL) != XTC_OK || klen != XS_VKLEN)
+		return 0;
+	return dec_tableid(k);
+}
+
+/*
+ * The largest id catalog `cat` has handed out: its largest rowid, its
+ * high-water row, and (for the table catalog) the largest table id with
+ * rows left in the tree.  The next allocation takes one past it.  Covers
+ * ids recovered from the WAL, since the catalog is replayed before any
+ * connect.
+ */
+static uint32_t
+xs_cat_high(bt_t *bt, uint32_t cat)
 {
 	bt_cursor_t *cur = NULL;
 	uint8_t startk[XS_VKLEN];
-	uint32_t maxid = 0;
-	int i;
-	enc_vkey(XS_IDXCAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) return 0;
+	uint32_t maxid = 0, hw = 0, data;
+	int seen0 = 0;
+
+	enc_vkey(cat, INT64_MIN, ~(uint64_t)0, startk);
+	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
+		return 0;
 	for (;;) {
-		const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
+		const void *k = NULL, *vv = NULL;
+		uint16_t klen = 0, vl = 0;
 		int64_t rid;
 		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN) break;
-		if (dec_tableid((const uint8_t *)k) != XS_IDXCAT_TABLEID) break;
+		    klen != XS_VKLEN)
+			break;
+		if (dec_tableid((const uint8_t *)k) != cat)
+			break;                       /* past the catalog */
 		rid = dec_rowid((const uint8_t *)k);
-		if (rid > 0 && (uint32_t)rid > maxid) maxid = (uint32_t)rid;
+		if (rid == 0 && !seen0) {
+			/* The newest version of the high-water row. */
+			seen0 = 1;
+			if (vl >= 1 && !(((const uint8_t *)vv)[0] & XS_F_DELETED))
+				hw = xs_hw_parse((const uint8_t *)vv + 1, vl - 1);
+		}
+		if (rid > 0 && (uint32_t)rid > maxid)
+			maxid = (uint32_t)rid;
 	}
 	bt_cursor_close(cur);
-	/* An id allocated in-process whose catalog row is not visible yet. */
+	data = cat == XS_CAT_TABLEID ? xs_data_max_id(bt) : 0;
+	if (data > hw)
+		hw = data;
+#if XTC_DST_BUG(XTC_DST_BUG_IDREUSE)
+	hw = 0;       /* planted: a dropped id comes back after GC */
+#endif
+	return hw > maxid ? hw : maxid;
+}
+
+/* The largest index id handed out (xs_cat_high over the index catalog),
+ * or a larger one allocated in-process whose catalog row is not visible
+ * yet.  The next index takes one past it, so an id is never reused. */
+static uint32_t
+xs_idxcat_max_id(bt_t *bt)
+{
+	uint32_t maxid = xs_cat_high(bt, XS_IDXCAT_TABLEID);
+	int i;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id > maxid)
@@ -7081,6 +7266,7 @@ xs_idxcat_load(bt_t *bt)
 		rid = dec_rowid(kb);
 		if (have_last && rid == last_rid) continue;   /* older version */
 		last_rid = rid; have_last = 1;
+		if (rid <= 0) continue;          /* the high-water row */
 		if (vl < 1 || (vb[0] & XS_F_DELETED)) continue;  /* dropped */
 		if (nrows >= XS_IDX_MAX || vl - 1 >= (int)sizeof rows[0].v) continue;
 		rows[nrows].id = (uint32_t)rid;
@@ -7582,7 +7768,9 @@ xstore_drop_index(struct xsql *db, const char *name)
 	xs_cat_unlock();
 	if (found <= 0) return found;   /* unknown (0) / constraint index (-1) */
 	vbuf[0] = 0;
-	(void)xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf, 1, 1);  /* tombstone catalog row */
+	if (xs_hw_raise(bt, XS_IDXCAT_TABLEID, idx_id) == SX_OK &&
+	    !xs_drop_gap("xstore.drop.index_gap"))
+		(void)xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf, 1, 1);  /* tombstone catalog row */
 	xs_idx_clear(bt, idx_id);
 	return 1;
 }
@@ -7591,13 +7779,14 @@ xstore_drop_index(struct xsql *db, const char *name)
 static void
 xs_idx_drop_table(bt_t *bt, const char *table)
 {
-	uint32_t ids[XS_IDX_MAX];
+	uint32_t ids[XS_IDX_MAX], top = 0;
 	uint8_t vbuf[8];
-	int n = 0, i;
+	int n = 0, i, marked;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; ) {
 		if (g_idx[i].bt == bt && strcmp(g_idx[i].table, table) == 0) {
 			ids[n++] = g_idx[i].rt.idx_id;
+			if (g_idx[i].rt.idx_id > top) top = g_idx[i].rt.idx_id;
 			g_idx[i] = g_idx[--g_idx_n];
 			XS_CATC_BUMP();
 		} else {
@@ -7606,8 +7795,15 @@ xs_idx_drop_table(bt_t *bt, const char *table)
 	}
 	xs_cat_unlock();
 	vbuf[0] = 0;
+	/* No tombstone without the mark, as in xstore_drop_index.  If the
+	 * mark cannot be written (a fail-stopped log, so the store takes no
+	 * more writes) the catalog rows stay live: the next open loads the
+	 * definitions, finds no table and taints the indexes. */
+	marked = n > 0 && xs_hw_raise(bt, XS_IDXCAT_TABLEID, top) == SX_OK &&
+	    !xs_drop_gap("xstore.drop.index_gap");
 	for (i = 0; i < n; i++) {
-		(void)xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)ids[i], vbuf, 1, 1);
+		if (marked)
+			(void)xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)ids[i], vbuf, 1, 1);
 		xs_idx_clear(bt, ids[i]);
 	}
 }
@@ -9356,7 +9552,11 @@ xstore_drop_table(struct xsql *db, const char *name)
 	nlen = strlen(name);
 	if (nlen > sizeof vbuf) nlen = sizeof vbuf;
 	memcpy(vbuf, name, nlen);
-	if (xs_put(bt, XS_CAT_TABLEID, (int64_t)id, vbuf, (int)nlen, 1) != SX_OK)
+	/* The mark first: once GC takes the tombstone, it alone keeps the
+	 * id from coming back (see the table-id comment). */
+	if (xs_hw_raise(bt, XS_CAT_TABLEID, id) != SX_OK ||
+	    xs_drop_gap("xstore.drop.table_gap") ||
+	    xs_put(bt, XS_CAT_TABLEID, (int64_t)id, vbuf, (int)nlen, 1) != SX_OK)
 		return -1;
 	xs_idx_drop_table(bt, name);
 	xstore_cat_forget_one(bt, name);
@@ -10252,7 +10452,9 @@ xstore_recover_inplace(bt_t *bt, bm_t *bm, const char *wal_path,
  * included) and for each (tableid, rowid) emits only the NEWEST version
  * (versions sort newest-first within a key) as a one-version
  * transaction frame [XL_UPDATE][XL_COMMIT], skipping tombstones and all
- * superseded versions.  This is the compaction that bounds the log:
+ * superseded versions, and every row of a dropped table (its catalog
+ * row's newest version is a tombstone).  This is the compaction that
+ * bounds the log:
  * regardless of how much churn preceded it, the dump -- and the log it
  * replaces -- is proportional to the live row count.  Safe only at a
  * quiesced checkpoint.  Original commit timestamps are preserved. */
@@ -10271,6 +10473,8 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 	uint8_t ck[XL_HDR_LEN + 16];
 	uint32_t last_tid = 0; int64_t last_rid = 0; int have_last = 0;
 	int cn;
+	struct xs_dropset dropped = { NULL, 0, 0 };
+	uint32_t mark[2] = { 0, 0 };   /* high-water rows: table, index catalog */
 
 	if ((cn = xl_enc_checkpoint(ck, sizeof ck, dc->clock, 0)) > 0)
 		emit(ectx, ck, (uint32_t)cn);
@@ -10330,6 +10534,7 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 			cur = NULL;
 			if (bt_cursor_open(bt, &past, 1, &cur) != XTC_OK) {
 				dc->cancelled = 1;    /* a truncated image: not swapped in */
+				free(dropped.id);
 				return XTC_E_IO;
 			}
 			continue;
@@ -10347,9 +10552,25 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 			continue;                  /* committed after the snapshot */
 		last_tid = tableid; last_rid = rowid; have_last = 1;
 		flags = (vl >= 1) ? ((const uint8_t *)vv)[0] : 0;
+		if ((tableid == XS_CAT_TABLEID || tableid == XS_IDXCAT_TABLEID) &&
+		    rowid == 0)
+			mark[tableid == XS_IDXCAT_TABLEID] = xs_hw_of(vv, vl);
+		/* A dropped table (xs_dropset): its rows leave the log with
+		 * its catalog row, so a rebuild does not bring them back.  A
+		 * catalog tombstone above its catalog's mark is dumped as is
+		 * (xs_hw_of), and so are its table's rows. */
+		if ((tableid == XS_CAT_TABLEID || tableid == XS_IDXCAT_TABLEID) &&
+		    rowid > 0 && (flags & XS_F_DELETED) &&
+		    (uint32_t)rowid > mark[tableid == XS_IDXCAT_TABLEID])
+			goto emit;
+		if (tableid == XS_CAT_TABLEID && rowid > 0 &&
+		    (flags & XS_F_DELETED))
+			xs_dropset_add(&dropped, (uint32_t)rowid);
 		if (flags & XS_F_DELETED)
 			continue;                  /* newest is a tombstone: row is gone */
-
+		if (tableid != XS_CAT_TABLEID && xs_dropset_has(&dropped, tableid))
+			continue;
+emit:
 		payl = (vl >= 1) ? (uint16_t)(vl - 1) : 0;
 		if (payl > XS_VMAX) payl = XS_VMAX;
 		h.type = XL_UPDATE; h.txn_id = ts; h.prev_lsn = 0;
@@ -10367,6 +10588,7 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 		emit(ectx, rec, (uint32_t)(p - rec));
 	}
 	bt_cursor_close(cur);
+	free(dropped.id);
 	return dc->cancelled ? XTC_E_IO : XTC_OK;
 }
 
