@@ -1658,6 +1658,7 @@ struct xs_idx_rt {
 	char     kind;              /* 'p' / 'u' / 'i' */
 	int      kmax;              /* bt_max_key: the entry bound */
 	uint64_t k0, k1;            /* SipHash key of truncated entries */
+	int      broken;            /* XTC_E_* of a failed rebuild, or 0 */
 };
 struct xs_idx_ent {
 	bt_t    *bt;
@@ -7559,11 +7560,30 @@ struct xs_rb_job {
 	int next, left;
 };
 
+/* Index `idx_id` could not be rebuilt (code rc): it misses entries for
+ * the rest of the run.  The planner and the index scan skip it, and a
+ * UNIQUE probe through it fails the write; the taint rebuilds it at the
+ * next open, and a later rebuild of this run replaces the entry. */
+static void
+xs_idx_mark_broken(bt_t *bt, uint32_t idx_id, int rc)
+{
+	int i;
+	xs_cat_lock();
+	for (i = 0; i < g_idx_n; i++)
+		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
+			g_idx[i].rt.broken = rc;
+			XS_CATC_BUMP();
+			break;
+		}
+	xs_cat_unlock();
+	xs_cat_gen_bump();           /* re-plan without it */
+}
+
 static int
 xs_rb_worker(void *arg)
 {
 	struct xs_rb_job *j = arg;
-	int i;
+	int i, rc;
 	while ((i = xtc_atomic_fetch_add_i32(&j->next, 1, xtc_mo_relaxed)) <
 	    j->n) {
 #if XTC_DST_BUG(XTC_DST_BUG_IDXSKIP)
@@ -7572,9 +7592,14 @@ xs_rb_worker(void *arg)
 #endif
 		/* A UNIQUE duplicate builds nothing; a failed read or no
 		 * memory builds nothing either.  Either way the index is
-		 * incomplete: not trusted at the next open. */
-		if (xs_idx_build_one(j->bt, &j->e[i]) != 0)
+		 * incomplete: not used this run, not trusted at the next
+		 * open. */
+		rc = xs_idx_build_one(j->bt, &j->e[i]);
+		if (rc != 0) {
 			xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+			xs_idx_mark_broken(j->bt, j->e[i].rt.idx_id,
+			    rc < -1 ? rc : XTC_E_INTERNAL);
+		}
 	}
 	xtc_atomic_fetch_sub_i32(&j->left, 1, xtc_mo_acq_rel);
 	return 0;
@@ -7640,8 +7665,9 @@ xstore_index_trust_tag(bt_t *bt)
 		return 0;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
-		if (g_idx[i].bt == bt && g_idx[i].rt.tableid == 0)
-			unresolved = 1;            /* not maintained this run */
+		if (g_idx[i].bt == bt && (g_idx[i].rt.tableid == 0 ||
+		    g_idx[i].rt.broken != 0))
+			unresolved = 1;            /* not complete this run */
 	xs_cat_unlock();
 	return unresolved ? 0 : XS_IDX_TRUST_TAG;
 }
@@ -7962,7 +7988,7 @@ xstore_index_list(bt_t *bt, const char *table, xstore_index_info_t *out,
 	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_relaxed);
 	for (i = 0; i < g_idx_n && n < cap; i++) {
 		if (g_idx[i].bt != bt || strcasecmp(g_idx[i].table, table) != 0 ||
-		    g_idx[i].rt.tableid == 0)
+		    g_idx[i].rt.tableid == 0 || g_idx[i].rt.broken != 0)
 			continue;
 		memset(&out[n], 0, sizeof out[n]);
 		out[n].idx_id = g_idx[i].rt.idx_id;
@@ -8056,6 +8082,7 @@ xstore_index_lookup(bt_t *bt, const char *table, const char *col,
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.tableid != 0 &&
+		    g_idx[i].rt.broken == 0 &&
 		    strcmp(g_idx[i].table, table) == 0 &&
 		    strcmp(g_idx[i].col[0], col) == 0 &&
 		    !(g_idx[i].rt.descmask & 1u)) {
@@ -8220,6 +8247,8 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 	bt_cursor_t *cur = NULL;
 	uint8_t *rec = NULL, kk[XS_IDX_KMAX];
 	int dup = 0, rc;
+	if (rt->broken != 0)
+		return rt->broken;   /* misses entries: proves nothing */
 	rc = bt_cursor_open(bt, key, (uint16_t)klen, &cur);
 	if (rc == XTC_OK && (xs_uniq_fail_now() || xs_rd_fault())) {
 		bt_cursor_close(cur);
@@ -8888,7 +8917,7 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 	(void)table;
 	if (bt == NULL) return NULL;
 	if (!xs_idx_get_rt(bt, idx_id, &rt) || rt.tableid == 0 ||
-	    neq > rt.ncol || ((lo || hi) && neq >= rt.ncol) ||
+	    rt.broken != 0 || neq > rt.ncol || ((lo || hi) && neq >= rt.ncol) ||
 	    ((lo || hi) && ((rt.descmask >> neq) & 1u)))
 		return NULL;
 	s = malloc(sizeof *s + (size_t)XS_ISCAN_NKEY * (size_t)rt.kmax);

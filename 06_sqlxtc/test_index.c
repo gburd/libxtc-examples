@@ -35,6 +35,11 @@
  *	     leaves no table (a duplicate INSERT cannot go in), also after a
  *	     crash and recovery from the log; CREATE TABLE IF NOT EXISTS over
  *	     an existing table keeps it.
+ *	  7. An index whose rebuild at open fails a read is not used for
+ *	     the rest of the run: seeks answer from the table, a UNIQUE
+ *	     write through it fails (it cannot prove the key absent), and the
+ *	     store does not mark the indexes trusted; a rebuild that
+ *	     succeeds puts it back.
  */
 
 #include <assert.h>
@@ -531,6 +536,75 @@ scenario_create_table_error(void)
 	return 0;
 }
 
+/* 7: an index whose rebuild failed is not used. */
+static int
+scenario_rebuild_error(void)
+{
+	bm_t *bm = NULL;
+	bt_t *bt = NULL;
+	sx_db *db = NULL;
+	sx_stmt *st = NULL;
+	bm_opts_t bo = BM_OPTS_DEFAULT;
+	xstore_index_info_t ix[4];
+	char path[256];
+	int fd, i, n, errs = 0, broke_u = 0;
+
+	t_tmpl(path, sizeof path, "sqlxtc-index-rberr");
+	fd = mkstemp(path); if (fd < 0) return 1; close(fd);
+	bo.path = path; bo.page_size = PAGE_SZ; bo.n_frames = 256;
+	CK(bm_create(&bo, &bm) == XTC_OK);
+	CK(bt_open(bm, &bt) == XTC_OK);
+	CK(sx_open_bt(bt, &db) == SX_OK);
+	CK(sx_exec(db, "CREATE TABLE t(k INTEGER PRIMARY KEY, g INTEGER, "
+	    "c INTEGER UNIQUE)", NULL) == SX_OK);
+	CK(sx_prepare(db, "INSERT INTO t VALUES(?, ?, ?)", -1, &st,
+	    NULL) == SX_OK);
+	for (i = 1; i <= 1000; i++) {
+		sx_bind_int64(st, 1, i);
+		sx_bind_int64(st, 2, i % 10);
+		sx_bind_int64(st, 3, i);
+		CK(sx_step(st) == SX_DONE);
+		sx_reset(st);
+	}
+	sx_finalize(st);
+	CK(sx_exec(db, "CREATE INDEX t_g ON t(g)", NULL) == SX_OK);
+	CK(xstore_index_list(bt, "t", ix, 4) == 2);
+
+	/* The n-th read of the rebuild fails, for every n: the index it hit
+	 * is not listed, a seek on g still finds its 100 rows, a write the
+	 * UNIQUE index cannot check fails, and nothing is trusted. */
+	for (n = 1; n < 100000; n++) {
+		xstore_scan_read_fail_at(n);
+		CK(xstore_index_rebuild_all(bt) == 0);
+		if (xstore_scan_read_fail_at(0) > 0) break;
+		errs++;
+		CK(xstore_index_list(bt, "t", ix, 4) == 1);
+		CK(xstore_index_trust_tag(bt) == 0);
+		CK(count_rows_i(db, "SELECT k FROM t WHERE g = ?", 3) == 100);
+		CK(sx_exec(db, "INSERT INTO t VALUES(2000, 1, 5)", NULL) != SX_OK);
+		CK(count_rows_i(db, "SELECT k FROM t WHERE k = ?", 2000) == 0);
+		if (strcmp(ix[0].name, "t_g") == 0)
+			broke_u++;             /* the UNIQUE index is the one out */
+	}
+	CK(errs > 1 && broke_u > 0 && broke_u < errs);
+
+	/* The run with no failed read rebuilt both whole (the run stays
+	 * tainted: the next open rebuilds again). */
+	CK(xstore_index_list(bt, "t", ix, 4) == 2);
+	CK(sx_exec(db, "INSERT INTO t VALUES(2000, 1, 5)", NULL) ==
+	    SX_CONSTRAINT);
+	CK(sx_exec(db, "INSERT INTO t VALUES(2000, 1, 2000)", NULL) == SX_OK);
+	CK(count_rows_i(db, "SELECT k FROM t WHERE g = ?", 1) == 101);
+
+	sx_close(db);
+	bt_close(bt); bm_destroy(bm);
+	unlink(path);
+	if (g_fail) return 1;
+	printf("  ok   index: with each of %d rebuild reads failing, the index "
+	    "it hit is not used; a whole rebuild restores it\n", errs);
+	return 0;
+}
+
 int
 main(void)
 {
@@ -538,6 +612,7 @@ main(void)
 	if (scenario_recover() != 0) return 1;
 	if (scenario_scan_error() != 0) return 1;
 	if (scenario_create_table_error() != 0) return 1;
+	if (scenario_rebuild_error() != 0) return 1;
 	printf("test_index: OK\n");
 	return 0;
 }
