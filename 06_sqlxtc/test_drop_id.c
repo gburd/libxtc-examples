@@ -79,6 +79,29 @@ index_id(const char *table, const char *name)
 	return 0;
 }
 
+/* Whether the tree holds any version of catalog row (`cat`, `rid`).  A
+ * version key starts with the table id and the rowid with its sign bit
+ * flipped, both big-endian (xstore.c enc_vkey). */
+static int
+cat_has(uint32_t cat, int64_t rid)
+{
+	uint8_t pre[12];
+	uint64_t r = (uint64_t)rid ^ ((uint64_t)1 << 63);
+	bt_cursor_t *c = NULL;
+	const void *k, *v;
+	uint16_t kl, vl;
+	int i, found = 0;
+	for (i = 0; i < 4; i++) pre[i] = (uint8_t)(cat >> (24 - 8 * i));
+	for (i = 0; i < 8; i++) pre[4 + i] = (uint8_t)(r >> (56 - 8 * i));
+	if (bt_cursor_open(sx_storage_bt(), pre, sizeof pre, &c) != 0)
+		return -1;
+	if (bt_cursor_next(c, &k, &kl, &v, &vl) == 0 && kl >= sizeof pre &&
+	    memcmp(k, pre, sizeof pre) == 0)
+		found = 1;
+	bt_cursor_close(c);
+	return found;
+}
+
 /* Close the store the way `mode` names, then open it again. */
 static void
 reopen(const char *path, int mode)
@@ -153,11 +176,16 @@ drop_case(int mode)
 	sx_close(h);
 	/* Space: once the store has closed cleanly, the dropped table's
 	 * rows are gone with its catalog row (GC), and so are they from the
-	 * log the close compacted.  The live table keeps its row. */
+	 * log the close compacted.  The live table keeps its row.  Both
+	 * tombstones are gone too, which only a high-water row covering them
+	 * allows. */
 	CK(sx_storage_close() == SX_OK);
 	CK(sx_storage_open(path, 256) == SX_OK);
 	CK(xstore_max_rowid(sx_storage_bt(), tb) == 0);
 	CK(xstore_max_rowid(sx_storage_bt(), ta) == 1);
+	CK(cat_has(0, tb) == 0);
+	CK(cat_has(IDXCAT, ix) == 0);
+	CK(cat_has(IDXCAT, inew) == 1);
 	CK(sx_storage_close() == SX_OK);
 	unlink_store(path);
 }
