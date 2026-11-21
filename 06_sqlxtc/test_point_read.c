@@ -12,6 +12,10 @@
  *
  *	P1  an index seek returning 40 rows costs O(1) cursor descents
  *	    (the index walk itself), not one descent per fetched row.
+ *	P4  an equality index probe of a single entry opens no cursor at
+ *	    all: 200 of them on an index of unique values, 0 cursor
+ *	    descents and 0 resumes.  Probes whose entries span leaves (the
+ *	    40-row groups, and a 600-row group) return every row.
  *	P3  a rowid point SELECT (WHERE k = ?) is one seek too: no cursor
  *	    descent at all, and it returns the version of its snapshot, or
  *	    nothing for a deleted or absent rowid.
@@ -93,7 +97,7 @@ main(void)
 	char path[256], wal[288], sql[128], got[4096], want[32];
 	int64_t ts[N_VER];
 	uint64_t descents;
-	int fd, i, n;
+	int fd, i, n, ok;
 
 	t_tmpl(path, sizeof path, "sqlxtc-pread");
 	fd = mkstemp(path);
@@ -143,6 +147,42 @@ main(void)
 	    !T_OLC || descents <= 4 ? "ok" : "FAIL", n,
 	    (unsigned long long)descents, n + 1,
 	    T_OLC ? "" : " [no OLC in this build: bound not checked]");
+
+	/* P4: single-entry equality probes take no cursor. */
+	CK(sx_exec(db, "CREATE INDEX t_v ON t(v)", NULL) == SX_OK);
+	for (i = 0; i < 100; i++)
+		if (rows_v(db, "SELECT v FROM t WHERE grp = ?", i, got,
+		        sizeof got) != 40)
+			n = -1;
+	bt_get_stats(bt, &s0);
+	for (i = 0; i < 200; i++) {
+		char vq[64];
+		snprintf(vq, sizeof vq, "SELECT k FROM t WHERE v = 'r%d'",
+		    1 + (i * 37) % N_ROWS);
+		if (rows_v(db, vq, 0, got, sizeof got) != 1)
+			n = -1;
+	}
+	bt_get_stats(bt, &s1);
+	descents = s1.descents - s0.descents;
+	ok = n != -1 &&
+	    (!T_OLC || (descents == 0 && s1.resumes == s0.resumes));
+	CK(ok);
+	printf("  %s   P4: 200 index equality probes, %llu cursor descents, "
+	       "%llu resumes%s\n",
+	    ok ? "ok" : "FAIL", (unsigned long long)descents,
+	    (unsigned long long)(s1.resumes - s0.resumes),
+	    T_OLC ? "" : " [no OLC in this build: bound not checked]");
+	CK(sx_exec(db, "BEGIN", NULL) == SX_OK);
+	for (i = 0; i < 600; i++) {
+		snprintf(sql, sizeof sql,
+		    "INSERT INTO t(k,grp,v) VALUES(%d,1001,'g')", 10000 + i);
+		CK(sx_exec(db, sql, NULL) == SX_OK);
+	}
+	CK(sx_exec(db, "COMMIT", NULL) == SX_OK);
+	n = rows_v(db, "SELECT v FROM t WHERE grp = ?", 1001, got, sizeof got);
+	CK(n == 600);
+	CK(sx_exec(db, "DELETE FROM t WHERE grp = 1001", NULL) == SX_OK);
+	CK(sx_exec(db, "DROP INDEX t_v", NULL) == SX_OK);
 
 	/* P3: rowid point reads.  Before: one cursor (descent) per read. */
 	bt_get_stats(bt, &s0);

@@ -8652,6 +8652,49 @@ xs_iscan_fail(xstore_iscan_t *s, int rc)
 	return -1;
 }
 
+/*
+ * The equality probe: the first fill of a forward scan whose bounds are
+ * an equality prefix alone (no range on a next column).  Its entries
+ * share the prefix and are almost always in one leaf, so they are read
+ * with one descent and no cursor (bt_seek_ge_keys).  If the read holds
+ * every entry with the prefix, they are the whole range: the batch is
+ * final (kb_end) and the walk never opens a cursor.  Otherwise (more
+ * entries than one batch, or the prefix runs on into the next leaf) the
+ * batch stands and the cursor walk continues after its last key
+ * (s->pos).  Returns the count (0 with kb_end: no entry; 0 without it:
+ * no entry in this leaf, the cursor walk starts at the bound), or -1 on
+ * an error (s->err).
+ *
+ * A HASH index (STORAGE_DESIGN section 10) fills the same key batch
+ * from its bucket for an equality, so the row read-ahead, the
+ * verification against the row and the buffered-row merge after this
+ * serve both index types.
+ */
+static int
+xs_iscan_point(xstore_iscan_t *s)
+{
+	int got = 0, more = 0, rc;
+
+	/* The whole batch, not the hinted size: the keys come from a leaf
+	 * already latched, and the row read-ahead keeps to the hint. */
+	rc = bt_seek_ge_keys(s->bt, s->pfx, (uint16_t)s->pfxlen,
+	    (uint16_t)s->pfxlen, s->ka->buf,
+	    XS_IKA_BYTES + (uint32_t)s->rt.kmax, s->ka->off, s->ka->len,
+	    XS_IKA_MAX, &got, &more);
+	if (rc == XTC_OK && xs_rd_fault())
+		rc = XTC_E_IO;
+	if (rc != XTC_OK)
+		return xs_iscan_fail(s, rc);
+	if (more && got > 0) {
+		s->poslen = s->ka->len[got - 1];
+		memcpy(s->pos, s->ka->buf + s->ka->off[got - 1],
+		    (size_t)s->poslen);
+	} else if (!more) {
+		s->kb_end = 1;
+	}
+	return got;
+}
+
 /* Refill the key batch with the next in-range entries in walk order.
  * Returns the count (0: the range is exhausted), or -1 when the batch
  * cannot be allocated or the tree cannot be read (s->err). */
@@ -8677,8 +8720,21 @@ xs_iscan_fill(xstore_iscan_t *s)
 	s->kb_want = s->kb_want == 0 ? (s->ra_left > 0 ? s->ra_left : 16) :
 	    s->kb_want * 2;
 	if (s->kb_want > XS_IKA_MAX) s->kb_want = XS_IKA_MAX;
+	if (!s->reverse && s->cur == NULL && !s->range && !s->started) {
+		s->started = 1; /* tried once; the cursor walk follows */
+		n = xs_iscan_point(s);
+		if (n != 0 || s->kb_end) {
+			s->kb_n = n < 0 ? 0 : n;
+			return n;
+		}
+	}
 	if (!s->reverse) {
-		if (s->cur == NULL) {
+		if (s->cur == NULL && s->poslen > 0) {
+			/* After the equality probe's batch: its last key, if
+			 * still there, is the cursor's first and is skipped. */
+			rc = bt_cursor_open(s->bt, s->pos, (uint16_t)s->poslen,
+			    &s->cur);
+		} else if (s->cur == NULL) {
 			const uint8_t *st = s->has_lo ? s->lo : s->pfx;
 			int sl = s->has_lo ? s->lolen : s->pfxlen;
 			rc = bt_cursor_open(s->bt, st, (uint16_t)sl, &s->cur);
@@ -8697,6 +8753,13 @@ xs_iscan_fill(xstore_iscan_t *s)
 			}
 			if (rc != XTC_OK)
 				return xs_iscan_fail(s, rc);
+			if (s->poslen > 0) {
+				int same = kl == s->poslen &&
+				    memcmp(k, s->pos, kl) == 0;
+				s->poslen = 0;
+				if (same)
+					continue;
+			}
 			w = xs_iscan_where(s, k, kl);
 			if (w == 2) { s->kb_end = 1; break; }
 			if (w == 0) continue;
