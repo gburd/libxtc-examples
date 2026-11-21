@@ -359,7 +359,8 @@ rw_put(run_writer_t *w, const run_row_t *r)
 	p64(rec + 16, r->self_wa);
 	rec[24] = r->flags;
 	p16(rec + 25, r->len);
-	memcpy(rec + RUN_ROW_HDR, r->rec, head - RUN_ROW_HDR);
+	if (head > RUN_ROW_HDR)
+		memcpy(rec + RUN_ROW_HDR, r->rec, head - RUN_ROW_HDR);
 	p16(pg + RUN_PG_HDR + 2u * w->cur_n, w->cur_lo);
 	w->cur_n++;
 	p16(pg + 28, w->cur_n);
