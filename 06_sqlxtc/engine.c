@@ -1680,6 +1680,7 @@ nat_select_run(struct sx_stmt *st)
 	uint64_t ck0;
 	int rc;
 	if (st->ran) return st->vres != NULL;
+	xstore_read_err_clear((struct xsql *)st->db);
 	if (nat_aborted(st->db)) return 0;   /* sx_step reports it */
 	ck0 = g_xbm != NULL ? bm_cksum_failures(g_xbm, NULL) : 0;
 	if (st->nkind == SXN_PRAGMA_TABLE_INFO) {
@@ -1907,6 +1908,7 @@ sx_step_body(sx_stmt *st)
 		}
 		if (st->ran) return SX_DONE;   /* one-shot kinds */
 		st->ran = 1;
+		xstore_read_err_clear((struct xsql *)st->db);
 		switch (st->nkind) {
 		case SXN_WRITE: {
 			int64_t nch = 0;

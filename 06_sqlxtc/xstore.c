@@ -5742,6 +5742,15 @@ xstore_read_err(struct xsql *db)
 	return cx != NULL ? cx->rd_err : "";
 }
 
+/* Clear the connection's index read error (see xstore.h). */
+void
+xstore_read_err_clear(struct xsql *db)
+{
+	xstore_ctx_t *cx = xstore_ctx_of(db);
+	if (cx != NULL)
+		cx->rd_err[0] = '\0';
+}
+
 /* Statement atomicity inside a transaction: a failed statement undoes
  * its own buffered writes and leaves the transaction open (SQLite).
  * stmt_mark returns the buffer position to undo to (-1 outside a txn). */

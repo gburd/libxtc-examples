@@ -495,6 +495,31 @@ t_wide_rows(sx_db *h)
 	return errs;
 }
 
+/* (6), part 3.  A statement that never reaches the store (PRAGMA
+ * table_info) reports its own error, not the index read error of the
+ * statement before it. */
+static void
+t_stale_read_err(sx_db *h)
+{
+	sx_stmt *st = NULL;
+	CK(sx_prepare(h, "SELECT count(*) FROM r WHERE g = 1", -1, &st, NULL)
+	    == SX_OK);
+	xstore_index_read_fail_at(1);
+	CK(sx_step(st) != SX_ROW);
+	xstore_index_read_fail_at(0);
+	sx_finalize(st);
+	CK(strncmp(sx_errmsg(h), RD_ERR, sizeof RD_ERR - 1) == 0);
+	st = NULL;
+	CK(sx_prepare(h, "PRAGMA table_info(nosuch)", -1, &st, NULL) == SX_OK);
+	(void)sx_step(st);
+	sx_finalize(st);
+	if (strncmp(sx_errmsg(h), RD_ERR, sizeof RD_ERR - 1) == 0) {
+		fprintf(stderr, "  PRAGMA table_info: stale error \"%s\"\n",
+		    sx_errmsg(h));
+		g_fail = 1;
+	}
+}
+
 /* (6) */
 static void
 t_read_errors(sx_db *h)
@@ -531,6 +556,7 @@ t_read_errors(sx_db *h)
 	errs += sweep_count(h, "SELECT count(*) FROM r WHERE g = 1", NULL, 101);
 	CK(sx_exec(h, "ROLLBACK", NULL) == SX_OK);
 	t_failed_scan_unlatched(h);
+	t_stale_read_err(h);
 	errs += t_wide_rows(h);
 	CK(errs > 0);
 	/* A duplicate long value, then a new one: the duplicate never goes

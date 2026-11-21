@@ -511,8 +511,13 @@ void xstore_iscan_hint(xstore_iscan_t *s, int64_t nrows);
 const char *xstore_uniq_err(struct xsql *db);
 /* The current statement's first index scan read error ("index error:
  * cannot read index t_g on t: I/O error"), "" if none.  Cleared when a
- * statement starts (xstore_stmt_begin, xstore_stmt_pin). */
+ * statement starts (xstore_read_err_clear, xstore_stmt_begin,
+ * xstore_stmt_pin). */
 const char *xstore_read_err(struct xsql *db);
+/* Forget the last statement's index read error.  The engine calls it
+ * when any statement starts, so a statement that never reaches the store
+ * (PRAGMA table_info) cannot report an earlier one's. */
+void xstore_read_err_clear(struct xsql *db);
 
 /* Statement atomicity in a transaction: mark the write buffer before a
  * statement; undo back to the mark if the statement fails (the
