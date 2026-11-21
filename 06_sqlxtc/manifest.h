@@ -74,8 +74,9 @@ typedef int (*mf_row_fn)(void *ctx, uint32_t frame, run_row_t *row);
 /*
  * Flush the nursery: freeze kd's active delta, setting the flush
  * boundary at the switch (*boundary_fn(ctx) is called from kd_freeze's
- * at-freeze hook and must return the lowest WAL address of a commit
- * still in flight, or the WAL end), write the frozen rows into a new
+ * at-freeze hook and returns kd_flush_boundary over the addresses the
+ * commits in flight recorded on entry, or wal_end_wa(); see kd_freeze's
+ * NB), write the frozen rows into a new
  * run at level MF_LEVEL_N0, fsync it, install a manifest that adds the
  * run and sets the boundary, publish the new run set in kd, and drop
  * the frozen delta.  XTC_E_AGAIN if a frozen delta exists already;

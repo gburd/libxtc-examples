@@ -24,7 +24,15 @@
  *	             run copy hidden by a newer run is never the answer;
  *	  threads    four threads put, delete and read the resident map at
  *	             once; a reader never sees a frame stored for another
- *	             key.
+ *	             key;
+ *	  boundary   the flush boundary against a real segmented WAL (plant
+ *	             P8's race): committers on two loops register, commit
+ *	             (wal_commit_wa) and put while a flusher freezes over and
+ *	             over; every commit whose frame is below a freeze's
+ *	             boundary is in that freeze.  The old rule ("a commit not
+ *	             yet written counts as the WAL end") must break this, the
+ *	             recorded-on-entry rule (wal_end_wa, kd_flush_boundary)
+ *	             never.
  *	Prints the resident-map hit cost and the miss cost over N runs
  *	(5.5), and the static stage's bytes per row (5.3).
  */
@@ -42,6 +50,8 @@
 #include "run.h"
 #include "wal.h"
 #include "xtc.h"
+#include "xtc_exec.h"
+#include "xtc_proc.h"
 #include "xtc_rcu.h"
 #include "t_tmp.h"
 
@@ -545,6 +555,174 @@ t_costs(bm_t *bm)
 	kd_destroy(kd);
 }
 
+/* ---- the flush boundary against commits in flight (P8) ---- */
+
+#define BC_FIBERS 4
+#define BC_PER    400
+#define BC_ROWS   (BC_FIBERS * BC_PER)
+#define BC_FREEZE 4096
+#define BC_NONE   UINT64_MAX         /* in flight, no address recorded */
+
+static keydir_t       *g_bkd;
+static wal_t          *g_bwal;
+static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t        g_reg[BC_FIBERS];   /* the in-flight registry */
+static uint64_t        g_bwa[BC_ROWS];     /* each commit's frame */
+static uint32_t        g_bfz[BC_ROWS];     /* the freeze that took it */
+static uint64_t        g_bb[BC_FREEZE];    /* each freeze's boundary */
+static uint32_t        g_nfz;
+static int             g_bleft, g_old_rule;
+
+/* The boundary, read at the switch.  The old rule skips a commit that
+ * has not learned its address yet (it "counts as the WAL end"). */
+static void
+bc_at_freeze(void *ctx)
+{
+	uint64_t b = BC_NONE;
+	uint32_t i;
+
+	(void)ctx;
+	(void)pthread_mutex_lock(&g_reg_mu);
+	if (g_old_rule) {
+		b = wal_end_wa(g_bwal);
+		for (i = 0; i < BC_FIBERS; i++)
+			if (g_reg[i] != 0 && g_reg[i] != BC_NONE && g_reg[i] < b)
+				b = g_reg[i];
+	} else {
+		b = kd_flush_boundary(g_reg, BC_FIBERS, wal_end_wa(g_bwal));
+	}
+	(void)pthread_mutex_unlock(&g_reg_mu);
+	g_bb[g_nfz] = b;
+}
+
+static void
+bc_committer(void *arg)
+{
+	uint32_t id = (uint32_t)(uintptr_t)arg, i, rid;
+	uint64_t lsn, wa;
+
+	for (i = 0; i < BC_PER; i++) {
+		rid = id * BC_PER + i;
+		/* Enter the registry: the new rule records the WAL end now,
+		 * before the WAL write; the old one only after it. */
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[id] = g_old_rule ? BC_NONE : wal_end_wa(g_bwal);
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		if (wal_commit_wa(g_bwal, "commit", 6, &lsn, &wa) != XTC_OK)
+			break;
+		if (g_old_rule) {
+			(void)pthread_mutex_lock(&g_reg_mu);
+			g_reg[id] = wa;
+			(void)pthread_mutex_unlock(&g_reg_mu);
+		}
+		g_bwa[rid] = wa;
+		(void)kd_delta_put(g_bkd, 1, (int64_t)rid, rid + 1u);
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[id] = 0;
+		(void)pthread_mutex_unlock(&g_reg_mu);
+	}
+	(void)xtc_atomic_fetch_sub_i32(&g_bleft, 1, xtc_mo_seq_cst);
+}
+
+static void
+bc_flusher(void *arg)
+{
+	uint32_t tid, frame;
+	int64_t rid;
+
+	(void)arg;
+	while (xtc_atomic_load_i32(&g_bleft, xtc_mo_seq_cst) > 0 &&
+	    g_nfz < BC_FREEZE) {
+		if (kd_freeze(g_bkd, bc_at_freeze, NULL) == XTC_OK) {
+			/* Number the frozen rows by this freeze. */
+			tid = 0;
+			rid = INT64_MIN;
+			xtc_rcu_read_lock();
+			while (kd_delta_next(g_bkd, 1, &tid, &rid, &frame)) {
+				g_bfz[frame - 1u] = g_nfz + 1u;
+				rid++;
+			}
+			xtc_rcu_read_unlock();
+			kd_drop_frozen(g_bkd);
+			g_nfz++;
+		}
+		xtc_yield();
+	}
+}
+
+/* One run under the current rule: the number of commits whose frame was
+ * below a freeze's boundary but which that freeze did not take. */
+static uint32_t
+bc_run(void)
+{
+	wal_opts_t wo = { 0 };
+	xtc_exec_t *ex = NULL;
+	xtc_proc_opts_t po = XTC_PROC_OPTS_INIT;
+	xtc_pid_t pid;
+	char p[300];
+	uint32_t i, r, k, bad = 0;
+
+	snprintf(p, sizeof p, "%s/bwal", g_dir);
+	wo.path = p;
+	wo.segment_bytes = 64u * 1024u;
+	CK(wal_open(&wo, &g_bwal) == XTC_OK);
+	CK(kd_create(1024, &g_bkd) == XTC_OK);
+	if (g_bwal == NULL || g_bkd == NULL)
+		return 0;
+	memset(g_bfz, 0, sizeof g_bfz);
+	memset(g_bwa, 0, sizeof g_bwa);
+	g_nfz = 0;
+	CK(xtc_exec_create(&(xtc_exec_opts_t){ .size = sizeof(xtc_exec_opts_t),
+	    .n_loops = 2 }, &ex) == XTC_OK);
+	if (ex == NULL)
+		return 0;
+	xtc_atomic_store_i32(&g_bleft, BC_FIBERS, xtc_mo_seq_cst);
+	for (i = 0; i < BC_FIBERS; i++)
+		CK(xtc_proc_spawn(xtc_exec_loop(ex, (int)(i % 2u)), bc_committer,
+		    (void *)(uintptr_t)i, &po, &pid) == XTC_OK);
+	CK(xtc_proc_spawn(xtc_exec_loop(ex, 1), bc_flusher, NULL, &po, &pid) ==
+	    XTC_OK);
+	CK(xtc_exec_run(ex) == XTC_OK);
+	xtc_exec_destroy(ex);
+	/* Row r must be in the first freeze whose boundary is past it. */
+	for (r = 0; r < BC_ROWS; r++) {
+		for (k = 0; k < g_nfz && g_bb[k] <= g_bwa[r]; k++)
+			;
+		if (g_bwa[r] != 0 && k < g_nfz &&
+		    (g_bfz[r] == 0 || g_bfz[r] > k + 1u))
+			bad++;
+	}
+	kd_destroy(g_bkd);
+	wal_close(g_bwal);
+	for (i = 1; i < 256; i++) {
+		snprintf(p, sizeof p, "%s/bwal/wal-%08u.log", g_dir, i);
+		(void)unlink(p);
+	}
+	snprintf(p, sizeof p, "%s/bwal", g_dir);
+	(void)rmdir(p);
+	return bad;
+}
+
+static void
+t_boundary(void)
+{
+	uint32_t old_bad = 0, bad = 0, n;
+
+	/* The old rule must lose a commit (a few rounds, as the window is a
+	 * real fsync); the new one never does. */
+	g_old_rule = 1;
+	for (n = 0; n < 8 && old_bad == 0; n++)
+		old_bad = bc_run();
+	CK(old_bad > 0);
+	g_old_rule = 0;
+	for (n = 0; n < 3; n++)
+		bad += bc_run();
+	CK(bad == 0);
+	printf("  boundary: old rule lost %u commits behind a freeze; "
+	    "recorded-on-entry rule lost %u (over 3 runs, %u freezes last)\n",
+	    old_bad, bad, g_nfz);
+}
+
 int
 main(void)
 {
@@ -576,6 +754,7 @@ main(void)
 		bm_destroy(bm);
 	}
 	t_threads();
+	t_boundary();
 	unlink(p);
 	for (i = 1; i <= LRUNS; i++) {
 		run_path(g_dir, (uint64_t)i, p, sizeof p);

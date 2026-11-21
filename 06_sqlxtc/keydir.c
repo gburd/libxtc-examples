@@ -521,6 +521,18 @@ kd_freeze(keydir_t *kd, void (*at_freeze)(void *ctx), void *ctx)
 	return rc;
 }
 
+uint64_t
+kd_flush_boundary(const uint64_t *entry_wa, uint32_t n, uint64_t wal_end)
+{
+	uint64_t b = wal_end;
+	uint32_t i;
+
+	for (i = 0; i < n; i++)
+		if (entry_wa[i] != 0 && entry_wa[i] < b)
+			b = entry_wa[i];
+	return b;
+}
+
 int
 kd_has_frozen(keydir_t *kd)
 {

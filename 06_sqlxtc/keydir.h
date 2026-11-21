@@ -97,13 +97,27 @@ uint64_t kd_delta_rows(keydir_t *kd);
  * XTC_E_AGAIN while a frozen delta exists (back-pressure, 9.2).  If
  * at_freeze is not NULL it runs at the switch, while no commit is
  * between the start and the end of a kd_delta_put: the flush boundary
- * (9.2 step 2) is computed there.  NB: that rule is only sound if a
- * commit enters the caller's in-flight registry before its WAL write
- * and leaves it after its kd_delta_put; otherwise a commit can land in
- * the new delta and leave the registry before the boundary is read.
+ * (9.2 step 2) is computed there, with kd_flush_boundary.  NB: that is
+ * only sound if a commit enters the caller's in-flight registry, and
+ * records wal_end_wa() in its entry, before its wal_commit_wa (the two
+ * atomic with respect to the boundary computation: the registry's
+ * lock), and leaves the registry only after its kd_delta_put.  A commit
+ * inside wal_commit_wa has a frame the registry cannot see yet; its
+ * entry's recorded address is below that frame, so the boundary is too.
  * at_freeze must not park or call into the keydir.
  */
 int  kd_freeze(keydir_t *kd, void (*at_freeze)(void *ctx), void *ctx);
+
+/*
+ * The flush boundary B (STORAGE_DESIGN 9.2 step 2): the minimum of the
+ * WAL addresses entry_wa[0..n) that the commits in flight recorded when
+ * they entered the registry (0: an unused slot), or wal_end when none is
+ * in flight.  Every commit whose frame is below B finished its
+ * kd_delta_put before the freeze.  Phase (b) callers then take the
+ * minimum with the steal low-water mark before wal_set_release.
+ */
+uint64_t kd_flush_boundary(const uint64_t *entry_wa, uint32_t n,
+             uint64_t wal_end);
 
 /* 1 while a frozen delta exists. */
 int  kd_has_frozen(keydir_t *kd);

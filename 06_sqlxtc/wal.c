@@ -2171,6 +2171,19 @@ wal_commit_wa(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
 	return wal_commit_any(w, record, len, lsn, wa);
 }
 
+uint64_t
+wal_end_wa(wal_t *w)
+{
+	uint64_t wa = 0;
+
+	if (w == NULL || w->seg_bytes == 0)
+		return 0;
+	wal_lock(&w->res_mu);
+	wa = WAL_WA(w->seg, w->res_pos - w->seg_base);
+	wal_unlock(&w->res_mu);
+	return wa;
+}
+
 void
 wal_set_release(wal_t *w, uint64_t wa)
 {

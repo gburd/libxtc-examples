@@ -285,6 +285,16 @@ uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
 int  wal_commit_wa(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
          uint64_t *wa);
 
+/*
+ * The WAL end as an address: the start of the frame the next reservation
+ * would get in the current segment (0 for a one-file log).  Every frame
+ * reserved later has a body address above it, wherever it lands (a
+ * roll only moves it up).  A commit reads it when it enters the
+ * caller's in-flight registry, before its wal_commit_wa, and the flush
+ * boundary is the minimum of those values (mf_flush_boundary).
+ */
+uint64_t wal_end_wa(wal_t *w);
+
 /* Raise the retention boundary (see above).  A lower wa is ignored. */
 void wal_set_release(wal_t *w, uint64_t wa);
 
