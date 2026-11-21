@@ -6907,7 +6907,7 @@ xs_cat_high(bt_t *bt, uint32_t cat)
 {
 	bt_cursor_t *cur = NULL;
 	uint8_t startk[XS_VKLEN];
-	uint32_t maxid = 0, hw = 0;
+	uint32_t maxid = 0, hw = 0, data;
 	int seen0 = 0;
 
 	enc_vkey(cat, INT64_MIN, ~(uint64_t)0, startk);
@@ -6933,15 +6933,13 @@ xs_cat_high(bt_t *bt, uint32_t cat)
 			maxid = (uint32_t)rid;
 	}
 	bt_cursor_close(cur);
-#if !XTC_DST_BUG(XTC_DST_BUG_IDREUSE)
-	if (hw > maxid)
-		maxid = hw;
-	if (cat == XS_CAT_TABLEID && (hw = xs_data_max_id(bt)) > maxid)
-		maxid = hw;
-#else
-	(void)hw;     /* planted: a dropped id comes back after GC */
+	data = cat == XS_CAT_TABLEID ? xs_data_max_id(bt) : 0;
+	if (data > hw)
+		hw = data;
+#if XTC_DST_BUG(XTC_DST_BUG_IDREUSE)
+	hw = 0;       /* planted: a dropped id comes back after GC */
 #endif
-	return maxid;
+	return hw > maxid ? hw : maxid;
 }
 
 /* The largest index id handed out (xs_cat_high over the index catalog),
