@@ -4938,6 +4938,25 @@ struct xs_dropset {
 	int       n, cap;
 };
 
+static uint32_t xs_hw_parse(const uint8_t *p, int n);   /* defined below */
+
+/*
+ * The high-water mark a catalog version (key value `vv`, `vl` bytes,
+ * flag byte first) records, or 0 for a tombstone.  A pass that drops
+ * tombstoned ids reads the mark from rowid 0, which sorts before every
+ * catalog row, and drops an id only if the mark covers it: a tombstone
+ * above the mark (a DROP by a release without the mark) is kept, so its
+ * id still counts as handed out and its rows stay.
+ */
+static uint32_t
+xs_hw_of(const void *vv, uint16_t vl)
+{
+	const uint8_t *v = vv;
+	if (vl < 1 || (v[0] & XS_F_DELETED))
+		return 0;
+	return xs_hw_parse(v + 1, (int)vl - 1);
+}
+
 static void
 xs_dropset_add(struct xs_dropset *d, uint32_t id)
 {
@@ -5007,6 +5026,7 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 	uint32_t prev_tableid = 0;
 	int in_group = 0, survivor_found = 0;
 	struct xs_dropset dropped = { NULL, 0, 0 };
+	uint32_t mark = 0;                 /* the table catalog's high-water row */
 
 	for (;;) {
 		bt_cursor_t *cur = NULL;
@@ -5049,10 +5069,12 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			if (first_in_group) {
 				prev_rowid = rid; prev_tableid = tid;
 				in_group = 1; survivor_found = 0;
+				if (tid == XS_CAT_TABLEID && rid == 0)
+					mark = xs_hw_of(vv, vl);
 				/* A table dropped below the horizon: no snapshot
 				 * can reach it, so its rows go with its tombstone. */
 				if (tid == XS_CAT_TABLEID && rid > 0 && deleted &&
-				    ts <= horizon)
+				    ts <= horizon && (uint32_t)rid <= mark)
 					xs_dropset_add(&dropped, (uint32_t)rid);
 			}
 			if (tid != XS_CAT_TABLEID && xs_dropset_has(&dropped, tid)) {
@@ -5060,7 +5082,11 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			} else if (!survivor_found) {
 				if (ts <= horizon) {
 					survivor_found = 1;
-					if (deleted && first_in_group)
+					/* An unmarked catalog tombstone stays: it alone
+					 * keeps its id from being handed out again. */
+					if (deleted && first_in_group &&
+					    !(tid == XS_CAT_TABLEID && rid > 0 &&
+					    (uint32_t)rid > mark))
 						memcpy(dead[ndead++], k, XS_VKLEN);
 				}
 				/* else ts > horizon: keep (newer than horizon). */
@@ -10113,6 +10139,7 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 	uint32_t last_tid = 0; int64_t last_rid = 0; int have_last = 0;
 	int cn;
 	struct xs_dropset dropped = { NULL, 0, 0 };
+	uint32_t mark[2] = { 0, 0 };   /* high-water rows: table, index catalog */
 
 	if ((cn = xl_enc_checkpoint(ck, sizeof ck, dc->clock, 0)) > 0)
 		emit(ectx, ck, (uint32_t)cn);
@@ -10190,8 +10217,17 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 			continue;                  /* committed after the snapshot */
 		last_tid = tableid; last_rid = rowid; have_last = 1;
 		flags = (vl >= 1) ? ((const uint8_t *)vv)[0] : 0;
+		if ((tableid == XS_CAT_TABLEID || tableid == XS_IDXCAT_TABLEID) &&
+		    rowid == 0)
+			mark[tableid == XS_IDXCAT_TABLEID] = xs_hw_of(vv, vl);
 		/* A dropped table (xs_dropset): its rows leave the log with
-		 * its catalog row, so a rebuild does not bring them back. */
+		 * its catalog row, so a rebuild does not bring them back.  A
+		 * catalog tombstone above its catalog's mark is dumped as is
+		 * (xs_hw_of), and so are its table's rows. */
+		if ((tableid == XS_CAT_TABLEID || tableid == XS_IDXCAT_TABLEID) &&
+		    rowid > 0 && (flags & XS_F_DELETED) &&
+		    (uint32_t)rowid > mark[tableid == XS_IDXCAT_TABLEID])
+			goto emit;
 		if (tableid == XS_CAT_TABLEID && rowid > 0 &&
 		    (flags & XS_F_DELETED))
 			xs_dropset_add(&dropped, (uint32_t)rowid);
@@ -10199,7 +10235,7 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 			continue;                  /* newest is a tombstone: row is gone */
 		if (tableid != XS_CAT_TABLEID && xs_dropset_has(&dropped, tableid))
 			continue;
-
+emit:
 		payl = (vl >= 1) ? (uint16_t)(vl - 1) : 0;
 		if (payl > XS_VMAX) payl = XS_VMAX;
 		h.type = XL_UPDATE; h.txn_id = ts; h.prev_lsn = 0;
