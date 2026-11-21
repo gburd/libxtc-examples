@@ -240,29 +240,60 @@ mf_job(struct mf_job *j)
 
 /* ---- text form ---- */
 
-/* The manifest text for runs[0..n) (and one more, `add`, if not NULL),
- * next and boundary.  malloc'd; *len its length. */
-static char *
-mf_text(const manifest_t *m, const run_meta_t *add, uint64_t next,
-    uint64_t boundary, size_t *len)
+/* Bytes a run line can take: "run " + 20 digits + " " + 10 + " " + 10
+ * + " " + 20 + " " + 8 hex + "\n" is 77; the head and the CRC line fit
+ * in MF_HEAD_MAX.  A line that does not fit is a bug, never a line
+ * silently left out (the next open would sweep its run). */
+#define MF_LINE_MAX 96u
+#define MF_HEAD_MAX 128u
+
+/* Append one formatted piece; 0 if it did not fit. */
+static int
+mf_put(size_t cap, size_t *at, size_t n)
 {
-	size_t cap = 128u + 64u * ((size_t)m->n + 1u), at;
+	if (n == 0 || n >= cap - *at)
+		return 0;
+	*at += n;
+	return 1;
+}
+
+/* The manifest text for runs[0..n) (and one more, `add`, if not NULL),
+ * next and boundary: XTC_OK with *out (malloc'd) and *len, else
+ * XTC_E_NOMEM or XTC_E_INTERNAL (a line did not fit). */
+static int
+mf_text(const manifest_t *m, const run_meta_t *add, uint64_t next,
+    uint64_t boundary, char **out, size_t *len)
+{
+	size_t cap = 2u * MF_HEAD_MAX + MF_LINE_MAX * ((size_t)m->n + 1u), at = 0;
+	const run_meta_t *r;
 	char *t;
 	uint32_t i;
+	int n, ok;
 
+	*out = NULL;
 	if ((t = malloc(cap)) == NULL)
-		return NULL;
-	at = (size_t)snprintf(t, cap, "%snext %" PRIu64 "\nboundary %016"
-	    PRIx64 "\n", MF_MAGIC, next, boundary);
-	for (i = 0; i <= m->n; i++) {
-		const run_meta_t *r = i < m->n ? &m->runs[i].meta : add;
+		return XTC_E_NOMEM;
+	n = snprintf(t, cap, "%snext %" PRIu64 "\nboundary %016" PRIx64 "\n",
+	    MF_MAGIC, next, boundary);
+	ok = n > 0 && mf_put(cap, &at, (size_t)n);
+	for (i = 0; ok && i <= m->n; i++) {
+		r = i < m->n ? &m->runs[i].meta : add;
 		if (r != NULL)
-			at += run_meta_enc(r, t + at, cap - at);
+			ok = mf_put(cap, &at, run_meta_enc(r, t + at,
+			    cap - at));
 	}
-	at += (size_t)snprintf(t + at, cap - at, "crc %08x\n",
-	    wal_crc32c(0, t, at));
+	if (ok) {
+		n = snprintf(t + at, cap - at, "crc %08x\n",
+		    wal_crc32c(0, t, at));
+		ok = n > 0 && mf_put(cap, &at, (size_t)n);
+	}
+	if (!ok) {
+		free(t);
+		return XTC_E_INTERNAL;
+	}
+	*out = t;
 	*len = at;
-	return t;
+	return XTC_OK;
 }
 
 /* Parse the manifest text: XTC_OK with next, boundary and the run lines
@@ -438,8 +469,9 @@ mf_create(manifest_t *m)
 		    "s");
 		return XTC_E_IO;
 	}
-	if ((text = mf_text(m, NULL, m->next, m->boundary, &len)) == NULL)
-		return XTC_E_NOMEM;
+	if ((rc = mf_text(m, NULL, m->next, m->boundary, &text, &len)) !=
+	    XTC_OK)
+		return rc;
 	memset(&j, 0, sizeof j);
 	j.dir = m->dir;
 	j.text = text;
@@ -627,11 +659,9 @@ mf_flush_frozen(manifest_t *m, mf_row_fn rowfn, void *ctx)
 	if ((rc = run_open(m->bm, p, &meta, &r)) != XTC_OK)
 		goto unlink;
 	mf_buggify("rowlog.flush.before_install");
-	if ((text = mf_text(m, &meta, m->next, m->frz_boundary,
-	    &len)) == NULL) {
-		rc = XTC_E_NOMEM;
+	if ((rc = mf_text(m, &meta, m->next, m->frz_boundary, &text,
+	    &len)) != XTC_OK)
 		goto close;
-	}
 	memset(&j, 0, sizeof j);
 	j.dir = m->dir;
 	j.text = text;

@@ -25,6 +25,9 @@
  *	  renamed    a failure after the manifest's rename (the directory
  *	             fsync) keeps the run it names, fail-stops later
  *	             flushes, and the reopen finds every row;
+ *	  text       64 runs with the widest ids, row counts and levels
+ *	             encode in full and parse back the same (no run line
+ *	             is silently dropped, no write past the buffer);
  *	  reclaim    many flushes with no synchronize of the test's own:
  *	             the live allocations do not grow (each flush reclaims
  *	             its frozen delta and the old run set);
@@ -383,6 +386,51 @@ t_renamed(void)
 	    "fail-stops, and the reopen finds every row\n");
 }
 
+static void
+t_text(void)
+{
+	manifest_t m;
+	run_meta_t add, *v = NULL;
+	uint64_t next = 0, bnd = 0;
+	uint32_t i, n = 0, bad = 0;
+	size_t len = 0;
+	char *t = NULL;
+
+	memset(&m, 0, sizeof m);
+	m.n = m.cap = 64;
+	CK((m.runs = calloc(m.n, sizeof *m.runs)) != NULL);
+	if (m.runs == NULL)
+		return;
+	for (i = 0; i < m.n; i++) {
+		m.runs[i].meta.runid = UINT64_MAX - 100u + i;
+		m.runs[i].meta.level = UINT32_MAX;
+		m.runs[i].meta.slot = 2;
+		m.runs[i].meta.nrows = UINT64_MAX - i;
+		m.runs[i].meta.hdr_crc = 0xFFFFFFFFu - i;
+	}
+	add = m.runs[0].meta;
+	add.runid = UINT64_MAX - 1u;
+	CK(mf_text(&m, &add, UINT64_MAX, UINT64_MAX, &t, &len) == XTC_OK);
+	if (t != NULL) {
+		CK(len < 2u * MF_HEAD_MAX + MF_LINE_MAX * 65u &&
+		    t[len - 1] == '\n');
+		CK(mf_parse(t, len, &next, &bnd, &v, &n) == XTC_OK);
+		CK(n == 65 && next == UINT64_MAX && bnd == UINT64_MAX);
+		for (i = 0; v != NULL && i < n && i < m.n; i++)
+			bad += v[i].runid != m.runs[i].meta.runid ||
+			    v[i].level != m.runs[i].meta.level ||
+			    v[i].slot != m.runs[i].meta.slot ||
+			    v[i].nrows != m.runs[i].meta.nrows ||
+			    v[i].hdr_crc != m.runs[i].meta.hdr_crc;
+		CK(bad == 0 && v != NULL && v[64].runid == add.runid);
+	}
+	free(v);
+	free(t);
+	free(m.runs);
+	printf("  text: 65 maximum-width run lines encode and parse back "
+	    "whole\n");
+}
+
 /* Live allocations after one flush of 2000 rows: the delta's keys and
  * maps, the run set, and the new run.  Without reclamation each flush
  * leaves its frozen delta behind, about 2000 allocations. */
@@ -530,6 +578,7 @@ main(void)
 	t_missing();
 	t_retry();
 	t_renamed();
+	t_text();
 	t_reclaim();
 	t_concurrent();
 	if (xtc_fs_dir_open(g_dir, &d) == XTC_OK) {
