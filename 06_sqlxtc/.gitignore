@@ -154,3 +154,4 @@ test_bm_files
 test_wal_seg
 test_ef
 test_run
+test_keydir
