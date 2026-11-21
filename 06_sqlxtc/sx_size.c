@@ -238,8 +238,8 @@ note_name(const uint8_t *k, const uint8_t *v, uint16_t vl)
 	char nm[64];
 	int i;
 
-	if (vl < 2 || (v[0] & 1))
-		return;
+	if (vl < 2 || (v[0] & 1) || rid <= 0)
+		return;                 /* a tombstone, or the high-water row */
 	for (i = 0; i + 1 < vl && i < 63 && v[1 + i]; i++)
 		nm[i] = (char)v[1 + i];
 	nm[i] = '\0';
