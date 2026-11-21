@@ -159,6 +159,13 @@ t_publish(void)
 	    "does not stop a publish\n");
 }
 
+/* The at-freeze hook runs once, at the switch. */
+static void
+at_freeze(void *ctx)
+{
+	(*(uint32_t *)ctx)++;
+}
+
 static void
 t_delta(void)
 {
@@ -170,6 +177,7 @@ t_delta(void)
 	CK(kd_create(1000, &kd) == XTC_OK);
 	if (kd == NULL)
 		return;
+	n = 0;
 	xtc_rcu_read_lock();
 	CK(kd_delta_put(kd, 5, 100, 1) == XTC_OK);
 	CK(kd_delta_put(kd, 2, -7, 2) == XTC_OK);
@@ -178,8 +186,8 @@ t_delta(void)
 	CK(kd_delta_put(kd, UINT32_MAX, INT64_MAX, 5) == XTC_OK);
 	CK(kd_delta_put(kd, 0, INT64_MIN, 6) == XTC_OK);
 	CK(kd_delta_rows(kd) == 5);
-	CK(kd_freeze(kd) == XTC_OK);
-	CK(kd_freeze(kd) == XTC_E_AGAIN && kd_has_frozen(kd));
+	CK(kd_freeze(kd, at_freeze, &n) == XTC_OK && n == 1);
+	CK(kd_freeze(kd, NULL, NULL) == XTC_E_AGAIN && kd_has_frozen(kd));
 	CK(kd_delta_put(kd, 5, 100, 7) == XTC_OK);
 	CK(kd_delta_rows(kd) == 1);
 	CK(kd_delta_get(kd, 5, 100, &f) && f == 7);  /* active first */
@@ -210,7 +218,7 @@ t_delta(void)
 	CK(n == 5);
 	xtc_rcu_read_unlock();
 	kd_drop_frozen(kd);
-	CK(!kd_has_frozen(kd) && kd_freeze(kd) == XTC_OK);
+	CK(!kd_has_frozen(kd) && kd_freeze(kd, NULL, NULL) == XTC_OK);
 	kd_drop_frozen(kd);
 	xtc_rcu_synchronize();
 	kd_destroy(kd);
@@ -315,7 +323,7 @@ t_lookup(bm_t *bm)
 		}
 		/* Flush: freeze, write the run, install it, drop the delta.
 		 * The frames stay resident until "evicted" below. */
-		CK(kd_freeze(kd) == XTC_OK);
+		CK(kd_freeze(kd, NULL, NULL) == XTC_OK);
 		CK(flush_frozen(kd, bm, (uint64_t)round + 1u) == XTC_OK);
 		CK(runs_newest_first(kd) == XTC_OK);
 		kd_drop_frozen(kd);

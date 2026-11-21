@@ -492,7 +492,7 @@ kd_delta_rows(keydir_t *kd)
 }
 
 int
-kd_freeze(keydir_t *kd)
+kd_freeze(keydir_t *kd, void (*at_freeze)(void *ctx), void *ctx)
 {
 	struct kd_delta *n;
 	int rc = XTC_OK;
@@ -512,6 +512,8 @@ kd_freeze(keydir_t *kd)
 		    xtc_mo_release);
 		xtc_atomic_store_ptr(&kd->active, n, xtc_mo_release);
 		n = NULL;
+		if (at_freeze != NULL)
+			at_freeze(ctx);
 	}
 	(void)xtc_arwlock_unlock(kd->dlock);
 	if (n != NULL)

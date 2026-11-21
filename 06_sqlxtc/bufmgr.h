@@ -285,6 +285,9 @@ int  bm_prefetch_pid(bm_t *bm, bm_pid_t pid);
 int  bm_file_attach(bm_t *bm, uint16_t file, const char *path);
 int  bm_file_detach(bm_t *bm, uint16_t file);
 
+/* The page size the manager was created with. */
+uint32_t bm_page_size(const bm_t *bm);
+
 /* Seal `page` for page id `pid` exactly as a write-back does (the
  * checksum slot at bm_opts.cksum_off; no-op without checksums), for a
  * writer that builds a file's pages itself and writes them with xtc_aio

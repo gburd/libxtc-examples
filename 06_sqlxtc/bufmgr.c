@@ -645,6 +645,12 @@ bm_set_cksum_hook(bm_t *bm, void (*hook)(void *ctx, bm_pid_t pid), void *ctx)
 	bm->cksum_hook = hook;
 }
 
+uint32_t
+bm_page_size(const bm_t *bm)
+{
+	return bm->page_size;
+}
+
 void
 bm_seal_page(const bm_t *bm, void *page, bm_pid_t pid)
 {

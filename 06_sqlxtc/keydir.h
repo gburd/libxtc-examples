@@ -92,9 +92,18 @@ int  kd_delta_get(keydir_t *kd, uint32_t tid, int64_t rid, uint32_t *frame);
 /* Rows in the active delta. */
 uint64_t kd_delta_rows(keydir_t *kd);
 
-/* Freeze the active delta for a flush and start an empty one.
- * XTC_E_AGAIN while a frozen delta exists (back-pressure, 9.2). */
-int  kd_freeze(keydir_t *kd);
+/*
+ * Freeze the active delta for a flush and start an empty one.
+ * XTC_E_AGAIN while a frozen delta exists (back-pressure, 9.2).  If
+ * at_freeze is not NULL it runs at the switch, while no commit is
+ * between the start and the end of a kd_delta_put: the flush boundary
+ * (9.2 step 2) is computed there.  NB: that rule is only sound if a
+ * commit enters the caller's in-flight registry before its WAL write
+ * and leaves it after its kd_delta_put; otherwise a commit can land in
+ * the new delta and leave the registry before the boundary is read.
+ * at_freeze must not park or call into the keydir.
+ */
+int  kd_freeze(keydir_t *kd, void (*at_freeze)(void *ctx), void *ctx);
 
 /* 1 while a frozen delta exists. */
 int  kd_has_frozen(keydir_t *kd);
