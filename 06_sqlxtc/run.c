@@ -389,8 +389,14 @@ run_writer_open(bm_t *bm, uint32_t page_size, const char *path,
 	run_writer_t *w;
 	int rc;
 
-	if (path == NULL || out == NULL || runid == 0 || page_size < 512 ||
-	    page_size > 65536 || strlen(path) >= sizeof w->path)
+	/* The seal is the format's only torn- and misdirected-write check,
+	 * so the buffer manager must checksum at the run's slot, and its
+	 * pages are the run's pages. */
+	if (bm == NULL || path == NULL || out == NULL || runid == 0 ||
+	    page_size < 512 || page_size > 65536 ||
+	    strlen(path) >= sizeof w->path ||
+	    bm_cksum_off(bm) != (int)BTNODE_CKSUM_OFF ||
+	    page_size != bm_page_size(bm))
 		return XTC_E_INVAL;
 	if ((w = xtc_calloc(1, sizeof *w)) == NULL)
 		return XTC_E_NOMEM;
@@ -713,7 +719,8 @@ run_open(bm_t *bm, const char *path, const run_meta_t *meta, run_t **out)
 	run_t *r;
 	int rc;
 
-	if (bm == NULL || path == NULL || meta == NULL || out == NULL)
+	if (bm == NULL || path == NULL || meta == NULL || out == NULL ||
+	    bm_cksum_off(bm) != (int)BTNODE_CKSUM_OFF)
 		return XTC_E_INVAL;
 	if ((r = xtc_calloc(1, sizeof *r)) == NULL)
 		return XTC_E_NOMEM;
@@ -735,7 +742,10 @@ run_open(bm_t *bm, const char *path, const run_meta_t *meta, run_t **out)
 	r->ndata = g32(h + 72);
 	r->ftr0 = r->ndata + 1u;
 	r->fbytes = g64(h + 80);
-	rc = g32(h + 48) == RUN_VERSION && g32(h + 52) == meta->level &&
+	/* Pages are bm_page_size bytes: a run written at another page size
+	 * cannot be parsed in these frames. */
+	rc = r->ps == bm_page_size(bm) &&
+	    g32(h + 48) == RUN_VERSION && g32(h + 52) == meta->level &&
 	    r->nrows == meta->nrows &&
 	    g32(h + BTNODE_CKSUM_OFF) == meta->hdr_crc && r->ntbl > 0 &&
 	    r->nchk > 0 && r->ps > RUN_PG_HDR + 2u + RUN_ROW_HDR &&

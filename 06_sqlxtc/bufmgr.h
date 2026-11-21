@@ -291,6 +291,10 @@ int  bm_file_detach(bm_t *bm, uint16_t file);
 /* Attempts to dirty a frame of a file other than 0 (refused). */
 uint64_t bm_ro_dirty_refused(const bm_t *bm);
 
+/* The checksum offset the manager was created with (bm_opts.cksum_off;
+ * -1: no checksums). */
+int  bm_cksum_off(const bm_t *bm);
+
 /* The page size the manager was created with. */
 uint32_t bm_page_size(const bm_t *bm);
 

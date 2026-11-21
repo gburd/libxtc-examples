@@ -20,6 +20,8 @@
  *	             is refused: by the run-id check, and a page of the
  *	             page file at that offset by the file-number seal;
  *	  empty      a run of no rows is refused and leaves no file;
+ *	  geometry   a run is refused by a buffer manager with no checksums
+ *	             (writer and reader) and by one of another page size;
  *	  malformed  a data page resealed with a bad slot array (slot count
  *	             past the page, a slot below the array, offsets that
  *	             rise, a record past the page end) is XTC_E_IO from
@@ -441,10 +443,55 @@ t_malformed(void)
 	    "the iterator, no read outside the page\n");
 }
 
+static void
+t_geometry(void)
+{
+	bm_opts_t o = BM_OPTS_DEFAULT;
+	char path[300], pf[300];
+	run_writer_t *w = NULL;
+	run_meta_t m;
+	run_t *r = NULL;
+	bm_t *bm, *nock = NULL, *big = NULL;
+
+	bm = open_bm("pages5", 16);
+	if (bm == NULL)
+		return;
+	run_path(g_dir, 45, path, sizeof path);
+	CK(write_run(bm, path, 45, 50, &m) == XTC_OK);
+	/* No checksums: a torn run page would read as data. */
+	snprintf(pf, sizeof pf, "%s/pages6", g_dir);
+	o.path = pf;
+	o.page_size = PS;
+	o.n_frames = 16;
+	CK(bm_create(&o, &nock) == XTC_OK);
+	CK(run_open(nock, path, &m, &r) == XTC_E_INVAL && r == NULL);
+	run_path(g_dir, 46, pf, sizeof pf);
+	CK(run_writer_open(nock, PS, pf, 46, 3, &w) == XTC_E_INVAL);
+	bm_destroy(nock);
+	/* Another page size: the frames do not hold the run's pages. */
+	snprintf(pf, sizeof pf, "%s/pages7", g_dir);
+	o.path = pf;
+	o.page_size = 2 * PS;
+	o.cksum_off = BTNODE_CKSUM_OFF;
+	o.cksum = wal_crc32c;
+	CK(bm_create(&o, &big) == XTC_OK);
+	CK(run_open(big, path, &m, &r) == XTC_E_IO && r == NULL);
+	run_path(g_dir, 46, pf, sizeof pf);
+	CK(run_writer_open(big, PS, pf, 46, 3, &w) == XTC_E_INVAL);
+	bm_destroy(big);
+	CK(run_open(bm, path, &m, &r) == XTC_OK);
+	run_close(r);
+	bm_destroy(bm);
+	unlink(path);
+	printf("  geometry: no checksums or another page size refuses the "
+	    "run\n");
+}
+
 int
 main(void)
 {
-	static const char *junk[] = { "pages", "pages2", "pages3", "pages4" };
+	static const char *junk[] = { "pages", "pages2", "pages3", "pages4",
+	    "pages5", "pages6", "pages7" };
 	char p[300];
 	unsigned i;
 
@@ -457,6 +504,7 @@ main(void)
 	t_order();
 	t_manifest_seal();
 	t_malformed();
+	t_geometry();
 	for (i = 0; i < sizeof junk / sizeof junk[0]; i++) {
 		snprintf(p, sizeof p, "%s/%s", g_dir, junk[i]);
 		(void)unlink(p);

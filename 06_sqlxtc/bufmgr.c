@@ -645,6 +645,12 @@ bm_ro_dirty_refused(const bm_t *bm)
 	    xtc_atomic_load_u64(&bm->ro_dirty, xtc_mo_relaxed);
 }
 
+int
+bm_cksum_off(const bm_t *bm)
+{
+	return bm->cksum_off;
+}
+
 uint32_t
 bm_page_size(const bm_t *bm)
 {

@@ -94,7 +94,9 @@ typedef struct run_writer run_writer_t;
 /*
  * Create run file `path` for run `runid` at `level`.  Pages are
  * bm's page size and sealed with bm's checksum (bm_seal_page); bm is
- * not otherwise touched.  The file must not exist.  I/O goes through
+ * not otherwise touched.  XTC_E_INVAL unless page_size is bm's and bm
+ * checksums at BTNODE_CKSUM_OFF: the seal is the run format's only
+ * torn- and misdirected-write check.  The file must not exist.  I/O goes through
  * xtc_aio (a fiber parks), the open and the unlink through
  * xtc_blocking_run.
  */
@@ -126,9 +128,11 @@ typedef struct run run_t;
 /*
  * Open run `meta->runid` from `path`: attach it to bm as RUN_FILE, read
  * and check the header against meta (id, level, row count, header
- * CRC), and load the table and chunk directories (the resident part:
- * about 40 bytes per table and 16 per EF_CHUNK rows).  Any mismatch or
- * damaged page is XTC_E_IO, and the file is detached again.
+ * CRC, and a page size equal to bm's), and load the table and chunk
+ * directories (the resident part: about 40 bytes per table and 16 per
+ * EF_CHUNK rows).  Any mismatch or damaged page is XTC_E_IO, and the
+ * file is detached again; a bm without checksums at BTNODE_CKSUM_OFF
+ * is XTC_E_INVAL.
  */
 int run_open(bm_t *bm, const char *path, const run_meta_t *meta,
     run_t **out);
