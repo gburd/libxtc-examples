@@ -88,6 +88,8 @@ typedef int (*mf_row_fn)(void *ctx, uint32_t frame, run_row_t *row);
  * failed write or a failed install before the manifest's rename, the
  * run file is removed, the manifest and the run set are untouched and
  * the delta stays frozen: a later flush retries it (mf_flush_frozen).
+ * XTC_E_INVAL, writing nothing, if the boundary the freeze read is
+ * below the installed one (it only rises).
  * NB: a failure after the rename (the directory fsync) returns
  * XTC_E_IO with the run installed in memory and kept on disk, and
  * fail-stops the manifest: every later flush returns XTC_E_IO, and the

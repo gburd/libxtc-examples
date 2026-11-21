@@ -159,7 +159,9 @@ void wal_fail_stop(wal_t *w);
  * passing a returned value continues it over the next bytes. */
 uint32_t wal_crc32c(uint32_t crc, const void *p, size_t n);
 
-/* Bytes of complete records in the log (the append offset). */
+/* Bytes of complete records in the log (the append offset).  NB: for a
+ * segmented log this is a log position (it keeps rising across rolls,
+ * and restarts low at reopen), not a byte count of the files on disk. */
 uint64_t wal_size(const wal_t *w);
 
 /*
@@ -269,6 +271,12 @@ uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
  * is below WAL_WA_SEG(wa), never the current one.  The boundary only
  * rises.  wal_checkpoint, the online checkpoint and wal_truncate refuse
  * a segmented log (XTC_E_INVAL): it is bounded by deletion instead.
+ *
+ * Lifetime: 24 bits of segment number at 64 MiB a segment is 1 PiB of
+ * log, about 13 days at a sustained 1 GB/s of WAL, or a year at
+ * 32 MB/s; past segment 2^24 - 1 a roll fail-stops the log.  The split
+ * is STORAGE_DESIGN 6.2's choice (40 offset bits cap one segment at
+ * 1 TiB); a store that outruns it needs a format with wider addresses.
  */
 #define WAL_SEG_HDR     4096u
 #define WAL_WA_SEG_BITS 24

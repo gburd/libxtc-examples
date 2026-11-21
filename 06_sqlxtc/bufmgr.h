@@ -283,7 +283,10 @@ int  bm_prefetch_pid(bm_t *bm, bm_pid_t pid);
  * resident frame of the file WITHOUT writing it and closes it.  NB: the
  * caller guarantees no fix of the file is in flight or will be issued
  * (the row log retires a run through RCU before it detaches it); a
- * fix of a file that is not attached returns XTC_E_INVAL.
+ * fix of a file that is not attached returns XTC_E_INVAL.  A fix that
+ * passed that check and then lost its file to a detach reads from a
+ * closed descriptor and fails like a damaged page (the checksum hook:
+ * the engine fail-stops the log), so the contract is not optional.
  */
 int  bm_file_attach(bm_t *bm, uint16_t file, const char *path);
 int  bm_file_detach(bm_t *bm, uint16_t file);

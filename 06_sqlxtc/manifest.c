@@ -264,7 +264,8 @@ static int
 mf_text(const manifest_t *m, const run_meta_t *add, uint64_t next,
     uint64_t boundary, char **out, size_t *len)
 {
-	size_t cap = 2u * MF_HEAD_MAX + MF_LINE_MAX * ((size_t)m->n + 1u), at = 0;
+	size_t cap = 2u * MF_HEAD_MAX + MF_LINE_MAX * ((size_t)m->n + 1u);
+	size_t at = 0;
 	const run_meta_t *r;
 	char *t;
 	uint32_t i;
@@ -323,8 +324,11 @@ mf_parse(char *t, size_t len, uint64_t *next, uint64_t *boundary,
 	if (sscanf(line, "next %" SCNu64 "\nboundary %" SCNx64, next,
 	    boundary) != 2)
 		return XTC_E_IO;
-	line = strchr(line, '\n') + 1;
-	line = strchr(line, '\n') + 1;
+	/* Past the next and boundary lines (each ends in a newline). */
+	if ((line = strchr(line, '\n')) == NULL ||
+	    (line = strchr(line + 1, '\n')) == NULL)
+		return XTC_E_IO;
+	line++;
 	for (; *line != '\0'; line = nl + 1) {
 		if ((nl = strchr(line, '\n')) == NULL)
 			break;
@@ -641,6 +645,11 @@ mf_flush_frozen(manifest_t *m, mf_row_fn rowfn, void *ctx)
 	xtc_rcu_read_lock();
 	empty = !kd_delta_next(m->kd, 1, &tid, &rid, &frame);
 	xtc_rcu_read_unlock();
+	/* The boundary only rises: a lower one would point recovery at
+	 * WAL that retention may already have deleted (a bad boundary_fn).
+	 * Refused before anything is written; the delta stays frozen. */
+	if (m->frz_boundary < m->boundary)
+		return XTC_E_INVAL;
 	if (empty) {
 		kd_drop_frozen(m->kd);       /* nothing to write */
 		xtc_rcu_synchronize();

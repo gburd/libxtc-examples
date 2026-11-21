@@ -22,6 +22,7 @@
  *	  retry      a flush whose row source fails installs nothing and
  *	             leaves the delta frozen; mf_flush_frozen finishes it;
  *	             an empty delta installs nothing;
+ *	             a boundary below the installed one is refused;
  *	  install    a flush whose manifest install fails (MANIFEST.tmp is
  *	             a directory) removes its run, keeps the delta frozen
  *	             and the boundary, and the old MANIFEST still opens;
@@ -95,6 +96,14 @@ boundary(void *ctx)
 {
 	(void)ctx;
 	return ++g_bnd * 1000u;
+}
+
+/* A broken boundary source: below every installed boundary. */
+static uint64_t
+low_boundary(void *ctx)
+{
+	(void)ctx;
+	return 1;
 }
 
 static bm_t *
@@ -175,11 +184,13 @@ t_flush_reopen(void)
 	/* Two flushes of 1000 rows over three tables; the second updates
 	 * half of the first's rows. */
 	for (i = 0; i < 1000; i++)
-		CK(kd_delta_put(kd, 1 + i % 3, (int64_t)i, 10000 + i) == XTC_OK);
+		CK(kd_delta_put(kd, 1 + i % 3, (int64_t)i, 10000 + i) ==
+		    XTC_OK);
 	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_OK);
 	CK(mf_nruns(m) == 1 && mf_boundary(m) == g_bnd * 1000u);
 	for (i = 0; i < 1000; i += 2)
-		CK(kd_delta_put(kd, 1 + i % 3, (int64_t)i, 20000 + i) == XTC_OK);
+		CK(kd_delta_put(kd, 1 + i % 3, (int64_t)i, 20000 + i) ==
+		    XTC_OK);
 	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_OK);
 	CK(mf_nruns(m) == 2 && exists("MANIFEST"));
 	for (i = 0; i < 1000; i++)
@@ -344,6 +355,21 @@ t_install_fail(manifest_t *m, keydir_t *kd, uint32_t n0, uint64_t b0)
 	bm_destroy(bm2);
 }
 
+/* A freeze boundary below the installed one is refused before anything
+ * is written (it only rises; review N4).  Runs while t_retry holds a
+ * frozen delta from boundary(); a second delta is not possible, so
+ * swap the frozen boundary to the low one and back. */
+static void
+t_low_boundary(manifest_t *m, keydir_t *kd, uint32_t n0, uint64_t b0)
+{
+	uint64_t keep = m->frz_boundary;
+
+	m->frz_boundary = low_boundary(NULL);
+	CK(b0 > 1 && mf_flush_frozen(m, row_of, NULL) == XTC_E_INVAL);
+	CK(kd_has_frozen(kd) && mf_nruns(m) == n0 && mf_boundary(m) == b0);
+	m->frz_boundary = keep;
+}
+
 static void
 t_retry(void)
 {
@@ -367,6 +393,7 @@ t_retry(void)
 	CK(mf_nruns(m) == n0 && mf_boundary(m) == b0 && kd_has_frozen(kd));
 	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_E_AGAIN);
 	t_install_fail(m, kd, n0, b0);
+	t_low_boundary(m, kd, n0, b0);
 	CK(mf_flush_frozen(m, row_of, NULL) == XTC_OK);
 	CK(mf_nruns(m) == n0 + 1 && mf_boundary(m) == g_bnd * 1000u &&
 	    !kd_has_frozen(kd));

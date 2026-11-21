@@ -99,7 +99,7 @@ t_resident(void)
 		case 1:
 			if (ref[k] != 0) {
 				CK(kd_res_del(kd, k % 7u, (int64_t)k * 4099,
-				    ref[k] + 1u, 0) == 0);      /* wrong frame */
+				    ref[k] + 1u, 0) == 0);   /* wrong frame */
 				CK(kd_res_del(kd, k % 7u, (int64_t)k * 4099,
 				    ref[k], (int)(i & 1u)) == 1);
 				ref[k] = 0;
@@ -476,7 +476,14 @@ t_threads(void)
 static void
 t_costs(bm_t *bm)
 {
+	static uint8_t hdr[PS];
 	keydir_t *kd = NULL;
+	run_writer_t *w = NULL;
+	run_meta_t m;
+	run_row_t r;
+	uint8_t rec[100];
+	uint64_t fb = 0;
+	FILE *fp;
 	kd_loc_t loc;
 	char path[300];
 	int64_t t0, t1;
@@ -503,8 +510,8 @@ t_costs(bm_t *bm)
 	xtc_rcu_read_lock();
 	t0 = xtc_clock_mono();
 	for (k = 0; k < 20000; k++) {
-		int r = (int)((uint32_t)k * 2654435761u % LR);
-		if (kd_lookup(kd, 1 + (uint32_t)k % LT, r * 3 - 500, &loc) ==
+		int ri = (int)((uint32_t)k * 2654435761u % LR);
+		if (kd_lookup(kd, 1 + (uint32_t)k % LT, ri * 3 - 500, &loc) ==
 		    XTC_OK && loc.kind == KD_RUN)
 			sink += loc.page;
 	}
@@ -515,40 +522,30 @@ t_costs(bm_t *bm)
 	/* Static-stage bytes per row in a full-size run: one table of
 	 * 100k dense rowids, 100-byte rows (5.3's case).  The footer
 	 * length is the header's field at byte 80. */
-	{
-		run_writer_t *w = NULL;
-		run_meta_t m;
-		run_row_t r;
-		uint8_t rec[100], hdr[PS];
-		uint64_t fb = 0;
-		FILE *fp;
-
-		memset(rec, 'r', sizeof rec);
-		run_path(g_dir, 9999, path, sizeof path);
-		CK(run_writer_open(bm, PS, path, 9999, 16, &w) == XTC_OK);
-		for (i = 0; w != NULL && i < 100000; i++) {
-			memset(&r, 0, sizeof r);
-			r.tableid = 4;
-			r.rowid = (int64_t)i + 1;
-			r.len = sizeof rec;
-			r.rec = rec;
-			CK(run_writer_add(w, &r) == XTC_OK);
-		}
-		CK(run_writer_finish(w, &m) == XTC_OK);
-		if ((fp = fopen(path, "rb")) != NULL &&
-		    fread(hdr, 1, PS, fp) == PS) {
-			memcpy(&fb, hdr + 80, 8);
-			printf("  static stage, 100k dense rowids, 100-byte "
-			    "rows: footer %.2f bits/row, resident %.2f "
-			    "bits/row\n", 8.0 * (double)fb / (double)m.nrows,
-			    8.0 * (40.0 + 16.0 * (double)((m.nrows + 511) /
-			    512)) / (double)m.nrows);
-			/* 5.3: about 2 + 0.5 + directory; well under 4. */
-			CK(8.0 * (double)fb / (double)m.nrows < 4.0);
-		}
-		if (fp != NULL)
-			fclose(fp);
+	memset(rec, 'r', sizeof rec);
+	run_path(g_dir, 9999, path, sizeof path);
+	CK(run_writer_open(bm, PS, path, 9999, 16, &w) == XTC_OK);
+	for (i = 0; w != NULL && i < 100000; i++) {
+		memset(&r, 0, sizeof r);
+		r.tableid = 4;
+		r.rowid = (int64_t)i + 1;
+		r.len = sizeof rec;
+		r.rec = rec;
+		CK(run_writer_add(w, &r) == XTC_OK);
 	}
+	CK(run_writer_finish(w, &m) == XTC_OK);
+	if ((fp = fopen(path, "rb")) != NULL && fread(hdr, 1, PS, fp) == PS) {
+		memcpy(&fb, hdr + 80, 8);
+		printf("  static stage, 100k dense rowids, 100-byte rows: "
+		    "footer %.2f bits/row, resident %.2f bits/row\n",
+		    8.0 * (double)fb / (double)m.nrows,
+		    8.0 * (40.0 + 16.0 * (double)((m.nrows + 511) / 512)) /
+		    (double)m.nrows);
+		/* 5.3: about 2 + 0.5 + directory; well under 4. */
+		CK(8.0 * (double)fb / (double)m.nrows < 4.0);
+	}
+	if (fp != NULL)
+		fclose(fp);
 	unlink(path);
 	if (sink == 0xFFFFFFFFu)
 		printf("%u\n", sink);
@@ -586,7 +583,8 @@ bc_at_freeze(void *ctx)
 	if (g_old_rule) {
 		b = wal_end_wa(g_bwal);
 		for (i = 0; i < BC_FIBERS; i++)
-			if (g_reg[i] != 0 && g_reg[i] != BC_NONE && g_reg[i] < b)
+			if (g_reg[i] != 0 && g_reg[i] != BC_NONE &&
+			    g_reg[i] < b)
 				b = g_reg[i];
 	} else {
 		b = kd_flush_boundary(g_reg, BC_FIBERS, wal_end_wa(g_bwal));
@@ -678,8 +676,8 @@ bc_run(void)
 		return 0;
 	xtc_atomic_store_i32(&g_bleft, BC_FIBERS, xtc_mo_seq_cst);
 	for (i = 0; i < BC_FIBERS; i++)
-		CK(xtc_proc_spawn(xtc_exec_loop(ex, (int)(i % 2u)), bc_committer,
-		    (void *)(uintptr_t)i, &po, &pid) == XTC_OK);
+		CK(xtc_proc_spawn(xtc_exec_loop(ex, (int)(i % 2u)),
+		    bc_committer, (void *)(uintptr_t)i, &po, &pid) == XTC_OK);
 	CK(xtc_proc_spawn(xtc_exec_loop(ex, 1), bc_flusher, NULL, &po, &pid) ==
 	    XTC_OK);
 	CK(xtc_exec_run(ex) == XTC_OK);
