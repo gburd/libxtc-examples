@@ -376,19 +376,12 @@ struct bm {
 
 	/* Cold: extra files (bm_file_attach).  xfd[file] holds fd + 1 (0:
 	 * not attached), allocated on the first attach; xf_mu serializes
-	 * attach and detach.  dw_pend holds the double-write images of
-	 * pages of files that were not attached when the ring was replayed
-	 * (dw_recover): bm_file_attach applies them before any fix. */
+	 * attach and detach.  Their frames are read-only: never dirtied, so
+	 * never double-written or written back.  ro_dirty counts refused
+	 * attempts to dirty one (a caller bug). */
 	int32_t          *xfd;
 	pthread_mutex_t   xf_mu;
-	struct bm_dw_pend *dw_pend;
-	uint32_t          dw_pend_n;
-};
-
-struct bm_dw_pend {
-	bm_pid_t pid;
-	uint64_t seq;
-	uint8_t *page;
+	uint64_t          ro_dirty;
 };
 
 /* The hash bucket of a page id.  A file-0 id hashes as it always has
@@ -645,6 +638,13 @@ bm_set_cksum_hook(bm_t *bm, void (*hook)(void *ctx, bm_pid_t pid), void *ctx)
 	bm->cksum_hook = hook;
 }
 
+uint64_t
+bm_ro_dirty_refused(const bm_t *bm)
+{
+	return bm == NULL ? 0 :
+	    xtc_atomic_load_u64(&bm->ro_dirty, xtc_mo_relaxed);
+}
+
 uint32_t
 bm_page_size(const bm_t *bm)
 {
@@ -822,37 +822,9 @@ dw_protect(bm_t *bm, bm_pid_t pid, const void *page)
 	return 0;
 }
 
-/* Keep a double-write image of a page of another file for
- * bm_file_attach (that file is not open yet when the ring is replayed).
- * Images arrive in sequence order, so a later one replaces an earlier
- * one of the same page.  Out of memory loses the image, as a failed
- * slot read does. */
-static void
-dw_keep(bm_t *bm, bm_pid_t pid, uint64_t seq, const uint8_t *pg)
-{
-	struct bm_dw_pend *e = NULL;
-	uint32_t i;
-
-	for (i = 0; i < bm->dw_pend_n; i++)
-		if (bm->dw_pend[i].pid == pid)
-			e = &bm->dw_pend[i];
-	if (e == NULL) {
-		if (bm->dw_pend == NULL &&
-		    (bm->dw_pend = xtc_calloc(BM_DW_SLOTS, sizeof *e)) == NULL)
-			return;
-		e = &bm->dw_pend[bm->dw_pend_n];
-		if ((e->page = xtc_malloc(bm->page_size)) == NULL)
-			return;
-		bm->dw_pend_n++;
-		e->pid = pid;
-	}
-	e->seq = seq;
-	memcpy(e->page, pg, bm->page_size);
-}
-
 /* On reopen, replay the double-write ring onto the main file in sequence
- * order, repairing any torn final write, then clear the ring.  Images of
- * other files' pages are kept for bm_file_attach (dw_keep).  Single-
+ * order, repairing any torn final write, then clear the ring.  Only page
+ * file pages are ever in it (other files' frames are read-only).  Single-
  * threaded: runs in bm_create before any proc is spawned. */
 static void
 dw_recover(bm_t *bm)
@@ -888,10 +860,8 @@ dw_recover(bm_t *bm)
 		    (off_t)ent[i].slot * (off_t)slotsz + BM_DW_HDR)
 		    != (ssize_t)bm->page_size)
 			continue;
-		if (BM_PID_FILE(ent[i].pid) != 0) {
-			dw_keep(bm, ent[i].pid, ent[i].seq, pg);
-			continue;
-		}
+		if (BM_PID_FILE(ent[i].pid) != 0)
+			continue;             /* never written; not ours */
 		if (pwrite(bm->fd, pg, bm->page_size,
 		    (off_t)ent[i].pid * (off_t)bm->page_size)
 		    == (ssize_t)bm->page_size)
@@ -2050,12 +2020,6 @@ bm_destroy(bm_t *bm)
 		xtc_free(bm->xfd);
 	}
 	(void)pthread_mutex_destroy(&bm->xf_mu);
-	if (bm->dw_pend != NULL) {
-		uint32_t i;
-		for (i = 0; i < bm->dw_pend_n; i++)
-			xtc_free(bm->dw_pend[i].page);
-		xtc_free(bm->dw_pend);
-	}
 	if (bm->frames != NULL) {
 		uint32_t i;
 		for (i = 0; i < bm->n_frames; i++)
@@ -2092,34 +2056,6 @@ bm_destroy(bm_t *bm)
 
 static int drop_resident(bm_t *bm, bm_pid_t pid);
 
-/* Apply the double-write images dw_recover kept for `file` to its
- * descriptor, and forget them.  xf_mu held. */
-static void
-dw_apply_pending(bm_t *bm, uint16_t file, int fd)
-{
-	uint32_t i = 0;
-	int wrote = 0;
-
-	while (i < bm->dw_pend_n) {
-		struct bm_dw_pend *e = &bm->dw_pend[i];
-		if (BM_PID_FILE(e->pid) != file) {
-			i++;
-			continue;
-		}
-		if (pwrite(fd, e->page, bm->page_size,
-		    (off_t)BM_PID_PAGE(e->pid) * (off_t)bm->page_size) ==
-		    (ssize_t)bm->page_size) {
-			xtc_atomic_fetch_add_u64(&bm->s_dw_repaired, 1,
-			    xtc_mo_relaxed);
-			wrote = 1;
-		}
-		xtc_free(e->page);
-		bm->dw_pend[i] = bm->dw_pend[--bm->dw_pend_n];
-	}
-	if (wrote)
-		(void)fdatasync(fd);
-}
-
 int
 bm_file_attach(bm_t *bm, uint16_t file, const char *path)
 {
@@ -2140,11 +2076,9 @@ bm_file_attach(bm_t *bm, uint16_t file, const char *path)
 	}
 	if (xtc_atomic_load_i32(&x[file], xtc_mo_relaxed) != 0) {
 		rc = XTC_E_INVAL;            /* already attached */
-	} else if ((fd = open(path, O_RDWR)) < 0) {
+	} else if ((fd = open(path, O_RDONLY)) < 0) {
 		rc = XTC_E_INVAL;
 	} else {
-		/* Repair torn pages before any fix can read them. */
-		dw_apply_pending(bm, file, fd);
 		xtc_atomic_store_i32(&x[file], fd + 1, xtc_mo_release);
 	}
 	(void)pthread_mutex_unlock(&bm->xf_mu);
@@ -2427,6 +2361,13 @@ retry:
 static void
 mark_dirty_edge(bm_t *bm, bm_frame_t *frame)
 {
+	/* A frame of a file other than 0 (a run) is read-only: refuse the
+	 * edge, so it is never double-written or written back. */
+	if (BM_PID_FILE(xtc_atomic_load_u64(&frame->pid, xtc_mo_acquire)) !=
+	    0) {
+		xtc_atomic_fetch_add_u64(&bm->ro_dirty, 1, xtc_mo_relaxed);
+		return;
+	}
 	/* Stamp the dirtying order on the clean -> dirty edge, so the
 	 * trickler can write oldest dirt first (a recLSN proxy). */
 	if (xtc_atomic_exchange_i32(&frame->dirty, 1, xtc_mo_acq_rel) == 0) {

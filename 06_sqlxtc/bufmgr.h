@@ -272,11 +272,14 @@ int  bm_prefetch_pid(bm_t *bm, bm_pid_t pid);
 
 /*
  * Extra files (page ids of file != 0).  bm_file_attach opens `path`
- * (read-write, never created or truncated) as file `file` (1..65535):
- * its pages are then fixed, cached, checksummed, evicted and, if a
- * caller dirties one, written back like file-0 pages, at the page's
- * offset in its own file.  XTC_E_INVAL for file 0, a file already
- * attached, or a path that does not open.  bm_file_detach drops every
+ * (read-only, never created or truncated) as file `file` (1..65535):
+ * its pages are then fixed, cached, checksummed and evicted like file-0
+ * pages, at the page's offset in its own file.  They are READ-ONLY
+ * (STORAGE_DESIGN 3.4: run pages are written once by their writer,
+ * sealed with bm_seal_page): bm_unfix(..., 1) or bm_predirty on such a
+ * frame is refused and counted (bm_ro_dirty_refused), so it is never
+ * double-written or written back.  XTC_E_INVAL for file 0, a file
+ * already attached, or a path that does not open.  bm_file_detach drops every
  * resident frame of the file WITHOUT writing it and closes it.  NB: the
  * caller guarantees no fix of the file is in flight or will be issued
  * (the row log retires a run through RCU before it detaches it); a
@@ -284,6 +287,9 @@ int  bm_prefetch_pid(bm_t *bm, bm_pid_t pid);
  */
 int  bm_file_attach(bm_t *bm, uint16_t file, const char *path);
 int  bm_file_detach(bm_t *bm, uint16_t file);
+
+/* Attempts to dirty a frame of a file other than 0 (refused). */
+uint64_t bm_ro_dirty_refused(const bm_t *bm);
 
 /* The page size the manager was created with. */
 uint32_t bm_page_size(const bm_t *bm);

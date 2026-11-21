@@ -14,13 +14,14 @@
  *	                 read back as page 3 of the page file;
  *	  file 0 seal    a file-0 page's seal is still the CRC of the page
  *	                 with its CRC word as zero (the format is unchanged);
- *	  writeback      a dirtied file-1 page that is evicted is written to
- *	                 file 1 at its own offset, never to the page file;
- *	  detach         drops the file's frames unwritten; a fix of it then
- *	                 fails, and another file attached under the same
- *	                 number serves its own bytes, not stale frames;
- *	  double-write   a torn file-1 page is repaired on reopen when the
- *	                 file is attached (the ring keeps the image);
+ *	  read-only      a file-1 frame cannot be dirtied (bm_unfix's mark
+ *	                 and bm_predirty are refused and counted): after
+ *	                 eviction and a checkpoint, with the double-write
+ *	                 ring on, file 1 and the page file are untouched and
+ *	                 the ring holds no file-1 image;
+ *	  detach         drops the file's frames; a fix of it then fails, and
+ *	                 another file attached under the same number serves
+ *	                 its own bytes, not stale frames;
  *	  freelist       bm_free_pid refuses a page of another file.
  *	Runs off a loop: xtc_aio is inline there.
  */
@@ -214,10 +215,30 @@ t_file_seal(void)
 	    "page file's; the file-0 seal is unchanged\n");
 }
 
-static void
-t_writeback_detach(void)
+/* 1 if the double-write ring file `dwb` holds an image of a page of a
+ * file other than 0 (slot: a 16-byte header, pid first, then the page). */
+static int
+ring_has_other(const char *dwb)
 {
-	char p0[300], p1[300], p3[300];
+	uint8_t hdr[8];
+	bm_pid_t pid;
+	off_t off;
+	int fd, found = 0;
+
+	if ((fd = open(dwb, O_RDONLY)) < 0)
+		return 0;
+	for (off = 0; pread(fd, hdr, 8, off) == 8; off += 16 + PS) {
+		memcpy(&pid, hdr, 8);
+		found |= pid != BM_PID_NONE && BM_PID_FILE(pid) != 0;
+	}
+	close(fd);
+	return found;
+}
+
+static void
+t_readonly_detach(void)
+{
+	char p0[300], p1[300], p3[300], dwb[310];
 	uint8_t pg[PS];
 	bm_frame_t *f;
 	bm_pid_t pid;
@@ -227,16 +248,21 @@ t_writeback_detach(void)
 	path_of(p0, sizeof p0, "pages");
 	path_of(p1, sizeof p1, "run1");
 	path_of(p3, sizeof p3, "run3");
-	bm = open_bm(p0, 0, 0, 4);
+	snprintf(dwb, sizeof dwb, "%s.dwb", p0);
+	bm = open_bm(p0, 0, 1, 4);
 	if (bm == NULL)
 		return;
 	make_file(bm, p1, 1);
 	make_file(bm, p3, 3);
 	CK(bm_file_attach(bm, 1, p1) == XTC_OK);
+	/* Dirty a file-1 frame both ways: each is refused. */
 	CK(bm_fix_pid(bm, BM_PID_MAKE(1, 2), &f) == XTC_OK);
 	fill(bm_page(f), BM_PID_MAKE(1, 2), 99);
+	bm_predirty(bm, f);
 	bm_unfix(bm, f, 1);
-	/* Churn the 4-frame pool so the dirty page is written and evicted. */
+	CK(bm_ro_dirty_refused(bm) == 2);
+	/* Churn the 4-frame pool so the frame is evicted, then checkpoint:
+	 * nothing reaches file 1, and the ring never takes a file-1 page. */
 	for (i = 0; i < 12; i++) {
 		CK(bm_alloc_pid(bm, &f, &pid) == XTC_OK);
 		fill(bm_page(f), pid, 100);
@@ -246,68 +272,20 @@ t_writeback_detach(void)
 	CK((fd = open(p1, O_RDONLY)) >= 0);
 	CK(pread(fd, pg, PS, 2 * PS) == PS);
 	close(fd);
-	CK(check(pg, BM_PID_MAKE(1, 2), 99));
-	CK(fix_check(bm, BM_PID_MAKE(1, 2), 99));
-	/* Detach with the page resident and dirty again: dropped unwritten. */
-	CK(bm_fix_pid(bm, BM_PID_MAKE(1, 2), &f) == XTC_OK);
-	fill(bm_page(f), BM_PID_MAKE(1, 2), 98);
-	bm_unfix(bm, f, 1);
+	CK(check(pg, BM_PID_MAKE(1, 2), 16 + 2));
+	CK(fix_check(bm, BM_PID_MAKE(1, 2), 16 + 2));
+	CK(!ring_has_other(dwb));
 	CK(bm_file_detach(bm, 1) == XTC_OK);
 	CK(bm_file_detach(bm, 1) == XTC_E_INVAL);
 	CK(bm_fix_pid(bm, BM_PID_MAKE(1, 2), &f) == XTC_E_INVAL);
-	CK(bm_checkpoint(bm) == XTC_OK);
-	CK((fd = open(p1, O_RDONLY)) >= 0);
-	CK(pread(fd, pg, PS, 2 * PS) == PS);
-	close(fd);
-	CK(check(pg, BM_PID_MAKE(1, 2), 99));
 	/* Another file under number 1: its pages were sealed as file 3's,
 	 * so a stale frame of the old file 1 would pass, a reload fails. */
 	CK(bm_file_attach(bm, 1, p3) == XTC_OK);
 	CK(bm_fix_pid(bm, BM_PID_MAKE(1, 2), &f) == XTC_E_IO);
 	CK(bm_dbg_dup_pid(bm) == 0);
 	bm_destroy(bm);
-	printf("  writeback/detach: an evicted file-1 page lands in file 1; "
-	    "detach drops frames unwritten\n");
-}
-
-static void
-t_double_write(void)
-{
-	char p0[300], p1[300];
-	uint8_t pg[PS];
-	bm_frame_t *f;
-	bm_stats_t st;
-	bm_t *bm;
-	int fd;
-
-	path_of(p0, sizeof p0, "dwpages");
-	path_of(p1, sizeof p1, "dwrun1");
-	bm = open_bm(p0, 0, 1, 16);
-	if (bm == NULL)
-		return;
-	make_file(bm, p1, 1);
-	CK(bm_file_attach(bm, 1, p1) == XTC_OK);
-	CK(bm_fix_pid(bm, BM_PID_MAKE(1, 4), &f) == XTC_OK);
-	fill(bm_page(f), BM_PID_MAKE(1, 4), 55);
-	bm_unfix(bm, f, 1);
-	CK(bm_checkpoint(bm) == XTC_OK);
-	bm_destroy(bm);
-	/* Tear the home write: half of the page is the old image. */
-	CK((fd = open(p1, O_RDWR)) >= 0);
-	memset(pg, 0xEE, PS / 2);
-	CK(pwrite(fd, pg, PS / 2, 4 * PS + PS / 2) == PS / 2);
-	close(fd);
-	bm = open_bm(p0, 1, 1, 16);
-	if (bm == NULL)
-		return;
-	CK(bm_file_attach(bm, 1, p1) == XTC_OK);
-	CK(fix_check(bm, BM_PID_MAKE(1, 4), 55));
-	CK(fix_check(bm, BM_PID_MAKE(1, 5), 16 + 5));
-	bm_get_stats(bm, &st);
-	CK(st.dw_repaired == 1);
-	CK(st.cksum_failures == 0);
-	bm_destroy(bm);
-	printf("  double-write: a torn file-1 page repaired at attach\n");
+	printf("  read-only/detach: a file-1 frame is never dirtied, written "
+	    "back or double-written; detach drops it\n");
 }
 
 int
@@ -325,8 +303,7 @@ main(void)
 	}
 	t_same_page();
 	t_file_seal();
-	t_writeback_detach();
-	t_double_write();
+	t_readonly_detach();
 	for (i = 0; i < sizeof names / sizeof names[0]; i++) {
 		path_of(p, sizeof p, names[i]);
 		(void)unlink(p);
