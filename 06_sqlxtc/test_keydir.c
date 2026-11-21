@@ -1,0 +1,1009 @@
+/*-
+ * Copyright (c) 2026, The XTC Project -- All rights reserved.
+ * Use of this source code is governed by the ISC License.
+ *
+ * SPDX-License-Identifier: ISC
+ *
+ * examples/06_sqlxtc/test_keydir.c
+ *	The keydir (keydir.c, STORAGE_DESIGN 5):
+ *	  resident   put / get / replace / delete against a reference map,
+ *	             through enough random keys to force long probe runs
+ *	             and backward shifts; a full map refuses, never loops;
+ *	  publish    a miss publishes only if no commit or drop moved the
+ *	             stripe's change counter (4.5): a commit during the miss
+ *	             wins, two misses on one RID publish once, an eviction
+ *	             does not move the counter and a tombstone drop does;
+ *	  delta      puts into the active delta, a freeze, puts into the
+ *	             new delta, an ordered walk of each (RID order across
+ *	             tables, the newest frame per RID), back-pressure (a
+ *	             second freeze is refused) and the drop;
+ *	  lookup     a property test: random rounds of commits (resident +
+ *	             delta), freezes and flushes into run files, evictions
+ *	             and tombstones; kd_lookup always agrees with a
+ *	             reference of where each RID's newest version is, and a
+ *	             run copy hidden by a newer run is never the answer;
+ *	  threads    four threads put, delete and read the resident map at
+ *	             once; a reader never sees a frame stored for another
+ *	             key;
+ *	  boundary   the flush boundary against a real segmented WAL (plant
+ *	             P8's race): committers on two loops register, commit
+ *	             (wal_commit_wa) and put while a flusher freezes over and
+ *	             over; every commit whose frame is below a freeze's
+ *	             boundary is in that freeze.  The old rule ("a commit not
+ *	             yet written counts as the WAL end") must break this; the
+ *	             recorded-on-entry rule (wal_end_wa, kd_flush_boundary),
+ *	             read under the registry's lock before the switch (and,
+ *	             equally sound, at it), never;
+ *	  shapes     every interleaving of one commit's steps with a
+ *	             flusher's, run on the real WAL and keydir: the boundary
+ *	             read in one step under the registry's lock, before or at
+ *	             the switch, never loses the commit; the registry and the
+ *	             WAL end read at different times (REREVIEW N10), a read
+ *	             after the switch, and the old rule each do, in a named
+ *	             interleaving.
+ *	Prints the resident-map hit cost and the miss cost over N runs
+ *	(5.5), and the static stage's bytes per row (5.3).
+ */
+
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "btnode.h"
+#include "bufmgr.h"
+#include "keydir.h"
+#include "run.h"
+#include "wal.h"
+#include "xtc.h"
+#include "xtc_exec.h"
+#include "xtc_proc.h"
+#include "xtc_rcu.h"
+#include "t_tmp.h"
+
+#define PS 4096
+
+static char g_dir[256];
+static uint64_t g_rng = 0x4B455944u;
+
+static uint64_t
+rnd(void)
+{
+	uint64_t z = (g_rng += 0x9E3779B97F4A7C15ull);
+
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+	return z ^ (z >> 31);
+}
+
+/* ---- resident map against a reference ---- */
+
+#define RN 20000
+
+static void
+t_resident(void)
+{
+	static uint32_t ref[RN];       /* frame per key index, 0 = absent */
+	keydir_t *kd = NULL;
+	uint32_t f, i, k, live = 0, bad = 0;
+
+	CK(kd_create(RN, &kd) == XTC_OK);
+	if (kd == NULL)
+		return;
+	memset(ref, 0, sizeof ref);
+	for (i = 0; i < 400000; i++) {
+		k = (uint32_t)(rnd() % RN);
+		/* Key k: table k % 7, rowid spread so stripes collide. */
+		switch (rnd() % 3) {
+		case 0:
+			f = 1u + (uint32_t)(rnd() % 1000000u);
+			CK(kd_res_put(kd, k % 7u, (int64_t)k * 4099, f) ==
+			    XTC_OK);
+			live += ref[k] == 0;
+			ref[k] = f;
+			break;
+		case 1:
+			if (ref[k] != 0) {
+				CK(kd_res_del(kd, k % 7u, (int64_t)k * 4099,
+				    ref[k] + 1u, 0) == 0);   /* wrong frame */
+				CK(kd_res_del(kd, k % 7u, (int64_t)k * 4099,
+				    ref[k], (int)(i & 1u)) == 1);
+				ref[k] = 0;
+				live--;
+			}
+			break;
+		default:
+			f = 0;
+			if (kd_res_get(kd, k % 7u, (int64_t)k * 4099, &f) !=
+			    (ref[k] != 0) || f != ref[k])
+				bad++;
+		}
+	}
+	for (k = 0; k < RN; k++) {
+		f = 0;
+		if (kd_res_get(kd, k % 7u, (int64_t)k * 4099, &f) !=
+		    (ref[k] != 0) || f != ref[k])
+			bad++;
+	}
+	CK(bad == 0 && kd_res_count(kd) == live);
+	kd_destroy(kd);
+	/* A full map refuses instead of probing forever. */
+	CK(kd_create(16, &kd) == XTC_OK);
+	for (i = 0, k = 0; kd != NULL && i < 100000; i++)
+		if (kd_res_put(kd, 1, (int64_t)i, 1) == XTC_E_RESOURCE)
+			k++;
+	CK(k > 0);
+	kd_destroy(kd);
+	printf("  resident: 400k ops against a reference map, %u live; a "
+	    "full map refuses\n", live);
+}
+
+static void
+t_publish(void)
+{
+	keydir_t *kd = NULL;
+	uint64_t v;
+	uint32_t cur;
+
+	CK(kd_create(1000, &kd) == XTC_OK);
+	if (kd == NULL)
+		return;
+	/* Two misses on RID (3, 9): the first publishes, the second sees
+	 * its frame. */
+	v = kd_res_ver(kd, 3, 9);
+	CK(kd_res_publish(kd, 3, 9, 11, v, &cur) == 1);
+	CK(kd_res_publish(kd, 3, 9, 12, v, &cur) == 0 && cur == 11);
+	/* An eviction does not move the counter: a miss sampled before it
+	 * may still publish. */
+	v = kd_res_ver(kd, 3, 9);
+	CK(kd_res_del(kd, 3, 9, 11, 0) == 1);
+	CK(kd_res_ver(kd, 3, 9) == v);
+	CK(kd_res_publish(kd, 3, 9, 13, v, &cur) == 1);
+	/* A commit during a miss wins: the miss's sample is stale. */
+	CK(kd_res_del(kd, 3, 9, 13, 0) == 1);
+	v = kd_res_ver(kd, 3, 9);
+	CK(kd_res_put(kd, 3, 9, 20) == XTC_OK);
+	CK(kd_res_del(kd, 3, 9, 20, 0) == 1);       /* even if evicted since */
+	CK(kd_res_publish(kd, 3, 9, 14, v, &cur) == 0 && cur == 0);
+	/* A tombstone drop moves it too. */
+	v = kd_res_ver(kd, 3, 9);
+	CK(kd_res_publish(kd, 3, 9, 15, v, &cur) == 1);
+	CK(kd_res_del(kd, 3, 9, 15, 1) == 1);
+	CK(kd_res_publish(kd, 3, 9, 16, v, &cur) == 0 && cur == 0);
+	kd_destroy(kd);
+	printf("  publish: a commit or a drop during a miss wins; an eviction "
+	    "does not stop a publish\n");
+}
+
+/* The at-freeze hook runs once, at the switch. */
+static void
+at_freeze(void *ctx)
+{
+	(*(uint32_t *)ctx)++;
+}
+
+static void
+t_delta(void)
+{
+	keydir_t *kd = NULL;
+	uint32_t tid, f, n;
+	int64_t rid, last;
+	uint32_t lt;
+
+	CK(kd_create(1000, &kd) == XTC_OK);
+	if (kd == NULL)
+		return;
+	n = 0;
+	xtc_rcu_read_lock();
+	CK(kd_delta_put(kd, 5, 100, 1) == XTC_OK);
+	CK(kd_delta_put(kd, 2, -7, 2) == XTC_OK);
+	CK(kd_delta_put(kd, 5, 50, 3) == XTC_OK);
+	CK(kd_delta_put(kd, 5, 100, 4) == XTC_OK);   /* replace */
+	CK(kd_delta_put(kd, UINT32_MAX, INT64_MAX, 5) == XTC_OK);
+	CK(kd_delta_put(kd, 0, INT64_MIN, 6) == XTC_OK);
+	CK(kd_delta_rows(kd) == 5);
+	CK(kd_freeze(kd, at_freeze, &n) == XTC_OK && n == 1);
+	CK(kd_freeze(kd, NULL, NULL) == XTC_E_AGAIN && kd_has_frozen(kd));
+	CK(kd_delta_put(kd, 5, 100, 7) == XTC_OK);
+	CK(kd_delta_rows(kd) == 1);
+	CK(kd_delta_get(kd, 5, 100, &f) && f == 7);  /* active first */
+	CK(kd_delta_get(kd, 5, 50, &f) && f == 3);   /* then frozen */
+	CK(!kd_delta_get(kd, 5, 51, &f));
+	/* The frozen delta in RID order. */
+	tid = 0;
+	rid = INT64_MIN;
+	n = 0;
+	lt = 0;
+	last = INT64_MIN;
+	while (kd_delta_next(kd, 1, &tid, &rid, &f)) {
+		CK(n == 0 || tid > lt || (tid == lt && rid > last));
+		static const uint32_t wf[] = { 6, 2, 3, 4, 5 };
+		CK(n < 5 && f == wf[n]);
+		n++;
+		lt = tid;
+		last = rid;
+		if (rid == INT64_MAX) {
+			if (tid == UINT32_MAX)
+				break;
+			tid++;
+			rid = INT64_MIN;
+		} else {
+			rid++;
+		}
+	}
+	CK(n == 5);
+	xtc_rcu_read_unlock();
+	kd_drop_frozen(kd);
+	CK(!kd_has_frozen(kd) && kd_freeze(kd, NULL, NULL) == XTC_OK);
+	kd_drop_frozen(kd);
+	xtc_rcu_synchronize();
+	kd_destroy(kd);
+	printf("  delta: freeze, back-pressure, ordered walk across tables, "
+	    "newest frame per RID\n");
+}
+
+/* ---- lookup property test ---- */
+
+#define LT  3              /* tables */
+#define LR  400            /* rowids per table */
+#define LRUNS 40
+
+struct where {
+	int      kind;         /* 0 none, 1 frame (resident), 2 run */
+	uint32_t frame;
+	int      run;          /* index into g_runs (creation order) */
+	int      dirty;        /* committed since the last flush */
+};
+
+static run_t *g_runs[LRUNS];
+static int g_nruns;
+
+/* Write the frozen delta of kd into run file `runid` and open it. */
+static int
+flush_frozen(keydir_t *kd, bm_t *bm, uint64_t runid)
+{
+	run_writer_t *w = NULL;
+	run_meta_t m;
+	run_row_t r;
+	uint8_t rec[16];
+	char path[300];
+	uint32_t tid = 0, f;
+	int64_t rid = INT64_MIN;
+	int rc;
+
+	run_path(g_dir, runid, path, sizeof path);
+	if ((rc = run_writer_open(bm, PS, path, runid, 16, &w)) != XTC_OK)
+		return rc;
+	xtc_rcu_read_lock();
+	while (kd_delta_next(kd, 1, &tid, &rid, &f)) {
+		memset(&r, 0, sizeof r);
+		r.tableid = tid;
+		r.rowid = rid;
+		r.commit_ts = f;
+		memcpy(rec, &f, 4);
+		r.len = 4;
+		r.rec = rec;
+		if ((rc = run_writer_add(w, &r)) != XTC_OK)
+			break;
+		rid++;
+	}
+	xtc_rcu_read_unlock();
+	if (rc != XTC_OK) {
+		run_writer_abort(w);
+		return rc;
+	}
+	if ((rc = run_writer_finish(w, &m)) != XTC_OK)
+		return rc;
+	return run_open(bm, path, &m, &g_runs[g_nruns++]);
+}
+
+static int
+runs_newest_first(keydir_t *kd)
+{
+	run_t *v[LRUNS];
+	int i;
+
+	for (i = 0; i < g_nruns; i++)
+		v[i] = g_runs[g_nruns - 1 - i];
+	return kd_runs_set(kd, v, (uint32_t)g_nruns);
+}
+
+static void
+t_lookup(bm_t *bm)
+{
+	static struct where ref[LT][LR];
+	static uint32_t in_run[LT][LR];     /* frame value of the newest run */
+	keydir_t *kd = NULL;
+	uint32_t next_frame = 1, t, f;
+	int round, i, bad = 0, nlook = 0, r;
+	kd_loc_t loc;
+	run_row_t row;
+	uint8_t buf[16];
+
+	CK(kd_create(LT * LR * 2, &kd) == XTC_OK);
+	if (kd == NULL)
+		return;
+	memset(ref, 0, sizeof ref);
+	memset(in_run, 0, sizeof in_run);
+	for (round = 0; round < LRUNS && !g_fail; round++) {
+		/* Commits: a resident frame and a delta entry each. */
+		for (i = 0; i < 300; i++) {
+			t = (uint32_t)(rnd() % LT);
+			r = (int)(rnd() % LR);
+			f = next_frame++;
+			CK(kd_res_put(kd, t + 1, r * 3 - 500, f) == XTC_OK);
+			CK(kd_delta_put(kd, t + 1, r * 3 - 500, f) == XTC_OK);
+			ref[t][r].kind = 1;
+			ref[t][r].frame = f;
+			ref[t][r].dirty = 1;
+		}
+		/* Flush: freeze, write the run, install it, drop the delta.
+		 * The frames stay resident until "evicted" below. */
+		CK(kd_freeze(kd, NULL, NULL) == XTC_OK);
+		CK(flush_frozen(kd, bm, (uint64_t)round + 1u) == XTC_OK);
+		CK(runs_newest_first(kd) == XTC_OK);
+		kd_drop_frozen(kd);
+		for (t = 0; t < LT; t++)
+			for (r = 0; r < LR; r++)
+				if (ref[t][r].dirty) {
+					in_run[t][r] = ref[t][r].frame;
+					ref[t][r].run = g_nruns - 1;
+					ref[t][r].dirty = 0;
+				}
+		/* Evict some resident frames: their lookups fall to the
+		 * newest run that holds the RID. */
+		for (i = 0; i < 400; i++) {
+			t = (uint32_t)(rnd() % LT);
+			r = (int)(rnd() % LR);
+			if (ref[t][r].kind == 1 &&
+			    kd_res_del(kd, t + 1, r * 3 - 500, ref[t][r].frame,
+			    0) == 1)
+				ref[t][r].kind = 2;
+		}
+		/* Every RID agrees with the reference. */
+		xtc_rcu_read_lock();
+		for (t = 0; t < LT; t++)
+			for (r = 0; r < LR; r++) {
+				nlook++;
+				if (kd_lookup(kd, t + 1, r * 3 - 500, &loc) !=
+				    XTC_OK) {
+					bad++;
+					continue;
+				}
+				if (ref[t][r].kind == 0) {
+					bad += loc.kind != KD_NONE;
+				} else if (ref[t][r].kind == 1) {
+					bad += loc.kind != KD_FRAME ||
+					    loc.frame != ref[t][r].frame;
+				} else if (loc.kind != KD_RUN ||
+				    run_read(loc.run, loc.page, t + 1,
+				    r * 3 - 500, &row, buf, sizeof buf) !=
+				    XTC_OK || row.len != 4 ||
+				    memcmp(buf, &in_run[t][r], 4) != 0 ||
+				    loc.run != g_runs[ref[t][r].run]) {
+					bad++;
+				}
+			}
+		/* RIDs never written are nowhere (between and past them). */
+		for (t = 1; t <= LT; t++)
+			if (kd_lookup(kd, t, -499, &loc) != XTC_OK ||
+			    loc.kind != KD_NONE ||
+			    kd_lookup(kd, t + LT, 1, &loc) != XTC_OK ||
+			    loc.kind != KD_NONE)
+				bad++;
+		xtc_rcu_read_unlock();
+	}
+	CK(bad == 0);
+	xtc_rcu_synchronize();
+	kd_destroy(kd);
+	printf("  lookup: %d rounds of commit/flush/evict, %d lookups agree "
+	    "with the reference (newest run wins)\n", round, nlook);
+}
+
+/* ---- threads ---- */
+
+#define TK 4096
+#define TS 512                      /* stable keys: never deleted */
+static keydir_t *g_kd;
+static int g_tbad, g_tstop;
+
+/* The frame stored for key k is always a function of k. */
+static uint32_t
+fr_of(uint32_t k, uint32_t gen)
+{
+	return ((k * 2654435761u) ^ (gen << 20)) | 1u;
+}
+
+static void *
+writer(void *arg)
+{
+	uint64_t s = (uint64_t)(uintptr_t)arg * 977u + 1u;
+	uint32_t i, k, gen;
+
+	for (i = 0; i < 300000; i++) {
+		s = s * 6364136223846793005ull + 1442695040888963407ull;
+		k = (uint32_t)(s >> 33) % TK;
+		gen = (uint32_t)(s >> 20) & 7u;
+		if ((s >> 40) & 1u)
+			(void)kd_res_put(g_kd, 9, (int64_t)k, fr_of(k, gen));
+		else
+			(void)kd_res_del(g_kd, 9, (int64_t)k, fr_of(k, gen),
+			    (int)((s >> 41) & 1u));
+	}
+	return NULL;
+}
+
+static void *
+reader(void *arg)
+{
+	uint32_t k = (uint32_t)(uintptr_t)arg, f, g;
+	int ok;
+
+	while (!xtc_atomic_load_i32(&g_tstop, xtc_mo_acquire)) {
+		k = (k * 1103515245u + 12345u) % TK;
+		/* A stable key is always there, with its one frame: a miss
+		 * or another frame is a torn read (a backward shift moved it
+		 * under the reader). */
+		f = 0;
+		if (!kd_res_get(g_kd, 10, (int64_t)(k % TS), &f) ||
+		    f != fr_of(k % TS, 9))
+			xtc_atomic_store_i32(&g_tbad, 1, xtc_mo_relaxed);
+		f = 0;
+		if (!kd_res_get(g_kd, 9, (int64_t)k, &f))
+			continue;
+		for (g = 0, ok = 0; g < 8; g++)
+			ok |= f == fr_of(k, g);
+		if (!ok)
+			xtc_atomic_store_i32(&g_tbad, 1, xtc_mo_relaxed);
+	}
+	return NULL;
+}
+
+static void
+t_threads(void)
+{
+	pthread_t w[2], r[2];
+	int i;
+
+	CK(kd_create(TK, &g_kd) == XTC_OK);
+	if (g_kd == NULL)
+		return;
+	for (i = 0; i < TS; i++)
+		CK(kd_res_put(g_kd, 10, i, fr_of((uint32_t)i, 9)) == XTC_OK);
+	for (i = 0; i < 2; i++) {
+		CK(pthread_create(&w[i], NULL, writer, (void *)(uintptr_t)i) ==
+		    0);
+		CK(pthread_create(&r[i], NULL, reader,
+		    (void *)(uintptr_t)(i + 7)) == 0);
+	}
+	for (i = 0; i < 2; i++)
+		(void)pthread_join(w[i], NULL);
+	xtc_atomic_store_i32(&g_tstop, 1, xtc_mo_release);
+	for (i = 0; i < 2; i++)
+		(void)pthread_join(r[i], NULL);
+	CK(!g_tbad);
+	kd_destroy(g_kd);
+	printf("  threads: 2 writers x 300k puts/deletes against 2 lock-free "
+	    "readers, no torn read, no stable key missed\n");
+}
+
+/* ---- costs ---- */
+
+static void
+t_costs(bm_t *bm)
+{
+	static uint8_t hdr[PS];
+	keydir_t *kd = NULL;
+	run_writer_t *w = NULL;
+	run_meta_t m;
+	run_row_t r;
+	uint8_t rec[100];
+	uint64_t fb = 0;
+	FILE *fp;
+	kd_loc_t loc;
+	char path[300];
+	int64_t t0, t1;
+	uint32_t i, f, sink = 0;
+	int k;
+
+	CK(kd_create(1u << 16, &kd) == XTC_OK);
+	if (kd == NULL)
+		return;
+	for (i = 0; i < 50000; i++)
+		CK(kd_res_put(kd, 1, (int64_t)i, i + 1u) == XTC_OK);
+	t0 = xtc_clock_mono();
+	for (i = 0; i < 2000000; i++)
+		if (kd_res_get(kd, 1, (int64_t)((i * 2654435761u) % 50000u),
+		    &f))
+			sink += f;
+	t1 = xtc_clock_mono();
+	printf("  cost: resident-map hit %.1f ns\n", (double)(t1 - t0) /
+	    2000000.0);
+	/* Misses over the runs of t_lookup, newest first: rowids that live
+	 * only in the oldest run cost a probe of every run that may hold
+	 * them (insert-ordered tables would be excluded by range). */
+	CK(runs_newest_first(kd) == XTC_OK);
+	xtc_rcu_read_lock();
+	t0 = xtc_clock_mono();
+	for (k = 0; k < 20000; k++) {
+		int ri = (int)((uint32_t)k * 2654435761u % LR);
+		if (kd_lookup(kd, 1 + (uint32_t)k % LT, ri * 3 - 500, &loc) ==
+		    XTC_OK && loc.kind == KD_RUN)
+			sink += loc.page;
+	}
+	t1 = xtc_clock_mono();
+	xtc_rcu_read_unlock();
+	printf("  cost: miss over %d runs (footers resident) %.0f ns\n",
+	    g_nruns, (double)(t1 - t0) / 20000.0);
+	/* Static-stage bytes per row in a full-size run: one table of
+	 * 100k dense rowids, 100-byte rows (5.3's case).  The footer
+	 * length is the header's field at byte 80. */
+	memset(rec, 'r', sizeof rec);
+	run_path(g_dir, 9999, path, sizeof path);
+	CK(run_writer_open(bm, PS, path, 9999, 16, &w) == XTC_OK);
+	for (i = 0; w != NULL && i < 100000; i++) {
+		memset(&r, 0, sizeof r);
+		r.tableid = 4;
+		r.rowid = (int64_t)i + 1;
+		r.len = sizeof rec;
+		r.rec = rec;
+		CK(run_writer_add(w, &r) == XTC_OK);
+	}
+	CK(run_writer_finish(w, &m) == XTC_OK);
+	if ((fp = fopen(path, "rb")) != NULL && fread(hdr, 1, PS, fp) == PS) {
+		memcpy(&fb, hdr + 80, 8);
+		printf("  static stage, 100k dense rowids, 100-byte rows: "
+		    "footer %.2f bits/row, resident %.2f bits/row\n",
+		    8.0 * (double)fb / (double)m.nrows,
+		    8.0 * (40.0 + 16.0 * (double)((m.nrows + 511) / 512)) /
+		    (double)m.nrows);
+		/* 5.3: about 2 + 0.5 + directory; well under 4. */
+		CK(8.0 * (double)fb / (double)m.nrows < 4.0);
+	}
+	if (fp != NULL)
+		fclose(fp);
+	unlink(path);
+	if (sink == 0xFFFFFFFFu)
+		printf("%u\n", sink);
+	kd_destroy(kd);
+}
+
+/* ---- the flush boundary against commits in flight (P8) ---- */
+
+#define BC_FIBERS 4
+#define BC_PER    400
+#define BC_ROWS   (BC_FIBERS * BC_PER)
+#define BC_FREEZE 4096
+#define BC_NONE   UINT64_MAX         /* in flight, no address recorded */
+
+static keydir_t       *g_bkd;
+static wal_t          *g_bwal;
+static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t        g_reg[BC_FIBERS];   /* the in-flight registry */
+static uint64_t        g_bwa[BC_ROWS];     /* each commit's frame */
+static uint32_t        g_bfz[BC_ROWS];     /* the freeze that took it */
+static uint64_t        g_bb[BC_FREEZE];    /* each freeze's boundary */
+static uint32_t        g_nfz;
+static int             g_bleft, g_old_rule, g_before;
+
+/* The boundary over the registry and the WAL end; g_reg_mu held.  The
+ * old rule skips a commit that has not learned its address yet (it
+ * "counts as the WAL end"). */
+static uint64_t
+bc_bound_locked(void)
+{
+	uint64_t b;
+	uint32_t i;
+
+	if (!g_old_rule)
+		return kd_flush_boundary(g_reg, BC_FIBERS, wal_end_wa(g_bwal));
+	b = wal_end_wa(g_bwal);
+	for (i = 0; i < BC_FIBERS; i++)
+		if (g_reg[i] != 0 && g_reg[i] != BC_NONE && g_reg[i] < b)
+			b = g_reg[i];
+	return b;
+}
+
+/* The boundary in one step: both reads under the registry's lock. */
+static uint64_t
+bc_bound(void)
+{
+	uint64_t b;
+
+	(void)pthread_mutex_lock(&g_reg_mu);
+	b = bc_bound_locked();
+	(void)pthread_mutex_unlock(&g_reg_mu);
+	return b;
+}
+
+/* The boundary, read at the switch.  Now and then it waits first (the
+ * flusher's loop thread sleeps; commits on the other loop run on).
+ * Under the freeze's exclusive lock they cannot finish a put meanwhile;
+ * a boundary read after that lock is dropped would miss the commits
+ * that landed in the new delta and left the registry in the gap. */
+static void
+bc_at_freeze(void *ctx)
+{
+	(void)ctx;
+	if (g_nfz % 8u == 0)
+		(void)xtc_thrd_sleep_ns(300000);
+	g_bb[g_nfz] = bc_bound();
+}
+
+static void
+bc_committer(void *arg)
+{
+	uint32_t id = (uint32_t)(uintptr_t)arg, i, rid;
+	uint64_t lsn, wa;
+
+	for (i = 0; i < BC_PER; i++) {
+		rid = id * BC_PER + i;
+		/* Enter the registry: the new rule records the WAL end now,
+		 * before the WAL write; the old one only after it. */
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[id] = g_old_rule ? BC_NONE : wal_end_wa(g_bwal);
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		if (wal_commit_wa(g_bwal, "commit", 6, &lsn, &wa) != XTC_OK)
+			break;
+		if (g_old_rule) {
+			(void)pthread_mutex_lock(&g_reg_mu);
+			g_reg[id] = wa;
+			(void)pthread_mutex_unlock(&g_reg_mu);
+		}
+		g_bwa[rid] = wa;
+		(void)kd_delta_put(g_bkd, 1, (int64_t)rid, rid + 1u);
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[id] = 0;
+		(void)pthread_mutex_unlock(&g_reg_mu);
+	}
+	(void)xtc_atomic_fetch_sub_i32(&g_bleft, 1, xtc_mo_seq_cst);
+}
+
+static void
+bc_flusher(void *arg)
+{
+	uint32_t tid, frame;
+	int64_t rid;
+	uint64_t b = 0;
+	int rc;
+
+	(void)arg;
+	while (xtc_atomic_load_i32(&g_bleft, xtc_mo_seq_cst) > 0 &&
+	    g_nfz < BC_FREEZE) {
+		/* The mf_flush shape (SF3): the boundary before the switch,
+		 * with a wait now and then between the two, during which
+		 * commits finish into the delta about to be frozen. */
+		if (g_before) {
+			b = bc_bound();
+			if (g_nfz % 8u == 0)
+				(void)xtc_thrd_sleep_ns(300000);
+			rc = kd_freeze(g_bkd, NULL, NULL);
+			if (rc == XTC_OK)
+				g_bb[g_nfz] = b;
+		} else {
+			rc = kd_freeze(g_bkd, bc_at_freeze, NULL);
+		}
+		if (rc == XTC_OK) {
+			/* Number the frozen rows by this freeze. */
+			tid = 0;
+			rid = INT64_MIN;
+			xtc_rcu_read_lock();
+			while (kd_delta_next(g_bkd, 1, &tid, &rid, &frame)) {
+				g_bfz[frame - 1u] = g_nfz + 1u;
+				rid++;
+			}
+			xtc_rcu_read_unlock();
+			kd_drop_frozen(g_bkd);
+			g_nfz++;
+		}
+		xtc_yield();
+	}
+}
+
+/* One run under the current rule: the number of commits whose frame was
+ * below a freeze's boundary but which that freeze did not take. */
+static uint32_t
+bc_run(void)
+{
+	wal_opts_t wo = { 0 };
+	xtc_exec_t *ex = NULL;
+	xtc_proc_opts_t po = XTC_PROC_OPTS_INIT;
+	xtc_pid_t pid;
+	char p[300];
+	uint32_t i, r, k, bad = 0;
+
+	snprintf(p, sizeof p, "%s/bwal", g_dir);
+	wo.path = p;
+	wo.segment_bytes = 64u * 1024u;
+	CK(wal_open(&wo, &g_bwal) == XTC_OK);
+	CK(kd_create(1024, &g_bkd) == XTC_OK);
+	if (g_bwal == NULL || g_bkd == NULL)
+		return 0;
+	memset(g_bfz, 0, sizeof g_bfz);
+	memset(g_bwa, 0, sizeof g_bwa);
+	g_nfz = 0;
+	CK(xtc_exec_create(&(xtc_exec_opts_t){ .size = sizeof(xtc_exec_opts_t),
+	    .n_loops = 2 }, &ex) == XTC_OK);
+	if (ex == NULL)
+		return 0;
+	xtc_atomic_store_i32(&g_bleft, BC_FIBERS, xtc_mo_seq_cst);
+	for (i = 0; i < BC_FIBERS; i++)
+		CK(xtc_proc_spawn(xtc_exec_loop(ex, (int)(i % 2u)),
+		    bc_committer, (void *)(uintptr_t)i, &po, &pid) == XTC_OK);
+	CK(xtc_proc_spawn(xtc_exec_loop(ex, 1), bc_flusher, NULL, &po, &pid) ==
+	    XTC_OK);
+	CK(xtc_exec_run(ex) == XTC_OK);
+	xtc_exec_destroy(ex);
+	/* Row r must be in the first freeze whose boundary is past it. */
+	for (r = 0; r < BC_ROWS; r++) {
+		for (k = 0; k < g_nfz && g_bb[k] <= g_bwa[r]; k++)
+			;
+		if (g_bwa[r] != 0 && k < g_nfz &&
+		    (g_bfz[r] == 0 || g_bfz[r] > k + 1u))
+			bad++;
+	}
+	kd_destroy(g_bkd);
+	wal_close(g_bwal);
+	for (i = 1; i < 256; i++) {
+		snprintf(p, sizeof p, "%s/bwal/wal-%08u.log", g_dir, i);
+		(void)unlink(p);
+	}
+	snprintf(p, sizeof p, "%s/bwal", g_dir);
+	(void)rmdir(p);
+	return bad;
+}
+
+static void
+t_boundary(void)
+{
+	uint32_t old_bad = 0, at = 0, before = 0, n;
+
+	/* The old rule must lose a commit (a few rounds, as the window is a
+	 * real fsync); the new one never does, read at the switch or before
+	 * it. */
+	g_old_rule = 1;
+	for (n = 0; n < 8 && old_bad == 0; n++)
+		old_bad = bc_run();
+	CK(old_bad > 0);
+	g_old_rule = 0;
+	for (n = 0; n < 3; n++)
+		at += bc_run();
+	CK(at == 0);
+	g_before = 1;
+	for (n = 0; n < 3; n++)
+		before += bc_run();
+	CK(before == 0);
+	g_before = 0;
+	printf("  boundary: old rule lost %u commits behind a freeze; "
+	    "recorded-on-entry rule lost %u at the switch, %u before it "
+	    "(3 runs each, %u freezes last)\n", old_bad, at, before, g_nfz);
+}
+
+/* ---- the boundary's shapes, every interleaving (N10) ---- */
+
+/* One commit's steps and the flusher's, as ops.  A flusher reads the
+ * registry (SH_REG), the WAL end (SH_END), or both under the lock in one
+ * step (SH_BOTH); freezes (SH_FRZ), or freezes with the boundary read
+ * in the at-freeze hook (SH_FRZ_AT).  A commit enters the registry,
+ * writes its WAL record, (old rule only) records the address it got,
+ * puts, and leaves. */
+enum { SH_REG, SH_END, SH_BOTH, SH_FRZ, SH_FRZ_AT,
+       SC_ENTER, SC_WRITE, SC_RECORD, SC_PUT, SC_LEAVE };
+
+struct sh_shape {
+	const char *name;
+	int         old_rule;
+	int         must_lose;
+	uint32_t    nf;
+	int         f[3];
+};
+
+static const struct sh_shape g_shapes[] = {
+	{ "one step under the lock, before the switch", 0, 0, 2,
+	    { SH_BOTH, SH_FRZ } },
+	{ "one step under the lock, at the switch", 0, 0, 1,
+	    { SH_FRZ_AT } },
+	{ "registry and WAL end read at different times", 0, 1, 3,
+	    { SH_REG, SH_END, SH_FRZ } },
+	{ "one step, after the switch", 0, 1, 2, { SH_FRZ, SH_BOTH } },
+	{ "old rule, before the switch", 1, 1, 2, { SH_BOTH, SH_FRZ } },
+};
+
+static uint64_t g_sh_copy, g_sh_b;
+
+/* SH_FRZ_AT's hook. */
+static void
+sh_at_freeze(void *ctx)
+{
+	(void)ctx;
+	g_sh_b = bc_bound();
+}
+
+/* Run one op of the flusher or the commit. */
+static void
+sh_op(int op, int64_t rid, uint64_t *wa)
+{
+	uint64_t lsn;
+
+	switch (op) {
+	case SH_REG:
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_sh_copy = g_reg[0];
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		break;
+	case SH_END:
+		g_sh_b = kd_flush_boundary(&g_sh_copy, 1, wal_end_wa(g_bwal));
+		break;
+	case SH_BOTH:
+		g_sh_b = bc_bound();
+		break;
+	case SH_FRZ:
+	case SH_FRZ_AT:
+		CK(kd_freeze(g_bkd, op == SH_FRZ_AT ? sh_at_freeze : NULL,
+		    NULL) == XTC_OK);
+		break;
+	case SC_ENTER:
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[0] = g_old_rule ? BC_NONE : wal_end_wa(g_bwal);
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		break;
+	case SC_WRITE:
+		CK(wal_commit_wa(g_bwal, "commit", 6, &lsn, wa) == XTC_OK);
+		break;
+	case SC_RECORD:
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[0] = *wa;
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		break;
+	case SC_PUT:
+		CK(kd_delta_put(g_bkd, 1, rid, 7) == XTC_OK);
+		break;
+	default:
+		(void)pthread_mutex_lock(&g_reg_mu);
+		g_reg[0] = 0;
+		(void)pthread_mutex_unlock(&g_reg_mu);
+		break;
+	}
+}
+
+/* Every interleaving of shape s with one commit: the number that lose
+ * the commit (its frame below the boundary, its row not in the frozen
+ * delta), and the first such interleaving in *first (a bit per step,
+ * 1 = a commit step). */
+static uint32_t
+sh_shape_run(const struct sh_shape *s, uint32_t *first)
+{
+	static const int cnew[] = { SC_ENTER, SC_WRITE, SC_PUT, SC_LEAVE };
+	static const int cold[] = { SC_ENTER, SC_WRITE, SC_RECORD, SC_PUT,
+	    SC_LEAVE };
+	const int *c = s->old_rule ? cold : cnew;
+	uint32_t nc = s->old_rule ? 5u : 4u, n = nc + s->nf;
+	uint32_t mask, i, fi, ci, lost = 0, f;
+	int64_t rid = 0, r;
+	uint64_t wa;
+	int in;
+
+	g_old_rule = s->old_rule;
+	for (mask = 0; mask < (1u << n); mask++) {
+		if ((uint32_t)__builtin_popcount(mask) != nc)
+			continue;
+		CK(kd_create(64, &g_bkd) == XTC_OK);
+		if (g_bkd == NULL)
+			break;
+		g_reg[0] = 0;
+		wa = 0;
+		rid++;
+		for (i = 0, fi = 0, ci = 0; i < n; i++)
+			sh_op(mask >> i & 1u ? c[ci++] : s->f[fi++], rid, &wa);
+		f = 0;
+		r = rid;
+		xtc_rcu_read_lock();
+		in = kd_delta_next(g_bkd, 1, &(uint32_t){ 1 }, &r, &f) &&
+		    r == rid;
+		xtc_rcu_read_unlock();
+		if (wa < g_sh_b && !in && lost++ == 0)
+			*first = mask;
+		kd_drop_frozen(g_bkd);
+		kd_destroy(g_bkd);
+	}
+	g_old_rule = 0;
+	return lost;
+}
+
+static void
+sh_proc(void *arg)
+{
+	uint32_t i, lost, first = 0;
+
+	(void)arg;
+	for (i = 0; i < sizeof g_shapes / sizeof g_shapes[0]; i++) {
+		lost = sh_shape_run(&g_shapes[i], &first);
+		if (g_shapes[i].must_lose ? lost == 0 : lost != 0) {
+			fprintf(stderr, "FAIL shape \"%s\": %u interleavings "
+			    "lose the commit (first 0x%x)\n", g_shapes[i].name,
+			    lost, first);
+			g_fail = 1;
+		}
+	}
+}
+
+static void
+t_shapes(void)
+{
+	wal_opts_t wo = { 0 };
+	xtc_exec_t *ex = NULL;
+	xtc_proc_opts_t po = XTC_PROC_OPTS_INIT;
+	xtc_pid_t pid;
+	char p[300];
+	uint32_t i;
+
+	snprintf(p, sizeof p, "%s/swal", g_dir);
+	wo.path = p;
+	wo.segment_bytes = 64u * 1024u;
+	CK(wal_open(&wo, &g_bwal) == XTC_OK);
+	CK(xtc_exec_create(&(xtc_exec_opts_t){ .size = sizeof(xtc_exec_opts_t),
+	    .n_loops = 1 }, &ex) == XTC_OK);
+	if (g_bwal == NULL || ex == NULL)
+		return;
+	CK(xtc_proc_spawn(xtc_exec_loop(ex, 0), sh_proc, NULL, &po, &pid) ==
+	    XTC_OK);
+	CK(xtc_exec_run(ex) == XTC_OK);
+	xtc_exec_destroy(ex);
+	wal_close(g_bwal);
+	for (i = 1; i < 16; i++) {
+		snprintf(p, sizeof p, "%s/swal/wal-%08u.log", g_dir, i);
+		(void)unlink(p);
+	}
+	snprintf(p, sizeof p, "%s/swal", g_dir);
+	(void)rmdir(p);
+	printf("  shapes: every interleaving of a commit with the flusher: one "
+	    "step under the lock, before or at the switch, loses none; a split "
+	    "read, a read after the switch, the old rule each lose one\n");
+}
+
+int
+main(void)
+{
+	bm_opts_t o = BM_OPTS_DEFAULT;
+	char p[300];
+	bm_t *bm = NULL;
+	int i;
+
+	t_tmpl(g_dir, sizeof g_dir, "keydir");
+	if (mkdtemp(g_dir) == NULL) {
+		perror("mkdtemp");
+		return 1;
+	}
+	t_resident();
+	t_publish();
+	t_delta();
+	snprintf(p, sizeof p, "%s/pages", g_dir);
+	o.path = p;
+	o.page_size = PS;
+	o.n_frames = 256;
+	o.cksum_off = BTNODE_CKSUM_OFF;
+	o.cksum = wal_crc32c;
+	CK(bm_create(&o, &bm) == XTC_OK);
+	if (bm != NULL) {
+		t_lookup(bm);
+		t_costs(bm);
+		for (i = 0; i < g_nruns; i++)
+			run_close(g_runs[i]);
+		bm_destroy(bm);
+	}
+	t_threads();
+	t_boundary();
+	t_shapes();
+	unlink(p);
+	for (i = 1; i <= LRUNS; i++) {
+		run_path(g_dir, (uint64_t)i, p, sizeof p);
+		unlink(p);
+	}
+	(void)rmdir(g_dir);
+	xtc_rcu_fini();                /* run what the keydirs retired */
+	if (!g_fail)
+		printf("ok test_keydir\n");
+	return g_fail;
+}

@@ -68,7 +68,19 @@ typedef struct wal_opts {
 	                            * (the frame at last_off checksums, ends at
 	                            * end and carries max_lsn; no frame starts
 	                            * at end), else the full scan runs.  NULL
-	                            * or !valid: scan, as before. */
+	                            * or !valid: scan, as before.  Ignored by
+	                            * a segmented log. */
+	uint64_t    segment_bytes; /* 0: one file at path (compacted in place,
+	                            * wal_checkpoint).  Else a segmented log:
+	                            * path is a directory (created if missing)
+	                            * of segment files wal-<seg>.log, and a
+	                            * segment rolls before a frame would take
+	                            * it past this size (a frame never spans
+	                            * two; one larger than this gets a segment
+	                            * of its own).  See "Segments" below.
+	                            * An append open checks the segment
+	                            * chain and refuses a damaged one
+	                            * (XTC_E_IO, as wal_scan_segs). */
 } wal_opts_t;
 
 typedef struct wal_stats {
@@ -147,7 +159,9 @@ void wal_fail_stop(wal_t *w);
  * passing a returned value continues it over the next bytes. */
 uint32_t wal_crc32c(uint32_t crc, const void *p, size_t n);
 
-/* Bytes of complete records in the log (the append offset). */
+/* Bytes of complete records in the log (the append offset).  NB: for a
+ * segmented log this is a log position (it keeps rising across rolls,
+ * and restarts low at reopen), not a byte count of the files on disk. */
 uint64_t wal_size(const wal_t *w);
 
 /*
@@ -233,6 +247,98 @@ int  wal_ockpt_catchup(wal_ock_t *k, uint64_t *left);
 int  wal_ockpt_finish(wal_ock_t *k);
 void wal_ockpt_abort(wal_ock_t *k);
 uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
+
+/*
+ * Segments (wal_opts_t.segment_bytes != 0).  The log is a sequence of
+ * files <dir>/wal-<seg>.log, seg counting up from 1 and never reused.
+ * The frame format, the LSNs (still a frame counter across segments),
+ * group commit and fail-stop are those of the one-file log.  A WAL
+ * address names a frame's body in a segment:
+ *
+ *     wa = seg (32 bits) | byte offset in the segment (32 bits)
+ *
+ * so wa 0 is "none", and wa order is log order.  A record's sub-record
+ * at byte k of the body the committer built is at wa + k.  The first
+ * WAL_SEG_HDR bytes of a segment are its header (the segment number,
+ * the first LSN it issues and its log position, under a CRC32C),
+ * durable before the segment takes a frame, so the first frame's body
+ * is at offset WAL_SEG_HDR + 12 and the LSN keeps rising even when
+ * retention has deleted every segment that held a frame.
+ *
+ * Retention: wal_set_release(w, wa) says every frame below wa is no
+ * longer needed (the caller owns the rule: STORAGE_DESIGN 6.4); a
+ * segment roll then unlinks, oldest first, every segment whose number
+ * is below WAL_WA_SEG(wa), never the current one.  The boundary only
+ * rises.  wal_checkpoint, the online checkpoint and wal_truncate refuse
+ * a segmented log (XTC_E_INVAL): it is bounded by deletion instead.
+ *
+ * Limits: 2^32 - 1 segments of 64 MiB is 256 EiB of log, far beyond any
+ * store's life.  The 32-bit offset caps segment_bytes at
+ * WAL_SEG_BYTES_MAX (wal_open refuses more, XTC_E_INVAL), and a record
+ * whose body would run past offset 2^32 - 1 is refused (XTC_E_INVAL),
+ * so every sub-record address wa + k stays inside its segment's field.
+ */
+#define WAL_SEG_HDR     4096u
+#define WAL_WA_SEG_BITS 32
+#define WAL_WA_OFF_BITS 32
+#define WAL_WA_MAX_SEG  0xFFFFFFFFu
+#define WAL_WA_OFF_MASK ((1ull << WAL_WA_OFF_BITS) - 1u)
+#define WAL_WA(seg, off) \
+	(((uint64_t)(seg) << WAL_WA_OFF_BITS) | \
+	 ((uint64_t)(off) & WAL_WA_OFF_MASK))
+#define WAL_WA_SEG(wa)   ((uint32_t)((wa) >> WAL_WA_OFF_BITS))
+#define WAL_WA_OFF(wa)   ((wa) & WAL_WA_OFF_MASK)
+/* The largest segment_bytes: rounded up to the 4 KiB direct-I/O block,
+ * a segment's every offset still fits the offset field. */
+#define WAL_SEG_BYTES_MAX (WAL_WA_OFF_MASK + 1u - 4096u)
+
+/* wal_commit that also returns the WAL address of the record's body in
+ * *wa (0 for a one-file log).  The address is assigned with the LSN. */
+int  wal_commit_wa(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
+         uint64_t *wa);
+
+/*
+ * The WAL end as an address: the start of the frame the next reservation
+ * would get in the current segment (0 for a one-file log).  Every frame
+ * reserved later has a body address above it, wherever it lands (a
+ * roll only moves it up).  A commit reads it when it enters the
+ * caller's in-flight registry, before its wal_commit_wa, and the flush
+ * boundary is the minimum of those values and this one, read under the
+ * registry's lock (kd_flush_boundary).
+ */
+uint64_t wal_end_wa(wal_t *w);
+
+/* Raise the retention boundary (see above).  A lower wa is ignored. */
+void wal_set_release(wal_t *w, uint64_t wa);
+
+/* The oldest and the current segment numbers (both 0 for a one-file
+ * log).  Segments in [*lo, *cur] are on disk. */
+void wal_seg_range(wal_t *w, uint32_t *lo, uint32_t *cur);
+
+/* Make the next commit start a new segment (it rolls, and deletes what
+ * the boundary allows, first).  For tests and a clean close that wants
+ * the retention applied; XTC_E_INVAL on a one-file log. */
+int  wal_roll(wal_t *w);
+
+/*
+ * Replay a segmented log in <dir> from the segment holding from_wa (0:
+ * the oldest on disk) through the last, calling cb with every complete
+ * frame and the WAL address of its body.  The chain must be whole:
+ * consecutive segments, each with an intact header that names it, LSNs
+ * without a gap, and every segment but the newest complete to its end.
+ * Only the newest may end in a torn frame (the end of the log).
+ * XTC_E_NOTFOUND if from_wa's segment is gone (deleted by retention);
+ * XTC_E_IO, naming the segment on stderr, if the chain breaks before
+ * the newest segment's end (a missing or damaged older segment: the
+ * open refuses such a log too, so no commit is acknowledged past a
+ * point recovery cannot read); XTC_OK otherwise.  cb returns non-zero
+ * to stop.  Reads the files directly: run it before the log is opened
+ * for append.
+ */
+typedef int (*wal_replay_wa_cb)(uint64_t lsn, uint64_t wa, const void *rec,
+    uint32_t len, void *user);
+int  wal_scan_segs(const char *dir, uint64_t from_wa, wal_replay_wa_cb cb,
+         void *user);
 
 /* Ask the writer to flush any pending batch and exit.  Call once all
  * committers are done so the loop can drain. */

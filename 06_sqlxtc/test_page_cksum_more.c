@@ -23,7 +23,11 @@
  *	  fence       a leaf's right link and upper fence damaged: 1.59
  *	              livelocked in move_right, now the read fails at once;
  *	  root        the root page damaged: the open itself reads it, and
- *	              rebuilds from the log at once (writable, not stopped).
+ *	              rebuilds from the log at once (writable, not stopped);
+ *	  filenum     the victim's page, intact, copied to the same offset
+ *	              of a second file attached to a buffer manager as file
+ *	              1 (a row-log run): refused there, while the page file
+ *	              still serves it (the seal covers the file number).
  *	The run is bounded by alarm(120): a hang is a failure, not a wait.
  *	A refused read must be an error naming the checksum, never data.
  */
@@ -36,7 +40,9 @@
 #include <unistd.h>
 
 #include "engine.h"
+#include "btnode.h"
 #include "bufmgr.h"
+#include "wal.h"
 #include "t_tmp.h"
 
 #define ROWS   400
@@ -412,6 +418,53 @@ t_root(void)
 	teardown();
 }
 
+/* A page the engine wrote, read through a buffer manager as page `pg`
+ * of file 0 (accepted) and of file 1, a copy of the page file at the
+ * same offsets (refused): the file number is in the seal. */
+static void
+t_filenum(void)
+{
+	char cpy[320];
+	static unsigned char p[PS];
+	bm_opts_t o = BM_OPTS_DEFAULT;
+	bm_frame_t *f;
+	bm_t *bm = NULL;
+	off_t pg;
+	int fd;
+
+	setup("ckfile");
+	CK((pg = victim_page("ROW%05d-", VICTIM)) > 0);
+	if (pg <= 0) { teardown(); return; }
+	CK(rw_page(pg, p, 0) == 0);
+	snprintf(cpy, sizeof cpy, "%s.run", g_path);
+	CK((fd = open(cpy, O_RDWR | O_CREAT | O_TRUNC, 0600)) >= 0);
+	if (fd >= 0) {
+		CK(pwrite(fd, p, PS, pg * PS) == PS);
+		close(fd);
+	}
+	o.path = g_path;
+	o.page_size = PS;
+	o.n_frames = 16;
+	o.reopen = 1;
+	o.lsn_off = 0;
+	o.cksum_off = BTNODE_CKSUM_OFF;
+	o.cksum = wal_crc32c;
+	CK(bm_create(&o, &bm) == XTC_OK);
+	if (bm != NULL) {
+		CK(bm_file_attach(bm, 1, cpy) == XTC_OK);
+		CK(bm_fix_pid(bm, BM_PID_MAKE(0, pg), &f) == XTC_OK);
+		if (!g_fail)
+			bm_unfix(bm, f, 0);
+		CK(bm_fix_pid(bm, BM_PID_MAKE(1, pg), &f) == XTC_E_IO);
+		CK(bm_cksum_failures(bm, NULL) == 1);
+		bm_destroy(bm);
+	}
+	unlink(cpy);
+	printf("  filenum: a page-file page at the same offset of file 1 is "
+	    "refused\n");
+	teardown();
+}
+
 int
 main(void)
 {
@@ -426,6 +479,7 @@ main(void)
 	t_oldformat();
 	t_fence();
 	t_root();
+	t_filenum();
 	if (!g_fail)
 		printf("ok test_page_cksum_more\n");
 	return g_fail;

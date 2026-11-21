@@ -134,6 +134,12 @@ db.o: db.c db.h quack.h engine.h
 conn.o: conn.c conn.h db.h quack.h sql_parse.h engine.h admin.h
 admin.o: admin.c admin.h quack.h
 engine.o: engine.c engine.h xstore.h btree.h bufmgr.h
+# wal_opts_t is in wal.h: its users rebuild when it changes.
+engine.o xstore.o wal.o: wal.h
+run.o: run.c run.h ef.h bufmgr.h btnode.h
+ef.o: ef.c ef.h
+keydir.o: keydir.c keydir.h run.h
+manifest.o: manifest.c manifest.h keydir.h run.h bufmgr.h
 metrics.o: metrics.c
 sql_parse.o: sql_parse.c sql_parse.h
 sql_parse_drv.o: sql_parse_drv.c sql_parse.h sql_parse_lime.h sql_parse_gen.h
@@ -168,6 +174,7 @@ clean:
 	rm -f test_wal_kill test_wal_tail test_wal_kill_engine test_uniq_commit test_uniq_long
 	rm -f test_steal_leaf test_cat_reopen test_ckpt_online test_wal_group_sync test_intents_thread test_torn_base test_snap_registry test_rowid_minmax test_btree_fill test_wal_bigtxn test_steal_reclaim test_dio_restart test_wal_prealloc
 	rm -f test_bufmgr test_bufmgr.o bufmgr.o test_bufmgr_dio test_bufmgr_dio.o
+	rm -f test_bm_files test_wal_seg test_ef ef.o test_run run.o test_keydir keydir.o test_manifest manifest.o test_onloop_io test_durable_order test_wal_wide
 	rm -f test_bufmgr_mt
 	rm -f test_drop_reserved test_evict_revalidate_sampled
 	rm -f test_bg_idle test_bg_kill test_ckpt_offloop test_scan_resist test_sweep_bound test_evict_revalidate test_btree_late_load test_flush_pin test_trickler_select test_pp_slice test_pp_idle_writes test_tr_slice test_publication_pin test_private_frame test_pid_writeback bm_sweep_bench
@@ -311,6 +318,67 @@ test_torn_smo: test_torn_smo.c $(ENGINE_NATIVE)
 
 test-torn-smo: test_torn_smo
 	./test_torn_smo
+
+# Elias-Fano chunks, the keydir's static stage (STORAGE_DESIGN 5.2).
+test: test-ef
+test_ef: test_ef.c ef.o
+	$(CC) $(CFLAGS) -o $@ test_ef.c ef.o $(LDFLAGS)
+
+test-ef: test_ef
+	./test_ef
+
+# Run files of the row log (STORAGE_DESIGN 3.3).
+test: test-run
+test_run: test_run.c run.o ef.o bufmgr.o wal.o
+	$(CC) $(CFLAGS) -o $@ test_run.c run.o ef.o bufmgr.o wal.o $(LDFLAGS)
+
+test-run: test_run
+	TMPDIR=$${TMPDIR:-/tmp} ./test_run
+
+# The row log's keydir: resident map, delta, run set (STORAGE_DESIGN 5).
+test: test-keydir
+test_keydir: test_keydir.c keydir.o run.o ef.o bufmgr.o wal.o
+	$(CC) $(CFLAGS) -o $@ test_keydir.c keydir.o run.o ef.o bufmgr.o wal.o $(LDFLAGS)
+
+test-keydir: test_keydir
+	TMPDIR=$${TMPDIR:-/tmp} ./test_keydir
+
+# The row log's MANIFEST and the nursery flush (STORAGE_DESIGN 7.2, 9.2).
+test: test-manifest
+test_manifest: test_manifest.c manifest.c manifest.h keydir.o run.o ef.o bufmgr.o wal.o
+	$(CC) $(CFLAGS) -o $@ test_manifest.c keydir.o run.o ef.o bufmgr.o wal.o $(LDFLAGS)
+
+test-manifest: test_manifest
+	TMPDIR=$${TMPDIR:-/tmp} ./test_manifest
+
+# The segmented WAL (STORAGE_DESIGN 6.2): addresses, rolls, retention.
+test: test-durable-order
+test_durable_order: test_durable_order.c manifest.o keydir.o run.o ef.o bufmgr.o wal.o
+	$(CC) $(CFLAGS) -o $@ test_durable_order.c manifest.o keydir.o run.o ef.o bufmgr.o wal.o $(LDFLAGS)
+
+test-durable-order: test_durable_order
+	TMPDIR=$${TMPDIR:-/tmp} ./test_durable_order
+
+test: test-onloop-io
+test_onloop_io: test_onloop_io.c manifest.o keydir.o run.o ef.o bufmgr.o wal.o
+	$(CC) $(CFLAGS) -o $@ test_onloop_io.c manifest.o keydir.o run.o ef.o bufmgr.o wal.o $(LDFLAGS)
+
+test-onloop-io: test_onloop_io
+	TMPDIR=$${TMPDIR:-/tmp} ./test_onloop_io
+
+test: test-wal-wide
+test_wal_wide: test_wal_wide.c wal.c wal.h
+	$(CC) $(CFLAGS) -o $@ test_wal_wide.c $(LDFLAGS)
+
+test-wal-wide: test_wal_wide
+	TMPDIR=$${TMPDIR:-/tmp} ./test_wal_wide
+
+test: test-wal-seg
+test_wal_seg: test_wal_seg.c wal.o
+	$(CC) $(CFLAGS) -o $@ test_wal_seg.c wal.o $(LDFLAGS)
+
+test-wal-seg: test_wal_seg
+	TMPDIR=$${TMPDIR:-/tmp} ./test_wal_seg
 
 test_wal_compact: test_wal_compact.c $(ENGINE_NATIVE)
 	$(CC) $(CFLAGS) -o $@ test_wal_compact.c $(ENGINE_NATIVE) $(LDFLAGS)
@@ -531,6 +599,14 @@ test_bufmgr: test_bufmgr.c bufmgr.o
 
 test-bufmgr: test_bufmgr
 	./test_bufmgr
+
+# Multi-file page ids (row-log run files): STORAGE_DESIGN 3.4.
+test: test-bm-files
+test_bm_files: test_bm_files.c bufmgr.o wal.o
+	$(CC) $(CFLAGS) -o $@ test_bm_files.c bufmgr.o wal.o $(LDFLAGS)
+
+test-bm-files: test_bm_files
+	TMPDIR=$${TMPDIR:-/tmp} ./test_bm_files
 
 test_bufmgr_dio: test_bufmgr_dio.c bufmgr.o
 	$(CC) $(CFLAGS) -o $@ test_bufmgr_dio.c bufmgr.o $(LDFLAGS)

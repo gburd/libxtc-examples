@@ -19,9 +19,10 @@
  *	engine detected the damage and repaired it from the log).
  *	FAIL: the corrupted bytes come back as the row's value.
  *
- *	EXPECTED TO FAIL on main (1.59): no page checksum.  Not part of
- *	`make test` until page checksums land; run with
- *	`make test-page-checksum`.
+ *	Also: the victim's page on disk carries the file-0 seal, the CRC32C
+ *	of the page with its CRC word as zero and the page number in the
+ *	pid word -- the page file's format is unchanged by multi-file page
+ *	ids (the file number seeds the sum only for files other than 0).
  */
 
 #include <fcntl.h>
@@ -31,11 +32,34 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "btnode.h"
 #include "engine.h"
+#include "wal.h"
 #include "t_tmp.h"
 
 #define ROWS   200
 #define VICTIM 123
+
+/* 1 if the 4 KiB page image `p` read at page `pg` of the page file has
+ * the file-0 seal: [crc32c of the page, CRC word zero][pg] at
+ * BTNODE_CKSUM_OFF, little-endian. */
+static int
+seal_is_file0(const char *p, off_t pg)
+{
+	static const uint8_t z[4];
+	const uint8_t *u = (const uint8_t *)p + BTNODE_CKSUM_OFF;
+	uint32_t c, crc, pid;
+
+	c = wal_crc32c(0, p, BTNODE_CKSUM_OFF);
+	c = wal_crc32c(c, z, 4);
+	c = wal_crc32c(c, p + BTNODE_CKSUM_OFF + 4,
+	    4096 - BTNODE_CKSUM_OFF - 4);
+	crc = (uint32_t)u[0] | (uint32_t)u[1] << 8 | (uint32_t)u[2] << 16 |
+	    (uint32_t)u[3] << 24;
+	pid = (uint32_t)u[4] | (uint32_t)u[5] << 8 | (uint32_t)u[6] << 16 |
+	    (uint32_t)u[7] << 24;
+	return crc == c && pid == (uint32_t)pg;
+}
 
 int
 main(void)
@@ -83,6 +107,8 @@ main(void)
 			copies++;
 		}
 	CK(copies == 1);
+	if (at >= 0)
+		CK(seal_is_file0(buf + (at / 4096) * 4096, at / 4096));
 	if (at >= 0)
 		CK(pwrite(fd, "B", 1, at) == 1);
 	(void)fsync(fd);

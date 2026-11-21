@@ -152,3 +152,12 @@ test_freelist_persist
 # ORDER BY ... LIMIT (top-N)
 test_order_limit
 test_qsel
+test_bm_files
+test_wal_seg
+test_ef
+test_run
+test_keydir
+test_manifest
+test_onloop_io
+test_durable_order
+test_wal_wide

@@ -373,7 +373,42 @@ struct bm {
 	uint64_t pre_end; /* the file covers [0, pre_end) */
 	int pre_busy;     /* a fiber is growing the file */
 	int pre_on;       /* 0: growth failed once, stop trying */
+
+	/* Cold: extra files (bm_file_attach).  xfd[file] holds fd + 1 (0:
+	 * not attached), allocated on the first attach; xf_mu serializes
+	 * attach and detach.  Their frames are read-only: never dirtied, so
+	 * never double-written or written back.  ro_dirty counts refused
+	 * attempts to dirty one (a caller bug). */
+	int32_t          *xfd;
+	pthread_mutex_t   xf_mu;
+	uint64_t          ro_dirty;
 };
+
+/* The hash bucket of a page id.  A file-0 id hashes as it always has
+ * (the page number); another file's pages are spread by a multiple of
+ * the file number, or the same page of every run would share a chain. */
+static inline uint32_t
+bm_bucket(const bm_t *bm, bm_pid_t pid)
+{
+	uint64_t h = BM_PID_PAGE(pid) +
+	    (uint64_t)BM_PID_FILE(pid) * 0x9E3779B1u;
+	return (uint32_t)(h & (bm->nbucket - 1u));
+}
+
+/* The descriptor of page id pid's file, or -1 if it is not attached. */
+static int
+bm_file_fd(const bm_t *bm, bm_pid_t pid)
+{
+	uint16_t file = BM_PID_FILE(pid);
+	int32_t *x;
+
+	if (file == 0)
+		return bm->fd;
+	x = xtc_atomic_load_ptr(&bm->xfd, xtc_mo_acquire);
+	if (x == NULL)
+		return -1;
+	return xtc_atomic_load_i32(&x[file], xtc_mo_acquire) - 1;
+}
 
 /* ---- page-file preallocation ----
  *
@@ -499,14 +534,18 @@ pf_trim(bm_t *bm)
 static int
 do_io(bm_t *bm, void *buf, bm_pid_t pid, int write)
 {
-	off_t off = (off_t)pid * (off_t)bm->page_size;
-	int n;
+	off_t off = (off_t)BM_PID_PAGE(pid) * (off_t)bm->page_size;
+	int n, fd = bm_file_fd(bm, pid);
+	if (fd < 0)
+		return -1;
 	if (write) {
-		pf_extend(bm, (uint64_t)off + bm->page_size);
-		n = xtc_aio_pwrite(bm->fd, buf, bm->page_size, off);
+		/* Only the page file is grown ahead (pf_extend). */
+		if (BM_PID_FILE(pid) == 0)
+			pf_extend(bm, (uint64_t)off + bm->page_size);
+		n = xtc_aio_pwrite(fd, buf, bm->page_size, off);
 		return (n == (int)bm->page_size) ? 0 : -1;
 	}
-	n = xtc_aio_pread(bm->fd, buf, bm->page_size, off);
+	n = xtc_aio_pread(fd, buf, bm->page_size, off);
 	if (n == (int)bm->page_size)
 		return 0;
 	if (n >= 0) {                          /* short read: zero-fill the tail */
@@ -529,7 +568,10 @@ do_io(bm_t *bm, void *buf, bm_pid_t pid, int write)
  * pid word is covered too: a page written at another page's offset (a
  * misdirected write) fails, as do a bad byte and a torn write.  Data
  * pages keep the slot at cksum_off; page 0 at the end of the superblock
- * page, before the freelist trailer (BM_SUPER_CK_TAIL). */
+ * page, before the freelist trailer (BM_SUPER_CK_TAIL).  A page of a
+ * file other than 0 starts the sum from its file number (two
+ * little-endian bytes), so a run page read from another run at the same
+ * offset fails too; a file-0 page starts from 0, as it always has. */
 static void
 ck_put32(uint8_t *p, uint32_t v)
 {
@@ -545,10 +587,19 @@ ck_get32(const uint8_t *p)
 }
 
 static uint32_t
-ck_sum(const bm_t *bm, const uint8_t *pg, uint32_t off)
+ck_sum(const bm_t *bm, const uint8_t *pg, bm_pid_t pid, uint32_t off)
 {
 	static const uint8_t zero4[4];
-	uint32_t c = bm->cksum(0, pg, off);
+	uint16_t file = BM_PID_FILE(pid);
+	uint8_t fb[2];
+	uint32_t c = 0;
+
+	if (file != 0) {
+		fb[0] = (uint8_t)file;
+		fb[1] = (uint8_t)(file >> 8);
+		c = bm->cksum(0, fb, 2);
+	}
+	c = bm->cksum(c, pg, off);
 
 	c = bm->cksum(c, zero4, 4);
 	return bm->cksum(c, pg + off + 4, bm->page_size - off - 4);
@@ -559,7 +610,7 @@ static void
 ck_seal(const bm_t *bm, uint8_t *pg, bm_pid_t pid, uint32_t off)
 {
 	ck_put32(pg + off + 4, (uint32_t)pid);
-	ck_put32(pg + off, ck_sum(bm, pg, off));
+	ck_put32(pg + off, ck_sum(bm, pg, pid, off));
 }
 
 /* 1 if the image read back as page `pid` is the one sealed for it.  An
@@ -569,7 +620,7 @@ static int
 ck_ok(const bm_t *bm, const uint8_t *pg, bm_pid_t pid, uint32_t off)
 {
 	return ck_get32(pg + off + 4) == (uint32_t)pid &&
-	    ck_get32(pg + off) == ck_sum(bm, pg, off);
+	    ck_get32(pg + off) == ck_sum(bm, pg, pid, off);
 }
 
 /* A load was refused (bad checksum, or the read failed): count it,
@@ -590,6 +641,32 @@ bm_set_cksum_hook(bm_t *bm, void (*hook)(void *ctx, bm_pid_t pid), void *ctx)
 		return;
 	bm->cksum_ctx = ctx;
 	bm->cksum_hook = hook;
+}
+
+uint64_t
+bm_ro_dirty_refused(const bm_t *bm)
+{
+	return bm == NULL ? 0 :
+	    xtc_atomic_load_u64(&bm->ro_dirty, xtc_mo_relaxed);
+}
+
+int
+bm_cksum_off(const bm_t *bm)
+{
+	return bm->cksum_off;
+}
+
+uint32_t
+bm_page_size(const bm_t *bm)
+{
+	return bm->page_size;
+}
+
+void
+bm_seal_page(const bm_t *bm, void *page, bm_pid_t pid)
+{
+	if (bm != NULL && page != NULL && bm->cksum_off >= 0)
+		ck_seal(bm, page, pid, (uint32_t)bm->cksum_off);
 }
 
 uint64_t
@@ -757,7 +834,8 @@ dw_protect(bm_t *bm, bm_pid_t pid, const void *page)
 }
 
 /* On reopen, replay the double-write ring onto the main file in sequence
- * order, repairing any torn final write, then clear the ring.  Single-
+ * order, repairing any torn final write, then clear the ring.  Only page
+ * file pages are ever in it (other files' frames are read-only).  Single-
  * threaded: runs in bm_create before any proc is spawned. */
 static void
 dw_recover(bm_t *bm)
@@ -793,6 +871,8 @@ dw_recover(bm_t *bm)
 		    (off_t)ent[i].slot * (off_t)slotsz + BM_DW_HDR)
 		    != (ssize_t)bm->page_size)
 			continue;
+		if (BM_PID_FILE(ent[i].pid) != 0)
+			continue;             /* never written; not ours */
 		if (pwrite(bm->fd, pg, bm->page_size,
 		    (off_t)ent[i].pid * (off_t)bm->page_size)
 		    == (ssize_t)bm->page_size)
@@ -940,8 +1020,7 @@ ht_lock(bm_t *bm, uint32_t b)
 static bm_frame_t *
 ht_insert_alloc(bm_t *bm, bm_frame_t *f)
 {
-	uint32_t b = (uint32_t)(xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) %
-	    bm->nbucket);
+	uint32_t b = bm_bucket(bm, xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst));
 	pthread_mutex_t *lk = ht_lock(bm, b);
 	bm_frame_t *e;
 
@@ -979,8 +1058,7 @@ ht_insert_alloc(bm_t *bm, bm_frame_t *f)
 static void
 ht_remove(bm_t *bm, bm_frame_t *f)
 {
-	uint32_t b = (uint32_t)(xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) %
-	    bm->nbucket);
+	uint32_t b = bm_bucket(bm, xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst));
 	pthread_mutex_t *lk = ht_lock(bm, b);
 	bm_frame_t *cur, *prev = NULL;
 	(void)pthread_mutex_lock(lk);
@@ -1018,7 +1096,7 @@ ht_remove(bm_t *bm, bm_frame_t *f)
 static bm_frame_t *
 ht_lookup_pin(bm_t *bm, bm_pid_t pid, uint64_t *generation)
 {
-	uint32_t b = (uint32_t)(pid % bm->nbucket);
+	uint32_t b = bm_bucket(bm, pid);
 	pthread_mutex_t *lk = ht_lock(bm, b);
 	bm_frame_t *f;
 	(void)pthread_mutex_lock(lk);
@@ -1069,7 +1147,7 @@ ht_lookup_pin(bm_t *bm, bm_pid_t pid, uint64_t *generation)
 static bm_frame_t *
 ht_lookup_pin_fast(bm_t *bm, bm_pid_t pid)
 {
-	uint32_t b = (uint32_t)(pid % bm->nbucket);
+	uint32_t b = bm_bucket(bm, pid);
 	bm_frame_t *f = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_acquire);
 
 	while (f != NULL) {
@@ -1117,7 +1195,7 @@ bm_fix_pid_nopin(bm_t *bm, bm_pid_t pid)
 
 	if (bm == NULL || pid == BM_PID_NONE)
 		return NULL;
-	b = (uint32_t)(pid % bm->nbucket);
+	b = bm_bucket(bm, pid);
 	f = xtc_atomic_load_ptr(&bm->buckets[b], xtc_mo_acquire);
 	while (f != NULL) {
 		if (xtc_atomic_load_u64(&f->pid, xtc_mo_acquire) == pid) {
@@ -1819,6 +1897,7 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 	(void)pthread_mutex_init(&bm->free_mu, NULL);
 	(void)pthread_mutex_init(&bm->pf_mu, NULL);
 	(void)pthread_mutex_init(&bm->pid_mu, NULL);
+	(void)pthread_mutex_init(&bm->xf_mu, NULL);
 
 	bm->fd = open(opts->path ? opts->path : "/tmp/sqlxtc-bm.tmp",
 	    opts->reopen ? (O_RDWR | O_CREAT) : (O_RDWR | O_CREAT | O_TRUNC), 0644);
@@ -1944,6 +2023,14 @@ bm_destroy(bm_t *bm)
 	}
 	if (bm->dw_fd >= 0) close(bm->dw_fd);
 	(void)pthread_mutex_destroy(&bm->dw_mu);
+	if (bm->xfd != NULL) {
+		uint32_t i;
+		for (i = 1; i <= 0xFFFFu; i++)
+			if (bm->xfd[i] > 0)
+				close(bm->xfd[i] - 1);
+		xtc_free(bm->xfd);
+	}
+	(void)pthread_mutex_destroy(&bm->xf_mu);
 	if (bm->frames != NULL) {
 		uint32_t i;
 		for (i = 0; i < bm->n_frames; i++)
@@ -1974,6 +2061,110 @@ bm_destroy(bm_t *bm)
 	xtc_aligned_free(bm->pool);
 	xtc_aligned_free(bm->frames);
 	xtc_free(bm);
+}
+
+/* ---- extra files (bm_file_attach) ---- */
+
+static int drop_resident(bm_t *bm, bm_pid_t pid);
+
+/* An attached file's open or close, run off the loop (xtc_blocking_run;
+ * inline off a loop) so a fiber parks instead of blocking its thread. */
+struct bm_xf_job {
+	const char *path;           /* open: the file; NULL: close fd */
+	int         fd;
+};
+
+static int
+bm_xf_io(void *arg)
+{
+	struct bm_xf_job *j = arg;
+
+	if (j->path == NULL)
+		return close(j->fd);
+	j->fd = open(j->path, O_RDONLY);
+	return j->fd < 0 ? -1 : 0;
+}
+
+static int
+bm_xf_run(struct bm_xf_job *j)
+{
+	int rc, res = -1;
+
+	while ((rc = xtc_blocking_run(bm_xf_io, j, &res)) == XTC_E_AGAIN)
+		xtc_yield();
+	return rc == XTC_OK ? res : -1;
+}
+
+int
+bm_file_attach(bm_t *bm, uint16_t file, const char *path)
+{
+	struct bm_xf_job j;
+	int32_t *x;
+	int rc = XTC_OK;
+
+	if (bm == NULL || file == 0 || path == NULL)
+		return XTC_E_INVAL;
+	j.path = path;
+	j.fd = -1;
+	if (bm_xf_run(&j) != 0)
+		return XTC_E_INVAL;          /* does not open */
+	(void)pthread_mutex_lock(&bm->xf_mu);
+	x = bm->xfd;
+	if (x == NULL) {
+		/* One slot per possible file number: 256 KiB, once. */
+		if ((x = xtc_calloc(0x10000u, sizeof *x)) == NULL) {
+			(void)pthread_mutex_unlock(&bm->xf_mu);
+			j.path = NULL;
+			(void)bm_xf_run(&j);
+			return XTC_E_NOMEM;
+		}
+		xtc_atomic_store_ptr(&bm->xfd, x, xtc_mo_release);
+	}
+	if (xtc_atomic_load_i32(&x[file], xtc_mo_relaxed) != 0) {
+		rc = XTC_E_INVAL;            /* already attached */
+	} else {
+		xtc_atomic_store_i32(&x[file], j.fd + 1, xtc_mo_release);
+		j.fd = -1;
+	}
+	(void)pthread_mutex_unlock(&bm->xf_mu);
+	if (j.fd >= 0) {
+		j.path = NULL;
+		(void)bm_xf_run(&j);
+	}
+	return rc;
+}
+
+int
+bm_file_detach(bm_t *bm, uint16_t file)
+{
+	struct bm_xf_job j;
+	uint32_t i;
+	int32_t v;
+
+	if (bm == NULL || file == 0 || bm->xfd == NULL)
+		return XTC_E_INVAL;
+	(void)pthread_mutex_lock(&bm->xf_mu);
+	v = xtc_atomic_load_i32(&bm->xfd[file], xtc_mo_relaxed);
+	if (v == 0) {
+		(void)pthread_mutex_unlock(&bm->xf_mu);
+		return XTC_E_INVAL;
+	}
+	/* Unattached first, so a stray fix fails instead of loading. */
+	xtc_atomic_store_i32(&bm->xfd[file], 0, xtc_mo_release);
+	(void)pthread_mutex_unlock(&bm->xf_mu);
+	/* Drop the file's resident frames unwritten: its pages are gone
+	 * with it, and a frame left behind would answer for the same file
+	 * number once another file is attached under it. */
+	for (i = 0; i < bm->n_frames; i++) {
+		bm_pid_t pid = xtc_atomic_load_u64(&bm->frames[i].pid,
+		    xtc_mo_acquire);
+		if (pid != BM_PID_NONE && BM_PID_FILE(pid) == file)
+			(void)drop_resident(bm, pid);
+	}
+	j.path = NULL;
+	j.fd = v - 1;
+	(void)bm_xf_run(&j);
+	return XTC_OK;
 }
 
 /* ---- quarantine membership set (the reclamation interlock) ----
@@ -2153,7 +2344,7 @@ finish_doomed_drop(bm_t *bm, bm_frame_t *f)
 static int
 drop_resident(bm_t *bm, bm_pid_t pid)
 {
-	uint32_t b = (uint32_t)(pid % bm->nbucket);
+	uint32_t b = bm_bucket(bm, pid);
 	pthread_mutex_t *lk = ht_lock(bm, b);
 	bm_frame_t *f, *cur, *prev;
 
@@ -2222,6 +2413,13 @@ retry:
 static void
 mark_dirty_edge(bm_t *bm, bm_frame_t *frame)
 {
+	/* A frame of a file other than 0 (a run) is read-only: refuse the
+	 * edge, so it is never double-written or written back. */
+	if (BM_PID_FILE(xtc_atomic_load_u64(&frame->pid, xtc_mo_acquire)) !=
+	    0) {
+		xtc_atomic_fetch_add_u64(&bm->ro_dirty, 1, xtc_mo_relaxed);
+		return;
+	}
 	/* Stamp the dirtying order on the clean -> dirty edge, so the
 	 * trickler can write oldest dirt first (a recLSN proxy). */
 	if (xtc_atomic_exchange_i32(&frame->dirty, 1, xtc_mo_acq_rel) == 0) {
@@ -2281,6 +2479,8 @@ bm_unfix(bm_t *bm, bm_frame_t *frame, int mark_dirty)
 void
 bm_predirty(bm_t *bm, bm_frame_t *frame)
 {
+	bm_pid_t pid;
+
 	if (bm == NULL || frame == NULL)
 		return;
 	/*
@@ -2293,9 +2493,11 @@ bm_predirty(bm_t *bm, bm_frame_t *frame)
 	 * to the latest change folded into the image, or recovery's page-LSN
 	 * gate would refuse a newer image.  Then take the normal dirty edge
 	 * so recLSN/dirty bookkeeping is set if this is the first touch.
+	 * A run frame (file != 0) is read-only: its bytes are not stamped,
+	 * and the edge only counts the refusal.
 	 */
-	if (bm->lsn_off >= 0 &&
-	    xtc_atomic_load_u64(&frame->pid, xtc_mo_seq_cst) != 0) {
+	pid = xtc_atomic_load_u64(&frame->pid, xtc_mo_seq_cst);
+	if (bm->lsn_off >= 0 && pid != 0 && BM_PID_FILE(pid) == 0) {
 		uint64_t lsn =
 		    xtc_atomic_load_u64(&bm->cur_lsn, xtc_mo_relaxed);
 		memcpy((uint8_t *)frame->page + bm->lsn_off, &lsn, sizeof lsn);
@@ -2483,8 +2685,8 @@ bm_free_pid(bm_t *bm, bm_pid_t pid)
 	int rc = XTC_OK;
 	void *nb;
 
-	if (bm == NULL || pid == BM_PID_NONE)
-		return XTC_E_INVAL;
+	if (bm == NULL || pid == BM_PID_NONE || BM_PID_FILE(pid) != 0)
+		return XTC_E_INVAL;     /* only the page file reissues ids */
 	/*
 	 * Quarantine the id BEFORE dropping its frame.  The membership set
 	 * is the reclamation interlock: once `pid` is a member, a fix that
@@ -2592,6 +2794,8 @@ bm_fix_pid(bm_t *bm, bm_pid_t pid, bm_frame_t **out_frame)
 	int ck_bad;
 	if (bm == NULL || out_frame == NULL || pid == BM_PID_NONE)
 		return XTC_E_INVAL;
+	if (BM_PID_FILE(pid) != 0 && bm_file_fd(bm, pid) < 0)
+		return XTC_E_INVAL;          /* a file that is not attached */
 #ifdef BM_CLASSIFY
 	/* Stage 5: feed the sharing-degree classifier at the single access
 	 * choke point -- core-private sketch writes only (Invariant 1). */
@@ -2667,7 +2871,7 @@ bm_fix_pid(bm_t *bm, bm_pid_t pid, bm_frame_t **out_frame)
 		    !ck_ok(bm, f->page, pid, (uint32_t)bm->cksum_off);
 		/* Publish: under the bucket's stripe lock, re-check no one beat us. */
 		{
-			uint32_t b = (uint32_t)(pid % bm->nbucket);
+			uint32_t b = bm_bucket(bm, pid);
 			pthread_mutex_t *lk = ht_lock(bm, b);
 			bm_frame_t *e;
 			(void)pthread_mutex_lock(lk);
@@ -3313,10 +3517,12 @@ static int
 tr_emit_run(bm_t *bm, uint8_t *base, int run_len, bm_pid_t pid0,
             bm_frame_t **run_f)
 {
-	off_t off = (off_t)pid0 * (off_t)bm->page_size;
+	off_t off = (off_t)BM_PID_PAGE(pid0) * (off_t)bm->page_size;
 	int len = run_len * (int)bm->page_size, k, ok, written = 0;
-	pf_extend(bm, (uint64_t)off + (uint64_t)len);
-	ok = xtc_aio_pwrite(bm->fd, base, len, off) == len;
+	int fd = bm_file_fd(bm, pid0);
+	if (BM_PID_FILE(pid0) == 0)
+		pf_extend(bm, (uint64_t)off + (uint64_t)len);
+	ok = fd >= 0 && xtc_aio_pwrite(fd, base, len, off) == len;
 	xtc_atomic_fetch_add_u64(&bm->s_tr_writes, 1, xtc_mo_relaxed);
 	for (k = 0; k < run_len; k++) {
 		tr_release(bm, run_f[k], ok);
@@ -3356,7 +3562,8 @@ tr_flush_batch(bm_t *bm, struct tr_cand *sel, int nsel, uint8_t *wbuf,
 			continue;
 		if (run_len > 0 &&
 		    xtc_atomic_load_u64(&f->pid, xtc_mo_seq_cst) ==
-		        prev_pid + 1) {
+		        prev_pid + 1 &&
+		    BM_PID_PAGE(prev_pid + 1) != 0) {   /* not across files */
 			run_f[run_len++] = f;        /* extend the contiguous run */
 		} else {
 			if (run_len > 0)             /* emit the finished run */
