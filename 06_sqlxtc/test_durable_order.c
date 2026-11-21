@@ -350,6 +350,19 @@ open(const char *path, int flags, ...)
 	return fd;
 }
 
+/*
+ * glibc's fortified open() (-D_FORTIFY_SOURCE, which the toolchain may add
+ * on its own) sends a two-argument call to __open_2, which the open() above
+ * never sees.  Route it here; the third argument keeps a fortified build of
+ * this file from turning the call back into __open_2.
+ */
+int __open_2(const char *path, int flags);
+int
+__open_2(const char *path, int flags)
+{
+	return open(path, flags, 0);
+}
+
 int
 close(int fd)
 {
