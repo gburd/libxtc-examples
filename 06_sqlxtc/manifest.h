@@ -95,11 +95,14 @@ typedef int (*mf_row_fn)(void *ctx, uint32_t frame, run_row_t *row);
  * XTC_E_IO with the run installed in memory and kept on disk, and
  * fail-stops the manifest: every later flush returns XTC_E_IO, and the
  * caller must fail-stop the WAL too (wal_fail_stop), since the new
- * MANIFEST may or may not be durable.  On success the frozen delta and the
- * old run set are reclaimed before the return (xtc_rcu_synchronize, so
- * the call waits for keydir readers to leave their read-sides: the
- * flusher must not hold one).  The caller unpins the flushed frames
- * after it returns XTC_OK.
+ * MANIFEST may or may not be durable.  On success the frozen delta and
+ * the old run set are retired through RCU and the call synchronizes
+ * (xtc_rcu_synchronize, so it waits for keydir readers to leave their
+ * read-sides: the flusher must not hold one).  libxtc's RCU frees a
+ * retired object at the second synchronize after its retire, so each
+ * flush frees what the flush before it retired: one frozen delta and
+ * one old run set stay allocated until the next flush or xtc_rcu_fini.
+ * The caller unpins the flushed frames after it returns XTC_OK.
  */
 int  mf_flush(manifest_t *m, mf_row_fn row, void *row_ctx,
          uint64_t (*boundary_fn)(void *ctx), void *bctx);

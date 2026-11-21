@@ -693,9 +693,10 @@ mf_flush_frozen(manifest_t *m, mf_row_fn rowfn, void *ctx)
 		return rc2;
 	}
 	kd_drop_frozen(m->kd);
-	/* Reclaim the frozen delta and the old run set now: libxtc's RCU
-	 * frees retired objects only in a synchronize (it parks a fiber
-	 * while readers drain), and nothing else in the engine calls it. */
+	/* Synchronize now: libxtc's RCU frees retired objects only in a
+	 * synchronize (it parks a fiber while readers drain), and nothing
+	 * else in the engine calls it.  The objects retired here are freed
+	 * by the next flush's synchronize (or xtc_rcu_fini). */
 	xtc_rcu_synchronize();
 	return rc;
 close:

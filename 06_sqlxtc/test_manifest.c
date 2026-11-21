@@ -33,8 +33,8 @@
  *	             encode in full and parse back the same (no run line
  *	             is silently dropped, no write past the buffer);
  *	  reclaim    many flushes with no synchronize of the test's own:
- *	             the live allocations do not grow (each flush reclaims
- *	             its frozen delta and the old run set);
+ *	             the live allocations do not grow (each flush frees
+ *	             what the flush before it retired);
  *	  concurrent committer fibers on two loops keep adding rows while a
  *	             flusher fiber flushes many times (each flush parks on
  *	             its file work); afterwards every row is either in the
