@@ -8,8 +8,9 @@
  *	Nothing in the row log's framework blocks the OS thread of a loop
  *	(review S9): a fiber opens a segmented WAL, commits across rolls,
  *	opens a manifest, flushes runs, reopens and closes it, while this
- *	test interposes open, close, unlink, rename, fsync, fdatasync and
- *	opendir and counts the calls made on the loop's own thread.  Each
+ *	test interposes open, close, unlink, rename, fsync, fdatasync,
+ *	opendir, pwrite, pread, ftruncate and mkdir and counts the calls
+ *	made on the loop's own thread.  Each
  *	must be zero: the work goes through xtc_blocking_run (or xtc_aio)
  *	and runs on another thread.  wal_close, bm_create and bm_destroy
  *	are outside the watched window (start-up and shutdown).
@@ -23,6 +24,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "btnode.h"
@@ -40,10 +42,11 @@
 
 static pthread_t g_loop_thr;
 static int       g_watch;
-static int       g_hits[7];
+static int       g_hits[11];
 static int       g_off;              /* watched calls on other threads */
-static const char *const g_name[7] = { "open", "close", "unlink",
-    "rename", "fsync", "fdatasync", "opendir" };
+static const char *const g_name[11] = { "open", "close", "unlink",
+    "rename", "fsync", "fdatasync", "opendir", "pwrite", "ftruncate",
+    "mkdir", "pread" };
 
 /* Count a call made on the loop's thread while the window is open. */
 static void
@@ -151,6 +154,50 @@ opendir(const char *path)
 	return real(path);
 }
 
+ssize_t
+pwrite(int fd, const void *b, size_t n, off_t o)
+{
+	static ssize_t (*real)(int, const void *, size_t, off_t);
+
+	if (real == NULL)
+		next_sym("pwrite", &real, sizeof real);
+	hit(7);
+	return real(fd, b, n, o);
+}
+
+ssize_t
+pread(int fd, void *b, size_t n, off_t o)
+{
+	static ssize_t (*real)(int, void *, size_t, off_t);
+
+	if (real == NULL)
+		next_sym("pread", &real, sizeof real);
+	hit(10);
+	return real(fd, b, n, o);
+}
+
+int
+ftruncate(int fd, off_t o)
+{
+	static int (*real)(int, off_t);
+
+	if (real == NULL)
+		next_sym("ftruncate", &real, sizeof real);
+	hit(8);
+	return real(fd, o);
+}
+
+int
+mkdir(const char *p, mode_t m)
+{
+	static int (*real)(const char *, mode_t);
+
+	if (real == NULL)
+		next_sym("mkdir", &real, sizeof real);
+	hit(9);
+	return real(p, m);
+}
+
 static char g_dir[256];
 static bm_t *g_bm;
 static wal_t *g_wal;
@@ -247,7 +294,7 @@ main(void)
 	CK(xtc_proc_spawn(loop, worker, NULL, &po, &pid) == XTC_OK);
 	CK(xtc_loop_run(loop) == XTC_OK);
 	xtc_loop_destroy(loop);
-	for (k = 0; k < 7; k++) {
+	for (k = 0; k < 11; k++) {
 		if (g_hits[k] != 0)
 			printf("  %s on the loop thread: %d\n", g_name[k],
 			    g_hits[k]);
@@ -259,7 +306,8 @@ main(void)
 	bm_destroy(g_bm);
 	xtc_rcu_fini();
 	printf("  on-loop: no open/close/unlink/rename/fsync/fdatasync/"
-	    "opendir on the loop's thread (%d off it)\n", g_off);
+	    "opendir/pwrite/pread/ftruncate/mkdir on the loop's thread "
+	    "(%d off it)\n", g_off);
 	if (!g_fail)
 		printf("ok test_onloop_io\n");
 	return g_fail;

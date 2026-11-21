@@ -755,6 +755,15 @@ wal_dio_setup(wal_t *w)
 #endif
 }
 
+/* wal_dio_setup as a blocking job: its pread and its durable probe
+ * write run off the loop (xtc_blocking_run). */
+static int
+wal_dio_job(void *arg)
+{
+	wal_dio_setup(arg);
+	return 0;
+}
+
 /* ---- segments (wal_opts_t.segment_bytes) ---- */
 
 static void wal_sync_dir(const char *path);
@@ -1276,7 +1285,14 @@ wal_open(const wal_opts_t *opts, wal_t **out)
 	wal_reset_marks(w, (uint64_t)o, maxlsn);
 	if (o != 0 && last != UINT64_MAX)
 		w->last_pos = last;           /* from the verified hint */
-	wal_dio_setup(w);
+	/* A segmented log's open does no file I/O on the loop's thread
+	 * (test_onloop_io): the direct-I/O probe is a durable write.  A
+	 * full offload queue leaves the log buffered (best-effort, as the
+	 * roll's). */
+	if (w->seg_bytes != 0)
+		(void)xtc_blocking_run(wal_dio_job, w, &(int){ 0 });
+	else
+		wal_dio_setup(w);
 	*out = w;
 	return XTC_OK;
 }
@@ -1801,13 +1817,6 @@ wal_roll_swap(wal_t *w, const struct wal_roll_job *j)
 	xtc_atomic_fetch_add_u64(&w->gen, 1, xtc_mo_acq_rel);
 	wal_unlock(&w->fl_mu);
 	wal_unlock(&w->res_mu);
-}
-
-static int
-wal_dio_job(void *arg)
-{
-	wal_dio_setup(arg);
-	return 0;
 }
 
 /*
