@@ -22,6 +22,9 @@
  *	  retry      a flush whose row source fails installs nothing and
  *	             leaves the delta frozen; mf_flush_frozen finishes it;
  *	             an empty delta installs nothing;
+ *	  install    a flush whose manifest install fails (MANIFEST.tmp is
+ *	             a directory) removes its run, keeps the delta frozen
+ *	             and the boundary, and the old MANIFEST still opens;
  *	  renamed    a failure after the manifest's rename (the directory
  *	             fsync) keeps the run it names, fail-stops later
  *	             flushes, and the reopen finds every row;
@@ -95,13 +98,13 @@ boundary(void *ctx)
 }
 
 static bm_t *
-open_bm(void)
+open_bm_at(const char *name)
 {
 	bm_opts_t o = BM_OPTS_DEFAULT;
 	char p[300];
 	bm_t *bm = NULL;
 
-	snprintf(p, sizeof p, "%s/pages", g_dir);
+	snprintf(p, sizeof p, "%s/%s", g_dir, name);
 	o.path = p;
 	o.page_size = PS;
 	o.n_frames = 128;
@@ -109,6 +112,12 @@ open_bm(void)
 	o.cksum = wal_crc32c;
 	CK(bm_create(&o, &bm) == XTC_OK);
 	return bm;
+}
+
+static bm_t *
+open_bm(void)
+{
+	return open_bm_at("pages");
 }
 
 /* 1 if the newest place of RID holds frame f (a run copy reads "f=<f>"). */
@@ -212,7 +221,7 @@ t_refuse(void)
 {
 	manifest_t *m = NULL;
 	keydir_t *kd = NULL;
-	char p[300], *t;
+	char p[300], q[300], *t, *at;
 	size_t len;
 	bm_t *bm;
 	FILE *fp;
@@ -226,28 +235,31 @@ t_refuse(void)
 	t = malloc(1u << 16);
 	len = fread(t, 1, 1u << 16, fp);
 	fclose(fp);
-	/* A flipped digit in a run line: the CRC refuses it. */
-	t[strstr(t, "run ") - t + 4] ^= 1;
+	/* The boundary's last hex digit flipped (0 <-> 1): the text still
+	 * parses, and names the same runs, so only the CRC refuses it. */
+	at = strstr(t, "\nboundary ");
+	CK(at != NULL);
+	if (at == NULL)
+		return;
+	at += strlen("\nboundary ") + 15;
+	*at ^= 1;
 	CK((fp = fopen(p, "wb")) != NULL && fwrite(t, 1, len, fp) == len);
 	fclose(fp);
 	CK(mf_open(g_dir, bm, kd, &m) == XTC_E_IO && m == NULL);
 	CK(exists("rl-1.run") && exists("rl-2.run"));
-	t[strstr(t, "run ") - t + 4] ^= 1;
+	*at ^= 1;
 	CK((fp = fopen(p, "wb")) != NULL && fwrite(t, 1, len, fp) == len);
 	fclose(fp);
 	/* A run file replaced by another (its header CRC differs). */
 	snprintf(p, sizeof p, "%s/rl-2.run", g_dir);
-	{
-		char q[300];
-		snprintf(q, sizeof q, "%s/rl-2.keep", g_dir);
-		CK(rename(p, q) == 0);
-		snprintf(q, sizeof q, "%s/rl-3.run", g_dir);
-		CK(link(q, p) == 0);
-		CK(mf_open(g_dir, bm, kd, &m) == XTC_E_IO);
-		CK(unlink(p) == 0);
-		snprintf(q, sizeof q, "%s/rl-2.keep", g_dir);
-		CK(rename(q, p) == 0);
-	}
+	snprintf(q, sizeof q, "%s/rl-2.keep", g_dir);
+	CK(rename(p, q) == 0);
+	snprintf(q, sizeof q, "%s/rl-3.run", g_dir);
+	CK(link(q, p) == 0);
+	CK(mf_open(g_dir, bm, kd, &m) == XTC_E_IO);
+	CK(unlink(p) == 0);
+	snprintf(q, sizeof q, "%s/rl-2.keep", g_dir);
+	CK(rename(q, p) == 0);
 	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK && mf_nruns(m) == 3);
 	mf_close(m);
 	free(t);
@@ -299,6 +311,39 @@ t_missing(void)
 	    "refuses the open, nothing deleted\n");
 }
 
+/*
+ * The install fails before its rename: MANIFEST.tmp is a directory, so
+ * it cannot be created.  The run file must be gone, the delta still
+ * frozen, the boundary and run count unchanged, and the old MANIFEST
+ * must still open with the same runs.
+ */
+static void
+t_install_fail(manifest_t *m, keydir_t *kd, uint32_t n0, uint64_t b0)
+{
+	manifest_t *m2 = NULL;
+	keydir_t *kd2 = NULL;
+	bm_t *bm2;
+	char p[300], name[64];
+	uint64_t id = m->next;
+
+	snprintf(p, sizeof p, "%s/MANIFEST.tmp", g_dir);
+	CK(mkdir(p, 0700) == 0);
+	CK(mf_flush_frozen(m, row_of, NULL) != XTC_OK);
+	snprintf(name, sizeof name, "rl-%" PRIu64 ".run", id);
+	CK(!exists(name));
+	CK(kd_has_frozen(kd) && mf_nruns(m) == n0 && mf_boundary(m) == b0);
+	CK(rmdir(p) == 0);
+	/* Through a second buffer manager: m's runs stay attached to its
+	 * own.  (It must not sweep: m2 sees the same durable manifest.) */
+	bm2 = open_bm_at("pages-if");
+	CK(kd_create(4096, &kd2) == XTC_OK);
+	CK(bm2 != NULL && mf_open(g_dir, bm2, kd2, &m2) == XTC_OK &&
+	    m2 != NULL && mf_nruns(m2) == n0 && mf_boundary(m2) == b0);
+	mf_close(m2);
+	kd_destroy(kd2);
+	bm_destroy(bm2);
+}
+
 static void
 t_retry(void)
 {
@@ -321,6 +366,7 @@ t_retry(void)
 	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_E_IO);
 	CK(mf_nruns(m) == n0 && mf_boundary(m) == b0 && kd_has_frozen(kd));
 	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_E_AGAIN);
+	t_install_fail(m, kd, n0, b0);
 	CK(mf_flush_frozen(m, row_of, NULL) == XTC_OK);
 	CK(mf_nruns(m) == n0 + 1 && mf_boundary(m) == g_bnd * 1000u &&
 	    !kd_has_frozen(kd));
