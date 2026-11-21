@@ -586,7 +586,8 @@ uint64_t xstore_index_close(bt_t *bt);
 uint64_t xstore_index_rebuild_count(void);
 /* Check every index against the base: *missing = live rows with no entry
  * (wrong answers), *stale = entries no row's newest version carries
- * (harmless).  Quiesced only.  Returns the number of indexes checked. */
+ * (harmless).  Quiesced only.  Returns the number of indexes checked,
+ * or the XTC_E_* code of a read that failed. */
 int      xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale);
 /* Test hook: the next n index entry inserts fail (as bt_insert can). */
 void     xstore_index_fail_inject(int n);

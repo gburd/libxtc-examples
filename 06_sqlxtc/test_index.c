@@ -588,6 +588,11 @@ scenario_rebuild_error(void)
 	}
 	CK(errs > 1 && broke_u > 0 && broke_u < errs);
 
+	/* The check reports a read it could not make, not short counts. */
+	xstore_scan_read_fail_at(1);
+	CK(xstore_index_check(bt, NULL, NULL) == XTC_E_IO);
+	xstore_scan_read_fail_at(0);
+
 	/* The run with no failed read rebuilt both whole (the run stays
 	 * tainted: the next open rebuilds again). */
 	CK(xstore_index_list(bt, "t", ix, 4) == 2);

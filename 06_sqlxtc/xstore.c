@@ -7492,7 +7492,9 @@ xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
 	if (e->rt.tableid == 0) return 0;
 	memset(&kb, 0, sizeof kb);
 	s = xstore_scan_open(bt, e->table, 0, 0, 0, 0, 0);
-	if (s == NULL) return XTC_E_NOMEM;   /* the table resolved: no memory */
+	if (s == NULL)   /* the table went away since it resolved, or no memory */
+		return xstore_table_id(bt, e->table, NULL) ? XTC_E_NOMEM :
+		    XTC_E_NOTFOUND;
 	while ((step = xstore_scan_next(s, &rowid, &rec, &reclen)) == 1) {
 		klen = xs_idx_rowkey(&e->rt, rec, reclen, rowid, 1, key,
 		    (int)sizeof key, &isnull);
@@ -7710,7 +7712,8 @@ xstore_index_rebuild_count(void)
  * rows whose newest committed version has no entry (a seek or a UNIQUE
  * check would miss the row), *stale counts entries the row's newest
  * committed version does not carry (harmless: readers filter them).
- * Run quiesced (tests, tools).  Returns the number of indexes checked.
+ * Run quiesced (tests, tools).  Returns the number of indexes checked,
+ * or the XTC_E_* code of a read that failed (the counts are then short).
  */
 int
 xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale)
@@ -7718,7 +7721,7 @@ xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale)
 	struct xs_idx_ent *snap;
 	uint8_t key[XS_IDX_KMAX], kk[XS_IDX_KMAX], pfx[5];
 	uint8_t *rec = NULL;
-	int ns = 0, i, kl, rl;
+	int ns = 0, i, kl, rl, step = 0, rc, err = 0;
 	uint64_t miss = 0, st = 0;
 	if (bt == NULL) return 0;
 	snap = malloc(sizeof *snap * XS_IDX_MAX);
@@ -7734,7 +7737,9 @@ xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale)
 		bt_cursor_t *cur = NULL;
 		int64_t rowid; const uint8_t *r; int rlen;
 		uint16_t vl;
-		while (s != NULL && xstore_scan_next(s, &rowid, &r, &rlen) == 1) {
+		if (s == NULL) err = XTC_E_NOMEM;
+		while (s != NULL &&
+		    (step = xstore_scan_next(s, &rowid, &r, &rlen)) == 1) {
 			kl = xs_idx_rowkey(&snap[i].rt, r, rlen, rowid, 1, key,
 			    (int)sizeof key, NULL);
 			if (kl < 0 ||
@@ -7742,31 +7747,40 @@ xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale)
 			        XTC_OK)
 				miss++;
 		}
+		if (step < 0) err = XTC_E_IO;
 		xstore_scan_close(s);
 		(void)xs_idx_prefix(snap[i].rt.idx_id, pfx);
-		if (bt_cursor_open(bt, pfx, 5, &cur) != XTC_OK) continue;
+		if ((rc = bt_cursor_open(bt, pfx, 5, &cur)) != XTC_OK) {
+			err = rc;
+			continue;
+		}
 		for (;;) {
 			const void *k = NULL, *vv = NULL; uint16_t klen = 0, vlen = 0;
 			int64_t rid;
-			if (bt_cursor_next(cur, &k, &klen, &vv, &vlen) != XTC_OK ||
-			    klen < 13 || memcmp(k, pfx, 5) != 0)
+			rc = bt_cursor_next(cur, &k, &klen, &vv, &vlen);
+			if (rc != XTC_OK && rc != XTC_E_NOTFOUND) err = rc;
+			if (rc != XTC_OK || klen < 13 || memcmp(k, pfx, 5) != 0)
 				break;
 			memcpy(key, k, klen);
 			kl = klen;
 			rid = (int64_t)(xs_get_be64(key + kl - 8) ^ 0x8000000000000000ull);
 			bt_cursor_park(cur);
 			rl = xs_read_rec(bt, snap[i].rt.tableid, rid, rec, XS_VMAX);
+			if (rl < 0) err = rl;
 			if (rl <= 0 || xs_idx_rowkey(&snap[i].rt, rec, rl, rid, 1, kk,
 			    (int)sizeof kk, NULL) != kl || memcmp(kk, key, (size_t)kl) != 0)
 				st++;
-			if (bt_cursor_resume(cur) != XTC_OK) break;
+			if ((rc = bt_cursor_resume(cur)) != XTC_OK) {
+				err = rc;
+				break;
+			}
 		}
 		bt_cursor_close(cur);
 	}
 	free(snap); free(rec);
 	if (missing) *missing = miss;
 	if (stale) *stale = st;
-	return ns;
+	return err != 0 ? err : ns;
 }
 
 int
