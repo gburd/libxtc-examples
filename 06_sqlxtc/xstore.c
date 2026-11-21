@@ -7914,6 +7914,8 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 			rl = XTC_E_IO;
 		else
 			rl = xs_read_rec(bt, rt->tableid, rid, rec, XS_VMAX);
+		if (rl < 0 && XTC_DST_BUG(XTC_DST_BUG_UNIQREAD))
+			rl = 0; /* planted 80: the unread candidate is absent */
 		if (rl < 0) { /* the candidate is unknown, not absent */
 			dup = rl;
 			break;

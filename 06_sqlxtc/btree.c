@@ -3613,8 +3613,9 @@ bt_seek_ge_keys(bt_t *bt, const void *lo, uint16_t lolen, uint16_t plen,
 	/* The leaf ran out first: its upper fence decides (+infinity for
 	 * the rightmost leaf, which has no right sibling). */
 	if (s == cnt) {
-		if (btnode_right_sibling(pg) == 0)
-			*more = 0;
+		if (btnode_right_sibling(pg) == 0 ||
+		    XTC_DST_BUG(XTC_DST_BUG_POINTEND))
+			*more = 0; /* planted 81: any leaf's end is the end */
 		else if (btnode_hi_fence(pg, hf, sizeof hf, &hfl) == 0 &&
 		    hfl > 0 && !key_has_prefix(hf, hfl, lo, plen) &&
 		    key_cmp(hf, hfl, lo, plen) > 0)
