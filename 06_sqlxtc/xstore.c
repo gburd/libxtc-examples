@@ -1188,7 +1188,12 @@ typedef struct xstore_vtab {
  * the tombstone is written.  Its value has an empty name (a NUL, then
  * the id in decimal), so no name lookup matches it, and a store written
  * this way stays readable by a release that does not know the row.  The
- * index catalog keeps the same row for index ids.
+ * index catalog keeps the same row for index ids.  GC and the dump keep
+ * a tombstone the mark does not cover (a DROP by an older release).
+ * One case is not covered: a store on which an older release already
+ * collected a dropped index's tombstone can hand that index id out
+ * again (tables have the data probe, xs_data_max_id; indexes have
+ * nothing to probe).  That is harmless: the DROP cleared the entries.
  */
 #define XS_CAT_TABLEID 0u
 #define XS_CAT_MAX 256
@@ -7713,7 +7718,10 @@ xs_idx_drop_table(bt_t *bt, const char *table)
 	}
 	xs_cat_unlock();
 	vbuf[0] = 0;
-	/* No tombstone without the mark, as in xstore_drop_index. */
+	/* No tombstone without the mark, as in xstore_drop_index.  If the
+	 * mark cannot be written (a fail-stopped log, so the store takes no
+	 * more writes) the catalog rows stay live: the next open loads the
+	 * definitions, finds no table and taints the indexes. */
 	marked = n > 0 && xs_hw_raise(bt, XS_IDXCAT_TABLEID, top) == SX_OK &&
 	    !xs_drop_gap("xstore.drop.index_gap");
 	for (i = 0; i < n; i++) {
