@@ -941,13 +941,14 @@ wal_roll_io(void *arg)
 	 * the leadership and the direct flag): close it here, off the loop;
 	 * wal_roll_swap installs the new fd. */
 	(void)close(j->w->fd);
-	/* Oldest first, so what is left is always one contiguous range. */
+	/* Oldest first, each durable before the next, so what is left is
+	 * always one contiguous range even on a filesystem that persists
+	 * unlinks out of order (one directory fsync per 64 MiB segment). */
 	for (k = j->w->seg_lo; k < j->del_upto; k++) {
 		wal_seg_path(j->w->dir, k, p, sizeof p);
 		(void)unlink(p);
-	}
-	if (j->del_upto > j->w->seg_lo)
 		wal_sync_dir(p);
+	}
 	return 0;
 }
 
@@ -1142,9 +1143,13 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 	w->seg_bytes = opts->segment_bytes;
 	wal_seg_list(w->dir, &lo, &hi);
 	if (!opts->append && hi != 0) {
+		/* Oldest first, each durable before the next and all before
+		 * segment 1 exists: a crash leaves one contiguous range, never
+		 * a new segment 1 beside old ones (as the roll's unlinks). */
 		for (s = lo; s <= hi; s++) {
 			wal_seg_path(w->dir, (uint32_t)s, p, sizeof p);
 			(void)unlink(p);
+			wal_sync_dir(p);
 		}
 		lo = hi = 0;
 	}

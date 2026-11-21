@@ -27,6 +27,10 @@
  *	             durable (a commit then lives in a durable directory);
  *	  commit     when wal_commit_wa returns, the segment holding the
  *	             record is durable with a durable name;
+ *	  unlinks    a segment is unlinked, or segment 1 created, only once
+ *	             every earlier segment unlink is durable (a filesystem
+ *	             may persist unlinks out of order, leaving a gap that the
+ *	             chain walk refuses: REREVIEW-sbf N3);
  *	  older      when a segment is created, no older segment has a
  *	             truncated torn tail that a crash could bring back (an
  *	             older segment must be clean to its end, or the chain
@@ -35,8 +39,8 @@
  *	The workload commits across many segment rolls, flushes the
  *	nursery into runs, releases the WAL below each flush boundary and
  *	reopens both; then it tears the newest segment's tail, reopens the
- *	log and rolls it at once (the reviewer's p_torn_roll).  It runs off
- *	a loop, where xtc_aio and
+ *	log and rolls it at once (the reviewer's p_torn_roll), and opens a
+ *	fresh log over the old one.  It runs off a loop, where xtc_aio and
  *	xtc_blocking_run run inline, so every operation is seen in order.
  */
 
@@ -88,6 +92,8 @@ static struct tpath g_p[NPATH];
 static struct tfd   g_fd[NFD];
 static int          g_on;        /* the model is armed */
 static int          g_bad, g_installs, g_unlinks, g_commits;
+static int          g_unl_pending;   /* segment unlinks, dir not synced */
+static int          g_wipe;          /* a fresh log removes every segment */
 
 static int (*r_open)(const char *, int, ...);
 static int (*r_close)(int);
@@ -221,6 +227,11 @@ check_seg_unlink(const char *path)
 	if (k == 0)
 		return;
 	g_unlinks++;
+	if (g_unl_pending)
+		violation("segment unlinked before an earlier segment's "
+		    "unlink is durable", path);
+	if (g_wipe)
+		return;                      /* not retention: no newer one */
 	dir_of(path, d, sizeof d);
 	if ((dp = opendir(d)) == NULL)
 		return;
@@ -256,6 +267,9 @@ check_seg_create(const char *path)
 
 	if (k == 0)
 		return;
+	if (k == 1 && g_unl_pending)
+		violation("segment 1 created before the old segments' unlinks "
+		    "are durable", path);
 	dir_of(path, d, sizeof d);
 	for (i = 0; i < NPATH; i++) {
 		if (!g_p[i].used || !g_p[i].cut_pending ||
@@ -397,6 +411,7 @@ synced(int fd)
 	}
 	if (!g_fd[fd].isdir)
 		return;
+	g_unl_pending = 0;               /* one WAL directory in this test */
 	for (i = 0; i < NPATH; i++) {
 		if (!g_p[i].used)
 			continue;
@@ -501,7 +516,10 @@ unlink(const char *path)
 	init_syms();
 	if (g_on && in_dir(path))
 		check_seg_unlink(path);
-	if ((rc = r_unlink(path)) == 0 && (i = path_find(path)) >= 0)
+	if ((rc = r_unlink(path)) == 0 && g_on && in_dir(path) &&
+	    file_num(path, "wal-%10u.lo%c") != 0)
+		g_unl_pending = 1;
+	if (rc == 0 && (i = path_find(path)) >= 0)
 		g_p[i].used = 0;
 	return rc;
 }
@@ -620,6 +638,12 @@ torn_roll(void)
 	CK(g_wal != NULL && wal_roll(g_wal) == XTC_OK);
 	wal_close(g_wal);
 	g_wal = open_wal(1);
+	wal_close(g_wal);
+	/* A fresh log over the old one (append = 0): the old segments go
+	 * before segment 1 is created. */
+	g_wipe = 1;
+	g_wal = open_wal(0);
+	g_wipe = 0;
 	wal_close(g_wal);
 }
 
