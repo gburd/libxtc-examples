@@ -769,22 +769,25 @@ wal_seg_path(const char *dir, uint32_t seg, char *out, size_t cap)
 }
 
 /* The lowest and highest segment numbers in `dir` (both 0 if there is
- * none).  Other files are ignored. */
+ * none).  Only names exactly as wal_seg_path prints them count (8 to 10
+ * digits); other files are ignored. */
 static void
 wal_seg_list(const char *dir, uint32_t *lo, uint32_t *hi)
 {
 	DIR *d;
 	struct dirent *e;
-	unsigned v;
-	char tail;
+	unsigned long long v;
+	char tail, canon[32];
 
 	*lo = *hi = 0;
 	if ((d = opendir(dir)) == NULL)
 		return;
 	while ((e = readdir(d)) != NULL) {
-		if (sscanf(e->d_name, "wal-%8u.lo%c", &v, &tail) != 2 ||
-		    tail != 'g' || strlen(e->d_name) != 16 || v == 0 ||
-		    v > WAL_WA_MAX_SEG)
+		if (sscanf(e->d_name, "wal-%10llu.lo%c", &v, &tail) != 2 ||
+		    tail != 'g' || v == 0 || v > WAL_WA_MAX_SEG)
+			continue;
+		snprintf(canon, sizeof canon, "wal-%08u.log", (unsigned)v);
+		if (strcmp(canon, e->d_name) != 0)
 			continue;
 		if (*lo == 0 || v < *lo)
 			*lo = v;
@@ -831,6 +834,11 @@ wal_zero_from(int fd, off_t off)
  * rewrites it.
  */
 _Static_assert(WAL_SEG_HDR % WAL_BLK == 0, "a header block of its own");
+_Static_assert(WAL_WA_SEG_BITS + WAL_WA_OFF_BITS == 64, "wa is 64 bits");
+_Static_assert(WAL_WA_SEG_BITS <= 32, "a segment number is a uint32_t");
+_Static_assert(WAL_SEG_BYTES_MAX % WAL_BLK == 0 &&
+    WAL_SEG_BYTES_MAX + WAL_BLK - 1u <= WAL_WA_OFF_MASK,
+    "a segment rounded up to WAL_BLK fits the offset field");
 #define WAL_SEG_MAGIC "SXWALSEG"
 #define WAL_SEG_VER   1u
 #define WAL_SEG_HLEN  36u
@@ -1068,17 +1076,18 @@ static int
 wal_seg_walk(struct wal_walk *k, uint32_t first, uint32_t hi)
 {
 	char p[1200];
-	uint32_t s;
+	uint64_t s;                      /* hi may be WAL_WA_MAX_SEG */
 	int fd, rc = XTC_OK;
 
 	k->last = UINT64_MAX;
 	k->end = (off_t)WAL_SEG_HDR;
 	k->stopped = k->nohdr = 0;
 	for (s = first; s <= hi && rc == XTC_OK && !k->stopped; s++) {
-		wal_seg_path(k->dir, s, p, sizeof p);
+		wal_seg_path(k->dir, (uint32_t)s, p, sizeof p);
 		if ((fd = open(p, O_RDONLY)) < 0)
-			return wal_walk_bad(k->dir, s, "missing from the chain");
-		rc = wal_walk_seg(k, fd, s, s == hi);
+			return wal_walk_bad(k->dir, (uint32_t)s,
+			    "missing from the chain");
+		rc = wal_walk_seg(k, fd, (uint32_t)s, s == hi);
 		close(fd);
 	}
 	if (k->last == UINT64_MAX)
@@ -1107,11 +1116,13 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 	struct wal_walk k;
 	struct wal_seg_hdr h;
 	char p[1200];
-	uint32_t lo, hi, s;
+	uint32_t lo, hi;
+	uint64_t s;
 	int rc;
 
-	if (opts->segment_bytes < 2u * WAL_SEG_HDR)
-		return XTC_E_INVAL;
+	if (opts->segment_bytes < 2u * WAL_SEG_HDR ||
+	    opts->segment_bytes > WAL_SEG_BYTES_MAX)
+		return XTC_E_INVAL;          /* must fit the offset field */
 	if ((w->dir = strdup(opts->path)) == NULL)
 		return XTC_E_NOMEM;
 	if (mkdir(w->dir, 0700) != 0 && errno != EEXIST)
@@ -1120,7 +1131,7 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 	wal_seg_list(w->dir, &lo, &hi);
 	if (!opts->append && hi != 0) {
 		for (s = lo; s <= hi; s++) {
-			wal_seg_path(w->dir, s, p, sizeof p);
+			wal_seg_path(w->dir, (uint32_t)s, p, sizeof p);
 			(void)unlink(p);
 		}
 		lo = hi = 0;
@@ -1862,7 +1873,7 @@ wal_roll_if(wal_t *w, uint64_t need, int force)
 		j.del_upto = rel < j.seg ? rel : j.seg;
 		j.fd = -1;
 		/* A full offload queue did not run the job: wait and retry. */
-		while ((rc = j.seg > WAL_WA_MAX_SEG ? XTC_E_RESOURCE :
+		while ((rc = w->seg == WAL_WA_MAX_SEG ? XTC_E_RESOURCE :
 		    xtc_blocking_run(wal_roll_io, &j, &res)) == XTC_E_AGAIN)
 			wal_nap();
 		if (rc != XTC_OK || res != 0) {
@@ -2101,6 +2112,11 @@ wal_commit_any(wal_t *w, const void *record, uint32_t len, uint64_t *lsn,
 	int rc;
 
 	if (w == NULL || (record == NULL && len != 0))
+		return XTC_E_INVAL;
+	/* In a segmented log every byte of the body must have an address:
+	 * a record alone in its segment starts after the header. */
+	if (w->seg_bytes != 0 &&
+	    (uint64_t)WAL_SEG_HDR + WAL_REC_HDR + len > WAL_WA_OFF_MASK + 1u)
 		return XTC_E_INVAL;
 	/*
 	 * A kill (xtc_exit_pid, a linked exit) raised at a park point below

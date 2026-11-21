@@ -255,7 +255,7 @@ uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
  * group commit and fail-stop are those of the one-file log.  A WAL
  * address names a frame's body in a segment:
  *
- *     wa = seg (24 bits) | byte offset in the segment (40 bits)
+ *     wa = seg (32 bits) | byte offset in the segment (32 bits)
  *
  * so wa 0 is "none", and wa order is log order.  A record's sub-record
  * at byte k of the body the committer built is at wa + k.  The first
@@ -272,21 +272,25 @@ uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
  * rises.  wal_checkpoint, the online checkpoint and wal_truncate refuse
  * a segmented log (XTC_E_INVAL): it is bounded by deletion instead.
  *
- * Lifetime: 24 bits of segment number at 64 MiB a segment is 1 PiB of
- * log, about 13 days at a sustained 1 GB/s of WAL, or a year at
- * 32 MB/s; past segment 2^24 - 1 a roll fail-stops the log.  The split
- * is STORAGE_DESIGN 6.2's choice (40 offset bits cap one segment at
- * 1 TiB); a store that outruns it needs a format with wider addresses.
+ * Limits: 2^32 - 1 segments of 64 MiB is 256 EiB of log, far beyond any
+ * store's life.  The 32-bit offset caps segment_bytes at
+ * WAL_SEG_BYTES_MAX (wal_open refuses more, XTC_E_INVAL), and a record
+ * whose body would run past offset 2^32 - 1 is refused (XTC_E_INVAL),
+ * so every sub-record address wa + k stays inside its segment's field.
  */
 #define WAL_SEG_HDR     4096u
-#define WAL_WA_SEG_BITS 24
-#define WAL_WA_OFF_BITS 40
-#define WAL_WA_MAX_SEG  ((1u << WAL_WA_SEG_BITS) - 1u)
+#define WAL_WA_SEG_BITS 32
+#define WAL_WA_OFF_BITS 32
+#define WAL_WA_MAX_SEG  0xFFFFFFFFu
+#define WAL_WA_OFF_MASK ((1ull << WAL_WA_OFF_BITS) - 1u)
 #define WAL_WA(seg, off) \
 	(((uint64_t)(seg) << WAL_WA_OFF_BITS) | \
-	 ((uint64_t)(off) & ((1ull << WAL_WA_OFF_BITS) - 1u)))
+	 ((uint64_t)(off) & WAL_WA_OFF_MASK))
 #define WAL_WA_SEG(wa)   ((uint32_t)((wa) >> WAL_WA_OFF_BITS))
-#define WAL_WA_OFF(wa)   ((wa) & ((1ull << WAL_WA_OFF_BITS) - 1u))
+#define WAL_WA_OFF(wa)   ((wa) & WAL_WA_OFF_MASK)
+/* The largest segment_bytes: rounded up to the 4 KiB direct-I/O block,
+ * a segment's every offset still fits the offset field. */
+#define WAL_SEG_BYTES_MAX (WAL_WA_OFF_MASK + 1u - 4096u)
 
 /* wal_commit that also returns the WAL address of the record's body in
  * *wa (0 for a one-file log).  The address is assigned with the LSN. */

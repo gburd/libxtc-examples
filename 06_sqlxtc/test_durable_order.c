@@ -196,7 +196,7 @@ file_num(const char *path, const char *fmt)
 static void
 check_seg_unlink(const char *path)
 {
-	unsigned k = file_num(path, "wal-%8u.lo%c"), n, best = 0;
+	unsigned k = file_num(path, "wal-%10u.lo%c"), n, best = 0;
 	char d[300], newer[320], magic[8];
 	DIR *dp;
 	struct dirent *e;
@@ -209,7 +209,7 @@ check_seg_unlink(const char *path)
 	if ((dp = opendir(d)) == NULL)
 		return;
 	while ((e = readdir(dp)) != NULL)
-		if ((n = file_num(e->d_name, "wal-%8u.lo%c")) > best)
+		if ((n = file_num(e->d_name, "wal-%10u.lo%c")) > best)
 			best = n;
 	closedir(dp);
 	if (best <= k) {
