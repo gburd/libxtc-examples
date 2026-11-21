@@ -181,6 +181,7 @@ clean:
 	rm -f test_btree_mt
 	rm -f test_btree_stale_descent test_btree_limits test_btree_sample bench_morsel_balance bench_point_iscan
 	rm -f test_btree_seek test_btree_seek_latched test_point_read test_index_walk test_group_exact test_xs_ctr
+	rm -f $(LATCHED_TESTS:=_latched)
 	rm -f test_xs_ctr test_bm_reuse_version test_kill_stmt test_cat_lock_shared test_conn_sup test_storage_sup
 	rm -f test_sql_results test_txn_fastpath test_wal_crc_once
 	rm -f test_btree_cursor_hop test_btree_smo_stress test_btree_bounded_descent test_btree_inner test_btree_shift test_page_bytes
@@ -1253,6 +1254,19 @@ test_uniq_long: test_uniq_long.c engine.o db.o quack.o metrics.o xstore.o xlog.o
 
 test-uniq-long: test_uniq_long
 	TMPDIR=$${TMPDIR:-/tmp} ./test_uniq_long
+
+# The engine's index and point-read tests once more without the
+# optimistic B-tree reads (-DBT_OLC_ENABLED=0, the path every TSan build
+# takes): every read the batches leave undecided goes through the
+# latched bt_seek_ge and cursor fallbacks.
+test: test-latched
+LATCHED_TESTS = test_point_read test_index_walk test_index test_uniq_long
+$(LATCHED_TESTS:=_latched): %_latched: %.c $(ENGINE_NATIVE)
+	$(CC) $(CFLAGS) -DBT_OLC_ENABLED=0 -o $@ $< $(ENGINE_NATIVE) $(LDFLAGS)
+
+test-latched: $(LATCHED_TESTS:=_latched)
+	for t in $(LATCHED_TESTS:=_latched); do \
+	    TMPDIR=$${TMPDIR:-/tmp} ./$$t || exit 1; done
 
 # A frame reused for a new page (bm_alloc_pid) changes its version, so a
 # pin-free optimistic reader that sampled it before cannot validate.

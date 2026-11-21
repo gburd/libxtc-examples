@@ -101,6 +101,7 @@ test_btree_delete_merge
 test_btree_limits
 test_btree_seek
 test_btree_seek_latched
+*_latched
 test_point_read
 test_index_walk
 test_group_exact
