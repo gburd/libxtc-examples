@@ -13,14 +13,15 @@
  *	tombstone.  The next CREATE then took the dropped id and read the
  *	dropped table's rows as its own.
  *
- *	Five cases, each on a fresh store: a clean close and reopen; a
+ *	Six cases, each on a fresh store: a clean close and reopen; a
  *	crash after a log compaction (the rebuild replays the dump); a
  *	crash with the whole log (the rebuild replays the DROP itself);
  *	and a store that already lost a dropped table's tombstone while
  *	its rows stayed (what an older release leaves), whose next CREATE
  *	must still get a fresh id; and a tombstone written without the
  *	high-water row (a DROP by an older release), which neither a crash
- *	rebuild nor GC may forget.  The first three also check that the
+ *	rebuild nor GC may forget; and a scan of a transaction that began
+ *	before the DROP, which GC must leave whole.  The first three also check that the
  *	dropped table's rows are gone once the store has closed cleanly.
  *	Off a loop.
  */
@@ -248,6 +249,58 @@ unmarked_case(void)
 	unlink_store(path);
 }
 
+/*
+ * The reclaim must not take rows a live snapshot still reads: a
+ * transaction scans b, another connection drops b and runs GC, and the
+ * scan must still see every row.  Once the transaction ends, GC takes
+ * them.
+ */
+static void
+snapshot_case(void)
+{
+	char path[256], sql[64];
+	sx_db *h = NULL, *h2 = NULL;
+	xstore_scan_t *s = NULL;
+	const uint8_t *rec;
+	int64_t rid;
+	uint32_t tb;
+	int fd, i, n = 0, rl;
+
+	t_tmpl(path, sizeof path, "sqlxtc-dropid");
+	if ((fd = mkstemp(path)) < 0) { CK(0); return; }
+	close(fd);
+	CK(sx_storage_open(path, 256) == SX_OK);
+	CK(sx_open(":memory:", &h) == SX_OK);
+	CK(sx_open(":memory:", &h2) == SX_OK);
+	CK(sx_exec(h, "CREATE TABLE b(k INTEGER PRIMARY KEY, v TEXT)", NULL) == SX_OK);
+	for (i = 1; i <= 200; i++) {
+		snprintf(sql, sizeof sql, "INSERT INTO b VALUES(%d, 'row')", i);
+		CK(sx_exec(h, sql, NULL) == SX_OK);
+	}
+	tb = table_id("b");
+	CK(sx_exec(h, "BEGIN", NULL) == SX_OK);
+	s = xstore_scan_open_txn(h, "b", 0, 0, 0, 0, 0);
+	CK(s != NULL);
+	if (s == NULL) return;
+	while (n < 10 && xstore_scan_next(s, &rid, &rec, &rl) == 1)
+		n++;
+	CK(sx_exec(h2, "DROP TABLE b", NULL) == SX_OK);
+	CK(xstore_gc_run(h2) >= 0);
+	while (xstore_scan_next(s, &rid, &rec, &rl) == 1)
+		n++;
+	printf("  %-24s a scan open across DROP and GC read %d of 200 rows\n",
+	    "snapshot held", n);
+	CK(n == 200);
+	xstore_scan_close(s);
+	CK(sx_exec(h, "COMMIT", NULL) == SX_OK);
+	CK(xstore_gc_run(h2) >= 0);
+	CK(xstore_max_rowid(sx_storage_bt(), tb) == 0);
+	sx_close(h);
+	sx_close(h2);
+	CK(sx_storage_close() == SX_OK);
+	unlink_store(path);
+}
+
 int
 main(void)
 {
@@ -257,6 +310,7 @@ main(void)
 	drop_case(REOPEN_CRASH_LOG);
 	orphan_case();
 	unmarked_case();
+	snapshot_case();
 	if (g_fail) { fprintf(stderr, "FAIL: test_drop_id\n"); return 1; }
 	printf("  ok   a dropped table's or index's id is never reused\n");
 	return 0;
