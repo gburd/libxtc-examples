@@ -7,10 +7,12 @@
  * examples/06_sqlxtc/test_durable_order.c
  *	The row log's fsync ordering, checked at every point where a crash
  *	would expose it.  The test interposes open, close, pwrite, pwritev,
- *	fsync, fdatasync, rename and unlink, and models what a crash keeps:
- *	a file's bytes are durable after an fsync or fdatasync of it (or at
- *	once on an O_DSYNC descriptor), and a created or renamed name after
- *	an fsync of its directory.  Then it checks:
+ *	ftruncate, fsync, fdatasync, rename and unlink, and models what a
+ *	crash keeps: a file's bytes are durable after an fsync or fdatasync
+ *	of it (or at once on an O_DSYNC descriptor), a created or renamed
+ *	name after an fsync of its directory, and a truncate that cut
+ *	nonzero bytes only after an fsync or fdatasync of the file (a write
+ *	elsewhere in it does not count).  Then it checks:
  *
  *	  install    when MANIFEST.tmp is renamed over MANIFEST, the tmp
  *	             file's bytes are durable, and every run file in the
@@ -21,11 +23,17 @@
  *	             with a durable name and a durable header (the LSN
  *	             survives: STORAGE_DESIGN 6.2, review B1);
  *	  commit     when wal_commit_wa returns, the segment holding the
- *	             record is durable with a durable name.
+ *	             record is durable with a durable name;
+ *	  older      when a segment is created, no older segment has a
+ *	             truncated torn tail that a crash could bring back (an
+ *	             older segment must be clean to its end, or the chain
+ *	             walk refuses the log: REREVIEW-sbf SF2).
  *
  *	The workload commits across many segment rolls, flushes the
  *	nursery into runs, releases the WAL below each flush boundary and
- *	reopens both.  It runs off a loop, where xtc_aio and
+ *	reopens both; then it tears the newest segment's tail, reopens the
+ *	log and rolls it at once (the reviewer's p_torn_roll).  It runs off
+ *	a loop, where xtc_aio and
  *	xtc_blocking_run run inline, so every operation is seen in order.
  */
 
@@ -63,6 +71,7 @@ struct tpath {
 	int  used;
 	int  dirty;                  /* bytes written since its last sync */
 	int  name_pending;           /* created/renamed, dir not synced */
+	int  cut_pending;            /* truncated nonzero bytes, not synced */
 };
 
 struct tfd {
@@ -85,6 +94,7 @@ static int (*r_fsync)(int);
 static int (*r_fdatasync)(int);
 static int (*r_rename)(const char *, const char *);
 static int (*r_unlink)(const char *);
+static int (*r_ftruncate)(int, off_t);
 
 /* The next definition of `name` (dlsym returns an object pointer; ISO C
  * has no cast from it to a function pointer, so copy the bits). */
@@ -109,6 +119,7 @@ init_syms(void)
 	next_sym("fdatasync", &r_fdatasync, sizeof r_fdatasync);
 	next_sym("rename", &r_rename, sizeof r_rename);
 	next_sym("unlink", &r_unlink, sizeof r_unlink);
+	next_sym("ftruncate", &r_ftruncate, sizeof r_ftruncate);
 }
 
 static int
@@ -229,6 +240,31 @@ check_seg_unlink(const char *path)
 	}
 }
 
+/* The older-segment check (see the header) before segment `path` is
+ * created. */
+static void
+check_seg_create(const char *path)
+{
+	unsigned k = file_num(path, "wal-%10u.lo%c"), n;
+	char d[300], pd[300];
+	int i;
+
+	if (k == 0)
+		return;
+	dir_of(path, d, sizeof d);
+	for (i = 0; i < NPATH; i++) {
+		if (!g_p[i].used || !g_p[i].cut_pending ||
+		    (n = file_num(g_p[i].path, "wal-%10u.lo%c")) == 0 ||
+		    n >= k)
+			continue;
+		dir_of(g_p[i].path, pd, sizeof pd);
+		if (strcmp(pd, d) == 0)
+			violation("segment becomes an older one while the "
+			    "truncate of its torn tail is not durable",
+			    g_p[i].path);
+	}
+}
+
 /* The install check (see the header) before rename(tmp, MANIFEST). */
 static void
 check_install(const char *from)
@@ -271,6 +307,8 @@ open(const char *path, int flags, ...)
 		va_end(ap);
 	}
 	existed = stat(path, &sb) == 0;
+	if (g_on && !existed && (flags & O_CREAT) && in_dir(path))
+		check_seg_create(path);
 	fd = r_open(path, flags, mode);
 	if (fd < 0 || fd >= NFD || !g_on || !in_dir(path))
 		return fd;
@@ -349,6 +387,7 @@ synced(int fd)
 		return;
 	if (g_fd[fd].pi >= 0) {
 		g_p[g_fd[fd].pi].dirty = 0;
+		g_p[g_fd[fd].pi].cut_pending = 0;
 		return;
 	}
 	if (!g_fd[fd].isdir)
@@ -380,9 +419,38 @@ fdatasync(int fd)
 
 	init_syms();
 	if ((rc = r_fdatasync(fd)) == 0 && fd >= 0 && fd < NFD &&
-	    g_fd[fd].pi >= 0)
+	    g_fd[fd].pi >= 0) {
 		g_p[g_fd[fd].pi].dirty = 0;
+		g_p[g_fd[fd].pi].cut_pending = 0;
+	}
 	return rc;
+}
+
+/* A truncate that cuts nonzero bytes: they come back in a crash until
+ * the file is synced. */
+int
+ftruncate(int fd, off_t len)
+{
+	struct stat sb;
+	char b[4096];
+	off_t at;
+	ssize_t n, i;
+	int cut = 0;
+
+	init_syms();
+	if (g_on && fd >= 0 && fd < NFD && g_fd[fd].pi >= 0 &&
+	    fstat(fd, &sb) == 0)
+		for (at = len; !cut && at < sb.st_size; at += n) {
+			if ((n = pread(fd, b, sizeof b, at)) <= 0)
+				break;
+			for (i = 0; i < n; i++)
+				cut |= b[i] != 0;
+		}
+	if (r_ftruncate(fd, len) != 0)
+		return -1;
+	if (cut)
+		g_p[g_fd[fd].pi].cut_pending = 1;
+	return 0;
 }
 
 int
@@ -496,6 +564,43 @@ run_rounds(manifest_t *m, keydir_t *kd, uint32_t *next)
 	}
 }
 
+/* Tear the newest segment's tail, reopen the log (which truncates the
+ * torn frame) and roll at once, before any commit: the truncated
+ * segment becomes an older one.  The torn frame spans blocks, so bytes
+ * past the end block (which the direct-I/O probe rewrites) remain for
+ * the truncate alone to remove.  The roll must find them gone for good;
+ * the reopen after it must accept the log. */
+static void
+torn_roll(void)
+{
+	uint64_t lsn = 0, wa = 0, at;
+	uint32_t i;
+	char p[300];
+	int fd;
+
+	g_wal = open_wal(1);
+	if (g_wal == NULL)
+		return;
+	for (i = 0; i < 10; i++)
+		CK(wal_commit_wa(g_wal, "abcdefgh", 8, &lsn, &wa) == XTC_OK);
+	wal_close(g_wal);
+	at = WAL_WA_OFF(wa) + 8u + 8u;         /* past the body and trailer */
+	snprintf(p, sizeof p, "%s/wal/wal-%08u.log", g_dir, WAL_WA_SEG(wa));
+	fd = r_open(p, O_RDWR);
+	CK(fd >= 0 &&
+	    pwrite(fd, "\x0b\0\0\0\0\0\0\0\x40\x9c\0\0torn", 16,
+	    (off_t)at) == 16 &&
+	    pwrite(fd, "body-of-torn-frame", 18, (off_t)at + 9000) == 18 &&
+	    fsync(fd) == 0);
+	if (fd >= 0)
+		r_close(fd);
+	g_wal = open_wal(1);
+	CK(g_wal != NULL && wal_roll(g_wal) == XTC_OK);
+	wal_close(g_wal);
+	g_wal = open_wal(1);
+	wal_close(g_wal);
+}
+
 /* Remove every file under dir (one level of subdirectory), then dir. */
 static void
 cleanup(const char *dir)
@@ -562,6 +667,7 @@ main(void)
 	mf_close(m);
 	kd_destroy(kd);
 	wal_close(g_wal);
+	torn_roll();
 	bm_destroy(bm);
 	g_on = 0;
 	CK(g_bad == 0);

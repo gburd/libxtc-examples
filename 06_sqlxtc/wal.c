@@ -1124,6 +1124,7 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 {
 	struct wal_walk k;
 	struct wal_seg_hdr h;
+	struct stat sb;
 	char p[1200];
 	uint32_t lo, hi;
 	uint64_t s;
@@ -1180,9 +1181,15 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 	/* k.last is at least the newest header's first LSN - 1 (the walk
 	 * starts each segment from its header). */
 	*maxlsn = k.last;
-	if (ftruncate(w->fd, k.end) != 0) {
-		/* non-fatal: appends overwrite the torn tail */
-	}
+	/* Drop a torn tail (or the zero fill past the end), durably: once a
+	 * roll makes this an older segment, the chain walk requires it to
+	 * be zeros past its last frame, and a truncate that a power cut
+	 * loses brings torn bytes back (REREVIEW-sbf SF2).  An O_DSYNC fd
+	 * does not cover a truncate.  One fdatasync per open; a failure
+	 * refuses the open, as the walk would after the next roll. */
+	if (fstat(w->fd, &sb) == 0 && sb.st_size > (off_t)k.end &&
+	    (ftruncate(w->fd, k.end) != 0 || fdatasync(w->fd) != 0))
+		return XTC_E_IO;
 	*o = (off_t)(h.base + (uint64_t)k.end);
 	return XTC_OK;
 }
