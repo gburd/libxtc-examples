@@ -396,7 +396,7 @@ t_retry(void)
 	keydir_t *kd = NULL;
 	bm_t *bm;
 	uint32_t i, n0, bad = 0;
-	uint64_t b0;
+	uint64_t b0, b1;
 
 	bm = open_bm();
 	CK(kd_create(4096, &kd) == XTC_OK);
@@ -410,7 +410,10 @@ t_retry(void)
 	g_fail_row = 50;
 	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_E_IO);
 	CK(mf_nruns(m) == n0 && mf_boundary(m) == b0 && kd_has_frozen(kd));
-	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_E_AGAIN);
+	/* Back-pressure reads no boundary and keeps the frozen delta's. */
+	b1 = m->frz_boundary;
+	CK(mf_flush(m, row_of, NULL, low_boundary, NULL) == XTC_E_AGAIN);
+	CK(m->frz_boundary == b1);
 	t_install_fail(m, kd, n0, b0);
 	t_low_boundary(m, kd, n0, b0);
 	CK(mf_flush_frozen(m, row_of, NULL) == XTC_OK);
