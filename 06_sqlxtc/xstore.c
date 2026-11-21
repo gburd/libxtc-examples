@@ -8665,12 +8665,15 @@ struct xs_ika {
 };
 
 /* Record the scan's first error (sticky: every later call fails too)
- * and return -1. */
+ * and return -1.  The cursor, if any, is parked: a failed scan holds no
+ * latch until it is closed. */
 static int
 xs_iscan_fail(xstore_iscan_t *s, int rc)
 {
 	if (s->err == 0)
 		s->err = rc;
+	if (s->cur != NULL)
+		(void)bt_cursor_park(s->cur);
 	return -1;
 }
 
@@ -8717,15 +8720,73 @@ xs_iscan_point(xstore_iscan_t *s)
 	return got;
 }
 
+/*
+ * The forward cursor walk: open the scan's cursor (at the equality
+ * probe's last key, or at the range's start) or resume it, and copy up
+ * to kb_want in-range keys into the key batch.  The cursor is parked on
+ * return, on success and on error alike, so no latch is held between
+ * batches.  Returns the count, or -1 on an error (s->err).
+ */
+static int
+xs_iscan_fwd(xstore_iscan_t *s)
+{
+	const void *k = NULL, *vv = NULL;
+	uint16_t kl = 0, vl = 0;
+	uint32_t used = 0;
+	int w, n = 0, rc;
+
+	/* Open or resume the cursor. */
+	if (s->cur == NULL && s->poslen > 0) {
+		/* After the equality probe's batch: its last key, if still
+		 * there, is the cursor's first and is skipped. */
+		rc = bt_cursor_open(s->bt, s->pos, (uint16_t)s->poslen, &s->cur);
+	} else if (s->cur == NULL) {
+		const uint8_t *st = s->has_lo ? s->lo : s->pfx;
+		int sl = s->has_lo ? s->lolen : s->pfxlen;
+		rc = bt_cursor_open(s->bt, st, (uint16_t)sl, &s->cur);
+	} else {
+		rc = bt_cursor_resume(s->cur);
+	}
+	if (rc == XTC_OK && xs_rd_fault())
+		rc = XTC_E_IO;
+	if (rc != XTC_OK)
+		return xs_iscan_fail(s, rc);
+	/* Copy the in-range keys, skipping the hand-off key. */
+	while (n < s->kb_want && used <= XS_IKA_BYTES) {
+		rc = bt_cursor_next(s->cur, &k, &kl, &vv, &vl);
+		if (rc == XTC_OK && xs_rd_fault())
+			rc = XTC_E_IO;
+		if (rc == XTC_E_NOTFOUND) {
+			s->kb_end = 1; /* the end of the tree */
+			break;
+		}
+		if (rc != XTC_OK)
+			return xs_iscan_fail(s, rc);
+		if (s->poslen > 0) {
+			int same = kl == s->poslen && memcmp(k, s->pos, kl) == 0;
+			s->poslen = 0;
+			if (same)
+				continue;
+		}
+		w = xs_iscan_where(s, k, kl);
+		if (w == 2) { s->kb_end = 1; break; }
+		if (w == 0) continue;
+		memcpy(s->ka->buf + used, k, kl);
+		s->ka->off[n] = used;
+		s->ka->len[n] = kl;
+		used += kl;
+		n++;
+	}
+	bt_cursor_park(s->cur);
+	return n;
+}
+
 /* Refill the key batch with the next in-range entries in walk order.
  * Returns the count (0: the range is exhausted), or -1 when the batch
  * cannot be allocated or the tree cannot be read (s->err). */
 static int
 xs_iscan_fill(xstore_iscan_t *s)
 {
-	const void *k = NULL, *vv = NULL;
-	uint16_t kl = 0, vl = 0;
-	uint32_t used = 0;
 	int w, n = 0, rc;
 
 	s->kb_n = s->kb_i = 0;
@@ -8751,49 +8812,8 @@ xs_iscan_fill(xstore_iscan_t *s)
 		}
 	}
 	if (!s->reverse) {
-		if (s->cur == NULL && s->poslen > 0) {
-			/* After the equality probe's batch: its last key, if
-			 * still there, is the cursor's first and is skipped. */
-			rc = bt_cursor_open(s->bt, s->pos, (uint16_t)s->poslen,
-			    &s->cur);
-		} else if (s->cur == NULL) {
-			const uint8_t *st = s->has_lo ? s->lo : s->pfx;
-			int sl = s->has_lo ? s->lolen : s->pfxlen;
-			rc = bt_cursor_open(s->bt, st, (uint16_t)sl, &s->cur);
-		} else {
-			rc = bt_cursor_resume(s->cur);
-		}
-		if (rc == XTC_OK && xs_rd_fault())
-			rc = XTC_E_IO;
-		if (rc != XTC_OK)
-			return xs_iscan_fail(s, rc);
-		while (n < s->kb_want && used <= XS_IKA_BYTES) {
-			rc = bt_cursor_next(s->cur, &k, &kl, &vv, &vl);
-			if (rc == XTC_OK && xs_rd_fault())
-				rc = XTC_E_IO;
-			if (rc == XTC_E_NOTFOUND) {
-				s->kb_end = 1; /* the end of the tree */
-				break;
-			}
-			if (rc != XTC_OK)
-				return xs_iscan_fail(s, rc);
-			if (s->poslen > 0) {
-				int same = kl == s->poslen &&
-				    memcmp(k, s->pos, kl) == 0;
-				s->poslen = 0;
-				if (same)
-					continue;
-			}
-			w = xs_iscan_where(s, k, kl);
-			if (w == 2) { s->kb_end = 1; break; }
-			if (w == 0) continue;
-			memcpy(s->ka->buf + used, k, kl);
-			s->ka->off[n] = used;
-			s->ka->len[n] = kl;
-			used += kl;
-			n++;
-		}
-		bt_cursor_park(s->cur);
+		if ((n = xs_iscan_fwd(s)) < 0)
+			return -1;
 	} else {
 		uint8_t bound[XS_IDX_KMAX + 16];
 		int bl, got = 0, j;

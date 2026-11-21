@@ -42,7 +42,8 @@
  *	    failed candidate-row read made the probe say "no duplicate" and
  *	    a failed cursor read ended the scan early.  A failed scan says
  *	    so ("index error: cannot read index r_g on r: I/O error"), not
- *	    "unsupported SQL (native engine)".
+ *	    "unsupported SQL (native engine)", and a failed scan left open
+ *	    holds no latch: a write into its leaf goes through.
  *	(7) The same for a transaction whose buffered rows were spilled to
  *	    the STEAL staging area: the n-th read fails, and the first n of
  *	    them are the staging area's (bringing a spilled payload back).
@@ -439,7 +440,13 @@ t_read_errors(sx_db *h)
 {
 	char *a = longval(699, 1), *b = longval(699, 2);
 	char *wide = longval(2000, 3); /* over bt_max_inline on 4 KiB pages */
-	int n, rc, errs;
+	const uint8_t *rec;
+	char sv[16];
+	xstore_iscan_t *sc;
+	xstore_val_t lo, hi;
+	uint32_t idx = 0;
+	int64_t rid;
+	int n, rc, rl, errs;
 	CK(sx_exec(h,
 	       "CREATE TABLE r(k INTEGER PRIMARY KEY, s TEXT UNIQUE, "
 	       "g INT)",
@@ -447,7 +454,6 @@ t_read_errors(sx_db *h)
 	CK(sx_exec(h, "CREATE INDEX r_g ON r(g)", NULL) == SX_OK);
 	for (n = 1; n <= 300; n++) {
 		sx_stmt *st = NULL;
-		char sv[16];
 		snprintf(sv, sizeof sv, "v%04d", n);
 		CK(sx_prepare(h, "INSERT INTO r VALUES(?, ?, ?)", -1, &st,
 		       NULL) == SX_OK);
@@ -469,6 +475,28 @@ t_read_errors(sx_db *h)
 	CK(sx_exec(h, "INSERT INTO r VALUES(1000, 'w', 1)", NULL) == SX_OK);
 	errs += sweep_count(h, "SELECT count(*) FROM r WHERE g = 1", NULL, 101);
 	CK(sx_exec(h, "ROLLBACK", NULL) == SX_OK);
+	/* A scan that failed, left open, holds no latch: a write into the
+	 * leaf it stopped in goes through (it hung when the failed cursor
+	 * kept the leaf latched). */
+	CK(xstore_index_lookup(sx_storage_bt(), "r", "g", &idx));
+	memset(&lo, 0, sizeof lo);
+	lo.cls = XSTORE_C_INT;
+	hi = lo;
+	hi.i = 2;
+	for (n = 1; n <= 3; n++) {
+		sc = xstore_iscan_open((struct xsql *)h, "r", idx, NULL, 0, &lo,
+		    0, &hi, 0, 0);
+		CK(sc != NULL);
+		xstore_index_read_fail_at(n);
+		while ((rc = xstore_iscan_next(sc, &rid, &rec, &rl)) == 1)
+			;
+		CK(rc < 0);
+		snprintf(sv, sizeof sv, "latch%d", n);
+		CK(ins_tab(h, "r", 3000 + n, sv) == SX_DONE);
+		xstore_iscan_close(sc);
+	}
+	xstore_index_read_fail_at(0);
+	CK(sx_exec(h, "DELETE FROM r WHERE k >= 3000", NULL) == SX_OK);
 	/* Rows too wide for a leaf: their values are out of line, which the
 	 * batched row read never settles, so every row is read by the point
 	 * read the batch falls back to (xs_point_get). */
