@@ -253,7 +253,12 @@ uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
  *     wa = seg (24 bits) | byte offset in the segment (40 bits)
  *
  * so wa 0 is "none", and wa order is log order.  A record's sub-record
- * at byte k of the body the committer built is at wa + k.
+ * at byte k of the body the committer built is at wa + k.  The first
+ * WAL_SEG_HDR bytes of a segment are its header (the segment number,
+ * the first LSN it issues and its log position, under a CRC32C),
+ * durable before the segment takes a frame, so the first frame's body
+ * is at offset WAL_SEG_HDR + 12 and the LSN keeps rising even when
+ * retention has deleted every segment that held a frame.
  *
  * Retention: wal_set_release(w, wa) says every frame below wa is no
  * longer needed (the caller owns the rule: STORAGE_DESIGN 6.4); a
@@ -262,6 +267,7 @@ uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
  * rises.  wal_checkpoint, the online checkpoint and wal_truncate refuse
  * a segmented log (XTC_E_INVAL): it is bounded by deletion instead.
  */
+#define WAL_SEG_HDR     4096u
 #define WAL_WA_SEG_BITS 24
 #define WAL_WA_OFF_BITS 40
 #define WAL_WA_MAX_SEG  ((1u << WAL_WA_SEG_BITS) - 1u)

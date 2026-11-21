@@ -595,11 +595,10 @@ wal_foff(const wal_t *w, uint64_t pos)
  * COMPLETE record (a torn tail is excluded), *maxlsn_out := highest LSN
  * seen.  Used to resume appending to an existing log. */
 static void
-wal_scan_tail(int fd, off_t *off_out, uint64_t *maxlsn_out)
+wal_scan_tail_from(int fd, off_t o, off_t *off_out, uint64_t *maxlsn_out)
 {
 	struct wal_rd r;
 	const uint8_t *body;
-	off_t o = 0;
 	uint64_t maxlsn = 0, lsn;
 	uint32_t len;
 	wal_rd_init(&r, fd, 1);
@@ -610,6 +609,12 @@ wal_scan_tail(int fd, off_t *off_out, uint64_t *maxlsn_out)
 	free(r.buf);
 	*off_out = o;
 	*maxlsn_out = maxlsn;
+}
+
+static void
+wal_scan_tail(int fd, off_t *off_out, uint64_t *maxlsn_out)
+{
+	wal_scan_tail_from(fd, 0, off_out, maxlsn_out);
 }
 
 /*
@@ -815,11 +820,82 @@ wal_zero_from(int fd, off_t off)
 	}
 }
 
+/*
+ * The segment header (STORAGE_DESIGN 6.2): the first WAL_SEG_HDR bytes of
+ * every segment file, written and made durable, with the directory entry,
+ * before the segment takes a frame:
+ *
+ *     magic "SXWALSEG" (8) | version (4) | segment number (4) |
+ *     first LSN (8) | seg_base (8) | CRC32C of the 32 bytes before (4)
+ *
+ * and zeros to WAL_SEG_HDR.  The first LSN is the one the segment's first
+ * frame will carry, so the LSN survives a retention that deleted every
+ * segment holding a frame: the open resumes from max(the highest LSN it
+ * scans, first LSN - 1).  seg_base is the log position of the segment's
+ * byte 0.  The header has a block to itself, so a direct-I/O flush never
+ * rewrites it.
+ */
+_Static_assert(WAL_SEG_HDR % WAL_BLK == 0, "a header block of its own");
+#define WAL_SEG_MAGIC "SXWALSEG"
+#define WAL_SEG_VER   1u
+#define WAL_SEG_HLEN  36u
+
+struct wal_seg_hdr {
+	uint32_t seg;
+	uint64_t first_lsn;
+	uint64_t base;
+};
+
+/* Write segment header h to fd and make it durable.  0 or -1. */
+static int
+wal_seg_hdr_write(int fd, const struct wal_seg_hdr *h)
+{
+	static const uint8_t zeros[WAL_SEG_HDR];
+	uint8_t b[WAL_SEG_HLEN];
+	uint32_t v = WAL_SEG_VER, crc;
+
+	memcpy(b, WAL_SEG_MAGIC, 8);
+	memcpy(b + 8, &v, 4);
+	memcpy(b + 12, &h->seg, 4);
+	memcpy(b + 16, &h->first_lsn, 8);
+	memcpy(b + 24, &h->base, 8);
+	crc = wal_crc32c(0, b, 32);
+	memcpy(b + 32, &crc, 4);
+	if (pwrite(fd, zeros, sizeof zeros, 0) != (ssize_t)sizeof zeros ||
+	    pwrite(fd, b, sizeof b, 0) != (ssize_t)sizeof b ||
+	    fdatasync(fd) != 0)
+		return -1;
+	return 0;
+}
+
+/* Read and check the header of segment `seg` from fd: 1 with *h if it is
+ * intact and names that segment, 0 otherwise. */
+static int
+wal_seg_hdr_read(int fd, uint32_t seg, struct wal_seg_hdr *h)
+{
+	uint8_t b[WAL_SEG_HLEN];
+	uint32_t v, crc;
+
+	if (pread(fd, b, sizeof b, 0) != (ssize_t)sizeof b ||
+	    memcmp(b, WAL_SEG_MAGIC, 8) != 0)
+		return 0;
+	memcpy(&v, b + 8, 4);
+	memcpy(&h->seg, b + 12, 4);
+	memcpy(&h->first_lsn, b + 16, 8);
+	memcpy(&h->base, b + 24, 8);
+	memcpy(&crc, b + 32, 4);
+	return v == WAL_SEG_VER && crc == wal_crc32c(0, b, 32) &&
+	    h->seg == seg && h->first_lsn != 0 &&
+	    (h->base & (WAL_BLK - 1)) == 0;
+}
+
 /* The work of a roll that blocks the OS thread (open, unlink, directory
  * fsync), run under xtc_blocking_run so a fiber parks instead. */
 struct wal_roll_job {
 	wal_t   *w;
 	uint32_t seg;            /* the new segment */
+	uint64_t first_lsn;      /* its header */
+	uint64_t base;
 	uint32_t del_upto;       /* unlink segments [w->seg_lo, del_upto) */
 	int      fd;             /* out: the new segment's fd, or -1 */
 	int      dsync;          /* out */
@@ -829,6 +905,7 @@ static int
 wal_roll_io(void *arg)
 {
 	struct wal_roll_job *j = arg;
+	struct wal_seg_hdr h;
 	char p[1200];
 	uint32_t k;
 
@@ -836,29 +913,69 @@ wal_roll_io(void *arg)
 	j->fd = wal_open_fd(p, O_RDWR | O_CREAT | O_TRUNC, &j->dsync);
 	if (j->fd < 0)
 		return -1;
+	/* The new segment's header and its name are durable before an old
+	 * segment goes: a crash in between leaves the old segments, and an
+	 * empty new one whose header carries the next LSN. */
+	h.seg = j->seg;
+	h.first_lsn = j->first_lsn;
+	h.base = j->base;
+	if (wal_seg_hdr_write(j->fd, &h) != 0)
+		return -1;
+	wal_sync_dir(p);
 	/* Oldest first, so what is left is always one contiguous range. */
 	for (k = j->w->seg_lo; k < j->del_upto; k++) {
 		wal_seg_path(j->w->dir, k, p, sizeof p);
 		(void)unlink(p);
 	}
-	/* The new segment's name must be durable before a commit in it is
-	 * acknowledged. */
-	wal_sync_dir(p);
+	if (j->del_upto > j->w->seg_lo)
+		wal_sync_dir(p);
 	return 0;
 }
 
-/* Open the segment log for wal_open: create the directory, then either
+/* Create segment `seg` of w's log with header (seg, first_lsn, base),
+ * durable with its name, and make it w's current segment.  0 or -1. */
+static int
+wal_seg_create(wal_t *w, uint32_t seg, uint64_t first_lsn, uint64_t base)
+{
+	struct wal_seg_hdr h;
+	char p[1200];
+
+	wal_seg_path(w->dir, seg, p, sizeof p);
+	w->fd = wal_open_fd(p, O_RDWR | O_CREAT | O_TRUNC, &w->dsync);
+	if (w->fd < 0)
+		return -1;
+	h.seg = seg;
+	h.first_lsn = first_lsn;
+	h.base = base;
+	if (wal_seg_hdr_write(w->fd, &h) != 0)
+		return -1;
+	wal_sync_dir(p);
+	w->seg = w->seg_lo = seg;
+	w->seg_base = base;
+	return 0;
+}
+
+/*
+ * Open the segment log for wal_open: create the directory, then either
  * start segment 1 (no segment, or not append: an existing log is
  * removed) or append to the newest segment after its last complete
- * frame.  Sets w->fd, seg, seg_lo; *o and *maxlsn as the one-file open
- * does.  The positions start at 0 in the current segment. */
+ * frame.  Sets w->fd, seg, seg_lo and seg_base; *o is the log position
+ * of the append point and *maxlsn the last LSN issued: the highest one
+ * on disk, or the newest header's first LSN - 1 when no frame is left
+ * (retention deleted every segment that held one).  A newest segment
+ * with no intact header never took a frame (a roll writes the header
+ * first): a crash in that roll left it, and it is removed.
+ */
 static int
 wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 {
+	struct wal_seg_hdr h;
 	char p[1200];
 	uint32_t lo, hi, k;
-	off_t junk;
+	off_t end;
 
+	if (opts->segment_bytes < 2u * WAL_SEG_HDR)
+		return XTC_E_INVAL;
 	if ((w->dir = strdup(opts->path)) == NULL)
 		return XTC_E_NOMEM;
 	if (mkdir(w->dir, 0700) != 0 && errno != EEXIST)
@@ -872,35 +989,46 @@ wal_open_segs(wal_t *w, const wal_opts_t *opts, off_t *o, uint64_t *maxlsn)
 		}
 		lo = hi = 0;
 	}
-	if (hi == 0) {
-		w->seg = w->seg_lo = 1;
-		wal_seg_path(w->dir, 1, p, sizeof p);
-		w->fd = wal_open_fd(p, O_RDWR | O_CREAT | O_TRUNC, &w->dsync);
+	for (;;) {
+		if (hi == 0) {
+			if (wal_seg_create(w, 1, 1, 0) != 0)
+				return XTC_E_INTERNAL;
+			*o = (off_t)WAL_SEG_HDR;
+			*maxlsn = 0;
+			return XTC_OK;
+		}
+		wal_seg_path(w->dir, hi, p, sizeof p);
+		w->fd = wal_open_fd(p, O_RDWR, &w->dsync);
 		if (w->fd < 0)
-			return XTC_E_INTERNAL;
+			return XTC_E_IO;
+		if (wal_seg_hdr_read(w->fd, hi, &h))
+			break;
+		/* No header: a roll's create that crashed.  It must hold
+		 * nothing, and an older segment must carry the LSN on. */
+		if (!wal_zero_from(w->fd, (off_t)WAL_SEG_HDR))
+			return XTC_E_IO;
+		close(w->fd);
+		w->fd = -1;
+		if (hi == 1) {
+			hi = 0;                  /* the first create: start over */
+			continue;
+		}
+		if (hi == lo)
+			return XTC_E_IO;         /* nothing names the next LSN */
+		(void)unlink(p);
 		wal_sync_dir(p);
-		return XTC_OK;
+		hi--;
 	}
 	w->seg = hi;
 	w->seg_lo = lo;
-	wal_seg_path(w->dir, hi, p, sizeof p);
-	w->fd = wal_open_fd(p, O_RDWR | O_CREAT, &w->dsync);
-	if (w->fd < 0)
-		return XTC_E_INTERNAL;
-	wal_scan_tail(w->fd, o, maxlsn);
-	if (ftruncate(w->fd, *o) != 0) {
+	w->seg_base = h.base;
+	wal_scan_tail_from(w->fd, (off_t)WAL_SEG_HDR, &end, maxlsn);
+	if (*maxlsn < h.first_lsn - 1)
+		*maxlsn = h.first_lsn - 1;
+	if (ftruncate(w->fd, end) != 0) {
 		/* non-fatal: appends overwrite the torn tail */
 	}
-	/* A roll that crashed right after creating the newest segment left
-	 * it empty: the highest LSN is in an older one. */
-	for (k = hi; *maxlsn == 0 && k > lo; k--) {
-		int fd;
-		wal_seg_path(w->dir, k - 1, p, sizeof p);
-		if ((fd = open(p, O_RDONLY)) < 0)
-			break;
-		wal_scan_tail(fd, &junk, maxlsn);
-		close(fd);
-	}
+	*o = (off_t)(h.base + (uint64_t)end);
 	return XTC_OK;
 }
 
@@ -1462,19 +1590,18 @@ wal_write_big_dio(wal_t *w, uint64_t start, const uint8_t *hdr,
 static int
 wal_seg_full(const wal_t *w, uint64_t need)
 {
-	return w->seg_bytes != 0 && w->res_pos > w->seg_base &&
+	return w->seg_bytes != 0 && w->res_pos > w->seg_base + WAL_SEG_HDR &&
 	    w->res_pos - w->seg_base + need > w->seg_bytes;
 }
 
 /* Swap the handle onto the segment job->seg opened: everything reserved
  * is durable and this caller holds the direct flag and the leadership,
- * so no frame is in the ring.  The new segment's position 0 is the old
- * end rounded up to WAL_BLK, so a direct-I/O flush stays aligned. */
+ * so no frame is in the ring.  The new segment's position 0 (j->base) is
+ * the old end rounded up to WAL_BLK, so a direct-I/O flush stays
+ * aligned; its first frame starts after the header block. */
 static void
 wal_roll_swap(wal_t *w, const struct wal_roll_job *j)
 {
-	uint64_t base = (w->res_pos + WAL_BLK - 1) & ~(uint64_t)(WAL_BLK - 1);
-
 	wal_lock(&w->res_mu);
 	wal_lock(&w->fl_mu);
 	close(w->fd);
@@ -1483,8 +1610,8 @@ wal_roll_swap(wal_t *w, const struct wal_roll_job *j)
 	w->seg = j->seg;
 	if (j->del_upto > w->seg_lo)
 		w->seg_lo = j->del_upto;
-	w->seg_base = base;
-	wal_reset_marks(w, base, w->next_lsn);
+	w->seg_base = j->base;
+	wal_reset_marks(w, j->base + WAL_SEG_HDR, w->next_lsn);
 	xtc_atomic_fetch_add_u64(&w->gen, 1, xtc_mo_acq_rel);
 	wal_unlock(&w->fl_mu);
 	wal_unlock(&w->res_mu);
@@ -1552,6 +1679,9 @@ wal_roll_if(wal_t *w, uint64_t need, int force)
 		memset(&j, 0, sizeof j);
 		j.w = w;
 		j.seg = w->seg + 1;
+		/* Nothing is reserved meanwhile (the direct flag). */
+		j.first_lsn = w->next_lsn + 1;
+		j.base = (target + WAL_BLK - 1) & ~(uint64_t)(WAL_BLK - 1);
 		rel = WAL_WA_SEG(xtc_atomic_load_u64(&w->release,
 		    xtc_mo_acquire));
 		j.del_upto = rel < j.seg ? rel : j.seg;
@@ -2459,14 +2589,20 @@ wal_scan_seg(int fd, uint32_t seg, uint64_t from_wa, wal_replay_wa_cb cb,
     void *user, int *stop, int *clean)
 {
 	struct wal_rd r;
+	struct wal_seg_hdr h;
 	const uint8_t *body;
 	uint8_t *buf = NULL;
 	size_t cap = 0;
-	off_t off = 0;
+	off_t off = (off_t)WAL_SEG_HDR;
 	uint64_t lsn, wa;
 	uint32_t len;
 	int rc = XTC_OK;
 
+	if (!wal_seg_hdr_read(fd, seg, &h)) {
+		*stop = 1;
+		*clean = 0;
+		return XTC_OK;
+	}
 	wal_rd_init(&r, fd, 1);
 	while (!*stop && wal_rd_frame(&r, off, &lsn, &len, &body)) {
 		wa = WAL_WA(seg, (uint64_t)off + WAL_REC_HDR);

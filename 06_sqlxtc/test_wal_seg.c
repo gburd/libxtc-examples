@@ -18,8 +18,12 @@
  *	             segment is XTC_E_NOTFOUND, from the boundary it works;
  *	  reopen     append resumes LSNs and positions past the last
  *	             complete frame, a torn tail of the newest segment is
- *	             dropped, and an empty newest segment (a roll that
- *	             crashed after its create) still resumes LSNs;
+ *	             dropped, and a newest segment with no header (a roll
+ *	             that crashed after its create) is removed;
+ *	  lsn        the LSN never restarts: not after a release at the log
+ *	             end plus a roll, a reopen and another roll (no segment
+ *	             holds a frame), and not after a crash between a roll's
+ *	             unlink and the new segment's first frame;
  *	  refuse     wal_checkpoint, the online checkpoint and wal_truncate
  *	             refuse a segmented log; a one-file log reports wa 0.
  */
@@ -44,6 +48,7 @@
 #define N_COMMITTERS  8
 #define PER_COMMITTER 200
 #define N_COMMITS     (N_COMMITTERS * PER_COMMITTER)
+#define FIRST_OFF     (WAL_SEG_HDR + 12u)  /* the first frame's body */
 
 static char g_dir[256];
 static wal_t *g_wal;
@@ -239,13 +244,13 @@ t_big_and_release(void)
 	/* A record larger than a segment, and one larger than a quarter of
 	 * the ring (the direct path): each in a segment of its own. */
 	CK(wal_commit_wa(w, big, 100000, &lsn, &wa) == XTC_OK);
-	CK(WAL_WA_OFF(wa) == 12);
+	CK(WAL_WA_OFF(wa) == FIRST_OFF);
 	seg_path(WAL_WA_SEG(wa), p, sizeof p);
 	CK(stat(p, &sb) == 0);
 	CK(wal_commit_wa(w, big, sizeof big, &lsn, &wa) == XTC_OK);
-	CK(WAL_WA_OFF(wa) == 12);
+	CK(WAL_WA_OFF(wa) == FIRST_OFF);
 	CK(wal_commit_wa(w, "after", 5, &lsn, &wa) == XTC_OK);
-	CK(WAL_WA_OFF(wa) == 12);      /* the big one filled its segment */
+	CK(WAL_WA_OFF(wa) == FIRST_OFF);  /* the big one filled its segment */
 	wal_seg_range(w, &lo, &cur);
 	CK(lo == 1);
 	/* Release below record 20's segment: the next roll unlinks only the
@@ -311,7 +316,8 @@ t_reopen(void)
 	wal_close(w);
 	CK(wal_scan_segs(g_dir, 0, scan_cb, &a) == XTC_OK);
 	CK(a.count == 36 && !a.bad);
-	/* An empty newest segment (a roll's create, then a crash). */
+	/* A newest segment with no header (a roll's create, then a crash):
+	 * it never took a frame, so the open removes it. */
 	seg_path(cur + 1, p, sizeof p);
 	CK((fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0600)) >= 0);
 	close(fd);
@@ -319,10 +325,58 @@ t_reopen(void)
 	if (w == NULL)
 		return;
 	CK(wal_commit_wa(w, "fourth", 6, &lsn, &wa) == XTC_OK);
-	CK(lsn == 37 && WAL_WA_SEG(wa) == cur + 1 && WAL_WA_OFF(wa) == 12);
+	CK(lsn == 37 && WAL_WA_SEG(wa) == cur && wa == wa1 + 5 + 8 + 12);
 	wal_close(w);
-	printf("  reopen: append resumes after a torn tail and after an "
-	    "empty newest segment\n");
+	printf("  reopen: append resumes after a torn tail and after a "
+	    "headerless newest segment\n");
+}
+
+/*
+ * The LSN outlives every segment that held a frame (review B1): with
+ * the release at the log end, a roll deletes every segment with a
+ * frame.  Both the clean path (roll, reopen, roll again, reopen) and a
+ * crash right after the roll's unlink (nothing written after it) must
+ * resume past the last LSN issued.
+ */
+static void
+t_lsn(void)
+{
+	uint64_t lsn = 0, wa = 0;
+	uint32_t lo, cur;
+	wal_t *w;
+	int i;
+
+	w = open_log(0);
+	if (w == NULL)
+		return;
+	for (i = 0; i < 10; i++)
+		CK(wal_commit_wa(w, "abcdefgh", 8, &lsn, &wa) == XTC_OK);
+	CK(lsn == 10);
+	wal_set_release(w, wa + 20);
+	CK(wal_roll(w) == XTC_OK);
+	wal_seg_range(w, &lo, &cur);
+	CK(lo == 1 && cur == 2);
+	wal_close(w);
+	w = open_log(1);
+	if (w == NULL)
+		return;
+	/* Release the start of segment 2: the roll deletes segment 1, the
+	 * only one with a frame.  wal_close writes nothing, so this is also
+	 * a crash after the unlink and before segment 3's first frame. */
+	wal_seg_range(w, &lo, &cur);
+	wal_set_release(w, WAL_WA(cur, 0));
+	CK(wal_roll(w) == XTC_OK);
+	wal_seg_range(w, &lo, &cur);
+	CK(lo == 2 && cur == 3);
+	wal_close(w);
+	w = open_log(1);
+	if (w == NULL)
+		return;
+	CK(wal_commit_wa(w, "x", 1, &lsn, &wa) == XTC_OK);
+	CK(lsn == 11 && WAL_WA_SEG(wa) == 3 && WAL_WA_OFF(wa) == FIRST_OFF);
+	wal_close(w);
+	printf("  lsn: no restart after every frame-holding segment is "
+	    "released\n");
 }
 
 static int
@@ -388,6 +442,7 @@ main(void)
 	run_group(4, "4-loop executor");
 	t_big_and_release();
 	t_reopen();
+	t_lsn();
 	t_refuse();
 	cleanup();
 	if (!g_fail)
