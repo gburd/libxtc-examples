@@ -331,8 +331,11 @@ verify(uint64_t seed, int64_t maxid, uint64_t *rows_out)
 	p = fork();
 	if (p == 0)
 		_exit(verifier(out));
-	if (p < 0 || waitpid(p, &status, 0) != p || !WIFEXITED(status) ||
-	    WEXITSTATUS(status) != 0) {
+	if (p < 0 || waitpid(p, &status, 0) != p) {
+		BAD("verify child: fork or wait failed: %s", strerror(errno));
+		return -1;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
 		BAD("verify child failed (status %d)", status);
 		return -1;
 	}
@@ -551,9 +554,11 @@ main(int argc, char **argv)
 		unlink(p2);
 	}
 	printf("  %d seeds: %llu acked commits, %d SIGKILLs, %d in-process clean "
-	    "reopens, %llu online checkpoints, %d verifies -- %d violations\n",
+	    "reopens, %llu online checkpoints, %d verifies (%llu rows in the "
+	    "last of each seed) -- %d violations\n",
 	    nseeds, (unsigned long long)tot_acked, tot_kills, tot_reopens,
-	    (unsigned long long)tot_ckpt, tot_verifies, g_fails);
+	    (unsigned long long)tot_ckpt, tot_verifies,
+	    (unsigned long long)tot_rows, g_fails);
 	if (g_fails) {
 		fprintf(stderr, "FAIL: test_crash_oracle\n");
 		return 1;
