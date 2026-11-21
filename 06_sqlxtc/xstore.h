@@ -414,10 +414,12 @@ int xstore_rollback_to(struct xsql *db, int level);
  * comma-joined column list, first column the INTEGER PRIMARY KEY), the
  * same catalog row the vtab xConnect writes -- vexec / the native write
  * path then operate on the table with no SQLite schema.  Returns the
- * tableid (>0) or 0.  drop_table tombstones the catalog row (lookup
- * skips it).  Returns 0 / -1.  These bypass SQLite's schema -- for the
- * native driver, where there is no VDBE to keep in sync. */
-uint32_t xstore_create_table(struct xsql *db, const char *name, const char *coldefs);
+ * tableid (>0) or 0; *created (if not NULL) says whether this call
+ * created the table (0: it existed).  drop_table tombstones the catalog
+ * row (lookup skips it).  Returns 0 / -1.  These bypass SQLite's schema
+ * -- for the native driver, where there is no VDBE to keep in sync. */
+uint32_t xstore_create_table(struct xsql *db, const char *name,
+    const char *coldefs, int *created);
 int xstore_drop_table(struct xsql *db, const char *name);
 /* ALTER TABLE oldname RENAME TO newname (re-keys the catalog entry). */
 int xstore_rename_table(struct xsql *db, const char *oldname, const char *newname);

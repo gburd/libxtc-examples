@@ -1422,13 +1422,16 @@ static uint32_t xs_cat_high(bt_t *bt, uint32_t cat);   /* defined below */
 
 /* Map (bt, name) to its allocated table-id: the in-process cache, then
  * the persisted catalog, else allocate a fresh dense id and persist it.
- * Returns the id (>= 1), or 0 only if a new id could not be written. */
+ * Returns the id (>= 1), or 0 only if a new id could not be written.
+ * *created (if not NULL) is set to 1 when this call allocated the id. */
 static uint32_t
-xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs)
+xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs,
+    int *created)
 {
 	uint32_t id = 0, maxid;
 	int i, do_persist = 0;
 
+	if (created != NULL) *created = 0;
 	xs_cat_lock();
 	for (i = 0; i < g_cat_n; i++)            /* seen in this process? */
 		if (g_cat[i].bt == bt && strcasecmp(g_cat[i].name, name) == 0) {
@@ -1490,6 +1493,7 @@ xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs)
 		xs_cat_unlock();
 		if (prc != SX_OK)
 			return 0;
+		if (created != NULL) *created = 1;
 		return id;
 	}
 	xs_cat_unlock();
@@ -2715,7 +2719,7 @@ xs_connect(xsql *db, void *pAux, int argc, const char *const *argv,
 	/* argv[2] is the table name: map it to a stable per-B-tree id and
 	 * persist its column schema (cdp) so the native paths read the
 	 * schema from the catalog, not sqlite_master. */
-	v->tableid = xs_cat_find_or_create(v->ctx->bt, argv[2], cdp);
+	v->tableid = xs_cat_find_or_create(v->ctx->bt, argv[2], cdp, NULL);
 	if (v->tableid == 0) {
 		xsql_free(v);
 		return SX_ERROR;
@@ -6980,12 +6984,14 @@ xstore_row_exists_txn(struct xsql *db, uint32_t tableid, int64_t rowid)
  * the native driver, where there is no VDBE to keep in sync.
  */
 uint32_t
-xstore_create_table(struct xsql *db, const char *name, const char *coldefs)
+xstore_create_table(struct xsql *db, const char *name, const char *coldefs,
+    int *created)
 {
 	bt_t *bt = xstore_bt_of(db);
 	xs_cat_gen_bump();
+	if (created != NULL) *created = 0;
 	if (bt == NULL || name == NULL) return 0;
-	return xs_cat_find_or_create(bt, name, coldefs);
+	return xs_cat_find_or_create(bt, name, coldefs, created);
 }
 
 /* Register a view (CREATE VIEW name AS <select>): record the SELECT

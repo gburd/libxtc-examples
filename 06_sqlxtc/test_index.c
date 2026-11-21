@@ -31,6 +31,10 @@
  *	     staging area.  Before
  *	     the fix a failed read ended the scan as if the table ended, and
  *	     CREATE INDEX built a short index and reported success.
+ *	  6. A CREATE TABLE whose PRIMARY KEY autoindex cannot be built
+ *	     leaves no table (a duplicate INSERT cannot go in), also after a
+ *	     crash and recovery from the log; CREATE TABLE IF NOT EXISTS over
+ *	     an existing table keeps it.
  */
 
 #include <assert.h>
@@ -407,12 +411,109 @@ scenario_scan_error(void)
 	return g_fail;
 }
 
+/* Insert (1, 1) into u twice: the second must never go in.  With no
+ * table both fail. */
+static void
+dup_insert_refused(sx_db *db)
+{
+	int a = sx_exec(db, "INSERT INTO u VALUES(1, 1)", NULL);
+	int b = sx_exec(db, "INSERT INTO u VALUES(1, 1)", NULL);
+	CK(b != SX_OK);
+	if (a == SX_OK && b != SX_CONSTRAINT)
+		fprintf(stderr, "  duplicate key: rc %d (%s)\n", b, sx_errmsg(db));
+	CK(a != SX_OK || b == SX_CONSTRAINT);
+}
+
+/* 6: a failed autoindex build in CREATE TABLE drops the new table. */
+static int
+scenario_create_table_error(void)
+{
+	bm_t *bm = NULL, *bm2 = NULL;
+	bt_t *bt = NULL, *bt2 = NULL;
+	sx_db *db = NULL, *db2 = NULL;
+	bm_opts_t bo = BM_OPTS_DEFAULT, b2 = BM_OPTS_DEFAULT;
+	char path[256], path2[256], logp[300];
+	wal_t *wal = NULL;
+	wal_opts_t wo;
+	xstore_index_info_t ix[4];
+	uint32_t id;
+	int fd, n, rc, errs = 0;
+
+	t_tmpl(path, sizeof path, "sqlxtc-index-ctab");
+	t_tmpl(path2, sizeof path2, "sqlxtc-index-ctab2");
+	fd = mkstemp(path); if (fd < 0) return 1; close(fd);
+	fd = mkstemp(path2); if (fd < 0) return 1; close(fd);
+	snprintf(logp, sizeof logp, "%s-wal", path);
+	memset(&wo, 0, sizeof wo);
+	wo.path = logp; wo.window_ns = 500000; wo.max_batch = 256;
+	if (wal_open(&wo, &wal) != XTC_OK) return 1;
+	bo.path = path; bo.page_size = PAGE_SZ; bo.n_frames = 256;
+	CK(bm_create(&bo, &bm) == XTC_OK);
+	CK(bt_open(bm, &bt) == XTC_OK);
+	xstore_set_wal((struct wal *)wal);
+	CK(sx_open_bt(bt, &db) == SX_OK);
+	CK(sx_exec(db, "CREATE TABLE e(a INTEGER, b INTEGER, PRIMARY KEY(a, b))",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO e VALUES(1, 1)", NULL) == SX_OK);
+
+	for (n = 1; n < 1000; n++) {
+		xstore_scan_read_fail_at(n);
+		rc = sx_exec(db, "CREATE TABLE u(a INTEGER, b INTEGER, "
+		    "PRIMARY KEY(a, b))", NULL);
+		if (xstore_scan_read_fail_at(0) > 0) break;
+		errs++;
+		CK(rc == SX_ERROR);
+		CK(!xstore_table_id(bt, "u", &id));
+		CK(xstore_index_list(bt, "u", ix, 4) == 0);
+		dup_insert_refused(db);
+		/* An existing table is never dropped. */
+		xstore_scan_read_fail_at(n);
+		(void)sx_exec(db, "CREATE TABLE IF NOT EXISTS e(a INTEGER, "
+		    "b INTEGER, PRIMARY KEY(a, b))", NULL);
+		xstore_scan_read_fail_at(0);
+		CK(first_int_i(db, "SELECT count(*) FROM e WHERE a = ?", 1) == 1);
+	}
+	CK(errs > 0 && n < 1000);
+	/* The run with no failed read created u whole: it enforces its key. */
+	CK(rc == SX_OK && xstore_index_list(bt, "u", ix, 4) == 1);
+	dup_insert_refused(db);
+	CK(sx_exec(db, "DROP TABLE u", NULL) == SX_OK);
+	xstore_scan_read_fail_at(1);
+	CK(sx_exec(db, "CREATE TABLE u(a INTEGER, b INTEGER, PRIMARY KEY(a, b))",
+	    NULL) == SX_ERROR);
+	xstore_scan_read_fail_at(0);
+
+	/* Crash with the failed CREATEs in the log (nothing flushed), and
+	 * recover into a fresh tree: no table u comes back. */
+	sx_close(db);
+	xstore_set_wal(NULL);
+	bt_close(bt); bm_destroy(bm);
+	wal_close(wal);
+	b2.path = path2; b2.page_size = PAGE_SZ; b2.n_frames = 256;
+	CK(bm_create(&b2, &bm2) == XTC_OK);
+	CK(bt_open(bm2, &bt2) == XTC_OK);
+	CK(xstore_recover(bt2, logp) == XTC_OK);
+	CK(xstore_index_rebuild_all(bt2) == 0);
+	CK(sx_open_bt(bt2, &db2) == SX_OK);
+	CK(!xstore_table_id(bt2, "u", &id));
+	CK(xstore_table_id(bt2, "e", &id));
+	dup_insert_refused(db2);
+	sx_close(db2);
+	bt_close(bt2); bm_destroy(bm2);
+	unlink(path); unlink(path2); unlink(logp);
+	if (g_fail) return 1;
+	printf("  ok   index: CREATE TABLE with each of %d autoindex scan reads "
+	    "failing leaves no table, after recovery too\n", errs);
+	return 0;
+}
+
 int
 main(void)
 {
 	if (scenario_index() != 0) return 1;
 	if (scenario_recover() != 0) return 1;
 	if (scenario_scan_error() != 0) return 1;
+	if (scenario_create_table_error() != 0) return 1;
 	printf("test_index: OK\n");
 	return 0;
 }

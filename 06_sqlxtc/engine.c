@@ -1829,17 +1829,16 @@ nat_create_index(struct sx_stmt *st, const char *name, const char *table,
 	return SX_ERROR;
 }
 
-/* CREATE TABLE: the table, then one UNIQUE autoindex per non-rowid
+/* Build the UNIQUE autoindexes CREATE TABLE declares, one per non-rowid
  * PRIMARY KEY / UNIQUE constraint ("p:c1,c2;u:c3;" after the coldefs),
- * named sqlite_autoindex_<t>_<n> as SQLite does. */
+ * named sqlite_autoindex_<t>_<n> as SQLite does.  Returns SX_DONE, or
+ * the first failure. */
 static int
-nat_create_table(struct sx_stmt *st)
+nat_create_autoindexes(struct sx_stmt *st)
 {
 	const char *ix = st->ddl_cols + strlen(st->ddl_cols) + 1;
 	char name[128], csv[1100];
 	int n = 0, rc;
-	if (xstore_create_table(st->db, st->ddl_name, st->ddl_cols) == 0)
-		return SX_ERROR;
 	while (*ix) {
 		char kind = ix[0];
 		const char *e = strchr(ix, ';');
@@ -1855,6 +1854,23 @@ nat_create_table(struct sx_stmt *st)
 		ix = e + 1;
 	}
 	return SX_DONE;
+}
+
+/* CREATE TABLE: the table, then its autoindexes.  If an autoindex
+ * cannot be built, a table this statement created is dropped again, so
+ * no table outlives the statement with a constraint it does not
+ * enforce; an existing table (IF NOT EXISTS) is left as it was. */
+static int
+nat_create_table(struct sx_stmt *st)
+{
+	int created = 0, rc;
+	if (xstore_create_table(st->db, st->ddl_name, st->ddl_cols,
+	    &created) == 0)
+		return SX_ERROR;
+	rc = nat_create_autoindexes(st);
+	if (rc != SX_DONE && created)
+		(void)xstore_drop_table(st->db, st->ddl_name);
+	return rc;
 }
 #endif
 
