@@ -81,9 +81,14 @@ typedef int (*mf_row_fn)(void *ctx, uint32_t frame, run_row_t *row);
  * run and sets the boundary, publish the new run set in kd, and drop
  * the frozen delta.  XTC_E_AGAIN if a frozen delta exists already;
  * XTC_E_NOTFOUND (nothing installed) when the delta was empty.  On a
- * failed write or install the run file is removed, the manifest and the
- * run set are untouched and the delta stays frozen: a later flush
- * retries it (mf_flush_frozen).  On success the frozen delta and the
+ * failed write or a failed install before the manifest's rename, the
+ * run file is removed, the manifest and the run set are untouched and
+ * the delta stays frozen: a later flush retries it (mf_flush_frozen).
+ * NB: a failure after the rename (the directory fsync) returns
+ * XTC_E_IO with the run installed in memory and kept on disk, and
+ * fail-stops the manifest: every later flush returns XTC_E_IO, and the
+ * caller must fail-stop the WAL too (wal_fail_stop), since the new
+ * MANIFEST may or may not be durable.  On success the frozen delta and the
  * old run set are reclaimed before the return (xtc_rcu_synchronize, so
  * the call waits for keydir readers to leave their read-sides: the
  * flusher must not hold one).  The caller unpins the flushed frames

@@ -344,8 +344,8 @@ test-keydir: test_keydir
 
 # The row log's MANIFEST and the nursery flush (STORAGE_DESIGN 7.2, 9.2).
 test: test-manifest
-test_manifest: test_manifest.c manifest.o keydir.o run.o ef.o bufmgr.o wal.o
-	$(CC) $(CFLAGS) -o $@ test_manifest.c manifest.o keydir.o run.o ef.o bufmgr.o wal.o $(LDFLAGS)
+test_manifest: test_manifest.c manifest.c manifest.h keydir.o run.o ef.o bufmgr.o wal.o
+	$(CC) $(CFLAGS) -o $@ test_manifest.c keydir.o run.o ef.o bufmgr.o wal.o $(LDFLAGS)
 
 test-manifest: test_manifest
 	TMPDIR=$${TMPDIR:-/tmp} ./test_manifest

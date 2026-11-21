@@ -19,6 +19,9 @@
  *	  retry      a flush whose row source fails installs nothing and
  *	             leaves the delta frozen; mf_flush_frozen finishes it;
  *	             an empty delta installs nothing;
+ *	  renamed    a failure after the manifest's rename (the directory
+ *	             fsync) keeps the run it names, fail-stops later
+ *	             flushes, and the reopen finds every row;
  *	  reclaim    many flushes with no synchronize of the test's own:
  *	             the live allocations do not grow (each flush reclaims
  *	             its frozen delta and the old run set);
@@ -38,7 +41,13 @@
 #include "btnode.h"
 #include "bufmgr.h"
 #include "keydir.h"
-#include "manifest.h"
+
+/* manifest.c is compiled in, so a test can fail the directory fsync
+ * that follows a manifest's rename (t_renamed). */
+static int g_fail_dirsync;
+static int t_renamed_sync(const char *dir);
+#define MF_RENAMED_SYNC(dir) t_renamed_sync(dir)
+#include "manifest.c"
 #include "run.h"
 #include "wal.h"
 #include "xtc.h"
@@ -276,6 +285,58 @@ t_retry(void)
 	    "manifest alone; the retry installs it\n");
 }
 
+static int
+t_renamed_sync(const char *dir)
+{
+	if (g_fail_dirsync) {
+		g_fail_dirsync = 0;
+		return XTC_E_IO;
+	}
+	return mf_sync_dir(dir);
+}
+
+static void
+t_renamed(void)
+{
+	manifest_t *m = NULL;
+	keydir_t *kd = NULL;
+	char name[64];
+	uint32_t i, n0, bad = 0;
+	bm_t *bm;
+
+	bm = open_bm();
+	CK(kd_create(4096, &kd) == XTC_OK);
+	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK);
+	if (m == NULL)
+		return;
+	n0 = mf_nruns(m);
+	for (i = 0; i < 100; i++)
+		CK(kd_delta_put(kd, 5, (int64_t)i, 50000 + i) == XTC_OK);
+	g_fail_dirsync = 1;
+	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_E_IO);
+	snprintf(name, sizeof name, "rl-%" PRIu64 ".run",
+	    m->runs[m->n - 1u].meta.runid);
+	CK(mf_nruns(m) == n0 + 1 && exists(name) && !kd_has_frozen(kd));
+	CK(kd_delta_put(kd, 5, 1000, 1) == XTC_OK);
+	CK(mf_flush(m, row_of, NULL, boundary, NULL) == XTC_E_IO);
+	mf_close(m);
+	kd_destroy(kd);
+	/* The renamed manifest is the store's: it opens, with the run. */
+	CK(kd_create(4096, &kd) == XTC_OK);
+	CK(mf_open(g_dir, bm, kd, &m) == XTC_OK);
+	if (m == NULL)
+		return;
+	CK(mf_nruns(m) == n0 + 1);
+	for (i = 0; i < 100; i++)
+		bad += !found_as(kd, 5, (int64_t)i, 50000 + i);
+	CK(bad == 0);
+	mf_close(m);
+	kd_destroy(kd);
+	bm_destroy(bm);
+	printf("  renamed: a failure after the rename keeps the run, "
+	    "fail-stops, and the reopen finds every row\n");
+}
+
 /* Live allocations after one flush of 2000 rows: the delta's keys and
  * maps, the run set, and the new run.  Without reclamation each flush
  * leaves its frozen delta behind, about 2000 allocations. */
@@ -421,6 +482,7 @@ main(void)
 	t_flush_reopen();
 	t_refuse();
 	t_retry();
+	t_renamed();
 	t_reclaim();
 	t_concurrent();
 	if (xtc_fs_dir_open(g_dir, &d) == XTC_OK) {

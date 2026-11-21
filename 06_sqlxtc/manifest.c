@@ -48,6 +48,7 @@ struct manifest {
 	void          *bctx;
 	struct mf_run *runs;          /* oldest first */
 	uint32_t       n, cap;
+	int            failed;        /* fail-stopped: see mf_flush */
 };
 
 /*
@@ -73,7 +74,14 @@ struct mf_job {
 	size_t      outlen;
 	int         op;               /* 0 read, 1 write, 2 unlink */
 	const char *name;             /* 2: the file in dir to unlink */
+	int         renamed;          /* 1: out, the rename was done */
 };
+
+/* The directory fsync after a manifest's rename; a test replaces it to
+ * make that step fail. */
+#ifndef MF_RENAMED_SYNC
+#define MF_RENAMED_SYNC(dir) mf_sync_dir(dir)
+#endif
 
 /* fsync directory `dir` so a rename or a create in it is durable. */
 static int
@@ -123,7 +131,9 @@ mf_read_file(struct mf_job *j)
 }
 
 /* MANIFEST.tmp written and fsynced, renamed over MANIFEST, the
- * directory fsynced. */
+ * directory fsynced.  j->renamed says whether the rename was done: past
+ * it the old manifest is gone, so a later failure (the directory fsync)
+ * leaves the new one visible and perhaps durable. */
 static int
 mf_write_file(struct mf_job *j)
 {
@@ -144,11 +154,12 @@ mf_write_file(struct mf_job *j)
 	(void)xtc_fs_close(fd);
 	if (rc == XTC_OK)
 		rc = xtc_fs_rename(tmp, fin);
-	if (rc == XTC_OK)
-		rc = mf_sync_dir(j->dir);
-	if (rc != XTC_OK)
+	if (rc != XTC_OK) {
 		(void)xtc_fs_unlink(tmp);
-	return rc;
+		return rc;
+	}
+	j->renamed = 1;
+	return MF_RENAMED_SYNC(j->dir);
 }
 
 static int
@@ -492,14 +503,15 @@ mf_flush_frozen(manifest_t *m, mf_row_fn rowfn, void *ctx)
 	run_t *r = NULL;
 	char p[1100], *text;
 	uint64_t id;
-	int rc;
-
+	size_t len;
 	uint32_t tid = 0, frame;
 	int64_t rid = INT64_MIN;
-	int empty;
+	int empty, rc, rc2;
 
 	if (m == NULL || rowfn == NULL || !kd_has_frozen(m->kd))
 		return XTC_E_INVAL;
+	if (m->failed)
+		return XTC_E_IO;
 	xtc_rcu_read_lock();
 	empty = !kd_delta_next(m->kd, 1, &tid, &rid, &frame);
 	xtc_rcu_read_unlock();
@@ -522,28 +534,48 @@ mf_flush_frozen(manifest_t *m, mf_row_fn rowfn, void *ctx)
 		goto unlink;
 	mf_buggify("rowlog.flush.before_install");
 	if ((text = mf_text(m, &meta, m->next, m->frz_boundary,
-	    &j.len)) == NULL) {
+	    &len)) == NULL) {
 		rc = XTC_E_NOMEM;
 		goto close;
 	}
+	memset(&j, 0, sizeof j);
 	j.dir = m->dir;
 	j.text = text;
+	j.len = len;
 	j.op = 1;
 	rc = mf_job(&j);
 	free(text);
-	if (rc != XTC_OK)
+	if (rc != XTC_OK && !j.renamed)
 		goto close;
-	/* Durable: publish, then the frozen rows are in a run. */
+	/*
+	 * Past the rename the visible MANIFEST names the run and the new
+	 * boundary, and it may reach the disk even if the directory fsync
+	 * failed: the run must stay, and the in-memory state follows the
+	 * new manifest.  An fsync failure cannot be retried (the kernel may
+	 * have dropped what it could not write), so the manifest fail-stops
+	 * (PostgreSQL's rule): this and every later flush return XTC_E_IO
+	 * and the caller fail-stops the log.
+	 */
+	if (rc != XTC_OK)
+		m->failed = 1;
 	m->boundary = m->frz_boundary;
-	if ((rc = mf_push(m, &meta, r)) != XTC_OK ||
-	    (rc = mf_publish(m)) != XTC_OK)
-		return rc;                   /* durable; the next open sees it */
+	/* Out of memory here leaves the install durable but the run set
+	 * stale: fail-stop rather than let a retry write the rows again. */
+	if ((rc2 = mf_push(m, &meta, r)) != XTC_OK) {
+		run_close(r);
+		m->failed = 1;
+		return rc2;
+	}
+	if ((rc2 = mf_publish(m)) != XTC_OK) {
+		m->failed = 1;
+		return rc2;
+	}
 	kd_drop_frozen(m->kd);
 	/* Reclaim the frozen delta and the old run set now: libxtc's RCU
 	 * frees retired objects only in a synchronize (it parks a fiber
 	 * while readers drain), and nothing else in the engine calls it. */
 	xtc_rcu_synchronize();
-	return XTC_OK;
+	return rc;
 close:
 	run_close(r);
 unlink:
