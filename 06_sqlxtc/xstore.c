@@ -2382,13 +2382,23 @@ static int  xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid,
     int64_t rowid, const uint8_t *rec, int reclen);
 
 /* Convenience: capture a row's committed pre-image for maintenance.
- * Returns the length written to `buf` (0 if none). */
+ * Returns the length written to `buf`, 0 if there is none or it could
+ * not be read.  Note that an unread pre-image leaves the old version's
+ * entries in place: readers verify every entry against its row, so a
+ * stale entry is never an answer, but nothing reaps it either, so the
+ * indexes are marked untrusted and the next open rebuilds them. */
 static int
 xs_idx_preimage(bt_t *bt, uint32_t tableid, int64_t rowid,
     uint8_t *buf, int cap)
 {
+	int n;
 	if (g_idx_n == 0) return 0;   /* no indexes: skip the read entirely */
-	return xs_read_rec(bt, tableid, rowid, buf, cap);
+	n = xs_read_rec(bt, tableid, rowid, buf, cap);
+	if (n < 0) {
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+		return 0;
+	}
+	return n;
 }
 
 /* ---- write-buffer hash maps ------------------------------------- *
@@ -4916,7 +4926,7 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	idx = g_idx_n > 0 && tableid != XS_CAT_TABLEID &&
 	    tableid < XS_IDXCAT_TABLEID;
 	if (idx && (pre = malloc(XS_VMAX)) != NULL)
-		prelen = xs_read_rec(bt, tableid, rowid, pre, XS_VMAX);
+		prelen = xs_idx_preimage(bt, tableid, rowid, pre, XS_VMAX);
 	enc_vkey(tableid, rowid, ts, key);
 	buf[0] = deleted ? XS_F_DELETED : 0;
 	if (!deleted && n > 0) memcpy(buf + 1, blob, (size_t)n);
