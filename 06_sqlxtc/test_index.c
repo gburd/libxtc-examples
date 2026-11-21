@@ -274,8 +274,9 @@ scenario_recover(void)
 /* Sweep the n-th base-scan read failing over `sql` (no binds): each run
  * must fail with SX_ERROR, or return `want`: the first column of its
  * first row, or the rows a write changed.  A run with no failed read
- * ends the sweep.  Returns how many runs failed; *ok_n counts the runs
- * that succeeded. */
+ * ends the sweep.  A failed run must report the table it could not
+ * read.  Returns how many runs failed; *ok_n counts the runs that
+ * succeeded. */
 static int
 sweep(sx_db *db, const char *sql, int64_t want, int *ok_n)
 {
@@ -300,6 +301,12 @@ sweep(sx_db *db, const char *sql, int64_t want, int *ok_n)
 		}
 		if (rc == SX_ERROR) {
 			errs++;
+			if (strncmp(sx_errmsg(db), "cannot read table ", 18) != 0 ||
+			    strstr(sx_errmsg(db), ": I/O error") == NULL) {
+				fprintf(stderr, "  %s: read %d failed: \"%s\"\n", sql, n,
+				    sx_errmsg(db));
+				g_fail = 1;
+			}
 			continue;
 		}
 		(*ok_n)++;

@@ -2995,6 +2995,8 @@ struct xstore_scan {
 	 * batch); then batches grow 16, 32, .. XS_RA_MAX rows. */
 	struct xs_ra   *ra;
 	int             ra_n, ra_i, ra_want;
+	xstore_ctx_t   *err_cx;    /* connection a read error is reported to */
+	char            name[64];  /* the table, for that report */
 };
 
 /* A read-ahead batch: up to XS_RA_MAX rows, their payloads packed in
@@ -3158,6 +3160,8 @@ xstore_scan_open_txn(struct xsql *db, const char *table, uint64_t snap,
 	}
 	s = xstore_scan_open(bt, table, snap, lo, has_lo, hi, has_hi);
 	if (s == NULL) return NULL;
+	s->err_cx = ctx;
+	snprintf(s->name, sizeof s->name, "%s", table);
 	/* Inside a txn, attach the connection ctx so the scan can (a) overlay
 	 * the write buffer for read-your-writes (when it has buffered writes)
 	 * and (b) record each read into the SSI read set (when serializable),
@@ -3300,7 +3304,13 @@ static int
 xs_scan_end(xstore_scan_t *s)
 {
 	s->done = 1;
-	return s->c.err != 0 ? -1 : 0;
+	if (s->c.err == 0)
+		return 0;
+	/* The statement's first read error is the one the client sees. */
+	if (s->err_cx != NULL && s->err_cx->rd_err[0] == '\0')
+		snprintf(s->err_cx->rd_err, sizeof s->err_cx->rd_err,
+		    "cannot read table %s: %s", s->name, xtc_strerror(s->c.err));
+	return -1;
 }
 
 int
