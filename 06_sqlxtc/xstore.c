@@ -10784,6 +10784,8 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 	ctx->sp_n = ctx->sp_cap = 0;
 	ctx->native_mode = native ? 1 : 0;
 	ctx->native_autocommit = 1;
+	ctx->implicit = 0;
+	ctx->stmt_snap = 0;
 	ctx->wmap = NULL; ctx->wmap_n = ctx->wmap_cap = ctx->wmap_bad = 0;
 	ctx->wmax_n = 0; ctx->wmax_ok = 1;
 	ctx->ilk_slot = 0; ctx->ilk_seq = 0; ctx->ilk = NULL;
