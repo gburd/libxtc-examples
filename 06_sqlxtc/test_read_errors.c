@@ -36,11 +36,13 @@
  *	     rows back; one that cannot be read back still guards its value
  *	     (before: it was left out of the map, and a duplicate of it in
  *	     the same transaction went in).
- *	  6. Catalog reads: CREATE TABLE, CREATE INDEX, DROP TABLE and ALTER
- *	     TABLE RENAME whose catalog or id read fails fail, and leave the
- *	     catalog as it was; no id is ever handed out twice (before: a
- *	     failed read was "no such name" or "max id 0", so a CREATE could
- *	     take an id in use, and a DROP or RENAME report success).
+ *	  6. Catalog reads: CREATE TABLE, CREATE INDEX, DROP INDEX, DROP
+ *	     TABLE and ALTER TABLE RENAME whose catalog or id read fails
+ *	     fail, and leave the catalog as it was; no id is ever handed out
+ *	     twice (before: a failed read was "no such name" or "max id 0",
+ *	     so a CREATE could take an id in use, and a DROP or RENAME report
+ *	     success; a DROP INDEX cleared the index and left its catalog
+ *	     row, so the next open trusted an empty index).
  *	  7. An index rebuild whose index catalog cannot be read fails, and
  *	     the indexes it did not load are not trusted; a whole one puts
  *	     every index back (before: the indexes past the failed read were
@@ -639,13 +641,6 @@ sweep_ddl(sx_db *db, bt_t *bt, const char *sql)
 		}
 		errs++;
 		cat_snap(db, bt, after, sizeof after);
-		/* DROP TABLE writes the table's tombstone before its indexes'
-		 * id mark; a mark it cannot read leaves the index catalog rows
-		 * for the next open (they name no table, so it taints).  The
-		 * DROP itself is done. */
-		if (rc == SX_OK && strncmp(sql, "DROP", 4) == 0 &&
-		    strstr(after, "c3=0:") != NULL)
-			break;
 		if (rc == SX_OK || strcmp(before, after) != 0) {
 			fprintf(stderr, "  %s: read %d failed: rc %d\n    before %s\n"
 			    "    after  %s\n", sql, n, rc, before, after);
@@ -671,6 +666,8 @@ case_catalog(sx_db *db, bt_t *bt)
 	n += sweep_ddl(db, bt, "CREATE TABLE c2(k INTEGER PRIMARY KEY, "
 	    "v INTEGER)");
 	n += sweep_ddl(db, bt, "CREATE INDEX c2_v ON c2(v)");
+	CK(sx_exec(db, "CREATE INDEX c2_w ON c2(v, k)", NULL) == SX_OK);
+	n += sweep_ddl(db, bt, "DROP INDEX c2_w");
 	n += sweep_ddl(db, bt, "ALTER TABLE c2 RENAME TO c3");
 	CK(xstore_table_id(bt, "c3", &b) == 1 && one_int(db,
 	    "SELECT count(*) FROM c3") == 0);

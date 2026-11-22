@@ -2136,12 +2136,20 @@ sx_step_body(sx_stmt *st)
 			return nat_create_index(st, st->ddl_name, table, cl, uq[0] == '1',
 			    (uint32_t)strtoul(dm, NULL, 10), 'i');
 		}
-		case SXN_DROP_INDEX:
+		case SXN_DROP_INDEX: {
 			/* Idempotent: dropping an unknown index is not an error. */
-			if (xstore_drop_index(st->db, st->ddl_name) < 0)
+			char m[96];
+			int dr = xstore_drop_index(st->db, st->ddl_name);
+			if (dr < -1) {
+				snprintf(m, sizeof m, "cannot read the catalog: %s",
+				    xtc_strerror(dr));
+				return nat_set_err(st->db, m, SX_ERROR);
+			}
+			if (dr < 0)
 				return nat_set_err(st->db, "index associated with UNIQUE or "
 				    "PRIMARY KEY constraint cannot be dropped", SX_ERROR);
 			return SX_DONE;
+		}
 		case SXN_PRAGMA_NOP:
 			return SX_DONE;   /* value-setting PRAGMA: no-op, no rows */
 		default:

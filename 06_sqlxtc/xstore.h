@@ -479,7 +479,9 @@ int xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 int xstore_create_index(struct xsql *db, const char *name, const char *table,
                         const char *col, int unique);
 /* Drop CREATE INDEX `name`.  1 on success, 0 if unknown, -1 if it is a
- * constraint index (PRIMARY KEY / UNIQUE: not droppable, as SQLite). */
+ * constraint index (PRIMARY KEY / UNIQUE: not droppable, as SQLite), or
+ * the XTC_E_* code (below -1) of a catalog read or write that failed
+ * (the index is left whole). */
 int xstore_drop_index(struct xsql *db, const char *name);
 
 /* The indexes of `table` (planner support): up to cap entries. */

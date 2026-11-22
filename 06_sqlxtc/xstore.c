@@ -8267,7 +8267,7 @@ xstore_drop_index(struct xsql *db, const char *name)
 {
 	bt_t *bt = xstore_bt_of(db);
 	uint32_t idx_id = 0;
-	int i, found = 0;
+	int i, found = 0, rc;
 	uint8_t vbuf[8];
 	xs_cat_gen_bump();
 	if (bt == NULL || name == NULL) return 0;
@@ -8276,33 +8276,60 @@ xstore_drop_index(struct xsql *db, const char *name)
 		if (g_idx[i].bt == bt && strcmp(g_idx[i].name, name) == 0) {
 			if (g_idx[i].rt.kind != 'i') { found = -1; break; }
 			idx_id = g_idx[i].rt.idx_id; found = 1;
+			break;
+		}
+	xs_cat_unlock();
+	if (found <= 0) return found;   /* unknown (0) / constraint index (-1) */
+	/* The mark first, before anything is removed: a mark that cannot
+	 * be read or written fails the DROP with the index whole.  Clearing
+	 * the entries of an index whose catalog row stays live would leave
+	 * an empty index that the next open trusts. */
+	if ((rc = xs_hw_raise(bt, XS_IDXCAT_TABLEID, idx_id)) != SX_OK)
+		return rc < -1 ? rc : XTC_E_IO;
+	xs_cat_lock();
+	for (i = 0; i < g_idx_n; i++)
+		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
 			g_idx_n--;
 			if (i != g_idx_n) g_idx[i] = g_idx[g_idx_n];
 			XS_CATC_BUMP();
 			break;
 		}
 	xs_cat_unlock();
-	if (found <= 0) return found;   /* unknown (0) / constraint index (-1) */
 	vbuf[0] = 0;
-	if (xs_hw_raise(bt, XS_IDXCAT_TABLEID, idx_id) == SX_OK &&
-	    !xs_drop_gap("xstore.drop.index_gap"))
-		(void)xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf, 1, 1);  /* tombstone catalog row */
+	if (xs_drop_gap("xstore.drop.index_gap") ||
+	    xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf, 1, 1) != SX_OK)
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	xs_idx_clear(bt, idx_id);
 	return 1;
 }
 
-/* Drop every index of `table` (DROP TABLE). */
+/* The largest index id of `table`'s indexes, or 0 if it has none. */
+static uint32_t
+xs_idx_table_top(bt_t *bt, const char *table)
+{
+	uint32_t top = 0;
+	int i;
+	xs_cat_lock();
+	for (i = 0; i < g_idx_n; i++)
+		if (g_idx[i].bt == bt && strcmp(g_idx[i].table, table) == 0 &&
+		    g_idx[i].rt.idx_id > top)
+			top = g_idx[i].rt.idx_id;
+	xs_cat_unlock();
+	return top;
+}
+
+/* Drop every index of `table` (DROP TABLE), whose caller has raised the
+ * index id mark past them (xs_idx_table_top). */
 static void
 xs_idx_drop_table(bt_t *bt, const char *table)
 {
-	uint32_t ids[XS_IDX_MAX], top = 0;
+	uint32_t ids[XS_IDX_MAX];
 	uint8_t vbuf[8];
 	int n = 0, i, marked;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; ) {
 		if (g_idx[i].bt == bt && strcmp(g_idx[i].table, table) == 0) {
 			ids[n++] = g_idx[i].rt.idx_id;
-			if (g_idx[i].rt.idx_id > top) top = g_idx[i].rt.idx_id;
 			g_idx[i] = g_idx[--g_idx_n];
 			XS_CATC_BUMP();
 		} else {
@@ -8311,15 +8338,14 @@ xs_idx_drop_table(bt_t *bt, const char *table)
 	}
 	xs_cat_unlock();
 	vbuf[0] = 0;
-	/* No tombstone without the mark, as in xstore_drop_index.  If the
-	 * mark cannot be written (a fail-stopped log, so the store takes no
-	 * more writes) the catalog rows stay live: the next open loads the
-	 * definitions, finds no table and taints the indexes. */
-	marked = n > 0 && xs_hw_raise(bt, XS_IDXCAT_TABLEID, top) == SX_OK &&
-	    !xs_drop_gap("xstore.drop.index_gap");
+	/* A tombstone that cannot be written (a fail-stopped log, so the
+	 * store takes no more writes) leaves its catalog row live: taint,
+	 * so the next open rebuilds rather than trusts it. */
+	marked = !xs_drop_gap("xstore.drop.index_gap");
 	for (i = 0; i < n; i++) {
-		if (marked)
-			(void)xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)ids[i], vbuf, 1, 1);
+		if (!marked || xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)ids[i], vbuf,
+		    1, 1) != SX_OK)
+			xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 		xs_idx_clear(bt, ids[i]);
 	}
 }
@@ -10059,7 +10085,7 @@ int
 xstore_drop_table(struct xsql *db, const char *name)
 {
 	bt_t *bt = xstore_bt_of(db);
-	uint32_t id;
+	uint32_t id, top;
 	uint8_t vbuf[256];
 	size_t nlen;
 	int err;
@@ -10074,9 +10100,14 @@ xstore_drop_table(struct xsql *db, const char *name)
 	nlen = strlen(name);
 	if (nlen > sizeof vbuf) nlen = sizeof vbuf;
 	memcpy(vbuf, name, nlen);
-	/* The mark first: once GC takes the tombstone, it alone keeps the
-	 * id from coming back (see the table-id comment). */
+	/* The marks first: once GC takes the tombstone, it alone keeps the
+	 * id from coming back (see the table-id comment).  The index mark
+	 * too, before the table goes: a DROP that cannot raise it fails
+	 * whole, rather than leave live index rows naming a dropped table
+	 * (a new table of the name would inherit them at the next open). */
+	top = xs_idx_table_top(bt, name);
 	if (xs_hw_raise(bt, XS_CAT_TABLEID, id) != SX_OK ||
+	    (top != 0 && xs_hw_raise(bt, XS_IDXCAT_TABLEID, top) != SX_OK) ||
 	    xs_drop_gap("xstore.drop.table_gap") ||
 	    xs_put(bt, XS_CAT_TABLEID, (int64_t)id, vbuf, (int)nlen, 1) != SX_OK)
 		return -1;
