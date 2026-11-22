@@ -2046,10 +2046,14 @@ sx_step_body(sx_stmt *st)
 				return nat_set_err(st->db, xstore_uniq_err(st->db),
 				    SX_CONSTRAINT);
 			const char *ck = sx_cksum_msg(ckbuf, sizeof ckbuf);
-			/* A UNIQUE probe that failed left its reason. */
+			/* A UNIQUE probe or a row read that failed left its
+			 * reason. */
 			if (ck == NULL && !xstore_wal_failed() &&
 			    xstore_uniq_err(st->db)[0] != '\0')
 				ck = xstore_uniq_err(st->db);
+			if (ck == NULL && !xstore_wal_failed() &&
+			    xstore_read_err(st->db)[0] != '\0')
+				ck = xstore_read_err(st->db);
 			return nat_set_err(st->db, ck != NULL ? ck :
 			    xstore_wal_failed() ? SX_MSG_WAL_IO
 			    : "commit failed; transaction rolled back", SX_ERROR);

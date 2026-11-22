@@ -764,7 +764,7 @@ rset_add(xstore_ctx_t *c, uint32_t tableid, int64_t rowid)
  *
  * The outgoing edge (something I read was overwritten by a committed
  * transaction after my snapshot) is detected from the shared B-tree's
- * version timestamps (xs_newest_ts), so it catches overwrites by any
+ * version timestamps (xs_newer_than), so it catches overwrites by any
  * committer regardless of its isolation level.  The incoming edge
  * (someone read what I am about to write) cannot be read from the
  * B-tree -- reads leave no version -- so serializable transactions
@@ -4590,7 +4590,8 @@ xs_spill_payloads(xstore_ctx_t *cx)
 	}
 }
 
-static uint64_t xs_newest_ts(bt_t *bt, uint32_t tableid, int64_t rowid);
+static int xs_newer_than(bt_t *bt, uint32_t tableid, int64_t rowid,
+    uint64_t base);
 
 /*
  * In-flight commit registry.  A commit takes its timestamp and registers
@@ -4915,16 +4916,18 @@ xs_wait_visible(uint64_t ts)
  * conflicts if the row has a committed version newer than the snapshot
  * the write was computed against (w->base), or if a commit still in
  * flight writes the same row (it has a timestamp after every snapshot
- * that cannot see it).  Returns 1 on a conflict.
+ * that cannot see it).  Returns 1 on a conflict, or the XTC_E_* code of
+ * a read that failed (*bad set to the row's table).
  */
 static int
 xs_ww_conflict_locked(bt_t *bt, const xs_wrec_t *ws, int wn)
 {
 	const struct xs_inflight *e;
-	int i;
+	int i, r;
 	for (i = 0; i < wn; i++) {
-		if (xs_newest_ts(bt, ws[i].tableid, ws[i].rowid) > ws[i].base)
-			return 1;
+		if ((r = xs_newer_than(bt, ws[i].tableid, ws[i].rowid,
+		    ws[i].base)) != 0)
+			return r;
 		for (e = g_inflight; e != NULL; e = e->next)
 			if (xs_inflight_has(e, ws[i].tableid, ws[i].rowid))
 				return 1;
@@ -4934,28 +4937,36 @@ xs_ww_conflict_locked(bt_t *bt, const xs_wrec_t *ws, int wn)
 
 /* The early half of the write-write check, WITHOUT the commit lock: is
  * any row of the write set committed past its base?  Returns 1 on a
- * conflict (certain: committed versions never go away).  Read the
- * horizon *v0 before calling; xs_ww_recheck_locked then finishes. */
+ * conflict (certain: committed versions never go away), or a read's
+ * XTC_E_* code with *bad set to its table.  Read the horizon *v0 before
+ * calling; xs_ww_recheck_locked then finishes. */
 static int
-xs_ww_probe(bt_t *bt, const xs_wrec_t *ws, int wn)
+xs_ww_probe(bt_t *bt, const xs_wrec_t *ws, int wn, uint32_t *bad)
 {
-	int i;
+	int i, r;
 	for (i = 0; i < wn; i++)
-		if (xs_newest_ts(bt, ws[i].tableid, ws[i].rowid) > ws[i].base)
-			return 1;
+		if ((r = xs_newer_than(bt, ws[i].tableid, ws[i].rowid,
+		    ws[i].base)) != 0) {
+			*bad = ws[i].tableid;
+			return r;
+		}
 	return 0;
 }
 
 /* Commit lock held, after xs_ww_probe passed at horizon v0: the full
- * check only for rows registered (stamped) after v0 -- see g_row_cts. */
+ * check only for rows registered (stamped) after v0 -- see g_row_cts.
+ * Returns as xs_ww_probe. */
 static int
-xs_ww_recheck_locked(bt_t *bt, const xs_wrec_t *ws, int wn, uint64_t v0)
+xs_ww_recheck_locked(bt_t *bt, const xs_wrec_t *ws, int wn, uint64_t v0,
+    uint32_t *bad)
 {
-	int i;
+	int i, r;
 	for (i = 0; i < wn; i++)
 		if (g_row_cts[xs_row_slot(ws[i].tableid, ws[i].rowid)] > v0 &&
-		    xs_ww_conflict_locked(bt, &ws[i], 1))
-			return 1;
+		    (r = xs_ww_conflict_locked(bt, &ws[i], 1)) != 0) {
+			*bad = ws[i].tableid;
+			return r;
+		}
 	return 0;
 }
 
@@ -5001,8 +5012,8 @@ xs_key_live_locked(bt_t *bt, uint32_t tableid, int64_t rowid)
  * engine lock); else only once its in-flight entry is unlinked.
  * A UNIQUE conflict returns SX_CONSTRAINT and a UNIQUE probe that could
  * not run its negative XTC_E_* code, both with *ubad set to the index;
- * a primary-key check that could not read the row returns its negative
- * XTC_E_* code with *ubad left 0. */
+ * a primary-key or write-write check that could not read the row
+ * returns its negative XTC_E_* code with *ubad left 0. */
 static int
 xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
     int deleted, uint64_t base, int insert, uint64_t *out_ts, uint32_t *ubad,
@@ -5030,8 +5041,8 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	memset(&probe, 0, sizeof probe);
 	probe.tableid = tableid; probe.rowid = rowid; probe.base = base;
 	v0 = xs_visible();             /* before the probe: see g_row_cts */
-	if (base != 0 && xs_ww_probe(bt, &probe, 1))
-		return SX_BUSY;
+	if (base != 0 && (rc = xs_ww_probe(bt, &probe, 1, &bad)) != 0)
+		return rc > 0 ? SX_BUSY : rc;   /* rc < 0: unread */
 	xs_commit_lock();
 	xs_gate_wait_locked();
 	if (insert && (rc = xs_key_live_locked(bt, tableid, rowid)) != 0) {
@@ -5050,9 +5061,10 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 		/* rc < 0: the probe's error */
 		return rc > 0 ? SX_CONSTRAINT : rc;
 	}
-	if (base != 0 && xs_ww_recheck_locked(bt, &probe, 1, v0)) {
+	if (base != 0 && (rc = xs_ww_recheck_locked(bt, &probe, 1, v0,
+	    &bad)) != 0) {
 		xs_commit_unlock();
-		return SX_BUSY;
+		return rc > 0 ? SX_BUSY : rc;
 	}
 	/* From registration to removal the commit is masked: its entry lives
 	 * on this stack, so a kill in between would leave g_inflight pointing
@@ -5106,26 +5118,39 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	return rc;
 }
 
-/* The commit_ts of the newest committed version of `rowid`, or 0 if the
- * rowid has no version.  Used by serializable validation to detect a
- * concurrent write to a key this transaction read. */
-static uint64_t
-xs_newest_ts(bt_t *bt, uint32_t tableid, int64_t rowid)
+/* Has `rowid` a committed version newer than `base`?  1 if so, 0 if
+ * not (or it has no version), or the XTC_E_* code of a read that
+ * failed: nothing is then known, and a write-write or serializable
+ * check that took it for "no" would let an update be lost.  Used by
+ * those checks to detect a concurrent write to a key this transaction
+ * read or writes. */
+static int
+xs_newer_than(bt_t *bt, uint32_t tableid, int64_t rowid, uint64_t base)
 {
 	bt_cursor_t *cur = NULL;
 	uint8_t startk[XS_VKLEN];
 	const void *k = NULL, *vv = NULL;
 	uint16_t klen = 0, vl = 0;
 	uint64_t ts = 0;
+	int rc;
 	enc_vkey(tableid, rowid, ~(uint64_t)0, startk);   /* newest version sorts first */
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
-	if (bt_cursor_next(cur, &k, &klen, &vv, &vl) == XTC_OK &&
-	    klen == XS_VKLEN && dec_tableid((const uint8_t *)k) == tableid &&
-	    dec_rowid((const uint8_t *)k) == rowid)
-		ts = dec_ts((const uint8_t *)k);
-	bt_cursor_close(cur);
-	return ts;
+	rc = bt_cursor_open(bt, startk, XS_VKLEN, &cur);
+	if (rc == XTC_OK) {
+		rc = bt_cursor_next(cur, &k, &klen, &vv, &vl);
+		if (rc == XTC_OK && xs_row_fault())
+			rc = XTC_E_IO;
+		if (rc == XTC_OK && klen == XS_VKLEN &&
+		    dec_tableid((const uint8_t *)k) == tableid &&
+		    dec_rowid((const uint8_t *)k) == rowid)
+			ts = dec_ts((const uint8_t *)k);
+		bt_cursor_close(cur);
+	}
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+		(void)xs_rd_count(rc);
+		/* planted 84: the unread row has no newer version */
+		return XTC_DST_BUG(XTC_DST_BUG_WWREAD) ? 0 : rc;
+	}
+	return ts > base;
 }
 
 /*
@@ -5628,14 +5653,15 @@ xs_ilk_wait_clear(xstore_ctx_t *cx)
  * waiting for another holder to finish, and check that no version was
  * committed past `base` (the snapshot the write was computed against).
  * Returns 0, or the conflict (XS_CONFL_STALE: a newer committed
- * version; XS_CONFL_HARD: a deadlock, or a wait past the cap).
+ * version; XS_CONFL_HARD: a deadlock, or a wait past the cap), or -1
+ * when the row could not be read (rd_err says why).
  */
 static int xs_stmt_restartable(const xstore_ctx_t *cx);
 
 static int
 xs_intent_take(xstore_ctx_t *cx, uint32_t tid, int64_t rid, uint64_t base)
 {
-	int hslot = 0, r, dl = 0;
+	int hslot = 0, r, nr, dl = 0;
 	uint64_t hseq = 0;
 	int64_t waited = 0, nap = XS_ILK_NAP0_NS;
 	if (tid == XS_CAT_TABLEID || tid >= XS_IDXCAT_TABLEID) return 0;
@@ -5654,8 +5680,16 @@ xs_intent_take(xstore_ctx_t *cx, uint32_t tid, int64_t rid, uint64_t base)
 		 * the snapshot the re-run had just taken, and the statement
 		 * burned its 8 re-runs without waiting once (TPC-C Payment's
 		 * warehouse UPDATE: 1.35M retries in 60 s at 32 threads). */
-		if (base != 0 && !(r == 1 && xs_stmt_restartable(cx)) &&
-		    xs_newest_ts(cx->bt, tid, rid) > base) {
+		nr = 0;
+		if (base != 0 && !(r == 1 && xs_stmt_restartable(cx)))
+			nr = xs_newer_than(cx->bt, tid, rid, base);
+		if (nr < 0) {                      /* unread: unknown */
+			if (r == 0) xs_ilk_drop(cx->bt, tid, rid, cx->ilk_slot, cx->ilk_seq);
+			xs_ilk_wait_clear(cx);
+			xs_rd_err_tid(cx, tid, nr);
+			return -1;
+		}
+		if (nr > 0) {
 			if (r == 0) xs_ilk_drop(cx->bt, tid, rid, cx->ilk_slot, cx->ilk_seq);
 			xs_ilk_wait_clear(cx);
 			xtc_atomic_fetch_add_u64(&g_ilk_conflicts, 1,
@@ -5900,7 +5934,7 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		if (!cx->ilk_skip && (rc = xs_intent_take(cx, tableid, rowid,
 		    cx->txn_iso >= XS_ISO_REPEATABLE_READ ? cx->txn_snap
 		    : cx->stmt_base)) != 0) {
-			cx->last_conflict = rc;
+			if (rc > 0) cx->last_conflict = rc;
 			return -1;
 		}
 		/* UNIQUE: against committed rows and this txn's own writes now;
@@ -5923,7 +5957,7 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 	/* base 0: xs_put_ts makes the stale-read check under the commit lock */
 	if ((rc = xs_intent_take(cx, tableid, rowid, 0)) != 0) {
 		xs_intents_release(cx);
-		cx->last_conflict = rc;
+		if (rc > 0) cx->last_conflict = rc;
 		return -1;
 	}
 	rc = xs_put_pruned(cx, tableid, rowid, deleted ? NULL : rec,
@@ -6331,14 +6365,15 @@ xs_begin(xsql_vtab *pv)
 /*
  * Serializable validation (Cahill SSI pivot detection).  Returns
  * SX_BUSY if this transaction is a dangerous pivot (BOTH an
- * outgoing and an incoming rw-antidependency), else SX_OK.  Shared
+ * outgoing and an incoming rw-antidependency), else SX_OK, or the
+ * XTC_E_* code of a read that failed (rd_err says which table).  Shared
  * by the vtab xSync (2PC phase 1) and the native commit path.
  */
 static int
 xs_ssi_validate_locked(xstore_ctx_t *cx)
 {
 	const struct xs_inflight *e;
-	int i, out_edge = 0, in_edge;
+	int i, r, out_edge = 0, in_edge;
 	xs_rkey_t *wr;
 	int nwr;
 	if (!cx->in_txn || !cx->serializable)
@@ -6355,8 +6390,13 @@ xs_ssi_validate_locked(xstore_ctx_t *cx)
 	 * write skew can no longer both validate before either is visible).
 	 */
 	for (i = 0; i < cx->rn && !out_edge; i++) {
-		if (xs_newest_ts(cx->bt, cx->rset[i].tableid, cx->rset[i].rowid)
-		    > cx->txn_snap) { out_edge = 1; break; }
+		r = xs_newer_than(cx->bt, cx->rset[i].tableid, cx->rset[i].rowid,
+		    cx->txn_snap);
+		if (r < 0) {                 /* unread: nothing is proven */
+			xs_rd_err_tid(cx, cx->rset[i].tableid, r);
+			return r;
+		}
+		if (r > 0) { out_edge = 1; break; }
 		for (e = g_inflight; e != NULL; e = e->next)
 			if (xs_inflight_has(e, cx->rset[i].tableid, cx->rset[i].rowid)) {
 				out_edge = 1;
@@ -6500,17 +6540,23 @@ xs_commit_ctx(xstore_ctx_t *cx)
 		 * lock; a dangerous pivot or a write-write conflict rolls back
 		 * with SX_BUSY, a UNIQUE violation with SX_CONSTRAINT. */
 		v0 = xs_visible();            /* before the probe: see g_row_cts */
-		if (xs_ww_probe(cx->bt, cx->wbuf, cx->wn)) {
+		if ((rc = xs_ww_probe(cx->bt, cx->wbuf, cx->wn, &ubad)) != 0) {
+			if (rc < 0) xs_rd_err_tid(cx, ubad, rc);
 			(void)xs_rollback_ctx(cx);
-			return SX_BUSY;           /* committed past our snapshot */
+			return rc > 0 ? SX_BUSY : SX_ERROR;   /* committed past us */
 		}
 		xs_commit_lock();
 		xs_gate_wait_locked();
-		if (xs_ssi_validate_locked(cx) != SX_OK ||
-		    xs_ww_recheck_locked(cx->bt, cx->wbuf, cx->wn, v0)) {
+		rc = xs_ssi_validate_locked(cx);
+		if (rc == SX_OK && (rc = xs_ww_recheck_locked(cx->bt, cx->wbuf,
+		    cx->wn, v0, &ubad)) != 0) {
+			if (rc < 0) xs_rd_err_tid(cx, ubad, rc);
+			else rc = SX_BUSY;
+		}
+		if (rc != SX_OK) {
 			xs_commit_unlock();
 			(void)xs_rollback_ctx(cx);
-			return SX_BUSY;           /* serialization failure */
+			return rc > 0 ? SX_BUSY : SX_ERROR;   /* rc < 0: unread */
 		}
 		rc = 0;
 		if (nuq > 0)

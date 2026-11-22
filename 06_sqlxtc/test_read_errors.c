@@ -17,6 +17,11 @@
  *	  1. An autocommit INSERT of an existing primary key whose key
  *	     check cannot read the row fails; it never puts in a duplicate
  *	     key (before: the row read as absent, and the INSERT went in).
+ *	  2. The write-write check of an UPDATE (autocommit, at its write
+ *	     intent in a transaction, and at COMMIT) and the serializable
+ *	     check of a COMMIT that cannot read the row fail the statement;
+ *	     an update never goes in on a check that could not run (before:
+ *	     the row had "no newer version", the lost-update guard).
  */
 
 #include <stdint.h>
@@ -163,6 +168,79 @@ case_pk(sx_db *db, bt_t *bt)
 	    "key reads failing fails, no duplicate\n", errs);
 }
 
+/* v of p's row 1, as the runs that committed left it. */
+static int64_t g_v;
+
+static int
+p_v_is(sx_db *db)
+{
+	return one_int(db, "SELECT v FROM p WHERE k = 1") == g_v ? 0 : -1;
+}
+
+/* Run `body` (statements separated by ';', no binds) with the n-th row
+ * read failing, for every n until none fails.  A failed read must fail
+ * some statement with the read message, and the transaction then rolls
+ * back; a run whose every statement succeeded adds `inc` to g_v.  p's
+ * row 1 must hold g_v after each run.  Returns the failed runs. */
+static int
+sweep_txn(sx_db *db, const char *const *body, int nbody, int inc)
+{
+	int n, i, rc = SX_OK, errs = 0, faults;
+	for (n = 1; n < 1000; n++) {
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		for (i = 0; i < nbody; i++) {
+			rc = sx_exec(db, body[i], NULL);
+			if (rc != SX_OK)
+				break;
+		}
+		if (rc != SX_OK && i > 0)
+			ck_read_msg(db, body[i], n);
+		if (rc != SX_OK)
+			(void)sx_exec(db, "ROLLBACK", NULL);
+		xstore_row_read_fail_at(0);
+		if (xstore_row_read_faults() == faults) {   /* none failed */
+			CK(rc == SX_OK);
+			g_v += inc;
+			CK(p_v_is(db) == 0);
+			break;
+		}
+		errs++;
+		if (rc == SX_OK) {
+			fprintf(stderr, "  %s: read %d failed, the transaction "
+			    "committed\n", body[nbody - 2], n);
+			g_fail = 1;
+			g_v += inc;
+		}
+		CK(p_v_is(db) == 0);
+	}
+	CK(n < 1000);
+	return errs;
+}
+
+/* 2: the write-write and serializable checks. */
+static void
+case_ww(sx_db *db)
+{
+	static const char *const snap[] = { "BEGIN",
+		"UPDATE p SET v = v + 1 WHERE k = 1", "COMMIT" };
+	static const char *const ser[] = {
+		"BEGIN ISOLATION LEVEL SERIALIZABLE",
+		"SELECT v FROM p WHERE k = 1",
+		"UPDATE p SET v = v + 1 WHERE k = 1", "COMMIT" };
+	int a, b, c;
+	g_v = one_int(db, "SELECT v FROM p WHERE k = 1");
+	a = sweep(db, "UPDATE p SET v = v + 1 WHERE k = 1", SX_OK, p_v_is);
+	g_v++;
+	CK(p_v_is(db) == 0);
+	b = sweep_txn(db, snap, 3, 1);
+	c = sweep_txn(db, ser, 4, 1);
+	CK(a > 0 && b > 0 && c > b);
+	printf("  ok   read errors: UPDATE with each of %d (autocommit), %d "
+	    "(transaction) and %d (serializable) check reads failing fails, "
+	    "no update lost\n", a, b, c);
+}
+
 int
 main(void)
 {
@@ -182,6 +260,7 @@ main(void)
 	    sx_open_bt(bt, &db) != SX_OK)
 		return 1;
 	case_pk(db, bt);
+	case_ww(db);
 	sx_close(db);
 	bt_close(bt); bm_destroy(bm);
 	unlink(path);
