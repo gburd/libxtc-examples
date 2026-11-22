@@ -2270,7 +2270,7 @@ xs_idx_key_reused(bt_t *bt, const struct xs_idx_rt *rt, int64_t rowid,
 			rc = XTC_E_IO;
 		if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
 			(void)xs_rd_count(rc);
-			used = 1;
+			used = !XTC_DST_BUG(XTC_DST_BUG_REAPREAD); /* planted 86 */
 			break;
 		}
 		if (rc != XTC_OK || kln != XS_VKLEN)
@@ -4176,6 +4176,8 @@ xstore_max_rowid(bt_t *bt, uint32_t tableid, int64_t *out)
 	 * hand out rowid 1 over a committed row. */
 	if (rc == XTC_E_NOTFOUND)
 		return XTC_OK;               /* nothing below: empty */
+	if (rc != XTC_OK && XTC_DST_BUG(XTC_DST_BUG_MAXROWID))
+		return XTC_OK;  /* planted 85: a failed descent is an empty table */
 	if (rc != XTC_OK)
 		return xs_rd_count(rc);
 	if (klen != XS_VKLEN || dec_tableid(k) != tableid)
