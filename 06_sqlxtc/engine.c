@@ -542,7 +542,7 @@ sx_storage_open(const char *path, unsigned int n_frames)
 	wal_tail_t tail;
 	const char *dpath = (path && path[0]) ? path : "sqlxtc.xdb";
 	uint64_t clean = 0, clock = 0, idxtag = 0, idxgarb = 0;
-	int trusted = 0, i;
+	int trusted = 0, i, rc;
 
 	if (g_xbt != NULL)
 		return SX_OK;                 /* already open */
@@ -683,15 +683,8 @@ sx_storage_open(const char *path, unsigned int n_frames)
 	i = xtc_ncpus();
 	if (i > 16) i = 16;
 	if ((unsigned)i > o.n_frames / 1024u) i = (int)(o.n_frames / 1024u);
-	/* An index catalog that cannot be read leaves the definitions
-	 * unknown: an index missing from the cache would be neither
-	 * maintained nor enforced, so the open fails (the base and the log
-	 * are untouched; a retry reads them again). */
-	if (xstore_index_open(g_xbt, trusted ? idxtag : 0, idxgarb, !trusted,
-	    i) < 0) {
-		sx_storage_abandon();
-		return SX_ERROR;
-	}
+	rc = xstore_index_open(g_xbt, trusted ? idxtag : 0, idxgarb, !trusted,
+	    i);
 	/* A trusted base that failed a page checksum while the open read it
 	 * (the index catalog load): drop it and rebuild from the log now,
 	 * rather than run fail-stopped until the next restart.  The log is
@@ -701,6 +694,14 @@ sx_storage_open(const char *path, unsigned int n_frames)
 		/* Not a loop: this open made the clean flag durably 0 above,
 		 * so the next one takes the rebuild path. */
 		return sx_storage_open(path, n_frames);
+	}
+	/* Any other index catalog that cannot be read leaves the
+	 * definitions unknown: an index missing from the cache would be
+	 * neither maintained nor enforced, so the open fails (the base and
+	 * the log are untouched; a retry reads them again). */
+	if (rc < 0) {
+		sx_storage_abandon();
+		return SX_ERROR;
 	}
 	return SX_OK;
 }
