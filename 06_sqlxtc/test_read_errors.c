@@ -552,6 +552,21 @@ case_reuse(sx_db *db, bt_t *bt)
 	    "a reused UNIQUE entry\n", errs);
 }
 
+/* Is index zt_v<n> in zt's index list? */
+static int
+zt_has_index(sx_db *db, int n)
+{
+	xstore_index_info_t ix[64];
+	char name[32];
+	int i, k = xstore_index_list(xstore_bt_of((struct xsql *)db), "zt",
+	    ix, 64);
+	snprintf(name, sizeof name, "zt_v%d", n);
+	for (i = 0; i < k; i++)
+		if (strcmp(ix[i].name, name) == 0)
+			return 1;
+	return 0;
+}
+
 /* 10: more tables than the catalog cache holds (256), so each statement
  * resolves its table from the catalog tree.  A failed resolve is an
  * error, never "no such table" taken for an empty one. */
@@ -595,6 +610,23 @@ case_catcache(sx_db *db)
 		r = NULL;
 	}
 	CK(n < 100 && errs > 0 && perrs > 0);
+	/* CREATE INDEX resolves the table again to enter its cache: a run
+	 * that succeeded has the index in use. */
+	for (n = 1; n < 100; n++) {
+		snprintf(sql, sizeof sql, "CREATE INDEX zt_v%d ON zt(v)", n);
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		rc = sx_exec(db, sql, NULL);
+		xstore_row_read_fail_at(0);
+		if (rc == SX_OK && one_int(db, "SELECT count(*) FROM zt "
+		    "WHERE v = 2") != 1)
+			CK(0);
+		CK(rc != SX_OK || zt_has_index(db, n));
+		if (xstore_row_read_faults() == faults)
+			break;
+		errs++;
+	}
+	CK(n < 100);
 	printf("  ok   read errors: with the catalog cache full, %d statement "
 	    "and %d parallel runs with a failed catalog read fail\n", errs,
 	    perrs);
