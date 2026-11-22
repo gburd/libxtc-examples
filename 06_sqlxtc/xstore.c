@@ -1363,6 +1363,25 @@ xstore_row_read_fail_at(int n)
 	return xtc_atomic_exchange_i32(&g_row_failat, n, xtc_mo_relaxed);
 }
 
+static int g_reap_fail;     /* test hook: every reap read fails */
+
+/* Should this read of the UNIQUE reap's reuse check fail
+ * (xstore_reap_read_fail)?  One relaxed load when disarmed. */
+static int
+xs_reap_fault(void)
+{
+	if (xtc_atomic_load_i32(&g_reap_fail, xtc_mo_relaxed) == 0)
+		return 0;
+	(void)xtc_atomic_fetch_add_i32(&g_row_faults, 1, xtc_mo_relaxed);
+	return 1;
+}
+
+int
+xstore_reap_read_fail(int on)
+{
+	return xtc_atomic_exchange_i32(&g_reap_fail, on != 0, xtc_mo_relaxed);
+}
+
 int
 xstore_row_read_faults(void)
 {
@@ -2277,7 +2296,7 @@ xs_idx_key_reused(bt_t *bt, const struct xs_idx_rt *rt, int64_t rowid,
 		const void *k = NULL, *vv = NULL; uint16_t kln = 0, vl = 0;
 		const uint8_t *kb;
 		rc = bt_cursor_next(cur, &k, &kln, &vv, &vl);   /* RDERR_OK: "used" */
-		if (rc == XTC_OK && xs_row_fault())
+		if (rc == XTC_OK && (xs_row_fault() || xs_reap_fault()))
 			rc = XTC_E_IO;
 		if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
 			(void)xs_rd_count(rc);

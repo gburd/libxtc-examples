@@ -209,6 +209,12 @@ int xstore_scan_read_fail_at(int n);
  * and a spilled payload brought back at COMMIT, MAX(rowid), the catalog
  * lookups and id allocation, and version GC. */
 int xstore_row_read_fail_at(int n);
+/* Test hook: while on, every cursor step of the UNIQUE reap's check that
+ * a newer version reuses a superseded entry fails with XTC_E_IO, and no
+ * other read does, so a test fails the reads the reap makes whatever the
+ * reads around them.  Its faults count in xstore_row_read_faults.
+ * Returns the previous setting. */
+int xstore_reap_read_fail(int on);
 /* Test hook: how many reads xstore_row_read_fail_at has failed so far. */
 int xstore_row_read_faults(void);
 /* Reads of the tree that failed with an error (not "no such key"), over
