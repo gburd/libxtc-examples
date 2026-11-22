@@ -2537,6 +2537,7 @@ xs_idx_preimage(bt_t *bt, uint32_t tableid, int64_t rowid,
 	if (g_idx_n == 0) return 0;   /* no indexes: skip the read entirely */
 	n = xs_read_rec(bt, tableid, rowid, buf, cap);
 	if (n < 0) {
+		(void)xs_rd_count(n);
 		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 		return 0;
 	}
@@ -8745,7 +8746,7 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 		rc = XTC_E_IO;
 	}
 	if (rc != XTC_OK) /* planted 72: the error reads as "no duplicate" */
-		return XTC_DST_BUG(XTC_DST_BUG_UNIQPROBE) ? 0 : rc;
+		return XTC_DST_BUG(XTC_DST_BUG_UNIQPROBE) ? 0 : xs_rd_count(rc);
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t kl = 0, vl = 0;
 		int64_t rid;
@@ -8794,6 +8795,8 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 	}
 	bt_cursor_close(cur);
 	free(rec);
+	if (dup < 0 && dup != XTC_E_NOMEM)
+		(void)xs_rd_count(dup);
 	return dup;
 }
 
@@ -8814,7 +8817,7 @@ xs_uniq_buffered_walk(xstore_ctx_t *c, const struct xs_idx_rt *rt,
 			continue;
 		rc = xs_wrec_payload(c, wi, &rec, &rl);
 		if (rc != XTC_OK)
-			return rc;
+			return rc == XTC_E_NOMEM ? rc : xs_rd_count(rc);
 		kl2 = xs_idx_rowkey(rt, rec, rl, b->rowid, 0, kk,
 		    (int)sizeof kk, NULL);
 		if (xs_uniq_same(rt, kk, kl2, key, klen, rec, rl,
@@ -8849,8 +8852,8 @@ xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
 		if (!wbuf_is_newest(c, wi) || c->wbuf[wi].deleted)
 			continue; /* superseded or deleted in this txn */
 		rc = xs_wrec_payload(c, wi, &rec, &rl);
-		if (rc != XTC_OK)
-			return rc; /* a spilled payload not read back */
+		if (rc != XTC_OK) /* a spilled payload not read back */
+			return rc == XTC_E_NOMEM ? rc : xs_rd_count(rc);
 		kl2 = xs_idx_rowkey(rt, rec, rl, c->wbuf[wi].rowid, 0, kk,
 		    (int)sizeof kk, NULL);
 		if (xs_uniq_same(rt, kk, kl2, key, klen, rec, rl,
@@ -9480,7 +9483,7 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 				continue;
 			rc = xs_wrec_payload(cx, wi, &rec, &rl);
 			if (rc != XTC_OK) { /* the first next fails */
-				s->err = rc;
+				s->err = rc == XTC_E_NOMEM ? rc : xs_rd_count(rc);
 				break;
 			}
 			kl = xs_idx_rowkey(&s->rt, rec, rl, cx->wbuf[wi].rowid,
@@ -9541,7 +9544,7 @@ static int
 xs_iscan_fail(xstore_iscan_t *s, int rc)
 {
 	if (s->err == 0)
-		s->err = rc;
+		s->err = rc == XTC_E_NOMEM ? rc : xs_rd_count(rc);
 	if (s->cur != NULL)
 		(void)bt_cursor_park(s->cur);
 	return -1;
@@ -9966,8 +9969,10 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 			    s->snap, s->rec, 1 + XS_VMAX, &s->err);
 			if (s->err == 0 && xs_rd_fault())
 				s->err = XTC_E_IO;
-			if (s->err != 0)
+			if (s->err != 0) {
+				(void)xs_rd_count(s->err);
 				return -1;
+			}
 			if (rl == 0) continue;
 			if (rl < 0) rl = 0;
 		}
@@ -11188,8 +11193,10 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 			/* NOTFOUND is the end of the tree; anything else would
 			 * leave a truncated image, which neither checkpoint
 			 * swaps in (the quiesced one gets XTC_E_IO below). */
-			if (n != XTC_E_NOTFOUND)
+			if (n != XTC_E_NOTFOUND) {
+				(void)xs_rd_count(n);
 				dc->cancelled = 1;
+			}
 			break;
 		}
 		/* Secondary-index entries (XS_IDX_LEAD keys, not version keys)
