@@ -572,7 +572,7 @@ typedef struct xstore_ctx {
 	uint64_t         uniq_vis;    /* horizon of the txn's UNIQUE checks */
 	uint64_t         uniq_gen;    /* index generation at those checks */
 	char             uniq_err[192]; /* last UNIQUE violation message */
-	char             rd_err[192];   /* this statement's index read error */
+	char             rd_err[192];   /* this statement's first read error */
 	uint32_t         rd_tid;        /* or a table read error, named later */
 	int              rd_rc;         /* its XTC_E_* code; 0: none */
 	/* Largest buffered rowid per table (xstore_max_rowid_txn), kept by
@@ -6186,8 +6186,9 @@ xstore_uniq_err(struct xsql *db)
 	return cx != NULL ? cx->uniq_err : "";
 }
 
-/* The current statement's first index read error ("index error: cannot
- * read index t_g on t: I/O error"), or "" if none. */
+/* The current statement's first read error ("index error: cannot read
+ * index t_g on t: ...", "cannot read table t: ...", "cannot read the
+ * catalog: ..."), or "" if none. */
 const char *
 xstore_read_err(struct xsql *db)
 {
@@ -6223,7 +6224,7 @@ xstore_read_err_catalog(struct xsql *db, int rc)
 	xs_rd_err_tid(xstore_ctx_of(db), XS_CAT_TABLEID, rc);
 }
 
-/* Clear the connection's index read error (see xstore.h). */
+/* Clear the connection's read error (see xstore.h). */
 void
 xstore_read_err_clear(struct xsql *db)
 {

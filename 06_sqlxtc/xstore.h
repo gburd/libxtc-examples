@@ -540,17 +540,18 @@ void xstore_iscan_hint(xstore_iscan_t *s, int64_t nrows);
 /* The connection's last UNIQUE-index violation message ("UNIQUE
  * constraint failed: t.a, t.b"), "" if none (a rowid-key conflict). */
 const char *xstore_uniq_err(struct xsql *db);
-/* The current statement's first index scan read error ("index error:
- * cannot read index t_g on t: I/O error"), "" if none.  Cleared when a
- * statement starts (xstore_read_err_clear, xstore_stmt_begin,
- * xstore_stmt_pin). */
+/* The current statement's first read error, "" if none: an index scan's
+ * ("index error: cannot read index t_g on t: I/O error"), a table's
+ * ("cannot read table t: I/O error"), or the catalog's ("cannot read the
+ * catalog: I/O error").  Cleared when a statement starts
+ * (xstore_read_err_clear, xstore_stmt_begin, xstore_stmt_pin). */
 const char *xstore_read_err(struct xsql *db);
 /* Record that a catalog read of the current statement failed with rc
  * (an XTC_E_* code from xstore_table_id or xstore_table_schema), so
  * xstore_read_err says "cannot read the catalog: ...".  A statement's
  * first read error wins. */
 void xstore_read_err_catalog(struct xsql *db, int rc);
-/* Forget the last statement's index read error.  The engine calls it
+/* Forget the last statement's read error.  The engine calls it
  * when any statement starts, so a statement that never reaches the store
  * (PRAGMA table_info) cannot report an earlier one's. */
 void xstore_read_err_clear(struct xsql *db);
