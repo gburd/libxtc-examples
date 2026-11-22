@@ -296,6 +296,20 @@ The engine provides:
     isolation levels (read committed through serializable) selectable
     over the wire with BEGIN ... ISOLATION LEVEL / SET TRANSACTION
     ISOLATION LEVEL; time-travel reads (AS OF a commit timestamp, C API);
+  - autocommit statements that are atomic: a statement that writes
+    one row commits it directly, and one that writes more (a multi-row
+    UPDATE, DELETE, INSERT ... SELECT or INSERT VALUES, or an UPDATE
+    that moves a primary key) runs as an implicit transaction at
+    SNAPSHOT isolation on the statement's snapshot, committing every
+    row at one timestamp or none of them.  A failure partway (a read
+    error, a UNIQUE violation, a row too large, a kill of the
+    connection) leaves nothing.  A stale write-write conflict re-runs
+    the statement, so an INSERT that loses a key race to another
+    session reports "UNIQUE constraint failed", as PostgreSQL does;
+    a deadlock between two such statements fails the youngest with
+    "could not serialize access".  The one-fsync commit holds while the
+    statement's buffered rows stay under 256 KiB; past that they spill
+    and each spilled row waits for its own fsync (xstore.h);
   - snapshots taken from a read horizon that trails in-flight commits,
     so no snapshot sees a partly applied transaction;
   - serializable snapshot isolation (SSI): a native scan records its
@@ -337,6 +351,10 @@ which the agent harness cannot drive safely):
     storage-native scan with read-your-writes and snapshots.
   - test_isolation / test_savepoint / test_native_txn -- isolation
     levels, SSI, savepoints, and native transaction control.
+  - test_stmt_atomic / test_insert_race -- autocommit statement
+    atomicity under read errors, constraint violations and kills, and
+    multi-row INSERTs racing on a key (UNIQUE, never a serialization
+    failure).
   - test_wal / test_wal_recover / test_torn_smo / test_wal_compact --
     group commit, crash recovery, torn-structure recovery, log
     compaction.

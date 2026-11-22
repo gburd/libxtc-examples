@@ -6194,11 +6194,13 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		                  deleted ? 0 : reclen, deleted);
 		return rc == SX_OK ? 0 : -1;
 	}
-	/* Autocommit: an UPDATE/DELETE computed this row from its read at
-	 * stmt_base; xs_put_ts refuses it (SX_BUSY) if the row was committed
-	 * past that since, or a commit writing it is in flight.  Holding the
-	 * row's intent for the put makes it wait for a transaction that
-	 * holds the row (and that transaction wait for it). */
+	/* Autocommit (a one-row statement; a multi-row one runs in an
+	 * implicit transaction): an UPDATE/DELETE computed this row from its
+	 * read at stmt_base; xs_put_ts refuses it (SX_BUSY) if the row was
+	 * committed past that since, or a commit writing it is in flight.
+	 * Holding the row's intent for the put makes it wait for a
+	 * transaction that holds the row (and that transaction wait for
+	 * it). */
 	/* base 0: xs_put_ts makes the stale-read check under the commit lock */
 	if ((rc = xs_intent_take(cx, tableid, rowid, 0)) != 0) {
 		xs_intents_release(cx);
@@ -6230,8 +6232,9 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 
 /* INSERT of one new row: like xstore_write_txn, but the key must not
  * exist.  Autocommit checks that atomically with the write (see
- * xs_put_ts); in a transaction the statement checked it and the commit's
- * write-write check catches a row committed since the snapshot.
+ * xs_put_ts); in a transaction (a multi-row statement's implicit one
+ * too) the statement checked it and the commit's write-write check
+ * catches a row committed since the snapshot.
  * Returns 0, 1 if the key exists (unique violation), or -1 on error. */
 int
 xstore_insert_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
@@ -6534,7 +6537,8 @@ static int xs_commit_ctx(xstore_ctx_t *cx);
  * write is checked against it: a row committed by another writer after
  * the statement read it fails the commit (SX_BUSY, a conflict the
  * engine re-runs the statement for), and so does a key another INSERT
- * committed after this one's key check.
+ * committed after this one's key check: that statement's re-run finds
+ * the key and reports UNIQUE, as PostgreSQL does.
  *
  * Its row intents are held to the end of the statement, so two such
  * statements that take the same rows in opposite orders (one in key

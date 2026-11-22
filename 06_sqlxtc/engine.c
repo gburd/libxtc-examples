@@ -2030,7 +2030,9 @@ sx_step_body(sx_stmt *st)
 			/* UPDATE/DELETE compute rows from a read: give the statement
 			 * one snapshot and a write-write check against it.  An INSERT
 			 * reads only "the key is absent", which the insert path checks
-			 * atomically with the write (xstore_insert_txn). */
+			 * atomically with the write (xstore_insert_txn); a multi-row
+			 * INSERT's implicit transaction checks it again at its
+			 * commit, and the stale conflict re-runs it (below). */
 			rd = sx_word(&w, "UPDATE") || sx_word(&w, "DELETE");
 			/* In a transaction a failed statement undoes only its own
 			 * writes; the transaction stays open (SQLite statement

@@ -9254,9 +9254,10 @@ vx_write_uniq_err(struct xsql *db, char **errmsg, const char *table,
 }
 
 /* Apply one INSERTed row.  REPLACE overwrites; a plain INSERT must not
- * find the key, checked atomically with the write (xstore_insert_txn),
- * so two concurrent INSERTs of one key cannot both succeed.  Returns 0,
- * or -1 with *errmsg set. */
+ * find the key, checked atomically with the write or, in a transaction
+ * (a multi-row statement's implicit one too), again at the commit
+ * (xstore_insert_txn), so two concurrent INSERTs of one key cannot both
+ * succeed.  Returns 0, or -1 with *errmsg set. */
 static int
 vx_insert_row(struct xsql *db, uint32_t tableid, int64_t rowid,
     const uint8_t *rec, int reclen, int replace, const char *table,

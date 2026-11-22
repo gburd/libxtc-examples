@@ -333,9 +333,11 @@ uint64_t xstore_wbuf_scan_count(void);
 int xstore_row_exists_txn(struct xsql *db, uint32_t tableid, int64_t rowid);
 /* INSERT one new row (the key must not already exist).  Autocommit
  * checks absence atomically with the write, waiting out an in-flight
- * writer of the key; in a transaction the commit's write-write check
- * refuses a row committed since the snapshot.  Returns 0, 1 on a unique
- * violation, -1 on any other error. */
+ * writer of the key; in a transaction, the implicit one of a multi-row
+ * statement included, the commit's write-write check refuses a row
+ * committed since the snapshot (a stale conflict: the engine re-runs an
+ * autocommit statement, whose key check then reports UNIQUE).  Returns
+ * 0, 1 on a unique violation, -1 on any other error. */
 int xstore_insert_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
                       const uint8_t *rec, int reclen);
 /* Reserve an auto-assigned rowid for `tableid`: greater than `floor`
@@ -378,9 +380,11 @@ int xstore_put_rec(bt_t *bt, uint32_t tableid, int64_t rowid,
 int xstore_delete_rec(bt_t *bt, uint32_t tableid, int64_t rowid);
 
 /* Transaction-aware native write: buffers into the connection's write
- * set when a BEGIN..COMMIT is open (committing atomically at one
- * timestamp with any other writes in the transaction, VDBE or native),
- * or autocommits immediately in autocommit mode.  `deleted` writes a
+ * set when a transaction is open, a BEGIN..COMMIT or a multi-row
+ * statement's implicit one (committing atomically at one timestamp with
+ * the transaction's other writes), or autocommits the row at once (a
+ * one-row statement).  A row write with a kill pending for the
+ * connection's proc fails instead of committing.  `deleted` writes a
  * tombstone (rec/reclen ignored).  Returns 0 on success, <0 on error. */
 int xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
                      const uint8_t *rec, int reclen, int deleted);
@@ -447,7 +451,10 @@ int  xstore_last_conflict(struct xsql *db);
 /* After a write statement failed on a stale-read conflict: 1 if it may
  * re-run on a fresh snapshot (READ COMMITTED; the first access of a
  * snapshot transaction, whose snapshot then moves; autocommit before
- * any row applied).  Prepares the re-run. */
+ * any row applied, which covers every multi-row statement, since its
+ * implicit transaction applies nothing until it commits).  An autocommit
+ * re-run first waits until every commit so far is visible.  Prepares
+ * the re-run. */
 int  xstore_stmt_restart(struct xsql *db);
 /* Native C-API equivalents of the MVCC SQL functions. */
 int64_t xstore_clock_now(void);              /* xstore_now() */
