@@ -6686,6 +6686,30 @@ xs_wal_log(xstore_ctx_t *cx, uint64_t ts, uint64_t *clsn)
 	return rc;
 }
 
+/* STEAL: bring the transaction's spilled payloads back before COMMIT
+ * logs them.  One that cannot be read back would go to the log as a
+ * record with no payload, so the transaction cannot commit.  SX_OK, or
+ * SX_ERROR with the statement's read error set (the caller rolls
+ * back). */
+static int
+xs_commit_unspill(xstore_ctx_t *cx)
+{
+	int i, rc;
+	for (i = 0; i < cx->wn; i++) {
+		xs_wrec_t *w = &cx->wbuf[i];
+		rc = w->spilled && xs_row_fault() ? SX_ERROR
+		    : xs_wrec_ensure(cx, w);
+		if (rc != SX_OK) {
+			if (rc != SX_NOMEM)
+				(void)xs_rd_count(XTC_E_IO);
+			xs_rd_err_tid(cx, w->tableid,
+			    rc == SX_NOMEM ? XTC_E_NOMEM : XTC_E_IO);
+			return SX_ERROR;
+		}
+	}
+	return SX_OK;
+}
+
 static int
 xs_commit_ctx(xstore_ctx_t *cx)
 {
@@ -6708,21 +6732,9 @@ xs_commit_ctx(xstore_ctx_t *cx)
 		return SX_OK;
 	}
 	{
-		/* STEAL: bring spilled payloads back.  One that cannot be read
-		 * back would go to the log as a record with no payload: the
-		 * transaction cannot commit. */
-		for (i = 0; cx->steal_txn != 0 && i < cx->wn; i++) {
-			xs_wrec_t *w = &cx->wbuf[i];
-			rc = w->spilled && xs_row_fault() ? SX_ERROR
-			    : xs_wrec_ensure(cx, w);
-			if (rc != SX_OK) {
-				if (rc != SX_NOMEM)
-					(void)xs_rd_count(XTC_E_IO);
-				xs_rd_err_tid(cx, w->tableid,
-				    rc == SX_NOMEM ? XTC_E_NOMEM : XTC_E_IO);
-				(void)xs_rollback_ctx(cx);
-				return SX_ERROR;
-			}
+		if (cx->steal_txn != 0 && xs_commit_unspill(cx) != SX_OK) {
+			(void)xs_rollback_ctx(cx);
+			return SX_ERROR;
 		}
 		/* First-committer-wins write-write check, the timestamp, and
 		 * the in-flight registration are one atomic step under the
