@@ -270,6 +270,8 @@ main(void)
 	double r1, r8, cap;
 	int64_t v0, v1;
 	int fd, i;
+	/* The races need volume; valgrind gives 3 s about 1/50 of it. */
+	long min_ops = getenv("XTC_UNDER_VALGRIND") != NULL ? 0 : 1000;
 
 	t_tmpl(g_path, sizeof g_path, "sqlxtc-snapreg");
 	if ((fd = mkstemp(g_path)) < 0) return 1;
@@ -320,7 +322,7 @@ main(void)
 	printf("  updates=%ld snapshot-violations=%ld\n",
 	    xtc_atomic_load_long(&g_upd, xtc_mo_seq_cst),
 	    xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst));
-	CK(xtc_atomic_load_long(&g_upd, xtc_mo_seq_cst) > 1000);
+	CK(xtc_atomic_load_long(&g_upd, xtc_mo_seq_cst) > min_ops);
 	CK(xtc_atomic_load_long(&g_bad, xtc_mo_seq_cst) == 0);
 
 	/* (3) */
@@ -341,7 +343,7 @@ main(void)
 	    xtc_atomic_load_long(&g_ac_zero, xtc_mo_seq_cst),
 	    (long long)(v1 - v0),
 	    xtc_atomic_load_long(&g_ac_short, xtc_mo_seq_cst));
-	CK(xtc_atomic_load_long(&g_ac_ok, xtc_mo_seq_cst) > 1000);
+	CK(xtc_atomic_load_long(&g_ac_ok, xtc_mo_seq_cst) > min_ops);
 	CK(xtc_atomic_load_long(&g_ac_zero, xtc_mo_seq_cst) == 0);
 	CK(v1 - v0 == xtc_atomic_load_long(&g_ac_ok, xtc_mo_seq_cst));
 	CK(xtc_atomic_load_long(&g_ac_short, xtc_mo_seq_cst) == 0);

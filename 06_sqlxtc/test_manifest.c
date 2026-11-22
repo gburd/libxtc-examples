@@ -648,7 +648,9 @@ t_concurrent(void)
 		}
 	xtc_rcu_read_unlock();
 	CK(bad == 0);
-	CK(g_flushes > 2);
+	/* valgrind slows the flush far more than the committers' sleeps. */
+	CK(g_flushes > 2 ||
+	    (getenv("XTC_UNDER_VALGRIND") != NULL && g_flushes > 0));
 	printf("  concurrent: %d committers on 2 loops, %d flushes, every RID "
 	    "at its newest place\n", CC_FIBERS, g_flushes);
 	mf_close(g_m);
