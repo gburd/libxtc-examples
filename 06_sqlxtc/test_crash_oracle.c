@@ -38,6 +38,19 @@
  *	  s%10 9    DELETE row of s-6   (autocommit)
  *	A target in an earlier round makes the op a plain INSERT, so every
  *	target was acked earlier on the same lane.
+ *	Every 20th op (s%20 5, a slot no op above targets) is instead a
+ *	multi-row autocommit statement, which runs as one implicit
+ *	transaction: all of its rows or none must survive.  Each lane owns NM
+ *	rows of table m; by q = s / 20:
+ *	  q%3 0     UPDATE the lane's m rows (v = id, and on every other one a
+ *	            3000-byte pad, so the statement spills past 256 KiB)
+ *	  q%3 1     INSERT INTO b SELECT the lane's m rows (NM rows, op = id)
+ *	  q%3 2     DELETE FROM b WHERE op = the INSERT of q-1 (through b's
+ *	            index); an UPDATE instead if that INSERT is in an earlier
+ *	            round
+ *	The verify child dumps m and b's per-op counts: a lane's m rows must
+ *	agree on v and the pad, b's count for an op is 0 or NM, and both
+ *	must match the model.
  *	Usage: test_crash_oracle [seeds [first-seed]] (default 3 1).
  */
 
@@ -69,8 +82,11 @@ int xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale);
 #define MAXID    (MAXSEQ * NLANE)
 #define FRAMES   2048
 #define NG       17
+#define NM       96                /* m rows per lane */
+#define BIGPAD   3000              /* a spilling UPDATE's pad length */
+#define NIDX     4                 /* t_g, t_gw, u's UNIQUE, b_op */
 
-enum { K_INS, K_TXN, K_UPD, K_DEL };
+enum { K_INS, K_TXN, K_UPD, K_DEL, K_MUPD, K_MINS, K_MDEL };
 enum { S_NONE, S_ACKED, S_UNKNOWN, S_APPLIED, S_GONE };   /* op status */
 
 struct msg { int32_t tag; int32_t kind; int64_t id; int64_t tgt; };
@@ -99,10 +115,55 @@ static int
 op_of(int64_t s, int64_t round_start, int64_t *tseq)
 {
 	int r = (int)(s % 10);
+	if (s % 20 == 5) {
+		/* A multi-row op: the DELETE's target is the INSERT 20 back. */
+		*tseq = s - 20;
+		switch ((s / 20) % 3) {
+		case 0: return K_MUPD;
+		case 1: return K_MINS;
+		default: return *tseq < round_start ? K_MUPD : K_MDEL;
+		}
+	}
 	*tseq = s - 6;
 	if (r < 6 || *tseq < round_start)
 		return K_INS;
 	return r <= 7 ? K_TXN : r == 8 ? K_UPD : K_DEL;
+}
+
+/* The pad length a multi-row UPDATE `id` writes: on every other one a
+ * pad that makes the statement spill. */
+static int
+pad_of(int64_t id)
+{
+	return (id / NLANE / 60) % 2 == 0 ? BIGPAD : 8;
+}
+
+/* Run a multi-row op of lane `ln`: see the header. */
+static int
+run_multi(sx_db *h, int kind, int64_t id, int64_t tgt, long ln)
+{
+	char sql[BIGPAD + 200], pad[BIGPAD + 1];
+	int n;
+	switch (kind) {
+	case K_MUPD:
+		n = pad_of(id);
+		memset(pad, 'a' + (int)(id % 26), (size_t)n);
+		pad[n] = '\0';
+		snprintf(sql, sizeof sql, "UPDATE m SET v = %lld, pad = '%s' WHERE "
+		    "k >= %ld AND k < %ld", (long long)id, pad, ln * NM,
+		    (ln + 1) * NM);
+		break;
+	case K_MINS:
+		snprintf(sql, sizeof sql, "INSERT INTO b SELECT k + %lld * 1000, "
+		    "%lld FROM m WHERE k >= %ld AND k < %ld", (long long)id,
+		    (long long)id, ln * NM, (ln + 1) * NM);
+		break;
+	default:
+		snprintf(sql, sizeof sql, "DELETE FROM b WHERE op = %lld",
+		    (long long)tgt);
+		break;
+	}
+	return sx_exec(h, sql, NULL);
 }
 
 static int
@@ -155,7 +216,8 @@ lane(void *arg)
 			kind = op_of(s, g_seg.round_start, &tseq);
 			tgt = kind == K_INS ? -1 : tseq * NLANE + ln;
 			send_msg('A', kind, id, tgt);
-			if (run_op(h, kind, id, tgt) == SX_OK)
+			if ((kind >= K_MUPD ? run_multi(h, kind, id, tgt, ln) :
+			    run_op(h, kind, id, tgt)) == SX_OK)
 				send_msg('K', kind, id, tgt);
 			else
 				send_msg('F', kind, id, tgt);   /* attempted, refused */
@@ -166,6 +228,53 @@ lane(void *arg)
 	}
 	if (xtc_atomic_fetch_sub_i32(&g_left, 1, xtc_mo_seq_cst) == 1)
 		sx_storage_quiesce();
+}
+
+/* The multi-row ops' tables: m with NM rows per lane (v 0, no pad), and
+ * b, empty, with an index on op. */
+static int
+create_multi(sx_db *h)
+{
+	char sql[96];
+	int k;
+	if (sx_exec(h, "CREATE TABLE m(k INTEGER PRIMARY KEY, v INTEGER, "
+	    "pad TEXT)", NULL) != SX_OK ||
+	    sx_exec(h, "CREATE TABLE b(k INTEGER PRIMARY KEY, op INTEGER)",
+	    NULL) != SX_OK ||
+	    sx_exec(h, "CREATE INDEX b_op ON b(op)", NULL) != SX_OK ||
+	    sx_exec(h, "BEGIN", NULL) != SX_OK)
+		return -1;
+	for (k = 0; k < NLANE * NM; k++) {
+		snprintf(sql, sizeof sql, "INSERT INTO m VALUES(%d, 0, '')", k);
+		if (sx_exec(h, sql, NULL) != SX_OK)
+			return -1;
+	}
+	return sx_exec(h, "COMMIT", NULL) == SX_OK ? 0 : -1;
+}
+
+/* Verify child, multi-row ops: every m row ("M k v padlen") and b's row
+ * count per op ("B op count"). */
+static void
+dump_multi(sx_db *h, FILE *f)
+{
+	sx_stmt *st = NULL;
+	if (sx_prepare(h, "SELECT k, v, length(pad) FROM m ORDER BY k", -1, &st,
+	    NULL) == SX_OK) {
+		while (sx_step(st) == SX_ROW)
+			fprintf(f, "M %lld %lld %lld\n",
+			    (long long)sx_column_int64(st, 0),
+			    (long long)sx_column_int64(st, 1),
+			    (long long)sx_column_int64(st, 2));
+		sx_finalize(st);
+	}
+	if (sx_prepare(h, "SELECT op, count(*) FROM b GROUP BY op", -1, &st,
+	    NULL) == SX_OK) {
+		while (sx_step(st) == SX_ROW)
+			fprintf(f, "B %lld %lld\n",
+			    (long long)sx_column_int64(st, 0),
+			    (long long)sx_column_int64(st, 1));
+		sx_finalize(st);
+	}
 }
 
 /* argv-less worker: segments [a, b) of the lane sequence, with clean
@@ -188,7 +297,8 @@ worker(int64_t round_start, const int64_t *cuts, int ncut, int create)
 		    sx_exec(h, "CREATE TABLE t(k INTEGER PRIMARY KEY, u TEXT UNIQUE, "
 		    "g INTEGER, w INTEGER)", NULL) != SX_OK ||
 		    sx_exec(h, "CREATE INDEX t_g ON t(g)", NULL) != SX_OK ||
-		    sx_exec(h, "CREATE INDEX t_gw ON t(g, w)", NULL) != SX_OK)
+		    sx_exec(h, "CREATE INDEX t_gw ON t(g, w)", NULL) != SX_OK ||
+		    create_multi(h) != 0)
 			return 1;
 		sx_close(h);
 	}
@@ -280,6 +390,7 @@ verifier(const char *out)
 			}
 		}
 		fprintf(f, "U %d %d\n", probes, bad);
+		dump_multi(h, f);
 		n = xstore_index_check((bt_t *)sx_storage_bt(), &miss, &stale);
 		fprintf(f, "I %d %llu %llu\n", n, (unsigned long long)miss,
 		    (unsigned long long)stale);
@@ -312,6 +423,98 @@ rnd(void)
 
 struct row { int present; char u[64]; int64_t g, w; };
 static struct row g_row[MAXID];
+static int64_t  g_mv[NLANE * NM], g_mpad[NLANE * NM];   /* m, as dumped */
+static uint8_t  g_mseen[NLANE * NM];
+static int32_t  g_bcnt[MAXID];     /* b's rows per op, as dumped */
+
+/* An in-flight op's outcome, from what the dump shows. */
+static void
+settle(int64_t i, int applied)
+{
+	if (g_st[i] == S_UNKNOWN)
+		g_st[i] = applied ? S_APPLIED : S_GONE;
+}
+
+static int
+done_op(int64_t i)
+{
+	return g_st[i] == S_ACKED || g_st[i] == S_APPLIED;
+}
+
+/* Lane ln's m rows: all agree, and their v is the lane's last UPDATE
+ * that committed, or a later one in flight at a kill (which settles it).
+ * v 0 with no pad: no UPDATE ever committed. */
+static void
+check_m(uint64_t seed, int64_t maxid, long ln)
+{
+	int64_t v = g_mv[ln * NM], last = 0, i;
+	int r;
+	for (r = 0; r < NM; r++)
+		if (!g_mseen[ln * NM + r] || g_mv[ln * NM + r] != v ||
+		    g_mpad[ln * NM + r] != g_mpad[ln * NM]) {
+			BAD("lane %ld: UPDATE torn: m row %ld is v %lld pad %lld, "
+			    "row %ld v %lld pad %lld", ln, ln * NM + r,
+			    (long long)g_mv[ln * NM + r],
+			    (long long)g_mpad[ln * NM + r], ln * NM,
+			    (long long)v, (long long)g_mpad[ln * NM]);
+			return;
+		}
+	for (i = ln; i < maxid; i += NLANE)
+		if (g_st[i] != S_NONE && g_kind[i] == K_MUPD && done_op(i))
+			last = i;
+	if (v != last && (v < last || v >= maxid || v % NLANE != ln ||
+	    g_st[v] == S_NONE || g_kind[v] != K_MUPD ||
+	    (g_st[v] != S_UNKNOWN && g_st[v] != S_APPLIED))) {
+		BAD("lane %ld: m has v %lld, want the UPDATE of %lld or a later "
+		    "one in flight (status %d)", ln, (long long)v,
+		    (long long)last, v >= 0 && v < maxid ? g_st[v] : -1);
+		return;
+	}
+	if (g_mpad[ln * NM] != (v == 0 ? 0 : pad_of(v)))
+		BAD("lane %ld: m pad %lld for UPDATE %lld", ln,
+		    (long long)g_mpad[ln * NM], (long long)v);
+	if (v != 0)
+		settle(v, 1);
+	for (i = v + NLANE; i < maxid; i += NLANE)    /* later: not applied */
+		if (g_st[i] != S_NONE && g_kind[i] == K_MUPD)
+			settle(i, 0);
+}
+
+/* b: each INSERT's rows are all there or none, and as the model says. */
+static void
+check_b(uint64_t seed, int64_t maxid)
+{
+	int64_t i, del;
+	int32_t c, want;
+	for (i = 0; i < maxid; i++) {
+		c = g_bcnt[i];
+		if (g_st[i] == S_NONE || g_kind[i] != K_MINS) {
+			if (c != 0)
+				BAD("b has %d rows of op %lld, which inserted none",
+				    c, (long long)i);
+			continue;
+		}
+		del = i + 20 * NLANE;    /* the DELETE that may target it */
+		if (del >= maxid || g_st[del] == S_NONE || g_kind[del] != K_MDEL ||
+		    g_tgt[del] != i)
+			del = -1;
+		if (c != 0 && c != NM) {
+			BAD("op %lld's b rows torn: %d of %d (INSERT ... SELECT status "
+			    "%d, DELETE %lld status %d)", (long long)i, c, NM, g_st[i],
+			    (long long)del, del >= 0 ? g_st[del] : -1);
+			continue;
+		}
+		if (del < 0 || !done_op(i))
+			settle(i, c == NM);
+		else
+			settle(del, c == 0);
+		want = done_op(i) && !(del >= 0 && done_op(del)) ? NM : 0;
+		if (c != want)
+			BAD("op %lld: b has %d rows, want %d (insert status %d, "
+			    "delete status %d)", (long long)i, c, want, g_st[i],
+			    del >= 0 ? g_st[del] : -1);
+	}
+}
 
 static int64_t
 mod(int64_t a) { return ((a % NG) + NG) % NG; }
@@ -341,6 +544,8 @@ verify(uint64_t seed, int64_t maxid, uint64_t *rows_out)
 	}
 	memset(g_row, 0, sizeof g_row[0] * (size_t)maxid);
 	memset(gcount, 0, sizeof gcount);
+	memset(g_mseen, 0, sizeof g_mseen);
+	memset(g_bcnt, 0, sizeof g_bcnt[0] * (size_t)maxid);
 	for (g = 0; g < NG; g++) gidx[g] = -1;
 	if ((f = fopen(out, "r")) == NULL) return -1;
 	while (fgets(line, sizeof line, f) != NULL) {
@@ -354,12 +559,19 @@ verify(uint64_t seed, int64_t maxid, uint64_t *rows_out)
 			g_row[k].g = gg; g_row[k].w = ww;
 			if (gg >= 0 && gg < NG) gcount[gg]++;
 			nrows++;
+		} else if (sscanf(line, "M %lld %lld %lld", &a, &b, &c) == 3) {
+			if (a < 0 || a >= NLANE * NM) { BAD("m row %lld", a); continue; }
+			g_mseen[a] = 1; g_mv[a] = b; g_mpad[a] = c;
+		} else if (sscanf(line, "B %lld %lld", &a, &b) == 2) {
+			if (a < 0 || a >= maxid) { BAD("b rows of op %lld", a); continue; }
+			g_bcnt[a] = (int32_t)b;
 		} else if (sscanf(line, "G %lld %lld", &a, &b) == 2) {
 			if (a >= 0 && a < NG) gidx[a] = (int)b;
 		} else if (sscanf(line, "U %lld %lld", &a, &b) == 2) {
 			if (b != 0) BAD("%lld of %lld duplicate UNIQUE inserts accepted", b, a);
 		} else if (sscanf(line, "I %lld %lld %lld", &a, &b, &c) == 3) {
-			if (a != 3) BAD("index check covered %lld indexes, want 3", a);
+			if (a != NIDX)
+				BAD("index check covered %lld indexes, want %d", a, NIDX);
 			if (b != 0) BAD("%lld rows missing from an index", b);
 		} else if (strncmp(line, "NOTABLE", 7) == 0) {
 			BAD("table t is gone (it was created before any kill)");
@@ -376,6 +588,9 @@ verify(uint64_t seed, int64_t maxid, uint64_t *rows_out)
 		if (gidx[g] != gcount[g])
 			BAD("index count for g=%d is %d, scan has %d", g, gidx[g], gcount[g]);
 	/* model check */
+	for (i = 0; i < NLANE; i++)
+		check_m(seed, maxid, (long)i);
+	check_b(seed, maxid);
 	for (i = 0; i < maxid; i++) {
 		int st = g_st[i];
 		if (st == S_UNKNOWN) {          /* in flight at a kill: observe it */
@@ -390,7 +605,8 @@ verify(uint64_t seed, int64_t maxid, uint64_t *rows_out)
 					    (long long)g_tgt[i], app ? "missing" : "present");
 				break;
 			case K_UPD: app = g_row[g_tgt[i]].w == i; break;
-			default:    app = !g_row[g_tgt[i]].present; break;
+			case K_DEL: app = !g_row[g_tgt[i]].present; break;
+			default:    continue;     /* multi-row: check_m, check_b */
 			}
 			g_st[i] = app ? S_APPLIED : S_GONE;
 		}
@@ -474,11 +690,11 @@ round_run(uint64_t seed, int64_t start, int64_t len, int create,
 		if (read(fds[0], &m, sizeof m) != (ssize_t)sizeof m) break;   /* EOF */
 		if (m.tag == 'R') { ready = 1; t0 = xtc_clock_mono(); }
 		else if (m.tag == 'Y') {
-			if ((m.kind != 3 && !create) || m.id != 0)
+			if ((m.kind != NIDX && !create) || m.id != 0)
 				BAD("right after an open: %lld rows missing from an index "
 				    "(%d indexes checked)", (long long)m.id, m.kind);
 		} else if (m.tag == 'X') {
-			if (m.kind != 3 || m.id != 0)
+			if (m.kind != NIDX || m.id != 0)
 				BAD("in run, before a clean close: %lld rows missing from "
 				    "an index (%d indexes checked)", (long long)m.id, m.kind);
 		}
