@@ -493,14 +493,6 @@ int xstore_index_list(bt_t *bt, const char *table, xstore_index_info_t *out,
 int xstore_index_lookup(bt_t *bt, const char *table, const char *col,
                         uint32_t *idx_id);
 
-/* Candidate rowids whose index entry's leading column equals the typed
- * value (XSTORE_C_*), into out (cap).  Returns the count, or -1 on
- * overflow (caller scans).  Candidates may be stale: the caller
- * re-fetches each through MVCC and re-applies the WHERE. */
-int xstore_index_seek_eq(bt_t *bt, uint32_t idx_id, int vclass,
-                         int64_t ival, double rval,
-                         const uint8_t *bytes, int nbytes,
-                         int64_t *out, int cap);
 
 /* xstore_val_t (a typed value: XSTORE_C_*, p/n for TEXT/BLOB) is
  * defined with the record codec above; it also carries index bounds. */

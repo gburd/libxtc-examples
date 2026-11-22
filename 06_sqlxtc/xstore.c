@@ -8295,40 +8295,6 @@ xstore_index_lookup(bt_t *bt, const char *table, const char *col,
 	return r;
 }
 
-/* Candidate rowids whose index entry's LEADING element equals the value
- * (the caller re-fetches each through MVCC and re-applies the WHERE, so
- * stale entries are filtered).  Returns the count, or -1 on overflow. */
-int
-xstore_index_seek_eq(bt_t *bt, uint32_t idx_id, int vclass,
-    int64_t ival, double rval, const uint8_t *bytes, int nbytes,
-    int64_t *out, int cap)
-{
-	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_IDX_KMAX];
-	int startlen, n = 0;
-	if (bt == NULL || out == NULL || cap <= 0) return -1;
-	xtc_atomic_fetch_add_u64(&g_idx_seeks, 1, xtc_mo_relaxed);
-	startlen = xs_idx_prefix(idx_id, startk);
-	startlen = xs_tup_elem(startk, startlen, (int)sizeof startk, vclass,
-	    ival, rval, bytes, nbytes, 0);
-	if (startlen < 0 || startlen + 8 > (int)bt_max_key(bt)) return -1;
-	if (bt_cursor_open(bt, startk, (uint16_t)startlen, &cur) != XTC_OK) return -1;
-	for (;;) {
-		const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
-		const uint8_t *kb;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK) break;
-		kb = (const uint8_t *)k;
-		if (klen < startlen + 8 || memcmp(kb, startk, (size_t)startlen) != 0)
-			break;   /* past the value's range */
-		if (n < cap)
-			out[n] = (int64_t)(xs_get_be64(kb + klen - 8) ^ 0x8000000000000000ull);
-		n++;
-		if (n > cap) { bt_cursor_close(cur); return -1; }   /* overflow */
-	}
-	bt_cursor_close(cur);
-	return n;
-}
-
 /* Number of index seeks the planner has served (metric/test evidence
  * that the seek path -- not a full scan -- was taken). */
 uint64_t
