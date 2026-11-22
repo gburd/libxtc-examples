@@ -327,6 +327,9 @@ static void xs_visible_catchup_locked(void);
  * lock.  g_wal_busy counts log writes in progress (any xs_wal_emit). */
 static int g_ckpt_gate;
 static int g_wal_busy;
+/* Set by xstore_quiesce_final (the engine is stopping and holds the gate
+ * for good), cleared when a log is attached (xs_commit_state_reset). */
+static int g_xs_stopped;
 static void xs_gate_wait_locked(void);
 
 /* The static engine amutexes, cached: xtc_amutex_static takes a global
@@ -4492,9 +4495,12 @@ xs_gate_wait_locked(void)
 static int g_ock_cancel; /* xstore_checkpoint_cancel */
 
 /* Take the checkpoint gate and drain the commits in flight.  With
- * `cancellable`, give up (returning 0, gate not taken) once
- * xstore_checkpoint_cancel is set: the engine is stopping and its final
- * quiesce holds the gate for good.  Returns 1 when quiesced. */
+ * `cancellable` XS_QB_CKPT, give up (returning 0, gate not taken) once
+ * xstore_checkpoint_cancel is set; with XS_QB_STOP, once
+ * xstore_quiesce_final has run.  Either way the engine is stopping and
+ * its final quiesce holds the gate for good.  Returns 1 when quiesced. */
+#define XS_QB_CKPT 1
+#define XS_QB_STOP 2
 static int
 xs_quiesce_begin(int cancellable)
 {
@@ -4502,8 +4508,10 @@ xs_quiesce_begin(int cancellable)
 	xs_commit_lock();
 	while (g_ckpt_gate) {          /* one checkpoint at a time */
 		xs_commit_unlock();
-		if (cancellable &&
-		    xtc_atomic_load_i32(&g_ock_cancel, xtc_mo_acquire))
+		if (((cancellable & XS_QB_CKPT) &&
+		    xtc_atomic_load_i32(&g_ock_cancel, xtc_mo_acquire)) ||
+		    ((cancellable & XS_QB_STOP) &&
+		    xtc_atomic_load_i32(&g_xs_stopped, xtc_mo_acquire)))
 			return 0;
 		xs_nap();
 		xs_commit_lock();
@@ -4527,14 +4535,43 @@ xstore_quiesce_begin(void)
 	(void)xs_quiesce_begin(0);
 }
 
+/* The engine's last quiesce: mark the store stopped, so a DDL statement
+ * that meets it fails instead of waiting for a gate that never opens,
+ * then quiesce as xstore_quiesce_begin does. */
+void
+xstore_quiesce_final(void)
+{
+	xtc_atomic_store_i32(&g_xs_stopped, 1, xtc_mo_release);
+	(void)xs_quiesce_begin(0);
+}
+
+/* How long one wait for the DDL lock lasts before the stopped flag is
+ * checked again. */
+#define XS_DDL_WAIT_NS (10LL * 1000 * 1000)
+
 /* One DDL statement at a time (see xstore.h).  Ranks before every
  * other engine lock: a DDL statement takes it first and holds it across
  * the cat and commit locks its steps take, and the parks of an index
- * build. */
-void
+ * build.  The wait is cut into XS_DDL_WAIT_NS slices so a stopped store
+ * is noticed: its holder may be parked at the closed gate for good. */
+int
 xstore_ddl_lock(void)
 {
-	xs_lk(XS_LK_DDL);
+	xtc_amutex_t *m = xs_lk_get(XS_LK_DDL);
+	(void)xtc_mask_enter();
+	for (;;) {
+		if (xtc_atomic_load_i32(&g_xs_stopped, xtc_mo_acquire))
+			break;
+		if (xtc_amutex_lock(m, XS_DDL_WAIT_NS) != XTC_OK)
+			continue;
+		/* Stopped while this waited: the statement could not commit. */
+		if (!xtc_atomic_load_i32(&g_xs_stopped, xtc_mo_acquire))
+			return XTC_OK;
+		(void)xtc_amutex_unlock(m);
+		break;
+	}
+	(void)xtc_mask_leave();
+	return XTC_E_STATE;
 }
 
 void
@@ -4954,6 +4991,7 @@ xs_commit_state_reset(void)
 	g_inflight = NULL;
 	xtc_atomic_store_i32(&g_ndone, 0, xtc_mo_seq_cst);
 	g_ckpt_gate = 0;
+	xtc_atomic_store_i32(&g_xs_stopped, 0, xtc_mo_release);
 	xtc_atomic_store_i32(&g_wal_busy, 0, xtc_mo_relaxed);
 	xtc_atomic_store_u64(&g_xvisible,
 	    xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed), xtc_mo_seq_cst);
@@ -8355,7 +8393,11 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 		return rc;
 	xtc_atomic_fetch_add_u64(&g_idx_gen, 1, xtc_mo_release);
 	xs_cat_gen_bump();
-	xstore_quiesce_begin();
+	/* A store the engine has stopped never opens its gate: fail. */
+	if (!xs_quiesce_begin(XS_QB_STOP)) {
+		xs_idx_cache_drop(bt, idx_id);
+		return XTC_E_STATE;
+	}
 	xstore_quiesce_end();
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
@@ -11423,7 +11465,7 @@ xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
 		return XTC_E_INVAL;
 	memset(&j, 0, sizeof j);
 	j.dc.bt = bt;
-	if (!xs_quiesce_begin(1))
+	if (!xs_quiesce_begin(XS_QB_CKPT))
 		return XTC_E_AGAIN;
 	j.dc.snap = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	if (j.dc.snap == 0)
@@ -11446,7 +11488,7 @@ xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
 		return j.rc;
 	}
 	xs_ock_yield("xstore.ockpt.finish");
-	if (!xs_quiesce_begin(1)) {
+	if (!xs_quiesce_begin(XS_QB_CKPT)) {
 		wal_ockpt_abort(j.k);
 		return XTC_E_AGAIN;
 	}

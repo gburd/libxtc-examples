@@ -914,7 +914,7 @@ sx_storage_quiesce(void)
 	sx_sw_stop();                      /* first: no restart mid-drain */
 	sx_ckpt_stop();
 	if (g_xwal != NULL)
-		xstore_quiesce_begin();        /* closed until the next open */
+		xstore_quiesce_final();        /* closed until the next open */
 	if (g_xwal != NULL) wal_writer_stop(g_xwal);
 	bm_trickler_stop(g_xbm);
 	bm_provider_stop(g_xbm);
@@ -1751,6 +1751,8 @@ nat_select_run(struct sx_stmt *st)
 #define SX_MSG_WAL_IO "I/O error: write-ahead log write or fsync failed; " \
 	"the transaction was not committed and the database is read-only " \
 	"until restart"
+#define SX_MSG_STOPPED "cannot change the schema: the storage engine " \
+	"is shutting down"
 #define SX_MSG_SERIALIZE "could not serialize access due to concurrent " \
 	"update; transaction rolled back"
 #define SX_MSG_ABORTED "current transaction is aborted, commands ignored " \
@@ -2197,7 +2199,8 @@ sx_step_body(sx_stmt *st)
 		case SXN_CREATE_INDEX:
 		case SXN_DROP_INDEX: {
 			int drc;
-			xstore_ddl_lock();
+			if (xstore_ddl_lock() != XTC_OK)
+				return nat_set_err(st->db, SX_MSG_STOPPED, SX_ERROR);
 			drc = nat_ddl(st);
 			xstore_ddl_unlock();
 			/* A DDL step that failed without a message of its own: a

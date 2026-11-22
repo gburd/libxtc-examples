@@ -49,6 +49,12 @@
  *	     table B was told it created, and its row, are never dropped by
  *	     A's clean-up (before: B's CREATE found A's index and returned
  *	     OK, its INSERT went in, and A then dropped u).
+ *	  9. The engine's final quiesce (xstore_quiesce_final, as
+ *	     sx_storage_quiesce runs it) while a DDL statement holds the DDL
+ *	     lock and another waits for it: the waiter fails ("shutting
+ *	     down") within a bound, and the holder's CREATE INDEX fails
+ *	     instead of waiting for a gate that never opens (before: both
+ *	     waited forever).
  */
 
 #include <assert.h>
@@ -782,6 +788,123 @@ scenario_create_race(void)
 	return 0;
 }
 
+/* Scenario 9's shared state: H holds the DDL lock when the store is
+ * stopped, B's CREATE TABLE waits behind it. */
+static struct {
+	wal_t *wal;
+	sx_db *h, *b;
+	int    bwait, bdone, brc, left;
+	char   bmsg[128];
+} g_s9;
+
+static void
+s9_exit(void)
+{
+	if (xtc_atomic_fetch_sub_i32(&g_s9.left, 1, xtc_mo_seq_cst) == 1)
+		(void)wal_writer_stop(g_s9.wal);
+}
+
+static void
+s9_b(void *arg)
+{
+	(void)arg;
+	xtc_atomic_store_i32(&g_s9.bwait, 1, xtc_mo_seq_cst);
+	g_s9.brc = sx_exec(g_s9.b, "CREATE TABLE z(k INTEGER PRIMARY KEY)",
+	    NULL);
+	snprintf(g_s9.bmsg, sizeof g_s9.bmsg, "%s", sx_errmsg(g_s9.b));
+	xtc_atomic_store_i32(&g_s9.bdone, 1, xtc_mo_seq_cst);
+	s9_exit();
+}
+
+/* H: take the DDL lock as a DDL statement does, let B queue behind it,
+ * stop the store, and check that B fails in time and that the holder's
+ * CREATE INDEX fails rather than waiting at the closed gate. */
+static void
+s9_h(void *arg)
+{
+	const char *cols[1] = { "v" };
+	int i, rc;
+	(void)arg;
+	CK(xstore_ddl_lock() == XTC_OK);
+	while (!xtc_atomic_load_i32(&g_s9.bwait, xtc_mo_seq_cst))
+		(void)xtc_proc_sleep(1LL * 1000 * 1000);
+	(void)xtc_proc_sleep(20LL * 1000 * 1000);     /* B is parked */
+	CK(!xtc_atomic_load_i32(&g_s9.bdone, xtc_mo_seq_cst));
+	xstore_quiesce_final();
+	for (i = 0; i < 5000 && !xtc_atomic_load_i32(&g_s9.bdone,
+	    xtc_mo_seq_cst); i++)
+		(void)xtc_proc_sleep(1LL * 1000 * 1000);
+	if (!xtc_atomic_load_i32(&g_s9.bdone, xtc_mo_seq_cst)) {
+		fprintf(stderr, "FAIL %s:%d: a DDL waiting behind the DDL lock "
+		    "of a stopped store still waits after 5 s\n", __FILE__,
+		    __LINE__);
+		_exit(1);
+	}
+	rc = xstore_create_index_ex((struct xsql *)g_s9.h, "iv", "t", cols,
+	    1, 0, 0, 'i');
+	CK(rc == XTC_E_STATE);
+	xstore_ddl_unlock();
+	s9_exit();
+}
+
+/* 9: a DDL that meets a stopped store fails, the holder's and the
+ * waiter's alike. */
+static int
+scenario_stopped_ddl(void)
+{
+	static void (*const fn[2])(void *) = { s9_h, s9_b };
+	char logp[256], pg[256];
+	wal_opts_t wo = { 0 };
+	bm_opts_t bo = BM_OPTS_DEFAULT;
+	bm_t *bm = NULL;
+	bt_t *bt = NULL;
+	xtc_exec_t *ex = NULL;
+	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "s9" };
+	xtc_pid_t pid;
+	int fd, i;
+	t_tmpl(logp, sizeof logp, "sqlxtc-index-s9-log");
+	t_tmpl(pg, sizeof pg, "sqlxtc-index-s9-pg");
+	if ((fd = mkstemp(logp)) < 0) return 1;
+	close(fd);
+	if ((fd = mkstemp(pg)) < 0) return 1;
+	close(fd);
+	memset(&g_s9, 0, sizeof g_s9);
+	g_s9.left = 2;
+	wo.path = logp;
+	bo.path = pg; bo.page_size = PAGE_SZ; bo.n_frames = 256;
+	if (wal_open(&wo, &g_s9.wal) != XTC_OK ||
+	    bm_create(&bo, &bm) != XTC_OK || bt_open(bm, &bt) != XTC_OK)
+		return 1;
+	xstore_set_wal((struct wal *)g_s9.wal);
+	if (sx_open_bt(bt, &g_s9.h) != SX_OK || sx_open_bt(bt, &g_s9.b) != SX_OK)
+		return 1;
+	CK(sx_exec(g_s9.h, "CREATE TABLE t(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(g_s9.h, "INSERT INTO t VALUES(1, 1), (2, 2)", NULL) ==
+	    SX_OK);
+	if (xtc_exec_create(&(xtc_exec_opts_t){ .size = sizeof(xtc_exec_opts_t),
+	    .n_loops = 2 }, &ex) != XTC_OK ||
+	    wal_writer_spawn(g_s9.wal, xtc_exec_loop(ex, 0), NULL) != XTC_OK)
+		return 1;
+	for (i = 0; i < 2; i++)
+		if (xtc_proc_spawn(xtc_exec_loop(ex, i), fn[i], NULL, &po,
+		    &pid) != XTC_OK)
+			return 1;
+	if (xtc_exec_run(ex) != XTC_OK) return 1;
+	xtc_exec_destroy(ex);
+	CK(g_s9.brc == SX_ERROR);
+	CK(strstr(g_s9.bmsg, "shutting down") != NULL);
+	sx_close(g_s9.h); sx_close(g_s9.b);
+	xstore_set_wal(NULL);
+	bt_close(bt); bm_destroy(bm);
+	wal_close(g_s9.wal);
+	unlink(logp); unlink(pg);
+	if (g_fail) return 1;
+	printf("  ok   index: a DDL that meets a stopped store fails (\"%s\"), "
+	    "the lock's holder and its waiter alike\n", g_s9.bmsg);
+	return 0;
+}
+
 int
 main(void)
 {
@@ -792,6 +915,7 @@ main(void)
 	if (scenario_create_table_error() != 0) return 1;
 	if (scenario_rebuild_error() != 0) return 1;
 	if (scenario_create_race() != 0) return 1;
+	if (scenario_stopped_ddl() != 0) return 1;
 	printf("test_index: OK\n");
 	return 0;
 }

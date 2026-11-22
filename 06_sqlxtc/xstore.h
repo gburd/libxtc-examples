@@ -54,12 +54,27 @@ int  xstore_wal_failed(void);
  * keep running.  Pair with xstore_quiesce_end.  Call from a proc or off
  * a loop, holding no engine lock. */
 void xstore_quiesce_begin(void);
+/* The engine's final quiesce (sx_storage_quiesce): as
+ * xstore_quiesce_begin, and the store is marked stopped until a log is
+ * attached again, so a DDL statement that meets it fails (see
+ * xstore_ddl_lock) instead of waiting for the gate. */
+void xstore_quiesce_final(void);
 /* Serialize DDL statements (the engine holds it across one CREATE /
  * DROP / ALTER, including a CREATE TABLE's autoindex build and its
  * clean-up), so a concurrent CREATE of the same table cannot find a
  * half-made one and report it created.  A parking lock: hold it on a
- * proc or an OS thread, never across a wait on another DDL. */
-void xstore_ddl_lock(void);
+ * proc or an OS thread, never across a wait on another DDL.
+ *
+ * It is held for the whole statement, so its hold time is the
+ * statement's: a CREATE INDEX or a CREATE TABLE with constraints holds
+ * it across a scan of the whole table (the index build), and every
+ * other DDL statement, an unrelated CREATE TABLE included, waits that
+ * long.  Writes and reads do not take it.  The holder runs masked, so a
+ * kill of its connection takes effect when the statement ends.  Returns
+ * XTC_OK when held, or XTC_E_STATE when the store has been stopped
+ * (xstore_quiesce_final): its holder may be parked at the closed gate
+ * for good, and a DDL statement there could not commit anyway. */
+int  xstore_ddl_lock(void);
 void xstore_ddl_unlock(void);
 void xstore_quiesce_end(void);
 
