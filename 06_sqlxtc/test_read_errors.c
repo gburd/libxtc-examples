@@ -22,6 +22,10 @@
  *	     check of a COMMIT that cannot read the row fail the statement;
  *	     an update never goes in on a check that could not run (before:
  *	     the row had "no newer version", the lost-update guard).
+ *	  3. A COMMIT whose spilled (STEAL) payload cannot be read back
+ *	     fails, says why, and commits nothing (before: the log record
+ *	     encoder refused the NULL payload, and the client got "commit
+ *	     failed" with no cause).
  */
 
 #include <stdint.h>
@@ -35,6 +39,7 @@
 #include "btree.h"
 #include "xstore.h"
 #include "xtc.h"
+#include "wal.h"
 #include "t_tmp.h"
 
 #define PAGE_SZ 4096
@@ -241,6 +246,57 @@ case_ww(sx_db *db)
 	    "no update lost\n", a, b, c);
 }
 
+/* No row of s is visible. */
+static int
+s_empty(sx_db *db)
+{
+	return one_int(db, "SELECT count(*) FROM s") == 0 ? 0 : -1;
+}
+
+/* 3: COMMIT brings a large transaction's spilled payloads back. */
+static void
+case_spill(sx_db *db)
+{
+	sx_stmt *st = NULL;
+	char pad[1001];
+	int n, i, rc = SX_OK, errs = 0, faults;
+	memset(pad, 'p', sizeof pad - 1);
+	pad[sizeof pad - 1] = '\0';
+	CK(sx_exec(db, "CREATE TABLE s(k INTEGER PRIMARY KEY, pad TEXT)",
+	    NULL) == SX_OK);
+	/* Each run reloads a few hundred payloads and builds 400 rows: fail
+	 * the first reads, then every 61st. */
+	for (n = 1; n < 1000; n += n < 4 ? 1 : 61) {
+		CK(sx_exec(db, "BEGIN", NULL) == SX_OK);
+		CK(sx_prepare(db, "INSERT INTO s VALUES(?, ?)", -1, &st,
+		    NULL) == SX_OK);
+		for (i = 1; i <= 400; i++) {   /* 400 KB: past the spill mark */
+			sx_bind_int64(st, 1, i);
+			sx_bind_text(st, 2, pad, -1);
+			CK(sx_step(st) == SX_DONE);
+			sx_reset(st);
+		}
+		sx_finalize(st);
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		rc = sx_exec(db, "COMMIT", NULL);
+		xstore_row_read_fail_at(0);
+		if (xstore_row_read_faults() == faults)
+			break;
+		errs++;
+		CK(rc == SX_ERROR);
+		ck_read_msg(db, "COMMIT", n);
+		CK(s_empty(db) == 0);
+		if (rc == SX_OK)
+			break;
+	}
+	CK(rc == SX_OK && errs > 0);
+	CK(one_int(db, "SELECT count(*) FROM s WHERE length(pad) = 1000") ==
+	    400);
+	printf("  ok   read errors: COMMIT with each of %d spilled payload "
+	    "reads failing fails and commits nothing\n", errs);
+}
+
 int
 main(void)
 {
@@ -248,22 +304,34 @@ main(void)
 	bt_t *bt = NULL;
 	sx_db *db = NULL;
 	bm_opts_t bo = BM_OPTS_DEFAULT;
-	char path[256];
+	char path[256], logp[300];
+	wal_t *wal = NULL;
+	wal_opts_t wo;
 	int fd;
 
 	t_tmpl(path, sizeof path, "sqlxtc-read-errors");
 	fd = mkstemp(path);
 	if (fd < 0) return 1;
 	close(fd);
+	/* A log, so a large transaction spills to the staging area. */
+	snprintf(logp, sizeof logp, "%s-wal", path);
+	memset(&wo, 0, sizeof wo);
+	wo.path = logp; wo.window_ns = 500000; wo.max_batch = 256;
+	if (wal_open(&wo, &wal) != XTC_OK) return 1;
 	bo.path = path; bo.page_size = PAGE_SZ; bo.n_frames = 256;
-	if (bm_create(&bo, &bm) != XTC_OK || bt_open(bm, &bt) != XTC_OK ||
-	    sx_open_bt(bt, &db) != SX_OK)
+	if (bm_create(&bo, &bm) != XTC_OK || bt_open(bm, &bt) != XTC_OK)
+		return 1;
+	xstore_set_wal((struct wal *)wal);
+	if (sx_open_bt(bt, &db) != SX_OK)
 		return 1;
 	case_pk(db, bt);
 	case_ww(db);
+	case_spill(db);
 	sx_close(db);
+	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);
-	unlink(path);
+	wal_close(wal);
+	unlink(path); unlink(logp);
 	if (g_fail) return 1;
 	printf("test_read_errors: OK\n");
 	return 0;

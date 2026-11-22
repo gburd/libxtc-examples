@@ -6522,9 +6522,22 @@ xs_commit_ctx(xstore_ctx_t *cx)
 		return SX_OK;
 	}
 	{
-		if (cx->steal_txn != 0)              /* STEAL: bring spilled payloads back */
-			for (i = 0; i < cx->wn; i++)
-				(void)xs_wrec_ensure(cx, &cx->wbuf[i]);
+		/* STEAL: bring spilled payloads back.  One that cannot be read
+		 * back would go to the log as a record with no payload: the
+		 * transaction cannot commit. */
+		for (i = 0; cx->steal_txn != 0 && i < cx->wn; i++) {
+			xs_wrec_t *w = &cx->wbuf[i];
+			rc = w->spilled && xs_row_fault() ? SX_ERROR
+			    : xs_wrec_ensure(cx, w);
+			if (rc != SX_OK) {
+				if (rc != SX_NOMEM)
+					(void)xs_rd_count(XTC_E_IO);
+				xs_rd_err_tid(cx, w->tableid,
+				    rc == SX_NOMEM ? XTC_E_NOMEM : XTC_E_IO);
+				(void)xs_rollback_ctx(cx);
+				return SX_ERROR;
+			}
+		}
 		/* First-committer-wins write-write check, the timestamp, and
 		 * the in-flight registration are one atomic step under the
 		 * commit lock; the log write and the apply run outside it so
