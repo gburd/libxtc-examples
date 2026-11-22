@@ -74,7 +74,7 @@ READ_HELPERS = {
     "xstore_rename_table", "xstore_create_index_ex",
     # NULL or 0 means "unread" (or out of memory) for these.
     "xstore_scan_open", "xstore_scan_open_txn", "xs_scan_new",
-    "xstore_iscan_open", "read_one_row", "xs_idx_build_one",
+    "xstore_iscan_open", "read_one_row", "vx_auto_rowid", "xs_idx_build_one",
     "xs_idx_resolve", "xs_table_schema_parse", "xs_idxcat_max_id",
     "xs_cat_find_or_create", "xstore_create_table",
 }

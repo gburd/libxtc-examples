@@ -9298,6 +9298,29 @@ vx_run_write_p(struct xsql *db, const char *sql,
 	return vx_run_write_ast(db, arena, root, binds, nbinds, nchanges, errmsg);
 }
 
+/* The rowid of a keyless INSERT row of table `tableid`: past *maxr, the
+ * largest rowid this statement has used or seen.  The table's largest
+ * rowid (this transaction's buffered rows included) is read once, at the
+ * statement's first keyless row, so an INSERT that names every key reads
+ * it never; *have records that it was read.  Returns 0 with *rowid set,
+ * or -1 when that read failed (the statement's read error is set): an
+ * unread maximum is not "empty", since rowid 1 may be taken. */
+static int
+vx_auto_rowid(struct xsql *db, uint32_t tableid, int *have, int64_t *maxr,
+    int64_t *rowid)
+{
+	int64_t m;
+	if (!*have) {
+		if (xstore_max_rowid_txn(db, tableid, &m) != 0)
+			return -1;
+		if (m > *maxr)
+			*maxr = m;
+		*have = 1;
+	}
+	*rowid = *maxr = xstore_next_rowid(db, tableid, *maxr);
+	return 0;
+}
+
 /* The write path over a parsed statement.  Takes ownership of `arena`
  * (destroyed before returning) when it is non-NULL; a cached statement
  * passes NULL and keeps its AST. */
@@ -9314,8 +9337,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	struct wschema ws;
 	struct vx_arena_blk *cell_arena = NULL, *rowarena = NULL;
 	struct vx_stmt *sst = NULL;     /* UPDATE: SET-expression plan */
-	int rc = 0, r, applied = 0;
-	int64_t maxr;
+	int rc = 0, r, applied = 0, have_maxr = 0;
+	int64_t maxr = INT64_MIN;    /* see vx_auto_rowid */
 
 	if (nchanges) *nchanges = 0;
 	if (errmsg) *errmsg = NULL;
@@ -9583,12 +9606,9 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	}
 
 	/* ---- INSERT INTO t [(col,...)] VALUES (...) ... ----------------- */
-	/* Auto-rowid base includes this txn's buffered rows (so an in-txn
-	 * auto-PK INSERT does not reuse a buffered rowid); outside a txn this
-	 * is the committed max. */
-	if (xstore_max_rowid_txn(db, tableid, &maxr) != 0) {
-		rc = -1; goto done;   /* unread: not "empty", rowid 1 may be taken */
-	}
+	/* A keyless row's rowid comes from vx_auto_rowid, whose base includes
+	 * this txn's buffered rows (so an in-txn auto-PK INSERT does not reuse
+	 * a buffered rowid); outside a txn it is the committed max. */
 
 	/* ---- INSERT INTO t DEFAULT VALUES -------------------------------
 	 * One row: PK auto-assigned (max committed + 1), every non-PK column
@@ -9600,7 +9620,10 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		vx_cell_t cells[64];
 		uint8_t rec[XS_REC_MAX];
 		int ci, reclen;
-		int64_t rowid = xstore_next_rowid(db, tableid, maxr);
+		int64_t rowid;
+		if (vx_auto_rowid(db, tableid, &have_maxr, &maxr, &rowid) != 0) {
+			rc = -1; goto done;
+		}
 		for (ci = 0; ci < ws.n; ci++) { cells[ci].type = VX_NULL; cells[ci].nbytes = 0; }
 		reclen = encode_payload(&cells[1], ws.n - 1, rec, (int)sizeof rec);
 		if (reclen < 0) {   /* unexpected */
@@ -9717,7 +9740,10 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 			if (cells[0].type == VX_INT) {
 				rowid = cells[0].i; if (rowid > maxr) maxr = rowid;
 			} else if (cells[0].type == VX_NULL) {
-				rowid = maxr = xstore_next_rowid(db, tableid, maxr);
+				if (vx_auto_rowid(db, tableid, &have_maxr, &maxr,
+				    &rowid) != 0) {
+					free(buf2); vx_result_free(sres); rc = -1; goto done;
+				}
 			} else { free(buf2); vx_result_free(sres); rc = 0; goto done; }
 
 			if (cells[0].type == VX_INT && !ins->replace) {
@@ -9804,7 +9830,10 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 				rowid = cells[0].i;
 				if (rowid > maxr) maxr = rowid;
 			} else if (cells[0].type == VX_NULL) {
-				rowid = maxr = xstore_next_rowid(db, tableid, maxr);
+				if (vx_auto_rowid(db, tableid, &have_maxr, &maxr,
+				    &rowid) != 0) {
+					free(buf); rc = -1; goto done;
+				}
 			} else { free(buf); rc = 0; goto done; }   /* non-int PK -> VDBE */
 
 			/* PRIMARY KEY uniqueness: a plain INSERT onto an existing
