@@ -804,7 +804,8 @@ resolve_schema(struct xsql *db, const char *table, struct namevec *nv, int *pay)
 	{
 		bt_t *bt = xstore_bt_of(db);
 		xstore_col_t cols[64];
-		int nc = bt ? vx_table_schema(db, bt, table, cols, 64) : 0;
+		int nc = bt ? vx_table_schema(db, bt, table, /* RDERR_OK: rd_err set */
+		    cols, 64) : 0;
 		if (nc > 0) {
 			int c;
 			for (c = 0; c < nc; c++)
@@ -4387,7 +4388,9 @@ src_open(struct vx_stmt *st, const char *table, const vx_apath_t *ap,
 			if (!ap_xval(&hic, &hi)) goto scan;
 			hashi = 1;
 		}
-		s->iscan = xstore_iscan_open((struct xsql *)st->db, table,
+		/* NULL is no usable index (a scan follows), never a failed read:
+		 * a read error is kept in the scan and fails its first next. */
+		s->iscan = xstore_iscan_open((struct xsql *)st->db, table, /* RDERR_OK: no read */
 		    ap->idx_id, eq, ap->neq, haslo ? &lo : NULL, ap->lo_incl,
 		    hashi ? &hi : NULL, ap->hi_incl, ap->reverse);
 		if (s->iscan != NULL) {
@@ -4725,7 +4728,8 @@ vx_prepare_select_body(struct xsql *db, sql_arena_t *ast, const sql_select_t *se
 		/* Fetch the schema once (needs the native xstore catalog). */
 		bt_t *sbt = xstore_bt_of(db);
 		int sc;
-		proj_nsc = sbt ? vx_table_schema(db, sbt, tabbuf, proj_scols, 64) : 0;
+		proj_nsc = sbt ? vx_table_schema(db, sbt, tabbuf, /* RDERR_OK: rd_err set */
+		    proj_scols, 64) : 0;
 		if (proj_nsc <= 0) goto fallback;
 		/* Count output columns: each star -> visible schema columns,
 		 * each expression -> one. */
@@ -4831,7 +4835,9 @@ vx_prepare_select_body(struct xsql *db, sql_arena_t *ast, const sql_select_t *se
 		 * (proj_scols is free here: a star would have added columns.) */
 		bt_t *sbt = xstore_bt_of(db);
 		sql_str_t nm;
-		if (sbt == NULL || vx_table_schema(db, sbt, tabbuf, proj_scols, 64) <= 0)
+		if (sbt == NULL ||
+		    vx_table_schema(db, sbt, tabbuf, proj_scols, /* RDERR_OK: rd_err set */
+		    64) <= 0)
 			goto fallback;
 		nm.p = proj_scols[0].name; nm.len = (uint32_t)strlen(proj_scols[0].name);
 		if (nv_add(&nv, &nm) < 0) goto fallback;
@@ -5491,7 +5497,7 @@ vx_try_prepare_agg(struct xsql *db, sql_arena_t *ast, const sql_select_t *sel,
 		snprintf(st->corr_alias, sizeof st->corr_alias, "%s", tabbuf);
 	sc = (xstore_col_t *)malloc(sizeof(xstore_col_t) * 64);
 	if (sc == NULL) goto oom;
-	nsc = vx_table_schema(db, st->bt, tabbuf, sc, 64);
+	nsc = vx_table_schema(db, st->bt, tabbuf, sc, 64); /* RDERR_OK: rd_err set */
 	if (nsc <= 0) goto fallback;
 
 	memset(&nv, 0, sizeof nv);
@@ -8822,7 +8828,8 @@ load_wschema(struct xsql *db, const char *table, struct wschema *ws)
 	{
 		bt_t *bt = xstore_bt_of(db);
 		xstore_col_t cols[64];
-		int nc = bt ? vx_table_schema(db, bt, table, cols, 64) : 0, c;
+		int nc = bt ? vx_table_schema(db, bt, table, /* RDERR_OK: rd_err set */
+		    cols, 64) : 0, c;
 		if (nc > 0) {
 			for (c = 0; c < nc && ws->n < 64; c++) {
 				snprintf(ws->name[ws->n], sizeof ws->name[0], "%.*s",
