@@ -2236,20 +2236,34 @@ static int xs_inflight_writes(uint32_t tid, int64_t rid);
 
 /* Does any version of (rt->tableid, rowid) committed at or after `ts`
  * carry index key `key` (with rowid suffix)?  Such a version (re)uses
- * the entry, so it must survive the reap. */
+ * the entry, so it must survive the reap.  A read that fails answers
+ * "used" (counted): a stale entry costs a candidate fetch, a missing one
+ * lets a duplicate UNIQUE value in. */
 static int
 xs_idx_key_reused(bt_t *bt, const struct xs_idx_rt *rt, int64_t rowid,
     uint64_t ts, const uint8_t *key, int klen)
 {
 	bt_cursor_t *cur = NULL;
 	uint8_t startk[XS_VKLEN], kk[XS_IDX_KMAX];
-	int used = 0, kl;
+	int used = 0, kl, rc;
 	enc_vkey(rt->tableid, rowid, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) return 1;
+	rc = bt_cursor_open(bt, startk, XS_VKLEN, &cur);
+	if (rc != XTC_OK) {
+		(void)xs_rd_count(rc);
+		return 1;
+	}
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t kln = 0, vl = 0;
 		const uint8_t *kb;
-		if (bt_cursor_next(cur, &k, &kln, &vv, &vl) != XTC_OK || kln != XS_VKLEN)
+		rc = bt_cursor_next(cur, &k, &kln, &vv, &vl);
+		if (rc == XTC_OK && xs_row_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+			(void)xs_rd_count(rc);
+			used = 1;
+			break;
+		}
+		if (rc != XTC_OK || kln != XS_VKLEN)
 			break;
 		kb = (const uint8_t *)k;
 		if (dec_tableid(kb) != rt->tableid || dec_rowid(kb) != rowid ||

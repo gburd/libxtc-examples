@@ -50,6 +50,10 @@
  *	  8. Version GC that cannot read stops early and counts the read in
  *	     xstore_read_errors() (the metric); no row is lost, and a later
  *	     GC reclaims what it left.
+ *	  9. The reap of a superseded UNIQUE entry whose row carries the
+ *	     value again keeps the entry when a read fails (before: a failed
+ *	     cursor step read as "not reused", the entry was deleted, and a
+ *	     duplicate of the value went in).
  */
 
 #include <stdint.h>
@@ -469,6 +473,64 @@ case_umap(sx_db *db)
 	    "UNIQUE value\n");
 }
 
+/* 9, one run: on a fresh table, row 1's UNIQUE value goes 10 -> 20 ->
+ * 10 while a snapshot pins the first entry, so the reap of (10, 1) is
+ * queued; then the pin ends, and the next commits reap it with the n-th
+ * row read failing.  The entry is live again (row 1 carries 10), so the
+ * reap must keep it whatever it could read.  Returns 1 when a read
+ * failed, 0 when none did, and checks the index and the constraint. */
+static int
+reuse_run(sx_db *db, bt_t *bt, int n)
+{
+	sx_db *pin = NULL;
+	uint64_t miss = 0, stale = 0;
+	char sql[96];
+	int i, faults, failed;
+	snprintf(sql, sizeof sql, "CREATE TABLE r%d(k INTEGER PRIMARY KEY, "
+	    "c INTEGER UNIQUE)", n);
+	CK(sx_exec(db, sql, NULL) == SX_OK);
+	snprintf(sql, sizeof sql, "INSERT INTO r%d VALUES(1, 10)", n);
+	CK(sx_exec(db, sql, NULL) == SX_OK);
+	CK(sx_open_bt(bt, &pin) == SX_OK);
+	CK(sx_exec(pin, "BEGIN ISOLATION LEVEL REPEATABLE READ", NULL) == SX_OK);
+	snprintf(sql, sizeof sql, "SELECT c FROM r%d WHERE k = 1", n);
+	CK(one_int(pin, sql) == 10);
+	snprintf(sql, sizeof sql, "UPDATE r%d SET c = 20 WHERE k = 1", n);
+	CK(sx_exec(db, sql, NULL) == SX_OK);
+	snprintf(sql, sizeof sql, "UPDATE r%d SET c = 10 WHERE k = 1", n);
+	CK(sx_exec(db, sql, NULL) == SX_OK);
+	CK(sx_exec(pin, "COMMIT", NULL) == SX_OK);
+	sx_close(pin);
+	faults = xstore_row_read_faults();
+	xstore_row_read_fail_at(n);
+	for (i = 0; i < 4; i++) {          /* may fail on the read: fine */
+		snprintf(sql, sizeof sql, "INSERT INTO r%d VALUES(%d, %d)", n,
+		    100 + i, 100 + i);
+		(void)sx_exec(db, sql, NULL);
+	}
+	xstore_row_read_fail_at(0);
+	failed = xstore_row_read_faults() != faults;
+	CK(xstore_index_check(bt, &miss, &stale) == XTC_OK && miss == 0);
+	snprintf(sql, sizeof sql, "INSERT INTO r%d VALUES(2, 10)", n);
+	CK(sx_exec(db, sql, NULL) == SX_CONSTRAINT);
+	return failed;
+}
+
+/* 9: the reap of a superseded UNIQUE entry that a later version uses
+ * again. */
+static void
+case_reuse(sx_db *db, bt_t *bt)
+{
+	uint64_t e0 = xstore_read_errors();
+	int n, errs = 0;
+	for (n = 1; n < 100 && reuse_run(db, bt, n); n++)
+		errs++;
+	CK(n < 100 && errs > 0);
+	CK(xstore_read_errors() > e0);
+	printf("  ok   read errors: a reap with each of %d reads failing keeps "
+	    "a reused UNIQUE entry\n", errs);
+}
+
 /* The catalog as a string: every table's id, then every index. */
 static void
 cat_snap(sx_db *db, bt_t *bt, char *out, size_t cap)
@@ -710,6 +772,7 @@ main(void)
 	case_catalog(db, bt);
 	case_idxcat(db, bt);
 	case_gc(db);
+	case_reuse(db, bt);
 	sx_close(db);
 	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);
