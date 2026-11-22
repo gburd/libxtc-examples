@@ -26,6 +26,7 @@
 #include "xtc_aio.h"
 #include "xtc_blocking.h"   /* xtc_blocking_run: page-file growth off the loop */
 #include "xtc_stats.h"
+#include "xtc_sim.h"        /* xtc_sim_active: the eviction seed */
 #include "xtc_sync.h"
 #include "xtc_dio_sched.h"
 #include "sx_dst.h"       /* DST planted bugs (no-op in prod) */
@@ -1386,6 +1387,7 @@ bm_cls_ensure(bm_t *bm)
 
 #ifdef BM_SAMPLED_EVICT
 #define BM_D_SAMPLE 16u
+#define BM_EVICT_SEED_DEFAULT 0x9E3779B97F4A7C15ull
 
 /* Lower score = better victim.  Weights follow the design's section-13
  * ratios, scaled to the signals available pre-classifier. */
@@ -1848,6 +1850,9 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 	bm_t *bm;
 	uint32_t i;
 	int rc;
+#ifdef BM_SAMPLED_EVICT
+	uint64_t evict_seed;
+#endif
 
 	if (opts == NULL || out == NULL || opts->page_size < 64 ||
 	    opts->n_frames < 2)
@@ -1861,9 +1866,20 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 	if (bm->cool_target < 1) bm->cool_target = 1;
 	bm->scan_resist = opts->scan_resist ? 1 : 0;
 	bm->claim_threshold = opts->claim_threshold;   /* 0 = unbounded */
-	xtc_atomic_store_u64(&bm->evict_rng,
-	    0x9E3779B97F4A7C15ull ^ ((uint64_t)(uintptr_t)bm),
-	    xtc_mo_relaxed); /* sampled-eviction PRNG seed (stage 2) */
+#ifdef BM_SAMPLED_EVICT
+	/* The sampled-eviction PRNG seed: the caller's, else a draw from the
+	 * run's seeded stream under the simulator (so a run replays), else a
+	 * fixed constant (so every run of a program evicts alike).  Drawn
+	 * only in this build, so the CLOCK build's xtc_rand stream is
+	 * unchanged. */
+	if (opts->evict_seed != 0)
+		evict_seed = opts->evict_seed;
+	else if (xtc_sim_active())
+		evict_seed = xtc_rand_u64();
+	else
+		evict_seed = BM_EVICT_SEED_DEFAULT;
+	xtc_atomic_store_u64(&bm->evict_rng, evict_seed, xtc_mo_relaxed);
+#endif
 #ifdef BM_CLASSIFY
 	{
 		int nc = xtc_ncpus();

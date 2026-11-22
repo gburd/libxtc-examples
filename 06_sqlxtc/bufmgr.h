@@ -145,6 +145,13 @@ typedef struct bm_opts {
 	 * default) = no checksum. */
 	int         cksum_off;
 	uint32_t  (*cksum)(uint32_t crc, const void *p, size_t n);
+
+	/* Seed of the sampled evictor's PRNG (BM_SAMPLED_EVICT builds only;
+	 * the CLOCK evictor draws nothing).  0 (the default) takes a draw
+	 * from the run's stream under the simulator and a fixed constant
+	 * otherwise, so eviction choices never depend on the heap address
+	 * or the time.  A test that needs one sampling pattern sets it. */
+	uint64_t    evict_seed;
 } bm_opts_t;
 
 /* Opt in with 128 after measuring the workload's hit-rate trade-off. */
@@ -155,7 +162,7 @@ typedef struct bm_opts {
 	  .scan_resist = 1, .reopen = 0, .double_write = 0, .lsn_off = -1, \
 	  .direct = 0, .adaptive_writeback = 0, \
 	  .claim_threshold = BM_CLAIM_THRESHOLD_DEFAULT, \
-	  .cksum_off = -1, .cksum = NULL }
+	  .cksum_off = -1, .cksum = NULL, .evict_seed = 0 }
 
 /* Lifecycle. */
 int  bm_create(const bm_opts_t *opts, bm_t **out);
