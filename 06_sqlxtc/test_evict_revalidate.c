@@ -55,8 +55,31 @@ race_hook(bm_t *bm, bm_frame_t *f, int phase)
 	}
 }
 
+#ifdef BM_SAMPLED_EVICT
+/* The evict_seed whose 16 draws all miss frame 3 of a 4-frame pool: the
+ * frame this test's one page lands in (the free list hands out the last
+ * frame pushed).  The sample then finds no COOL frame, and only the
+ * sweep after it can reclaim the page. */
+#define MISS_SEED  38u
+#define MISS_FRAME 3u
+
+/* Nonzero if the sampler, seeded with `seed`, never draws frame `idx`. */
 static int
-run(uint32_t theta)
+sample_misses(uint64_t seed, uint32_t idx, uint32_t n)
+{
+	unsigned d;
+
+	for (d = 0; d < BM_D_SAMPLE; d++) {
+		seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+		if ((uint32_t)((seed >> 33) % n) == idx)
+			return 0;
+	}
+	return 1;
+}
+#endif
+
+static int
+run(uint32_t theta, uint64_t seed)
 {
 	bm_opts_t opts = BM_OPTS_DEFAULT;
 	bm_t *bm;
@@ -75,6 +98,7 @@ run(uint32_t theta)
 	opts.n_frames = 4;
 	opts.scan_resist = theta != 0; /* claim arm first passes HOT */
 	opts.claim_threshold = theta;
+	opts.evict_seed = seed;
 	if (bm_create(&opts, &bm) != XTC_OK)
 		goto unlink_out;
 	if (bm_alloc_pid(bm, &f, &pid) != XTC_OK)
@@ -84,6 +108,14 @@ run(uint32_t theta)
 	if (bm_checkpoint(bm) != XTC_OK)
 		goto out;
 	target = f;
+#ifdef BM_SAMPLED_EVICT
+	if (seed != 0 && ((uint32_t)(f - bm->frames) != MISS_FRAME ||
+	    !sample_misses(seed, MISS_FRAME, opts.n_frames))) {
+		fprintf(stderr, "FAIL: seed %llu does not miss the page's frame "
+		    "%u\n", (unsigned long long)seed, (unsigned)(f - bm->frames));
+		goto out;
+	}
+#endif
 	xtc_atomic_store_i32(&f->ref, 0, xtc_mo_seq_cst);
 	xtc_atomic_store_u32(&bm->clock, (uint32_t)(f - bm->frames),
 	    xtc_mo_seq_cst);
@@ -102,7 +134,8 @@ run(uint32_t theta)
 		reclaimed = evict_one(bm);
 	if (!reclaimed || armed || !staged) {
 		fprintf(stderr, "FAIL: interleaving did not reclaim: theta=%u "
-		    "reclaimed=%d armed=%d staged=%d\n", theta, reclaimed, armed, staged);
+		    "seed=%llu reclaimed=%d armed=%d staged=%d\n", theta,
+		    (unsigned long long)seed, reclaimed, armed, staged);
 		goto out;
 	}
 	if (bm_fix_pid(bm, pid, &f) != XTC_OK)
@@ -125,8 +158,12 @@ unlink_out:
 int
 main(void)
 {
-	int a = run(0), b = run(1);
-	if (a || b)
+	int a = run(0, 0), b = run(1, 0), c = 0;
+#ifdef BM_SAMPLED_EVICT
+	/* The sample misses the only COOL frame: the sweep must find it. */
+	c = run(1, MISS_SEED);
+#endif
+	if (a || b || c)
 		return 1;
 	puts("OK: eviction revalidates a completed write under reservation");
 	return 0;
