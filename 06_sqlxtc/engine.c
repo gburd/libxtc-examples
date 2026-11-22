@@ -2062,9 +2062,14 @@ sx_step_body(sx_stmt *st)
 			 * waited for re-runs on a new snapshot where the client
 			 * cannot tell (READ COMMITTED, autocommit, a transaction's
 			 * first access: see xstore_stmt_restart) instead of failing.
-			 * Bounded: a hot row under constant churn still fails, with
-			 * the error below. */
-			if (rd && restarts < 8 && xstore_stmt_restart(st->db)) {
+			 * In autocommit that covers a multi-row INSERT too: its
+			 * implicit transaction's commit finds a key committed past
+			 * its snapshot, and the re-run's own key check then reports
+			 * the duplicate as UNIQUE, as PostgreSQL does.  Bounded: a
+			 * hot row under constant churn still fails, with the error
+			 * below. */
+			if ((rd || !xstore_in_txn(st->db)) && restarts < 8 &&
+			    xstore_stmt_restart(st->db)) {
 				free(verr); verr = NULL; nch = 0;
 				restarts++;
 				goto restart;

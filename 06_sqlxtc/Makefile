@@ -187,7 +187,7 @@ clean:
 	rm -f test_btree_loop
 	rm -f test_btree_mt
 	rm -f test_btree_stale_descent test_btree_limits test_btree_sample bench_morsel_balance bench_point_iscan
-	rm -f test_btree_seek test_btree_seek_latched test_point_read test_index_walk test_group_exact test_xs_ctr test_read_errors test_stmt_atomic
+	rm -f test_btree_seek test_btree_seek_latched test_point_read test_index_walk test_group_exact test_xs_ctr test_read_errors test_stmt_atomic test_insert_race
 	rm -f $(LATCHED_TESTS:=_latched)
 	rm -f test_xs_ctr test_bm_reuse_version test_kill_stmt test_cat_lock_shared test_conn_sup test_storage_sup
 	rm -f test_sql_results test_txn_fastpath test_wal_crc_once
@@ -1140,6 +1140,15 @@ test_stmt_atomic: test_stmt_atomic.c $(ENGINE_NATIVE)
 
 test-stmt-atomic: test_stmt_atomic
 	./test_stmt_atomic
+
+# Multi-row autocommit INSERTs racing on a key report UNIQUE, not a
+# serialization failure, and stay atomic (plain threads).
+test: test-insert-race
+test_insert_race: test_insert_race.c $(ENGINE_NATIVE)
+	$(CC) $(CFLAGS) -o $@ test_insert_race.c $(ENGINE_NATIVE) $(LDFLAGS)
+
+test-insert-race: test_insert_race
+	TMPDIR=$${TMPDIR:-/tmp} ./test_insert_race
 
 # GROUP BY / DISTINCT keep integer keys exact (2^53 vs 2^53+1).
 test: test-group-exact

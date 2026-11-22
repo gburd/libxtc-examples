@@ -6421,6 +6421,7 @@ xs_stmt_pin(xstore_ctx_t *cx, struct xsql *db)
 {
 	xs_enter_ctx(cx, db);
 	cx->stmt_puts = 0;
+	cx->last_conflict = 0;       /* an INSERT must not see the last one's */
 	xs_rd_err_clear(cx);
 	if (!cx->in_txn &&
 	    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed) == 0)
@@ -6489,7 +6490,16 @@ xstore_stmt_restart(struct xsql *db)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
 	if (cx == NULL || cx->last_conflict != XS_CONFL_STALE) return 0;
-	if (!cx->in_txn) return cx->stmt_puts == 0;
+	if (!cx->in_txn) {
+		if (cx->stmt_puts != 0) return 0;
+		/* The conflicting commit may be applied but not yet visible
+		 * (an older commit is still in flight).  A re-run before it is
+		 * would miss it again: an INSERT, which takes no row intent to
+		 * wait on, would re-run until the cap.  Nothing is held here,
+		 * and in-flight commits never wait on us. */
+		xs_wait_visible(xtc_atomic_load_u64(&g_xclock, xtc_mo_seq_cst));
+		return 1;
+	}
 	if (cx->txn_iso < XS_ISO_REPEATABLE_READ) return 1;
 	if (!cx->stmt_first || cx->serializable || cx->wn != 0) return 0;
 	cx->txn_snap = snap_pin_visible(&cx->snap_slot);
