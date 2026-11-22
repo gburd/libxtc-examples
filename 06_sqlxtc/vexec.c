@@ -8993,9 +8993,11 @@ encode_payload(const vx_cell_t *cells, int npay, uint8_t *out, int cap)
 #define VX_MSG_TOOBIG "row too large: the native engine stores at most " \
 	"4096 bytes per row (all columns, encoded)"
 
-/* Upper bound on rows a single native DELETE / UPDATE will touch.  A
- * range matching more than this falls back to the VDBE rather than run
- * unbounded work (and an unbounded native buffer) on one statement. */
+/* Upper bound on rows a single native DELETE, UPDATE or INSERT ...
+ * SELECT will change.  A statement over it fails with "too many rows"
+ * (vx_too_many_err) before it writes anything, rather than run
+ * unbounded work (and an unbounded native buffer) on one statement;
+ * there is no other engine to take it. */
 #define XS_NATIVE_MAX_ROWS  100000
 
 /* Does `e` name the primary-key column (unqualified or table-qualified)? */
@@ -9726,7 +9728,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	 * must return exactly ncolmap columns (one per target slot).  An
 	 * in-txn INSERT..SELECT, a parametrized SELECT, an arity mismatch,
 	 * a non-integer PK, a duplicate PK, or a too-large row falls back
-	 * (writing nothing first).  REPLACE..SELECT overwrites on conflict. */
+	 * (writing nothing first); more than XS_NATIVE_MAX_ROWS rows fail
+	 * with "too many rows".  REPLACE..SELECT overwrites on conflict. */
 	if (ins->select != NULL) {
 		vx_result_t *sres = NULL;
 		const char *ssrc = ins->select->src;
