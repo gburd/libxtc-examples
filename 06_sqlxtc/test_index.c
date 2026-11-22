@@ -34,7 +34,10 @@
  *	  6. A CREATE TABLE whose PRIMARY KEY autoindex cannot be built
  *	     leaves no table (a duplicate INSERT cannot go in), also after a
  *	     crash and recovery from the log; CREATE TABLE IF NOT EXISTS over
- *	     an existing table keeps it.
+ *	     an existing table keeps it.  When the clean-up DROP fails a read
+ *	     too, the table stays with its constraint index defined: writes
+ *	     are refused, and a rebuild restores the index (before: the
+ *	     table stayed with no index, and a duplicate key went in).
  *	  7. An index whose rebuild at open fails a read is not used for
  *	     the rest of the run: seeks answer from the table, a UNIQUE
  *	     write through it fails (it cannot prove the key absent), and the
@@ -475,7 +478,7 @@ scenario_create_table_error(void)
 	wal_opts_t wo;
 	xstore_index_info_t ix[4];
 	uint32_t id;
-	int fd, n, rc, errs = 0;
+	int fd, n, rc, errs = 0, kept;
 
 	t_tmpl(path, sizeof path, "sqlxtc-index-ctab");
 	t_tmpl(path2, sizeof path2, "sqlxtc-index-ctab2");
@@ -516,6 +519,27 @@ scenario_create_table_error(void)
 	CK(rc == SX_OK && xstore_index_list(bt, "u", ix, 4) == 1);
 	dup_insert_refused(db);
 	CK(sx_exec(db, "DROP TABLE u", NULL) == SX_OK);
+	/* A second read error, in the clean-up DROP: the table may stay,
+	 * but never without its constraint, and a rebuild (what the next
+	 * open runs) finds the persisted autoindex. */
+	for (n = 1, kept = 0; n < 1000; n++) {
+		xstore_scan_read_fail_at(1);
+		xstore_row_read_fail_at(n);
+		rc = sx_exec(db, "CREATE TABLE u(a INTEGER, b INTEGER, "
+		    "PRIMARY KEY(a, b))", NULL);
+		xstore_scan_read_fail_at(0);
+		if (xstore_row_read_fail_at(0) > 0) break;
+		CK(rc == SX_ERROR);
+		if (xstore_table_id(bt, "u", &id) != 1)
+			continue;
+		kept++;
+		dup_insert_refused(db);
+		CK(xstore_index_rebuild_all(bt) == 0);
+		CK(xstore_index_list(bt, "u", ix, 4) == 1);
+		dup_insert_refused(db);
+		CK(sx_exec(db, "DROP TABLE u", NULL) == SX_OK);
+	}
+	CK(n < 1000 && kept > 0);
 	xstore_scan_read_fail_at(1);
 	CK(sx_exec(db, "CREATE TABLE u(a INTEGER, b INTEGER, PRIMARY KEY(a, b))",
 	    NULL) == SX_ERROR);

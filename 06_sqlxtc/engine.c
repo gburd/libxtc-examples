@@ -1874,20 +1874,28 @@ nat_create_autoindexes(struct sx_stmt *st)
 }
 
 /* CREATE TABLE: the table, then its autoindexes.  If an autoindex
- * cannot be built, a table this statement created is dropped again, so
- * no table outlives the statement with a constraint it does not
- * enforce; an existing table (IF NOT EXISTS) is left as it was. */
+ * cannot be built, a table this statement created is dropped again; an
+ * existing table (IF NOT EXISTS) is left as it was.  An autoindex that
+ * failed its build stays defined and refuses writes (xstore.c), so a
+ * table the drop could not remove still enforces its constraint: the
+ * message says so, and the next open rebuilds the index. */
 static int
 nat_create_table(struct sx_stmt *st)
 {
+	char m[400];
 	int created = 0, rc;
 	if (xstore_create_table(st->db, st->ddl_name, st->ddl_cols,
 	    &created) == 0)
 		return SX_ERROR;
 	rc = nat_create_autoindexes(st);
-	if (rc != SX_DONE && created)
-		(void)xstore_drop_table(st->db, st->ddl_name);
-	return rc;
+	if (rc == SX_DONE || !created)
+		return rc;
+	if (xstore_drop_table(st->db, st->ddl_name) == 0)
+		return rc;
+	snprintf(m, sizeof m, "%s; table %s was created but could not be "
+	    "dropped again: it refuses writes until a restart rebuilds its "
+	    "index", sx_errmsg(st->db), st->ddl_name);
+	return nat_set_err(st->db, m, SX_ERROR);
 }
 
 /* One DDL statement (CREATE / DROP TABLE, ALTER TABLE RENAME, CREATE /

@@ -7949,6 +7949,22 @@ struct xs_rb_job {
 	int next, left;
 };
 
+/* Take index `idx_id` out of the in-process cache (its catalog row, if
+ * any, is the caller's to handle). */
+static void
+xs_idx_cache_drop(bt_t *bt, uint32_t idx_id)
+{
+	int i;
+	xs_cat_lock();
+	for (i = 0; i < g_idx_n; i++)
+		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
+			g_idx[i] = g_idx[--g_idx_n];
+			XS_CATC_BUMP();
+			break;
+		}
+	xs_cat_unlock();
+}
+
 /* Index `idx_id` could not be rebuilt (code rc): it misses entries for
  * the rest of the run.  The planner and the index scan skip it, and a
  * UNIQUE probe through it fails the write; the taint rebuilds it at the
@@ -8253,6 +8269,24 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) { e = g_idx[i]; break; }
 	xs_cat_unlock();
+	/* A constraint index (CREATE TABLE's autoindex) is persisted before
+	 * its build: a build that fails leaves it durable and broken, so it
+	 * refuses writes and the next open rebuilds it.  Removing it instead
+	 * would leave the table without its constraint whenever the clean-up
+	 * DROP could not run (a crash, or a second failed read). */
+	if (kind != 0 && kind != 'i') {
+		if (xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf,
+		    (int)off, 0) != SX_OK) {
+			xs_idx_cache_drop(bt, idx_id);
+			return 0;
+		}
+		rc = xs_idx_build_one(bt, &e);
+		if (rc != 0) {
+			xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+			xs_idx_mark_broken(bt, idx_id, rc < -1 ? rc : XTC_E_INTERNAL);
+		}
+		return rc != 0 ? rc : 1;
+	}
 	rc = xs_idx_build_one(bt, &e);
 	if (rc != 0) {
 		/* Duplicates (SQLite refuses the index), or the table could not
