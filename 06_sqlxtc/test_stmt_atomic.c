@@ -29,7 +29,8 @@
  *	  (d) a kill of the connection's proc that lands while the statement
  *	      runs (the kill is deferred to the statement's end, see
  *	      sx_step): the connection never hears an answer, and the
- *	      statement's rows must not be committed by a dead connection.
+ *	      statement's rows must not be committed by a dead connection,
+ *	      whether it changes one row or many.
  *	A line per statement reports the failed runs and how many of them
  *	left rows committed; the test fails if any did.
  *
@@ -356,6 +357,11 @@ main(void)
 		"INSERT INTO d SELECT k + 1000, v + 100000 FROM s",
 		"UPDATE s SET v = v + 1",
 		"DELETE FROM s WHERE v > 0",
+		/* One row each: the direct autocommit write, which a pending
+		 * kill must discard too. */
+		"INSERT INTO d VALUES(2000, 200000)",
+		"UPDATE s SET v = v + 1 WHERE k = 10",
+		"DELETE FROM s WHERE k = 10",
 	};
 	bm_t *bm = NULL;
 	bt_t *bt = NULL;

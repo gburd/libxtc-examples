@@ -6205,6 +6205,13 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		if (rc > 0) cx->last_conflict = rc;
 		return -1;
 	}
+	/* A kill pending once the row is ours (the wait above is the last
+	 * park) discards a one-row statement, as xstore_stmt_implicit_end
+	 * discards a multi-row one: a dead connection commits nothing. */
+	if (xtc_cancel_requested()) {
+		xs_intents_release(cx);
+		return -1;
+	}
 	rc = xs_put_pruned(cx, tableid, rowid, deleted ? NULL : rec,
 	                   deleted ? 0 : reclen, deleted, 0);
 	if (rc == SX_BUSY)
@@ -6243,6 +6250,8 @@ xstore_insert_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		cx->ilk_skip = 0;
 		return rc;
 	}
+	if (xtc_cancel_requested())
+		return -1;            /* as in xstore_write_txn */
 	cx->uniq_err[0] = '\0';
 	rc = xs_put_pruned(cx, tableid, rowid, rec, reclen, 0, 1);
 	if (rc == SX_OK) {

@@ -1970,8 +1970,10 @@ static int sx_step_body(sx_stmt *st);
  * connection leaked a shared latch on an internal node, a splitter
  * holding the SMO lock waited on it, and every commit behind it).  So a
  * step runs with cancellation masked and a kill raised meanwhile is
- * delivered when it returns -- kill latency is one statement.  Off a
- * proc both calls are no-ops.
+ * delivered when it returns -- kill latency is one statement.  A write
+ * statement with a kill pending writes nothing: its rows are discarded
+ * whether it changes one row or many (xstore_write_txn,
+ * xstore_stmt_implicit_end).  Off a proc both calls are no-ops.
  */
 int
 sx_step(sx_stmt *st)
