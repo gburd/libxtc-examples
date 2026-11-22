@@ -169,7 +169,8 @@ xstore_scan_t *xstore_scan_open(bt_t *bt, const char *table,
                                 int64_t hi, int has_hi);
 /* MAX(rowid) of `table` at `snap` (0 = the connection's snapshot), with
  * the connection's buffered writes, optionally <= hi: O(log n) per dead
- * rowid skipped.  1 with *out, 0 if no live row. */
+ * rowid skipped.  1 with *out, 0 if no live row, -1 if a read failed
+ * (xstore_read_err says why). */
 int xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
     int64_t hi, int has_hi, int64_t *out);
 /* Like xstore_scan_open, but honours the connection's uncommitted

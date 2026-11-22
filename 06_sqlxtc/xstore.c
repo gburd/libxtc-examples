@@ -3121,7 +3121,8 @@ xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
  * the connection's buffered writes are merged: a buffered row above the
  * committed answer wins, a buffered DELETE hides a committed row.
  * `snap` 0 = the connection's read snapshot (as xstore_scan_open_txn).
- * Returns 1 with *out, or 0 if the table has no live row (<= hi).
+ * Returns 1 with *out, 0 if the table has no live row (<= hi), or -1
+ * when a read failed (rd_err says which table): the answer is unknown.
  */
 static int xs_point_get(bt_t *bt, uint32_t tid, int64_t rid, uint64_t snap,
     uint8_t *out, int cap, int *err);
@@ -3134,7 +3135,7 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 	uint8_t bound[XS_VKLEN], k[XS_VKLEN + 8];
 	uint32_t tid;
 	int64_t bmax = 0, rid;
-	int have_b = 0, guard, i;
+	int have_b = 0, guard, i, rc, err = 0;
 
 	if (bt == NULL || table == NULL || !xstore_table_id(bt, table, &tid))
 		return 0;
@@ -3172,8 +3173,15 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 		uint8_t val[1 + XS_VMAX];
 		const xs_wrec_t *w;
 		int live;
-		if (bt_seek_lt(bt, bound, XS_VKLEN, k, sizeof k, &klen, NULL, 0, NULL)
-		    != XTC_OK || klen != XS_VKLEN || dec_tableid(k) != tid)
+		rc = bt_seek_lt(bt, bound, XS_VKLEN, k, sizeof k, &klen, NULL, 0,
+		    NULL);
+		if (rc == XTC_OK && xs_row_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+			err = rc;
+			break;
+		}
+		if (rc != XTC_OK || klen != XS_VKLEN || dec_tableid(k) != tid)
 			break;                       /* no lower rowid in this table */
 		rid = dec_rowid(k);
 		if (have_b && bmax >= rid) {     /* a buffered row is the answer */
@@ -3187,12 +3195,21 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 			live = !w->deleted;
 		else
 			live = xs_point_get(bt, tid, rid, snap, val,
-			           (int)sizeof val, NULL) != 0;
+			           (int)sizeof val, &err) != 0;
+		if (err == 0 && w == NULL && xs_row_fault())
+			err = XTC_E_IO;
+		if (err != 0)
+			break;
 		if (live) {
 			*out = rid;
 			return 1;
 		}
 		enc_vkey(tid, rid, ~(uint64_t)0, bound);   /* below every version */
+	}
+	if (err != 0) {
+		(void)xs_rd_count(err);
+		xs_rd_err_tid(cx, tid, err);
+		return -1;
 	}
 	if (have_b) { *out = bmax; return 1; }
 	return 0;

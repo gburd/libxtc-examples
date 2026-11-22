@@ -26,6 +26,9 @@
  *	     fails, says why, and commits nothing (before: the log record
  *	     encoder refused the NULL payload, and the client got "commit
  *	     failed" with no cause).
+ *	  4. SELECT max(rowid) (one descent per rowid, no scan) fails when a
+ *	     read fails (before: the table read as empty, or the MAX as an
+ *	     older rowid).
  */
 
 #include <stdint.h>
@@ -297,6 +300,51 @@ case_spill(sx_db *db)
 	    "reads failing fails and commits nothing\n", errs);
 }
 
+/* Sweep the n-th row read failing over `sql`, whose first column must
+ * be `want` in every run that succeeds.  Returns the failed runs. */
+static int
+sweep_val(sx_db *db, const char *sql, int64_t want)
+{
+	int n, errs = 0, faults;
+	int64_t got;
+	for (n = 1; n < 1000; n++) {
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		got = one_int(db, sql);
+		xstore_row_read_fail_at(0);
+		if (xstore_row_read_faults() == faults) {
+			CK(got == want);
+			break;
+		}
+		errs++;
+		if (got != -2) {
+			fprintf(stderr, "  %s: read %d failed, got %lld\n", sql, n,
+			    (long long)got);
+			g_fail = 1;
+		} else {
+			ck_read_msg(db, sql, n);
+		}
+	}
+	CK(n < 1000);
+	return errs;
+}
+
+/* 4: MAX(rowid) by descent. */
+static void
+case_maxrowid(sx_db *db)
+{
+	int n;
+	CK(sx_exec(db, "CREATE TABLE m(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO m VALUES(1, 1), (2, 2), (3, 3)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "DELETE FROM m WHERE k = 3", NULL) == SX_OK);
+	n = sweep_val(db, "SELECT max(k) FROM m", 2);
+	CK(n > 2);                /* the deleted rowid's reads, then 2's */
+	printf("  ok   read errors: MAX(rowid) with each of %d reads failing "
+	    "fails\n", n);
+}
+
 int
 main(void)
 {
@@ -327,6 +375,7 @@ main(void)
 	case_pk(db, bt);
 	case_ww(db);
 	case_spill(db);
+	case_maxrowid(db);
 	sx_close(db);
 	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);

@@ -4388,7 +4388,10 @@ src_open(struct vx_stmt *st, const char *table, const vx_apath_t *ap,
 	}
 	if (ap->rowmax) {
 		int64_t m;
-		if (!xstore_max_live_rowid((struct xsql *)st->db, table, st->snap, 0, 0, &m)) {
+		int r = xstore_max_live_rowid((struct xsql *)st->db, table,
+		    st->snap, 0, 0, &m);
+		if (r < 0) { rc = -1; goto out; }   /* unread: not "empty" */
+		if (r == 0) {
 			s->empty = 1;
 			goto out;
 		}
