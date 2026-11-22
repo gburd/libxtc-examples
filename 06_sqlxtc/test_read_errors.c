@@ -45,6 +45,9 @@
  *	     dropped from the cache, silently neither maintained nor used).
  *	     The engine's open (sx_storage_open) fails the same way, and a
  *	     later open has every index.
+ *	  8. Version GC that cannot read stops early and counts the read in
+ *	     xstore_read_errors() (the metric); no row is lost, and a later
+ *	     GC reclaims what it left.
  */
 
 #include <stdint.h>
@@ -526,6 +529,43 @@ case_idxcat(sx_db *db, bt_t *bt)
 	    "reads failing fails\n", errs);
 }
 
+/* 8: version GC. */
+static void
+case_gc(sx_db *db)
+{
+	uint64_t e0;
+	int n, r, errs = 0, faults, i;
+	char sql[80];
+	CK(sx_exec(db, "CREATE TABLE g(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	for (i = 1; i <= 50; i++) {
+		snprintf(sql, sizeof sql, "INSERT INTO g VALUES(%d, 0)", i);
+		CK(sx_exec(db, sql, NULL) == SX_OK);
+	}
+	xstore_gc_set_batch(8);            /* several batches */
+	for (n = 1; n < 1000; n++) {
+		CK(sx_exec(db, "UPDATE g SET v = v + 1", NULL) == SX_OK);
+		e0 = xstore_read_errors();
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		r = xstore_gc_run((struct xsql *)db);
+		xstore_row_read_fail_at(0);
+		CK(r >= 0);
+		if (xstore_row_read_faults() == faults)
+			break;
+		errs++;
+		CK(xstore_read_errors() > e0);
+		CK(one_int(db, "SELECT count(*) FROM g") == 50);
+		CK(one_int(db, "SELECT sum(v) FROM g") == 50 * n);
+	}
+	xstore_gc_set_batch(0);
+	CK(n < 1000 && errs > 0);
+	CK(xstore_gc_run((struct xsql *)db) >= 0);
+	CK(one_int(db, "SELECT sum(v) FROM g") == 50 * n);
+	printf("  ok   read errors: GC with each of %d reads failing stops, "
+	    "counts the error, loses nothing\n", errs);
+}
+
 /* 7, the engine: sx_storage_open with the n-th catalog read failing. */
 static void
 case_open(void)
@@ -608,6 +648,7 @@ main(void)
 	case_umap(db);
 	case_catalog(db, bt);
 	case_idxcat(db, bt);
+	case_gc(db);
 	sx_close(db);
 	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);

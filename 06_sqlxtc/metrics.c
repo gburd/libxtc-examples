@@ -121,7 +121,7 @@ metrics_proc(void *arg)
 			    "parses=%llu "
 			    "plans=%llu wal_commits=%llu wal_fsyncs=%llu "
 			    "row_waits=%llu row_wait_ms=%llu row_conflicts=%llu "
-			    "row_deadlocks=%llu",
+			    "row_deadlocks=%llu read_errors=%llu",
 			    xtc_atomic_load_i32(st->conn_count, xtc_mo_seq_cst),
 			    (long long)qs, (long long)errs, (long long)p50,
 			    (long long)p99, (long long)qmax, (long long)mem,
@@ -132,7 +132,8 @@ metrics_proc(void *arg)
 			    (unsigned long long)(xstore_intent_wait_ns() /
 			        1000000u),
 			    (unsigned long long)xstore_intent_conflicts(),
-			    (unsigned long long)xstore_intent_deadlocks());
+			    (unsigned long long)xstore_intent_deadlocks(),
+			    (unsigned long long)xstore_read_errors());
 		}
 		/* Not queued (pool unavailable): the next tick retries; never
 		 * write on the loop. */

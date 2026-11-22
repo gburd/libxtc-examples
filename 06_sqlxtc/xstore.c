@@ -5333,8 +5333,15 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 		in_group = 0;     /* planted: the row state restarts per batch */
 #endif
 
-		if (bt_cursor_open(bt, start, have_resume ? XS_VKLEN : 0, &cur) != XTC_OK)
+		rc = bt_cursor_open(bt, start, have_resume ? XS_VKLEN : 0, &cur);
+		if (rc == XTC_OK && xs_row_fault()) {
+			bt_cursor_close(cur);
+			rc = XTC_E_IO;
+		}
+		if (rc != XTC_OK) {
+			(void)xs_rd_count(rc);   /* stop: the rest only leaks */
 			break;
+		}
 		for (;;) {
 			const void *k = NULL, *vv = NULL;
 			uint16_t klen = 0, vl = 0;
@@ -5342,7 +5349,8 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			uint32_t tid;
 			int is_cat;
 
-			if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK)
+			rc = xs_rd_count(bt_cursor_next(cur, &k, &klen, &vv, &vl));
+			if (rc != XTC_OK)
 				break;
 			/* The tables end at the index namespace (index entries
 			 * are not versions, and one can be 20 bytes long too).
@@ -5353,7 +5361,8 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			if (klen >= 1 && ((const uint8_t *)k)[0] == XS_IDX_LEAD) {
 				bt_cursor_close(cur);
 				cur = NULL;
-				if (bt_cursor_open(bt, &past, 1, &cur) != XTC_OK)
+				if ((rc = xs_rd_count(bt_cursor_open(bt, &past, 1,
+				    &cur))) != XTC_OK)
 					break;
 				continue;
 			}
@@ -5407,16 +5416,17 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 				break;
 			}
 		}
-		bt_cursor_close(cur);
+		if (cur != NULL)
+			bt_cursor_close(cur);
 		for (i = 0; i < ndead; i++) {
 			if (bt_delete(bt, dead[i], XS_VKLEN) == XTC_OK) reclaimed++;
 		}
 		if (ndead < g_gc_batch)
-			break;     /* scanned to the end */
+			break;     /* scanned to the end, or stopped on a read */
 	}
 	free(dropped.id);
 	if (out_reclaimed != NULL) *out_reclaimed = reclaimed;
-	return rc;
+	return rc == XTC_E_NOTFOUND ? XTC_OK : rc;
 }
 
 /*
@@ -5437,14 +5447,14 @@ xs_prune_rowid(bt_t *bt, uint32_t tableid, int64_t rowid, uint64_t horizon)
 	int ndead = 0, i, survivor_found = 0, first = 1, reclaimed = 0;
 
 	enc_vkey(tableid, rowid, ~(uint64_t)0, startk);    /* newest version first */
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
+	if (xs_rd_count(bt_cursor_open(bt, startk, XS_VKLEN, &cur)) != XTC_OK)
+		return 0;                 /* a read error stops it: a leak only */
 	for (;;) {
 		const void *k = NULL, *vv = NULL;
 		uint16_t klen = 0, vl = 0;
 		uint64_t ts; int deleted;
 
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
+		if (xs_rd_count(bt_cursor_next(cur, &k, &klen, &vv, &vl)) != XTC_OK ||
 		    klen != XS_VKLEN ||
 		    dec_tableid((const uint8_t *)k) != tableid ||
 		    dec_rowid((const uint8_t *)k) != rowid)
@@ -7667,27 +7677,37 @@ xs_idx_clear(bt_t *bt, uint32_t idx_id)
 	enum { KMAX = XS_IDX_KMAX, BATCH = 32 };
 	uint8_t (*dead)[KMAX];
 	uint16_t deadlen[BATCH];
+	int rc = XTC_OK;
 	dead = malloc(sizeof *dead * BATCH);
-	if (dead == NULL) return;
+	if (dead == NULL) {
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+		return;
+	}
 	(void)xs_idx_prefix(idx_id, prefix);
 	for (;;) {
 		bt_cursor_t *cur = NULL;
 		int ndead = 0, j;
-		if (bt_cursor_open(bt, prefix, 5, &cur) != XTC_OK) break;
+		if ((rc = xs_rd_count(bt_cursor_open(bt, prefix, 5, &cur))) !=
+		    XTC_OK)
+			break;
 		for (;;) {
 			const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
-			if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK) break;
+			rc = xs_rd_count(bt_cursor_next(cur, &k, &klen, &vv, &vl));
+			if (rc != XTC_OK) break;
 			if (klen < 5 || memcmp(k, prefix, 5) != 0) break;   /* past this index */
 			if (klen > KMAX) continue;   /* unreachable: keys <= BT_MAX_KEY */
 			memcpy(dead[ndead], k, klen); deadlen[ndead] = klen;
 			if (++ndead >= BATCH) break;
 		}
 		bt_cursor_close(cur);
-		if (ndead == 0) break;
 		for (j = 0; j < ndead; j++)
 			(void)bt_delete(bt, dead[j], deadlen[j]);
 		if (ndead < BATCH) break;
 	}
+	/* Entries left behind are stale (readers check each against its
+	 * row), but no reap knows them: do not trust the indexes. */
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	free(dead);
 }
 
