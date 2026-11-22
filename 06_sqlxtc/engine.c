@@ -683,8 +683,15 @@ sx_storage_open(const char *path, unsigned int n_frames)
 	i = xtc_ncpus();
 	if (i > 16) i = 16;
 	if ((unsigned)i > o.n_frames / 1024u) i = (int)(o.n_frames / 1024u);
-	(void)xstore_index_open(g_xbt, trusted ? idxtag : 0, idxgarb, !trusted,
-	    i);
+	/* An index catalog that cannot be read leaves the definitions
+	 * unknown: an index missing from the cache would be neither
+	 * maintained nor enforced, so the open fails (the base and the log
+	 * are untouched; a retry reads them again). */
+	if (xstore_index_open(g_xbt, trusted ? idxtag : 0, idxgarb, !trusted,
+	    i) < 0) {
+		sx_storage_abandon();
+		return SX_ERROR;
+	}
 	/* A trusted base that failed a page checksum while the open read it
 	 * (the index catalog load): drop it and rebuild from the log now,
 	 * rather than run fail-stopped until the next restart.  The log is

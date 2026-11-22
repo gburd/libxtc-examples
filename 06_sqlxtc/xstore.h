@@ -563,7 +563,8 @@ uint64_t xstore_intent_wait_ns(void);    /* total nap time of those waits */
 uint64_t xstore_index_seek_count(void);
 
 /* Rebuild every catalog-recorded index for `bt` from its base rows
- * (clearing the old entries first).  Returns 0. */
+ * (clearing the old entries first).  Returns 0, or the XTC_E_* code of
+ * an index catalog that could not be read. */
 int xstore_index_rebuild_all(bt_t *bt);
 
 /*
@@ -577,7 +578,10 @@ int xstore_index_rebuild_all(bt_t *bt);
  * tag on a trusted base, with little garbage, loads the index catalog and
  * keeps the entries (returns 1); anything else -- 0 after a crash, a
  * tainted run, another format, too many stale entries -- rebuilds every
- * index (returns 0).  fresh = 1: the tree was rebuilt from the log on an
+ * index (returns 0).  An index catalog that cannot be read returns its
+ * XTC_E_* code: the definitions are unknown, so the store must not run
+ * (an index missing from the cache is neither maintained nor enforced).
+ * fresh = 1: the tree was rebuilt from the log on an
  * empty page file (no entries to clear).  A rebuild runs one index per
  * thread on up to `workers` threads (the caller and blocking-pool
  * workers; 1 under simulation).  Each pins a few frames at a time, so

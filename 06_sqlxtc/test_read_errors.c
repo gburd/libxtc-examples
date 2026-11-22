@@ -39,6 +39,12 @@
  *	     catalog as it was; no id is ever handed out twice (before: a
  *	     failed read was "no such name" or "max id 0", so a CREATE could
  *	     take an id in use, and a DROP or RENAME report success).
+ *	  7. An index rebuild whose index catalog cannot be read fails, and
+ *	     the indexes it did not load are not trusted; a whole one puts
+ *	     every index back (before: the indexes past the failed read were
+ *	     dropped from the cache, silently neither maintained nor used).
+ *	     The engine's open (sx_storage_open) fails the same way, and a
+ *	     later open has every index.
  */
 
 #include <stdint.h>
@@ -489,6 +495,85 @@ case_catalog(sx_db *db, bt_t *bt)
 	    "fails and leaves the catalog as it was\n", n);
 }
 
+/* 7: the index catalog load of a rebuild (and of the open). */
+static void
+case_idxcat(sx_db *db, bt_t *bt)
+{
+	xstore_index_info_t ix[4];
+	char sql[96];
+	int n, rc, errs = 0, faults;
+	CK(sx_exec(db, "CREATE INDEX p_v ON p(v)", NULL) == SX_OK);
+	CK(xstore_index_list(bt, "p", ix, 4) == 1);
+	for (n = 1; n < 1000; n++) {
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		rc = xstore_index_rebuild_all(bt);
+		xstore_row_read_fail_at(0);
+		if (xstore_row_read_faults() == faults) {
+			CK(rc == 0);
+			break;
+		}
+		errs++;
+		CK(rc == XTC_E_IO);
+		CK(xstore_index_trust_tag(bt) == 0);
+	}
+	CK(n < 1000 && errs > 0);
+	CK(xstore_index_list(bt, "p", ix, 4) == 1);
+	snprintf(sql, sizeof sql, "SELECT count(*) FROM p WHERE v = %lld",
+	    (long long)g_v);
+	CK(one_int(db, sql) == 1);         /* through the index */
+	printf("  ok   read errors: an index rebuild with each of %d catalog "
+	    "reads failing fails\n", errs);
+}
+
+/* 7, the engine: sx_storage_open with the n-th catalog read failing. */
+static void
+case_open(void)
+{
+	char path[256], walp[300], sql[64];
+	sx_db *h = NULL;
+	xstore_index_info_t ix[4];
+	int n, rc, errs = 0, faults, fd;
+	t_tmpl(path, sizeof path, "sqlxtc-read-errors-open");
+	fd = mkstemp(path);
+	if (fd < 0) { g_fail = 1; return; }
+	close(fd);
+	snprintf(walp, sizeof walp, "%s-wal", path);
+	CK(sx_storage_open(path, 256) == SX_OK);
+	CK(sx_open(":memory:", &h) == SX_OK);
+	CK(sx_exec(h, "CREATE TABLE o(k INTEGER PRIMARY KEY, v INTEGER UNIQUE)",
+	    NULL) == SX_OK);
+	CK(sx_exec(h, "INSERT INTO o VALUES(1, 1)", NULL) == SX_OK);
+	sx_close(h);
+	CK(sx_storage_close() == SX_OK);
+	for (n = 1; n < 1000; n++) {
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		rc = sx_storage_open(path, 256);
+		xstore_row_read_fail_at(0);
+		if (xstore_row_read_faults() == faults) {
+			CK(rc == SX_OK);
+			break;
+		}
+		if (rc == SX_OK) {      /* the read was not the index catalog's */
+			CK(xstore_index_list(sx_storage_bt(), "o", ix, 4) == 1);
+			CK(sx_storage_close() == SX_OK);
+			continue;
+		}
+		errs++;
+	}
+	CK(n < 1000 && errs > 0);
+	CK(xstore_index_list(sx_storage_bt(), "o", ix, 4) == 1);
+	CK(sx_open(":memory:", &h) == SX_OK);
+	snprintf(sql, sizeof sql, "INSERT INTO o VALUES(2, 1)");
+	CK(sx_exec(h, sql, NULL) == SX_CONSTRAINT);
+	sx_close(h);
+	CK(sx_storage_close() == SX_OK);
+	unlink(path); unlink(walp);
+	printf("  ok   read errors: an open with each of %d catalog reads "
+	    "failing fails; the next has every index\n", errs);
+}
+
 int
 main(void)
 {
@@ -522,11 +607,13 @@ main(void)
 	case_maxrowid(db);
 	case_umap(db);
 	case_catalog(db, bt);
+	case_idxcat(db, bt);
 	sx_close(db);
 	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);
 	wal_close(wal);
 	unlink(path); unlink(logp);
+	case_open();
 	if (g_fail) return 1;
 	printf("test_read_errors: OK\n");
 	return 0;

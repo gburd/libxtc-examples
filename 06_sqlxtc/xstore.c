@@ -7495,13 +7495,16 @@ xs_split_cols(const char *csv, char col[][64])
 
 /* Add (or replace) an in-process index-cache entry, resolving its table
  * id and payload map now (a table not resolvable yet keeps tableid 0:
- * never maintained, never chosen). */
-static void
+ * never maintained, never chosen).  XTC_OK, or XTC_E_IO when the table
+ * could not be resolved because a read failed: the entry is not added,
+ * since an unresolved index is neither maintained nor enforced. */
+static int
 xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
     char col[][64], int ncol, uint32_t descmask, int unique, char kind,
     const uint64_t *sipk)
 {
 	struct xs_idx_ent e;
+	uint64_t rd0 = xstore_read_errors();
 	int i;
 	memset(&e, 0, sizeof e);
 	e.bt = bt;
@@ -7519,6 +7522,12 @@ xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
 		snprintf(e.col[i], sizeof e.col[i], "%s", col[i]);
 	if (!xstore_table_id(bt, table, &e.rt.tableid) ||
 	    xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay) != 0) {
+		/* shortcut: the resolvers say "unknown" for a failed read too,
+		 * so a read error is seen as the metric moving; a concurrent
+		 * one elsewhere also fails this (safe: the caller fails, and a
+		 * retry resolves).  Upgrade if the resolvers return errors. */
+		if (xstore_read_errors() != rd0)
+			return XTC_E_IO;
 		/* Not maintained while unresolved: if its table appears later
 		 * the index would be trusted with no entries -- do not. */
 		e.rt.tableid = 0;
@@ -7532,6 +7541,7 @@ xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
 	if (i < XS_IDX_MAX) g_idx[i] = e;
 	XS_CATC_BUMP();
 	xs_cat_unlock();
+	return XTC_OK;
 }
 
 /* Parse an index-catalog value: the current six-field form
@@ -7584,24 +7594,27 @@ xs_idxcat_tail(char *vbuf, size_t cap, size_t off, const struct xs_idx_rt *rt)
 }
 
 /* Load every persisted (non-tombstoned) index-catalog row for `bt` into
- * the in-process cache.  Called at open before rebuilding entries. */
-static void
+ * the in-process cache.  Called at open before rebuilding entries.
+ * XTC_OK, or the XTC_E_* code of a read that failed: the cache then
+ * holds only the definitions read before it. */
+static int
 xs_idxcat_load(bt_t *bt)
 {
 	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
 	int64_t last_rid = 0; int have_last = 0;
 	struct { uint32_t id; char v[1100]; int vl; } *rows = NULL;
-	int nrows = 0, i;
+	int nrows = 0, i, rc;
 	rows = malloc(sizeof *rows * XS_IDX_MAX);
-	if (rows == NULL) return;
-	enc_vkey(XS_IDXCAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) { free(rows); return; }
+	if (rows == NULL) return XTC_E_NOMEM;
+	if ((rc = xs_cat_open(bt, XS_IDXCAT_TABLEID, &cur)) != XTC_OK) {
+		free(rows);
+		return rc == XTC_E_NOTFOUND ? XTC_OK : rc;
+	}
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
 		const uint8_t *kb, *vb; int64_t rid;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN) break;
+		rc = xs_cat_next(cur, &k, &klen, &vv, &vl);
+		if (rc != XTC_OK || klen != XS_VKLEN) break;
 		kb = (const uint8_t *)k; vb = (const uint8_t *)vv;
 		if (dec_tableid(kb) != XS_IDXCAT_TABLEID) break;
 		rid = dec_rowid(kb);
@@ -7617,6 +7630,12 @@ xs_idxcat_load(bt_t *bt)
 		nrows++;
 	}
 	bt_cursor_close(cur);
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+		/* A definition not loaded would not be maintained or
+		 * enforced: the caller must not run on a part of the list. */
+		free(rows);
+		return rc;
+	}
 	/* Resolve outside the cursor: cache add reads the table catalog. */
 	for (i = 0; i < nrows; i++) {
 		const char *nm, *tb, *cl;
@@ -7628,11 +7647,12 @@ xs_idxcat_load(bt_t *bt)
 		        &dm, &kd, sk))
 			continue;
 		nc = xs_split_cols(cl, col);
-		if (nc > 0)
-			xs_idx_cache_add(bt, rows[i].id, nm, tb, col, nc, dm,
-			    uq, kd, sk);
+		if (nc > 0 && (rc = xs_idx_cache_add(bt, rows[i].id, nm, tb, col,
+		    nc, dm, uq, kd, sk)) != XTC_OK)
+			break;
 	}
 	free(rows);
+	return rc == XTC_E_NOTFOUND ? XTC_OK : rc;
 }
 
 /* Delete every index entry under `idx_id` (a range over the [0xFE][id]
@@ -7865,20 +7885,25 @@ xs_rb_worker(void *arg)
 /* Load the persisted catalog and rebuild every index of `bt` from the
  * base rows, on up to `workers` threads.  clear = 0 when the index
  * namespace is known empty (a tree rebuilt from the log on a fresh page
- * file). */
-static void
+ * file).  XTC_OK, or the error of a catalog that could not be read (no
+ * index is rebuilt then). */
+static int
 xs_idx_rebuild(bt_t *bt, int clear, int workers)
 {
 	struct xs_rb_job j;
-	int i, nw;
+	int i, nw, rc;
 	memset(&j, 0, sizeof j);
 	xs_idx_dead_forget(bt);      /* every entry is rebuilt from the base */
 	xtc_atomic_store_u64(&g_idx_garbage, 0, xtc_mo_relaxed);
-	xs_idxcat_load(bt);          /* refresh cache from persisted catalog */
+	/* Refresh the cache from the persisted catalog. */
+	if ((rc = xs_idxcat_load(bt)) != XTC_OK) {
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+		return rc;
+	}
 	j.e = malloc(sizeof *j.e * XS_IDX_MAX);
 	if (j.e == NULL) {
 		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
-		return;
+		return XTC_E_NOMEM;
 	}
 	j.bt = bt;
 	xs_cat_lock();
@@ -7904,14 +7929,14 @@ xs_idx_rebuild(bt_t *bt, int clear, int workers)
 			(void)xtc_proc_sleep(1000LL * 1000);
 	}
 	free(j.e);
+	return XTC_OK;
 }
 
 int
 xstore_index_rebuild_all(bt_t *bt)
 {
 	if (bt == NULL) return 0;
-	xs_idx_rebuild(bt, 1, 1);
-	return 0;
+	return xs_idx_rebuild(bt, 1, 1);
 }
 
 uint64_t
@@ -7933,19 +7958,22 @@ int
 xstore_index_open(bt_t *bt, uint64_t tag, uint64_t garbage, int fresh,
     int workers)
 {
+	int rc;
 	if (bt == NULL) return 0;
 	xtc_atomic_store_i32(&g_idx_taint, 0, xtc_mo_release);
 	if (!fresh && tag == XS_IDX_TRUST_TAG && garbage < XS_IDX_GARBAGE_MAX) {
 		xs_idx_dead_forget(bt);
 		xtc_atomic_store_u64(&g_idx_garbage, garbage, xtc_mo_relaxed);
-		xs_idxcat_load(bt);        /* the entries are complete: trust them */
+		/* The entries are complete: trust them. */
+		if ((rc = xs_idxcat_load(bt)) != XTC_OK)
+			return rc;
 		/* Loading may taint (an unresolvable index): rebuild then. */
 		if (!xtc_atomic_load_i32(&g_idx_taint, xtc_mo_acquire))
 			return 1;
 		xtc_atomic_store_i32(&g_idx_taint, 0, xtc_mo_release);
 	}
-	xs_idx_rebuild(bt, !fresh, workers);
-	return 0;
+	rc = xs_idx_rebuild(bt, !fresh, workers);
+	return rc != XTC_OK ? rc : 0;
 }
 
 uint64_t
@@ -8098,8 +8126,9 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	/* Enter the cache BEFORE the build so a commit applied from here on
 	 * maintains the index; the barrier below waits out the commits in
 	 * flight (which may have missed it), and the build scans after it. */
-	xs_idx_cache_add(bt, idx_id, name, table, e.col, ncol, descmask, unique,
-	    kind ? (char)kind : 'i', sipk);
+	/* The table and columns resolved above, so no read can fail here. */
+	(void)xs_idx_cache_add(bt, idx_id, name, table, e.col, ncol, descmask,
+	    unique, kind ? (char)kind : 'i', sipk);
 	xtc_atomic_fetch_add_u64(&g_idx_gen, 1, xtc_mo_relaxed);
 	xs_cat_gen_bump();
 	xstore_quiesce_begin();
