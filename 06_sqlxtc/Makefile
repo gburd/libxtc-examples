@@ -11,6 +11,9 @@
 #   make clean      remove objects + binary
 #   make distclean  also remove Lime artifacts
 #   make test       run the basic smoke test (requires python3)
+#   make test-valgrind  every C test of make test under valgrind
+#                   memcheck; needs a libxtc built with
+#                   --with-io-backend=epoll (test/test_valgrind.sh)
 #
 # Override XTC_BUILD to point at a different libxtc build dir.
 
@@ -1364,6 +1367,13 @@ $(LATCHED_TESTS:=_latched): %_latched: %.c $(ENGINE_NATIVE)
 test-latched: $(LATCHED_TESTS:=_latched)
 	for t in $(LATCHED_TESTS:=_latched); do \
 	    TMPDIR=$${TMPDIR:-/tmp} ./$$t || exit 1; done
+
+# Every C test of 'make test' once under valgrind memcheck, failing on any
+# error.  Not part of 'make test': it takes about 30 minutes on 16 cores
+# and needs its own libxtc build (see test/test_valgrind.sh).
+.PHONY: test-valgrind
+test-valgrind:
+	XTC_BUILD=$(XTC_BUILD) XTC_INC=$(XTC_INC) bash test/test_valgrind.sh
 
 # A frame reused for a new page (bm_alloc_pid) changes its version, so a
 # pin-free optimistic reader that sampled it before cannot validate.

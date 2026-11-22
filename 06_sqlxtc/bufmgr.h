@@ -28,6 +28,12 @@
  *	(io_uring natively, else the blocking pool) and parks only the
  *	calling fiber, so the loop never stalls; metrics go to xtc_stats.
  *
+ *	The page pool is not zeroed; a frame's bytes are defined once its
+ *	page is read or the caller fills it.  valgrind memcheck does not
+ *	see a read io_uring completes, so on an io_uring build it reports
+ *	every page read as uninitialised.  Run memcheck on a readiness
+ *	backend build (make test-valgrind), or set XTC_AIO_FORCE_OFFLOAD=1.
+ *
  *	BM_SAMPLED_EVICT (a test build only) replaces the CLOCK sweep under
  *	scan resistance with sampled eviction: 16 random frames, the
  *	lowest-scored clean COOL one evicted, and a sweep of every frame
