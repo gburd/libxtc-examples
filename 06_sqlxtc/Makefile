@@ -737,8 +737,9 @@ test_idx_trust: test_idx_trust.c $(ENGINE_NATIVE)
 test-idx-trust: test_idx_trust
 	TMPDIR=$${TMPDIR:-/tmp} ./test_idx_trust
 
-# The crash oracle: 8 seeds in `test` (~10 s); the long sweep takes
-# ORACLE_SEEDS / ORACLE_FIRST.
+# The crash oracle (kill -9 at a random time, one-row, explicit-txn and
+# multi-row autocommit statements): 8 seeds in `test` (~50 s); the long
+# sweep takes ORACLE_SEEDS / ORACLE_FIRST.
 test_crash_oracle: test_crash_oracle.c $(ENGINE_NATIVE)
 	$(CC) $(CFLAGS) -o $@ test_crash_oracle.c $(ENGINE_NATIVE) $(LDFLAGS)
 
