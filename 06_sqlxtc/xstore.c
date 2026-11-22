@@ -571,6 +571,8 @@ typedef struct xstore_ctx {
 	uint64_t         uniq_gen;    /* index generation at those checks */
 	char             uniq_err[192]; /* last UNIQUE violation message */
 	char             rd_err[192];   /* this statement's index read error */
+	uint32_t         rd_tid;        /* or a table read error, named later */
+	int              rd_rc;         /* its XTC_E_* code; 0: none */
 	/* Largest buffered rowid per table (xstore_max_rowid_txn), kept by
 	 * wbuf_add; a truncate/clear invalidates it (wmax_ok = 0) and the
 	 * next query rebuilds it with one pass. */
@@ -1364,27 +1366,25 @@ xstore_row_read_faults(void)
 	return xtc_atomic_load_i32(&g_row_faults, xtc_mo_relaxed);
 }
 
-/* Leave "cannot read table T: <rc>" in the connection's rd_err (the
- * statement's first read error, which the engine reports), naming the
- * table by id.  Takes the cat lock: never call it holding the commit
- * lock. */
+/* Record that a read of table `tid` failed with rc, as the statement's
+ * first read error unless it has one.  xstore_read_err() formats it as
+ * "cannot read table T: <rc>"; the name is looked up there, since the
+ * caller may hold the commit lock, which ranks after the cat lock. */
 static void
 xs_rd_err_tid(xstore_ctx_t *cx, uint32_t tid, int rc)
 {
-	char name[64];
-	int i;
-	if (cx == NULL || cx->rd_err[0] != '\0')
+	if (cx == NULL || cx->rd_err[0] != '\0' || cx->rd_rc != 0)
 		return;
-	snprintf(name, sizeof name, "%u", (unsigned)tid);
-	xs_cat_lock();
-	for (i = 0; i < g_cat_n; i++)
-		if (g_cat[i].bt == cx->bt && g_cat[i].tableid == tid) {
-			snprintf(name, sizeof name, "%s", g_cat[i].name);
-			break;
-		}
-	xs_cat_unlock();
-	snprintf(cx->rd_err, sizeof cx->rd_err, "cannot read table %s: %s",
-	    name, xtc_strerror(rc));
+	cx->rd_tid = tid;
+	cx->rd_rc = rc;
+}
+
+/* Forget the statement's read error. */
+static void
+xs_rd_err_clear(xstore_ctx_t *cx)
+{
+	cx->rd_err[0] = '\0';
+	cx->rd_rc = 0;
 }
 
 uint64_t
@@ -3380,7 +3380,8 @@ xs_scan_end(xstore_scan_t *s)
 	if (s->c.err == 0)
 		return 0;
 	/* The statement's first read error is the one the client sees. */
-	if (s->err_cx != NULL && s->err_cx->rd_err[0] == '\0')
+	if (s->err_cx != NULL && s->err_cx->rd_err[0] == '\0' &&
+	    s->err_cx->rd_rc == 0)
 		snprintf(s->err_cx->rd_err, sizeof s->err_cx->rd_err,
 		    "cannot read table %s: %s", s->name, xtc_strerror(s->c.err));
 	return -1;
@@ -5988,7 +5989,23 @@ const char *
 xstore_read_err(struct xsql *db)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
-	return cx != NULL ? cx->rd_err : "";
+	char name[64];
+	int i;
+	if (cx == NULL)
+		return "";
+	if (cx->rd_err[0] == '\0' && cx->rd_rc != 0) {
+		snprintf(name, sizeof name, "%u", (unsigned)cx->rd_tid);
+		xs_cat_lock();
+		for (i = 0; i < g_cat_n; i++)
+			if (g_cat[i].bt == cx->bt && g_cat[i].tableid == cx->rd_tid) {
+				snprintf(name, sizeof name, "%s", g_cat[i].name);
+				break;
+			}
+		xs_cat_unlock();
+		snprintf(cx->rd_err, sizeof cx->rd_err,
+		    "cannot read table %s: %s", name, xtc_strerror(cx->rd_rc));
+	}
+	return cx->rd_err;
 }
 
 /* Clear the connection's index read error (see xstore.h). */
@@ -5997,7 +6014,7 @@ xstore_read_err_clear(struct xsql *db)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
 	if (cx != NULL)
-		cx->rd_err[0] = '\0';
+		xs_rd_err_clear(cx);
 }
 
 /* Statement atomicity inside a transaction: a failed statement undoes
@@ -6110,7 +6127,7 @@ xs_stmt_pin(xstore_ctx_t *cx, struct xsql *db)
 {
 	xs_enter_ctx(cx, db);
 	cx->stmt_puts = 0;
-	cx->rd_err[0] = '\0';
+	xs_rd_err_clear(cx);
 	if (!cx->in_txn &&
 	    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed) == 0)
 		return snap_pin_visible(&cx->snap_slot);
@@ -9707,7 +9724,7 @@ xs_iscan_err_msg(xstore_iscan_t *s)
 {
 	struct xs_idx_ent e;
 	int rc = s->err != 0 ? s->err : XTC_E_NOMEM;
-	if (s->cx == NULL || s->cx->rd_err[0] != '\0')
+	if (s->cx == NULL || s->cx->rd_err[0] != '\0' || s->cx->rd_rc != 0)
 		return;
 	if (xs_idx_get(s->bt, s->rt.idx_id, &e))
 		snprintf(s->cx->rd_err, sizeof s->cx->rd_err,
@@ -10172,7 +10189,7 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 	ctx->umap = NULL; ctx->umap_n = ctx->umap_cap = 0;
 	ctx->uniq_vis = ctx->uniq_gen = 0;
 	ctx->uniq_err[0] = '\0';
-	ctx->rd_err[0] = '\0';
+	xs_rd_err_clear(ctx);
 	return ctx;
 }
 
