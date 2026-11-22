@@ -1556,16 +1556,18 @@ static int xs_cat_high(bt_t *bt, uint32_t cat, uint32_t *out);   /* below */
 /* Map (bt, name) to its allocated table-id: the in-process cache, then
  * the persisted catalog, else allocate a fresh dense id and persist it.
  * Returns the id (>= 1), or 0 if a new id could not be written or the
- * catalog could not be read.  *created (if not NULL) is set to 1 when
- * this call allocated the id. */
+ * catalog could not be read; *rderr (if not NULL) is then the read's
+ * XTC_E_* code, or 0 for a failed write.  *created (if not NULL) is set
+ * to 1 when this call allocated the id. */
 static uint32_t
 xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs,
-    int *created)
+    int *created, int *rderr)
 {
 	uint32_t id = 0, maxid = 0;
 	int i, do_persist = 0, err;
 
 	if (created != NULL) *created = 0;
+	if (rderr != NULL) *rderr = 0;
 	xs_cat_lock();
 	for (i = 0; i < g_cat_n; i++)            /* seen in this process? */
 		if (g_cat[i].bt == bt && strcasecmp(g_cat[i].name, name) == 0) {
@@ -1582,6 +1584,7 @@ xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs,
 		err = xs_cat_high(bt, XS_CAT_TABLEID, &maxid);   /* RDERR_OK: err: 0 */
 	if (err != 0) {                          /* unread: nothing known */
 		xs_cat_unlock();
+		if (rderr != NULL) *rderr = err;
 		return 0;
 	}
 	if (id == 0) {
@@ -2894,7 +2897,8 @@ xs_connect(xsql *db, void *pAux, int argc, const char *const *argv,
 	/* argv[2] is the table name: map it to a stable per-B-tree id and
 	 * persist its column schema (cdp) so the native paths read the
 	 * schema from the catalog, not sqlite_master. */
-	v->tableid = xs_cat_find_or_create(v->ctx->bt, argv[2], cdp, NULL);
+	v->tableid = xs_cat_find_or_create(v->ctx->bt, argv[2], cdp, NULL,
+	    NULL);
 	if (v->tableid == 0) {
 		xsql_free(v);
 		return SX_ERROR;
@@ -7457,18 +7461,14 @@ xstore_create_table(struct xsql *db, const char *name, const char *coldefs,
     int *created)
 {
 	bt_t *bt = xstore_bt_of(db);
-	uint64_t rd0 = xstore_read_errors();
 	uint32_t id;
+	int rderr;
 	xs_cat_gen_bump();
 	if (created != NULL) *created = 0;
 	if (bt == NULL || name == NULL) return 0;
-	id = xs_cat_find_or_create(bt, name, coldefs, created);
-	/* shortcut: a failed catalog read is told from a failed write by
-	 * the read-error count moving (a concurrent read error elsewhere
-	 * names the catalog too: still an error).  Upgrade if
-	 * xs_cat_find_or_create returns its code. */
-	if (id == 0 && xstore_read_errors() != rd0)
-		xstore_read_err_catalog(db, XTC_E_IO);
+	id = xs_cat_find_or_create(bt, name, coldefs, created, &rderr);
+	if (id == 0 && rderr != 0)
+		xstore_read_err_catalog(db, rderr);
 	return id;
 }
 
