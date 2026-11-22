@@ -42,7 +42,9 @@
  *	     twice (before: a failed read was "no such name" or "max id 0",
  *	     so a CREATE could take an id in use, and a DROP or RENAME report
  *	     success; a DROP INDEX cleared the index and left its catalog
- *	     row, so the next open trusted an empty index).
+ *	     row, so the next open trusted an empty index).  Each failed
+ *	     DDL says why (before: "", or the previous statement's
+ *	     message).
  *	  7. An index rebuild whose index catalog cannot be read fails, and
  *	     the indexes it did not load are not trusted; a whole one puts
  *	     every index back (before: the indexes past the failed read were
@@ -724,6 +726,11 @@ sweep_ddl(sx_db *db, bt_t *bt, const char *sql)
 		}
 		errs++;
 		cat_snap(db, bt, after, sizeof after);
+		if (rc != SX_OK && strstr(sx_errmsg(db), "I/O error") == NULL) {
+			fprintf(stderr, "  %s: read %d failed: \"%s\"\n", sql, n,
+			    sx_errmsg(db));
+			g_fail = 1;
+		}
 		if (rc == SX_OK || strcmp(before, after) != 0) {
 			fprintf(stderr, "  %s: read %d failed: rc %d\n    before %s\n"
 			    "    after  %s\n", sql, n, rc, before, after);

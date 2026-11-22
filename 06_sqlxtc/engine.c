@@ -1681,6 +1681,8 @@ sx_prepare(sx_db *h, const char *sql, int n_bytes, sx_stmt **out,
  * on the first step AND from sx_column_count / sx_column_name, since the
  * caller (exec_stmt) reads the column count BEFORE the first step. */
 #ifdef SQLXTC_HAVE_LIME
+static void nat_clear_err(sx_db *db);
+
 static int
 nat_select_run(struct sx_stmt *st)
 {
@@ -1689,6 +1691,7 @@ nat_select_run(struct sx_stmt *st)
 	int rc;
 	if (st->ran) return st->vres != NULL;
 	xstore_read_err_clear((struct xsql *)st->db);
+	nat_clear_err(st->db);
 	if (nat_aborted(st->db)) return 0;   /* sx_step reports it */
 	ck0 = g_xbm != NULL ? bm_cksum_failures(g_xbm, NULL) : 0;
 	if (st->nkind == SXN_PRAGMA_TABLE_INFO) {
@@ -1777,6 +1780,18 @@ nat_set_err(sx_db *db, const char *msg, int rc)
 	free(nd->errmsg);
 	nd->errmsg = strdup(msg);
 	return rc;
+}
+
+/* Forget the connection's last error message: a statement starts with
+ * none, so a failure that sets no message cannot show an earlier one. */
+static void
+nat_clear_err(sx_db *db)
+{
+	struct sx_native_db *nd;
+	if (!sx_is_native_db(db)) return;
+	nd = (struct sx_native_db *)db;
+	free(nd->errmsg);
+	nd->errmsg = NULL;
 }
 
 static int
@@ -1998,6 +2013,7 @@ sx_step_body(sx_stmt *st)
 		if (st->ran) return SX_DONE;   /* one-shot kinds */
 		st->ran = 1;
 		xstore_read_err_clear((struct xsql *)st->db);
+		nat_clear_err(st->db);
 		switch (st->nkind) {
 		case SXN_WRITE: {
 			int64_t nch = 0;
@@ -2184,6 +2200,15 @@ sx_step_body(sx_stmt *st)
 			xstore_ddl_lock();
 			drc = nat_ddl(st);
 			xstore_ddl_unlock();
+			/* A DDL step that failed without a message of its own: a
+			 * catalog read it recorded, or the fail-stopped log. */
+			if (drc == SX_ERROR && sx_errmsg(st->db)[0] == '\0') {
+				if (xstore_read_err(st->db)[0] != '\0')
+					return nat_set_err(st->db, xstore_read_err(st->db),
+					    SX_ERROR);
+				if (xstore_wal_failed())
+					return nat_set_err(st->db, SX_MSG_WAL_IO, SX_ERROR);
+			}
 			return drc;
 		}
 		case SXN_CREATE_VIEW:

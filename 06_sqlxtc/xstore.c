@@ -7367,10 +7367,19 @@ xstore_create_table(struct xsql *db, const char *name, const char *coldefs,
     int *created)
 {
 	bt_t *bt = xstore_bt_of(db);
+	uint64_t rd0 = xstore_read_errors();
+	uint32_t id;
 	xs_cat_gen_bump();
 	if (created != NULL) *created = 0;
 	if (bt == NULL || name == NULL) return 0;
-	return xs_cat_find_or_create(bt, name, coldefs, created);
+	id = xs_cat_find_or_create(bt, name, coldefs, created);
+	/* shortcut: a failed catalog read is told from a failed write by
+	 * the read-error count moving (a concurrent read error elsewhere
+	 * names the catalog too: still an error).  Upgrade if
+	 * xs_cat_find_or_create returns its code. */
+	if (id == 0 && xstore_read_errors() != rd0)
+		xstore_read_err_catalog(db, XTC_E_IO);
+	return id;
 }
 
 /* Register a view (CREATE VIEW name AS <select>): record the SELECT
@@ -10179,7 +10188,10 @@ xstore_drop_table(struct xsql *db, const char *name)
 	xs_cat_gen_bump();
 	if (bt == NULL || name == NULL) return -1;
 	id = xs_cat_lookup(bt, name, &err);
-	if (err != 0) return -1;             /* unread: not known to be gone */
+	if (err != 0) {                      /* unread: not known to be gone */
+		xstore_read_err_catalog(db, err);
+		return -1;
+	}
 	if (id == 0) return 0;               /* not present: idempotent */
 	/* Tombstone the catalog row: a new version at (XS_CAT_TABLEID, id)
 	 * marked deleted, so xs_cat_lookup skips it.  Keep the name as the
@@ -10193,9 +10205,14 @@ xstore_drop_table(struct xsql *db, const char *name)
 	 * whole, rather than leave live index rows naming a dropped table
 	 * (a new table of the name would inherit them at the next open). */
 	top = xs_idx_table_top(bt, name);
-	if (xs_hw_raise(bt, XS_CAT_TABLEID, id) != SX_OK ||
-	    (top != 0 && xs_hw_raise(bt, XS_IDXCAT_TABLEID, top) != SX_OK) ||
-	    xs_drop_gap("xstore.drop.table_gap") ||
+	if ((err = xs_hw_raise(bt, XS_CAT_TABLEID, id)) != SX_OK ||
+	    (top != 0 && (err = xs_hw_raise(bt, XS_IDXCAT_TABLEID, top)) !=
+	    SX_OK)) {
+		if (err < -1)
+			xstore_read_err_catalog(db, err);
+		return -1;
+	}
+	if (xs_drop_gap("xstore.drop.table_gap") ||
 	    xs_put(bt, XS_CAT_TABLEID, (int64_t)id, vbuf, (int)nlen, 1) != SX_OK)
 		return -1;
 	xs_idx_drop_table(bt, name);
@@ -10211,7 +10228,7 @@ int
 xstore_rename_table(struct xsql *db, const char *oldname, const char *newname)
 {
 	bt_t *bt = xstore_bt_of(db);
-	uint32_t id, exists;
+	uint32_t id, exists = 0;
 	uint8_t val[1024], vbuf[1024];
 	int vlen, i, err;
 	const char *coldefs = NULL;
@@ -10219,10 +10236,13 @@ xstore_rename_table(struct xsql *db, const char *oldname, const char *newname)
 	xs_cat_gen_bump();
 	if (bt == NULL || oldname == NULL || newname == NULL) return -1;
 	id = xs_cat_lookup(bt, oldname, &err);
-	if (err != 0) return -1;                     /* unread */
-	if (id == 0) return 0;                       /* unknown: idempotent */
-	exists = xs_cat_lookup(bt, newname, &err);
-	if (err != 0) return -1;
+	if (id == 0 && err == 0) return 0;           /* unknown: idempotent */
+	if (err == 0)
+		exists = xs_cat_lookup(bt, newname, &err);
+	if (err != 0) {                              /* unread */
+		xstore_read_err_catalog(db, err);
+		return -1;
+	}
 	if (exists != 0 && exists != id) return -1;  /* target name taken */
 
 	/* Recover the column schema from the persisted catalog value
@@ -10230,7 +10250,10 @@ xstore_rename_table(struct xsql *db, const char *oldname, const char *newname)
 	 * cannot be read fails the rename: a new row without the schema
 	 * would lose the table's columns. */
 	vlen = xs_cat_value(bt, oldname, val, (int)sizeof val - 1);
-	if (vlen < 0) return -1;
+	if (vlen < 0) {
+		xstore_read_err_catalog(db, vlen);
+		return -1;
+	}
 	if (vlen > 0) {
 		val[vlen] = '\0';      /* the value is not NUL-terminated */
 		for (i = 0; i < vlen; i++) if (val[i] == 0) break;
