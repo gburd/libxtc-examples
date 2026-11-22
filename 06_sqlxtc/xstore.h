@@ -267,7 +267,9 @@ int xstore_index_elem(uint8_t *out, int cap, const xstore_val_t *v, int desc);
  */
 
 /* Resolve a table name to its catalog id.  Returns 1 with *tableid set,
- * or 0 if the table is unknown (read-only catalog lookup). */
+ * 0 if the table is unknown, or the XTC_E_* code of a catalog read that
+ * failed (the table may well exist: a caller must not take it for
+ * unknown).  Read-only catalog lookup. */
 int xstore_table_id(bt_t *bt, const char *name, uint32_t *tableid);
 
 /* The smallest rowid strictly greater than every existing rowid in the
@@ -331,7 +333,8 @@ typedef struct xstore_col {
 /* Fill `cols` (capacity `cap`) with the schema of `name` from the
  * persisted catalog.  Returns the column count (>=1) on success, 0 if
  * the table is unknown or has no recorded schema (caller falls back to
- * sqlite_master), or <0 on error / overflow. */
+ * sqlite_master), -1 on a bad argument, or the XTC_E_* code (below -1)
+ * of a catalog read that failed. */
 int xstore_table_schema(bt_t *bt, const char *name,
                         xstore_col_t *cols, int cap);
 
@@ -533,6 +536,11 @@ const char *xstore_uniq_err(struct xsql *db);
  * statement starts (xstore_read_err_clear, xstore_stmt_begin,
  * xstore_stmt_pin). */
 const char *xstore_read_err(struct xsql *db);
+/* Record that a catalog read of the current statement failed with rc
+ * (an XTC_E_* code from xstore_table_id or xstore_table_schema), so
+ * xstore_read_err says "cannot read the catalog: ...".  A statement's
+ * first read error wins. */
+void xstore_read_err_catalog(struct xsql *db, int rc);
 /* Forget the last statement's index read error.  The engine calls it
  * when any statement starts, so a statement that never reaches the store
  * (PRAGMA table_info) cannot report an earlier one's. */

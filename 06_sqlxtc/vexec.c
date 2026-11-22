@@ -728,6 +728,7 @@ struct namevec {
 	 * file-scoped: see vx_prepare_select. */
 	const char *otab;
 	bt_t       *bt;
+	struct xsql *db;   /* bt's connection: where a read error is told */
 };
 
 static int
@@ -770,6 +771,21 @@ nv_add(struct namevec *nv, const sql_str_t *s)
 	return nv->n++;
 }
 
+/* xstore_table_schema for the executor: a catalog read that failed is
+ * recorded as the statement's read error (xstore_read_err_catalog), so
+ * the caller's decline reports it instead of "unsupported SQL" or "no
+ * such table".  Returns what xstore_table_schema returns; NB: a result
+ * below -1 is an error, not "no schema", and must fail the statement. */
+static int
+vx_table_schema(struct xsql *db, bt_t *bt, const char *table,
+    xstore_col_t *cols, int cap)
+{
+	int n = xstore_table_schema(bt, table, cols, cap);
+	if (n < -1)
+		xstore_read_err_catalog(db, n);
+	return n;
+}
+
 /* Resolve each source column (by name, in nv order) against the table
  * schema.  Tries the native xstore catalog first (no VDBE, no
  * sqlite_master); falls back to PRAGMA table_info for non-xstore tables
@@ -788,7 +804,7 @@ resolve_schema(struct xsql *db, const char *table, struct namevec *nv, int *pay)
 	{
 		bt_t *bt = xstore_bt_of(db);
 		xstore_col_t cols[64];
-		int nc = bt ? xstore_table_schema(bt, table, cols, 64) : 0;
+		int nc = bt ? vx_table_schema(db, bt, table, cols, 64) : 0;
 		if (nc > 0) {
 			int c;
 			for (c = 0; c < nc; c++)
@@ -1341,7 +1357,8 @@ collect_columns(struct namevec *nv, const sql_expr_t *e)
 				if (icols == NULL) return -1;
 				memcpy(itab, q->from->table.p, q->from->table.len);
 				itab[q->from->table.len] = '\0';
-				inc = xstore_table_schema(nv->bt, itab, icols, 64);
+				inc = vx_table_schema(nv->db, nv->bt, itab, icols, 64);
+				if (inc < -1) { free(icols); return -1; }   /* unread */
 				for (i = 0; i < inc && i < 64; i++) innames[i] = icols[i].name;
 				if (inc > 0) inner = innames;
 			}
@@ -1955,7 +1972,8 @@ compile_exists(struct vx_compiler *c, const sql_expr_t *e)
 		if (icols == NULL) { c->fail = 1; return NULL; }
 		memcpy(itab, e->sel->from->table.p, e->sel->from->table.len);
 		itab[e->sel->from->table.len] = '\0';
-		inc = bt ? xstore_table_schema(bt, itab, icols, 64) : 0;
+		inc = bt ? vx_table_schema(c->st->db, bt, itab, icols, 64) : 0;
+		if (inc < -1) { free(icols); c->fail = 1; return NULL; }   /* unread */
 		for (i = 0; i < inc && i < 64; i++) innames[i] = icols[i].name;
 	}
 
@@ -4707,7 +4725,7 @@ vx_prepare_select_body(struct xsql *db, sql_arena_t *ast, const sql_select_t *se
 		/* Fetch the schema once (needs the native xstore catalog). */
 		bt_t *sbt = xstore_bt_of(db);
 		int sc;
-		proj_nsc = sbt ? xstore_table_schema(sbt, tabbuf, proj_scols, 64) : 0;
+		proj_nsc = sbt ? vx_table_schema(db, sbt, tabbuf, proj_scols, 64) : 0;
 		if (proj_nsc <= 0) goto fallback;
 		/* Count output columns: each star -> visible schema columns,
 		 * each expression -> one. */
@@ -4758,6 +4776,7 @@ vx_prepare_select_body(struct xsql *db, sql_arena_t *ast, const sql_select_t *se
 	if (!proj_has_star) {
 		nv.otab = st->corr_alias;   /* collect correlated-subquery outer refs */
 		nv.bt = xstore_bt_of(db);   /* inner-schema access for EXISTS refs */
+		nv.db = db;
 		for (it = sel->cols->head; it; it = it->next)
 			if (collect_columns(&nv, it->expr) != 0) goto fallback;
 		if (sel->where && collect_columns(&nv, sel->where) != 0) goto fallback;
@@ -4812,7 +4831,7 @@ vx_prepare_select_body(struct xsql *db, sql_arena_t *ast, const sql_select_t *se
 		 * (proj_scols is free here: a star would have added columns.) */
 		bt_t *sbt = xstore_bt_of(db);
 		sql_str_t nm;
-		if (sbt == NULL || xstore_table_schema(sbt, tabbuf, proj_scols, 64) <= 0)
+		if (sbt == NULL || vx_table_schema(db, sbt, tabbuf, proj_scols, 64) <= 0)
 			goto fallback;
 		nm.p = proj_scols[0].name; nm.len = (uint32_t)strlen(proj_scols[0].name);
 		if (nv_add(&nv, &nm) < 0) goto fallback;
@@ -5472,7 +5491,7 @@ vx_try_prepare_agg(struct xsql *db, sql_arena_t *ast, const sql_select_t *sel,
 		snprintf(st->corr_alias, sizeof st->corr_alias, "%s", tabbuf);
 	sc = (xstore_col_t *)malloc(sizeof(xstore_col_t) * 64);
 	if (sc == NULL) goto oom;
-	nsc = xstore_table_schema(st->bt, tabbuf, sc, 64);
+	nsc = vx_table_schema(db, st->bt, tabbuf, sc, 64);
 	if (nsc <= 0) goto fallback;
 
 	memset(&nv, 0, sizeof nv);
@@ -5621,7 +5640,7 @@ jc_schema_load(struct xsql *db, struct vx_joinctx *jc)
 		if (bt == NULL) continue;
 		jc->sc[side] = (xstore_col_t *)malloc(sizeof(xstore_col_t) * 64);
 		if (jc->sc[side] == NULL) continue;
-		n = xstore_table_schema(bt, jc->tab[side], jc->sc[side], 64);
+		n = vx_table_schema(db, bt, jc->tab[side], jc->sc[side], 64);
 		jc->nsc[side] = n > 0 ? n : 0;
 	}
 }
@@ -6757,7 +6776,7 @@ jsrc_build(struct xsql *db, const char *table, char names[][64], int ncol,
 	js->ncol = ncol;
 	if (ncol > (int)(sizeof js->pay / sizeof js->pay[0])) return -1;
 	if (bt == NULL) return -1;
-	nc = xstore_table_schema(bt, table, cols, 64);
+	nc = vx_table_schema(db, bt, table, cols, 64);
 	if (nc <= 0) return -1;   /* not an xstore table -> fall back (no SQLite source) */
 	for (i = 0; i < ncol; i++) js->pay[i] = -2;
 	for (i = 0; i < ncol; i++)
@@ -8565,7 +8584,11 @@ run_parallel_plan(vx_stmt_t *plan, struct xsql *db, int n_workers,
 	 * rowid (counts tombstones -> a safe upper bound) + 1 for hi and the
 	 * start of the table for lo -- no SQLite call.  An empty table gives
 	 * max 0 -> hi 0 -> no rows. */
-	if (bt != NULL && xstore_table_id(bt, plan->table, &tid)) {
+	if (bt != NULL && (i = xstore_table_id(bt, plan->table, &tid)) < 0) {
+		xstore_read_err_catalog(db, i);
+		rc = -1; goto cleanup;           /* unread: not an empty table */
+	}
+	if (bt != NULL && i > 0) {
 		int64_t mx;
 		/* The _txn variant sets the statement's read error; its bound
 		 * also covers buffered rows, still a safe upper bound. */
@@ -8792,7 +8815,7 @@ load_wschema(struct xsql *db, const char *table, struct wschema *ws)
 	{
 		bt_t *bt = xstore_bt_of(db);
 		xstore_col_t cols[64];
-		int nc = bt ? xstore_table_schema(bt, table, cols, 64) : 0, c;
+		int nc = bt ? vx_table_schema(db, bt, table, cols, 64) : 0, c;
 		if (nc > 0) {
 			for (c = 0; c < nc && ws->n < 64; c++) {
 				snprintf(ws->name[ws->n], sizeof ws->name[0], "%.*s",
@@ -9321,7 +9344,11 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	tabbuf[tname->len] = '\0';
 
 	bt = xstore_bt_of(db);
-	if (bt == NULL || !xstore_table_id(bt, tabbuf, &tableid)) {
+	if (bt != NULL && (r = xstore_table_id(bt, tabbuf, &tableid)) < 0) {
+		xstore_read_err_catalog(db, r);
+		sql_arena_destroy(arena); return -1;  /* unread: not "not ours" */
+	}
+	if (bt == NULL || r == 0) {
 		sql_arena_destroy(arena); return 0;   /* not an xstore table -> VDBE */
 	}
 	if (load_wschema(db, tabbuf, &ws) != 0 || ws.pk_col != 0) {
@@ -10388,9 +10415,9 @@ vx_pragma_table_info(struct xsql *db, const char *table, vx_result_t **res)
 	*res = NULL;
 	if (bt == NULL || table == NULL)
 		return 0;
-	nc = xstore_table_schema(bt, table, cols, 64);
+	nc = vx_table_schema(db, bt, table, cols, 64);
 	if (nc <= 0)
-		return 0;                       /* unknown table */
+		return nc < -1 ? -1 : 0;        /* unread / unknown table */
 
 	/* Count user-visible columns (skip a synthetic implicit-rowid). */
 	{
@@ -10470,7 +10497,8 @@ vx_unknown_table(struct xsql *db, const char *sql)
 		if (fr->subquery || fr->table.len == 0 || fr->table.len >= sizeof t)
 			continue;
 		memcpy(t, fr->table.p, fr->table.len); t[fr->table.len] = '\0';
-		if (xstore_table_id(bt, t, &id)) continue;          /* table exists */
+		/* RDERR_OK: message only; an unread name is not named missing. */
+		if (xstore_table_id(bt, t, &id) != 0) continue;     /* exists */
 		if (xstore_view_sql(bt, t, vtmp, (int)sizeof vtmp)) continue; /* view */
 		snprintf(namebuf, sizeof namebuf, "%s", t);
 		found = namebuf;

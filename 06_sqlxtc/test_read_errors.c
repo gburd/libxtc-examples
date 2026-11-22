@@ -54,6 +54,10 @@
  *	     value again keeps the entry when a read fails (before: a failed
  *	     cursor step read as "not reused", the entry was deleted, and a
  *	     duplicate of the value went in).
+ *	 10. With more tables than the catalog cache holds, a statement whose
+ *	     table resolve (a catalog read) fails fails with "cannot read the
+ *	     catalog" (before: the table was "unknown", so MAX(k) and a
+ *	     parallel count(*) read it as empty and returned NULL and 0).
  */
 
 #include <stdint.h>
@@ -102,7 +106,8 @@ one_int(sx_db *db, const char *sql)
 static void
 ck_read_msg(sx_db *db, const char *sql, int n)
 {
-	if (strncmp(sx_errmsg(db), "cannot read table ", 18) == 0 &&
+	if ((strncmp(sx_errmsg(db), "cannot read table ", 18) == 0 ||
+	    strncmp(sx_errmsg(db), "cannot read the catalog", 23) == 0) &&
 	    strstr(sx_errmsg(db), ": I/O error") != NULL)
 		return;
 	fprintf(stderr, "  %s: read %d failed: \"%s\"\n", sql, n,
@@ -172,7 +177,7 @@ case_pk(sx_db *db, bt_t *bt)
 	CK(sx_exec(db, "CREATE TABLE p(k INTEGER PRIMARY KEY, v INTEGER)",
 	    NULL) == SX_OK);
 	CK(sx_exec(db, "INSERT INTO p VALUES(1, 10)", NULL) == SX_OK);
-	CK(xstore_table_id(bt, "p", &tid));
+	CK(xstore_table_id(bt, "p", &tid) == 1);
 	rec[0] = 1;
 	len = xstore_rec_put(rec, 1, (int)sizeof rec, XSTORE_C_INT, 11, 0,
 	    NULL, 0);
@@ -326,9 +331,11 @@ case_spill(sx_db *db)
 }
 
 /* Sweep the n-th row read failing over `sql`, whose first column must
- * be `want` in every run that succeeds.  Returns the failed runs. */
+ * be `want` in every run that succeeds.  With `may_pass`, a run whose
+ * failed read only filled a cache may succeed (with `want`).  Returns
+ * the failed runs. */
 static int
-sweep_val(sx_db *db, const char *sql, int64_t want)
+sweep_val_ex(sx_db *db, const char *sql, int64_t want, int may_pass)
 {
 	int n, errs = 0, faults;
 	int64_t got;
@@ -342,6 +349,8 @@ sweep_val(sx_db *db, const char *sql, int64_t want)
 			break;
 		}
 		errs++;
+		if (got == want && may_pass)
+			continue;
 		if (got != -2) {
 			fprintf(stderr, "  %s: read %d failed, got %lld\n", sql, n,
 			    (long long)got);
@@ -352,6 +361,13 @@ sweep_val(sx_db *db, const char *sql, int64_t want)
 	}
 	CK(n < 1000);
 	return errs;
+}
+
+/* sweep_val_ex where every failed read must fail the statement. */
+static int
+sweep_val(sx_db *db, const char *sql, int64_t want)
+{
+	return sweep_val_ex(db, sql, want, 0);
 }
 
 /* 4: MAX(rowid) by descent. */
@@ -531,6 +547,54 @@ case_reuse(sx_db *db, bt_t *bt)
 	    "a reused UNIQUE entry\n", errs);
 }
 
+/* 10: more tables than the catalog cache holds (256), so each statement
+ * resolves its table from the catalog tree.  A failed resolve is an
+ * error, never "no such table" taken for an empty one. */
+static void
+case_catcache(sx_db *db)
+{
+	sx_vx_result *r = NULL;
+	char sql[80];
+	int i, n, rc, errs, perrs = 0, faults;
+	for (i = 0; i < 260; i++) {
+		snprintf(sql, sizeof sql, "CREATE TABLE z%d(k INTEGER PRIMARY KEY)",
+		    i);
+		CK(sx_exec(db, sql, NULL) == SX_OK);
+	}
+	CK(sx_exec(db, "CREATE TABLE zt(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO zt VALUES(1, 1), (2, 2), (3, 3)",
+	    NULL) == SX_OK);
+	/* The resolve primes the cache from the catalog value; that read
+	 * failing only leaves the cache cold. */
+	errs = sweep_val_ex(db, "SELECT max(k) FROM zt", 3, 1);
+	errs += sweep_val_ex(db, "SELECT count(*) FROM zt", 3, 1);
+	for (n = 1; n < 100; n++) {
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		rc = sx_vexec_try(db, "SELECT count(*) FROM zt", 4, &r);
+		xstore_row_read_fail_at(0);
+		if (xstore_row_read_faults() == faults) {
+			CK(rc == 1 && r != NULL && sx_vexec_int64(r, 0, 0) == 3);
+			if (r != NULL) sx_vexec_free(r);
+			r = NULL;
+			break;
+		}
+		perrs++;
+		if (rc == 1 && r != NULL && sx_vexec_int64(r, 0, 0) != 3) {
+			fprintf(stderr, "  parallel count(*): read %d failed, got "
+			    "%lld\n", n, (long long)sx_vexec_int64(r, 0, 0));
+			g_fail = 1;
+		}
+		if (r != NULL) sx_vexec_free(r);
+		r = NULL;
+	}
+	CK(n < 100 && errs > 0 && perrs > 0);
+	printf("  ok   read errors: with the catalog cache full, %d statement "
+	    "and %d parallel runs with a failed catalog read fail\n", errs,
+	    perrs);
+}
+
 /* The catalog as a string: every table's id, then every index. */
 static void
 cat_snap(sx_db *db, bt_t *bt, char *out, size_t cap)
@@ -544,7 +608,7 @@ cat_snap(sx_db *db, bt_t *bt, char *out, size_t cap)
 	(void)db;
 	out[0] = '\0';
 	for (i = 0; i < (int)(sizeof names / sizeof names[0]); i++) {
-		if (!xstore_table_id(bt, names[i], &id))
+		if (xstore_table_id(bt, names[i], &id) != 1)
 			id = 0;
 		off += (size_t)snprintf(out + off, cap - off, "%s=%u:", names[i],
 		    (unsigned)id);
@@ -608,13 +672,13 @@ case_catalog(sx_db *db, bt_t *bt)
 	    "v INTEGER)");
 	n += sweep_ddl(db, bt, "CREATE INDEX c2_v ON c2(v)");
 	n += sweep_ddl(db, bt, "ALTER TABLE c2 RENAME TO c3");
-	CK(xstore_table_id(bt, "c3", &b) && one_int(db,
+	CK(xstore_table_id(bt, "c3", &b) == 1 && one_int(db,
 	    "SELECT count(*) FROM c3") == 0);
 	n += sweep_ddl(db, bt, "DROP TABLE c3");
 	CK(sx_exec(db, "CREATE TABLE c1(k INTEGER PRIMARY KEY, v INTEGER)",
 	    NULL) == SX_OK);
-	CK(xstore_table_id(bt, "c1", &a));
-	CK(xstore_table_id(bt, "p", &c));
+	CK(xstore_table_id(bt, "c1", &a) == 1);
+	CK(xstore_table_id(bt, "p", &c) == 1);
 	CK(a > b && b > c);      /* each CREATE took a new id */
 	printf("  ok   read errors: DDL with each of %d catalog reads failing "
 	    "fails and leaves the catalog as it was\n", n);
@@ -773,6 +837,7 @@ main(void)
 	case_idxcat(db, bt);
 	case_gc(db);
 	case_reuse(db, bt);
+	case_catcache(db);
 	sx_close(db);
 	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);

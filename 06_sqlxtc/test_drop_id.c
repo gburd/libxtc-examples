@@ -65,7 +65,7 @@ static uint32_t
 table_id(const char *name)
 {
 	uint32_t id = 0;
-	return xstore_table_id(sx_storage_bt(), name, &id) ? id : 0;
+	return xstore_table_id(sx_storage_bt(), name, &id) > 0 ? id : 0;
 }
 
 /* The largest rowid of table `tid` (any version), or -1 when it cannot

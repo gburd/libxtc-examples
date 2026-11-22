@@ -492,7 +492,7 @@ scenario_create_table_error(void)
 		if (xstore_scan_read_fail_at(0) > 0) break;
 		errs++;
 		CK(rc == SX_ERROR);
-		CK(!xstore_table_id(bt, "u", &id));
+		CK(xstore_table_id(bt, "u", &id) == 0);
 		CK(xstore_index_list(bt, "u", ix, 4) == 0);
 		dup_insert_refused(db);
 		/* An existing table is never dropped. */
@@ -524,8 +524,8 @@ scenario_create_table_error(void)
 	CK(xstore_recover(bt2, logp) == XTC_OK);
 	CK(xstore_index_rebuild_all(bt2) == 0);
 	CK(sx_open_bt(bt2, &db2) == SX_OK);
-	CK(!xstore_table_id(bt2, "u", &id));
-	CK(xstore_table_id(bt2, "e", &id));
+	CK(xstore_table_id(bt2, "u", &id) == 0);
+	CK(xstore_table_id(bt2, "e", &id) == 1);
 	dup_insert_refused(db2);
 	sx_close(db2);
 	bt_close(bt2); bm_destroy(bm2);

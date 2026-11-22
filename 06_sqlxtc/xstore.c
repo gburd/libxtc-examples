@@ -1994,14 +1994,16 @@ xs_idx_prefix(uint32_t idx_id, uint8_t *out)
 }
 
 /* Resolve index columns `col[0..ncol)` of `table` to payload positions
- * (0-based over the non-rowid columns; -1 = the rowid).  Returns 0, or
- * -1 if the table or a column is unknown. */
+ * (0-based over the non-rowid columns; -1 = the rowid).  Returns 0, -1
+ * if the table or a column is unknown, or the XTC_E_* code (below -1)
+ * of a catalog read that failed. */
 static int
 xs_idx_resolve(bt_t *bt, const char *table, char col[][64], int ncol, int *pay)
 {
 	xstore_col_t cols[64];
 	int n, i, c;
 	n = xstore_table_schema(bt, table, cols, 64);
+	if (n < -1) return n;                /* unread */
 	if (n <= 0) return -1;
 	for (i = 0; i < ncol; i++) {
 		pay[i] = -2;
@@ -3144,17 +3146,25 @@ xs_i64_cmp(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
-xstore_scan_t *
-xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
-                 int64_t lo, int has_lo, int64_t hi, int has_hi)
+/* xstore_scan_open, saying why it returned NULL: *err is XTC_E_NOTFOUND
+ * (no such table), XTC_E_NOMEM, or the catalog read's error. */
+static xstore_scan_t *
+xs_scan_new(bt_t *bt, const char *table, uint64_t snap, int64_t lo,
+    int has_lo, int64_t hi, int has_hi, int *err)
 {
 	xstore_scan_t *s;
 	uint32_t tid;
+	int r;
+	*err = XTC_E_NOTFOUND;
 	if (bt == NULL || table == NULL) return NULL;
-	if (!xstore_table_id(bt, table, &tid))
-		return NULL;                       /* unknown table */
+	if ((r = xstore_table_id(bt, table, &tid)) <= 0) {
+		if (r < 0) *err = r;               /* unread, not unknown */
+		return NULL;
+	}
+	*err = XTC_E_NOMEM;
 	s = (xstore_scan_t *)calloc(1, sizeof *s);
 	if (s == NULL) return NULL;
+	*err = XTC_OK;
 	s->c.bt = bt;
 	s->c.tableid = tid;
 	s->c.snap = snap ? snap : xs_visible();
@@ -3164,6 +3174,14 @@ xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
 	s->c.eof = 0;
 	s->c.btc = NULL;
 	return s;
+}
+
+xstore_scan_t *
+xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
+                 int64_t lo, int has_lo, int64_t hi, int has_hi)
+{
+	int err;
+	return xs_scan_new(bt, table, snap, lo, has_lo, hi, has_hi, &err);
 }
 
 /*
@@ -3194,8 +3212,13 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 	int64_t bmax = 0, rid;
 	int have_b = 0, guard, i, rc, err = 0;
 
-	if (bt == NULL || table == NULL || !xstore_table_id(bt, table, &tid))
+	if (bt == NULL || table == NULL)
 		return 0;
+	if ((rc = xstore_table_id(bt, table, &tid)) <= 0) {
+		if (rc == 0) return 0;           /* unknown table */
+		xs_rd_err_tid(cx, XS_CAT_TABLEID, rc);   /* counted by the read */
+		return -1;
+	}
 	if (cx != NULL) {
 		uint64_t rs =
 		    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed);
@@ -3287,6 +3310,7 @@ xstore_scan_open_txn(struct xsql *db, const char *table, uint64_t snap,
 	bt_t *bt = xstore_bt_of(db);
 	xstore_ctx_t *ctx = xstore_ctx_of(db);
 	xstore_scan_t *s;
+	int err;
 	/* Effective read snapshot, mirroring the vtab cursor (xs_filter): an
 	 * explicit ctx->read_snap (AS OF), else the txn's frozen snapshot for
 	 * REPEATABLE READ and stricter, else the latest committed clock for
@@ -3302,8 +3326,12 @@ xstore_scan_open_txn(struct xsql *db, const char *table, uint64_t snap,
 			snap = ctx->stmt_base;   /* one snapshot for a DML statement */
 		/* else leave 0 -> xstore_scan_open uses the latest clock */
 	}
-	s = xstore_scan_open(bt, table, snap, lo, has_lo, hi, has_hi);
-	if (s == NULL) return NULL;
+	s = xs_scan_new(bt, table, snap, lo, has_lo, hi, has_hi, &err);
+	if (s == NULL) {
+		if (err != XTC_E_NOTFOUND && err != XTC_E_NOMEM)
+			xs_rd_err_tid(ctx, XS_CAT_TABLEID, err);
+		return NULL;
+	}
 	s->err_cx = ctx;
 	snprintf(s->name, sizeof s->name, "%s", table);
 	/* Inside a txn, attach the connection ctx so the scan can (a) overlay
@@ -3896,7 +3924,8 @@ xstore_table_id(bt_t *bt, const char *name, uint32_t *tableid)
 		}
 	xs_cat_unlock();
 	id = xs_cat_lookup(bt, name, &err);
-	if (id == 0) return 0;   /* unknown, or unread (err): not resolved */
+	if (err != 0) return err;   /* unread: not known to be absent */
+	if (id == 0) return 0;      /* unknown */
 	xs_cat_prime(bt, name, id);
 	if (tableid) *tableid = id;
 	return 1;
@@ -4022,7 +4051,7 @@ xs_table_schema_parse(bt_t *bt, const char *name, xstore_col_t *cols, int cap)
 {
 	uint8_t val[1024];
 	char    cached[512];
-	int vlen, i, ncol = 0, pass;
+	int vlen, i, ncol = 0, pass, r;
 	const char *cd; int cdlen;
 
 	if (bt == NULL || name == NULL || cols == NULL || cap <= 0) return -1;
@@ -4051,15 +4080,15 @@ xs_table_schema_parse(bt_t *bt, const char *name, xstore_col_t *cols, int cap)
 		xs_cat_unlock();
 		if (hit)
 			break;                      /* cached (coldefs may not fit) */
-		if (pass == 0 && !xstore_table_id(bt, name, &pid))
-			return 0;                   /* no such table */
+		if (pass == 0 && (r = xstore_table_id(bt, name, &pid)) <= 0)
+			return r;                   /* no such table, or unread */
 	}
 	if (cached[0] != '\0') {
 		cd = cached;
 		cdlen = (int)strlen(cached);
 	} else {
 		vlen = xs_cat_value(bt, name, val, (int)sizeof val);
-		if (vlen <= 0) return 0;
+		if (vlen <= 0) return vlen;      /* none recorded, or unread */
 		/* The coldefs follow the name and a NUL. */
 		for (i = 0; i < vlen; i++) if (val[i] == 0) break;
 		if (i >= vlen - 1) return 0;          /* no schema recorded */
@@ -6124,7 +6153,11 @@ xstore_read_err(struct xsql *db)
 	int i;
 	if (cx == NULL)
 		return "";
-	if (cx->rd_err[0] == '\0' && cx->rd_rc != 0) {
+	if (cx->rd_err[0] == '\0' && cx->rd_rc != 0 &&
+	    cx->rd_tid == XS_CAT_TABLEID) {
+		snprintf(cx->rd_err, sizeof cx->rd_err,
+		    "cannot read the catalog: %s", xtc_strerror(cx->rd_rc));
+	} else if (cx->rd_err[0] == '\0' && cx->rd_rc != 0) {
 		snprintf(name, sizeof name, "%u", (unsigned)cx->rd_tid);
 		xs_cat_lock();
 		for (i = 0; i < g_cat_n; i++)
@@ -6137,6 +6170,14 @@ xstore_read_err(struct xsql *db)
 		    "cannot read table %s: %s", name, xtc_strerror(cx->rd_rc));
 	}
 	return cx->rd_err;
+}
+
+/* Record a failed catalog read as the statement's read error (see
+ * xstore.h). */
+void
+xstore_read_err_catalog(struct xsql *db, int rc)
+{
+	xs_rd_err_tid(xstore_ctx_of(db), XS_CAT_TABLEID, rc);
 }
 
 /* Clear the connection's index read error (see xstore.h). */
@@ -7540,17 +7581,16 @@ xs_split_cols(const char *csv, char col[][64])
 
 /* Add (or replace) an in-process index-cache entry, resolving its table
  * id and payload map now (a table not resolvable yet keeps tableid 0:
- * never maintained, never chosen).  XTC_OK, or XTC_E_IO when the table
- * could not be resolved because a read failed: the entry is not added,
- * since an unresolved index is neither maintained nor enforced. */
+ * never maintained, never chosen).  XTC_OK, or the error of a catalog
+ * read that failed: the entry is not added then, since an unresolved
+ * index is neither maintained nor enforced. */
 static int
 xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
     char col[][64], int ncol, uint32_t descmask, int unique, char kind,
     const uint64_t *sipk)
 {
 	struct xs_idx_ent e;
-	uint64_t rd0 = xstore_read_errors();
-	int i;
+	int i, r;
 	memset(&e, 0, sizeof e);
 	e.bt = bt;
 	e.rt.idx_id = idx_id;
@@ -7565,14 +7605,13 @@ xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
 	snprintf(e.table, sizeof e.table, "%s", table);
 	for (i = 0; i < ncol; i++)
 		snprintf(e.col[i], sizeof e.col[i], "%s", col[i]);
-	if (!xstore_table_id(bt, table, &e.rt.tableid) ||
-	    xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay) != 0) {
-		/* shortcut: the resolvers say "unknown" for a failed read too,
-		 * so a read error is seen as the metric moving; a concurrent
-		 * one elsewhere also fails this (safe: the caller fails, and a
-		 * retry resolves).  Upgrade if the resolvers return errors. */
-		if (xstore_read_errors() != rd0)
-			return XTC_E_IO;
+	r = xstore_table_id(bt, table, &e.rt.tableid);
+	if (r < 0)
+		return r;                        /* unread: not unresolved */
+	r = r == 0 ? -1 : xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay);
+	if (r < -1)
+		return r;
+	if (r != 0) {
 		/* Not maintained while unresolved: if its table appears later
 		 * the index would be trusted with no entries -- do not. */
 		e.rt.tableid = 0;
@@ -7822,9 +7861,10 @@ xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
 	if (e->rt.tableid == 0) return 0;
 	memset(&kb, 0, sizeof kb);
 	s = xstore_scan_open(bt, e->table, 0, 0, 0, 0, 0);
-	if (s == NULL)   /* the table went away since it resolved, or no memory */
-		return xstore_table_id(bt, e->table, NULL) ? XTC_E_NOMEM :
-		    XTC_E_NOTFOUND;
+	if (s == NULL) {  /* the table went away, no memory, or unread */
+		rc = xstore_table_id(bt, e->table, NULL);
+		return rc < 0 ? rc : rc > 0 ? XTC_E_NOMEM : XTC_E_NOTFOUND;
+	}
 	while ((step = xstore_scan_next(s, &rowid, &rec, &reclen)) == 1) {
 		klen = xs_idx_rowkey(&e->rt, rec, reclen, rowid, 1, key,
 		    (int)sizeof key, &isnull);
@@ -8134,15 +8174,16 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	size_t off = 0, cl = 0;
 	if (bt == NULL || name == NULL || table == NULL || cols == NULL ||
 	    ncol < 1 || ncol > XS_IDX_NCOL) return 0;
-	if (!xstore_table_id(bt, table, &tableid)) return 0;   /* unknown table */
+	if ((rc = xstore_table_id(bt, table, &tableid)) <= 0)
+		return rc < 0 ? rc : 0;   /* unread / unknown table */
 	memset(&e, 0, sizeof e);
 	for (i = 0; i < ncol; i++) {
 		if (strlen(cols[i]) >= sizeof e.col[0]) return 0;
 		snprintf(e.col[i], sizeof e.col[i], "%s", cols[i]);
 		cl += strlen(cols[i]) + 1;
 	}
-	if (xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay) != 0)
-		return 0;                       /* unknown column */
+	if ((rc = xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay)) != 0)
+		return rc < -1 ? rc : 0;        /* unread / unknown column */
 
 	/* Idempotent by name: if an index of this name already exists, keep it. */
 	xs_cat_lock();
