@@ -57,19 +57,24 @@ static void
 worker(void *arg)
 {
 	long me = (long)arg;
-	char q[96];
-	const char *err;
+	char q[96], err[160];
 	int key, k = 0, rc;
 	for (key = 0; key < KEYS; key++) {
 		barrier(&k);
 		snprintf(q, sizeof q, "INSERT INTO d VALUES(%d,%d,%ld)", key, key, me);
+		/* The message is read before the ROLLBACK: every statement,
+		 * one that succeeds too, clears the connection's message. */
+		err[0] = '\0';
 		if (me & 1) {
 			rc = sx_exec(g_c[me], "BEGIN", NULL);
 			if (rc == SX_OK) rc = sx_exec(g_c[me], q, NULL);
 			if (rc == SX_OK) rc = sx_exec(g_c[me], "COMMIT", NULL);
-			else (void)sx_exec(g_c[me], "ROLLBACK", NULL);
+			snprintf(err, sizeof err, "%s", sx_errmsg(g_c[me]));
+			if (rc != SX_OK)
+				(void)sx_exec(g_c[me], "ROLLBACK", NULL);
 		} else {
 			rc = sx_exec(g_c[me], q, NULL);
+			snprintf(err, sizeof err, "%s", sx_errmsg(g_c[me]));
 		}
 		if (rc == SX_OK) {
 			xtc_atomic_fetch_add_long(&g_ok[key], 1,
@@ -78,10 +83,9 @@ worker(void *arg)
 			    xtc_mo_seq_cst);
 		} else {
 			xtc_atomic_fetch_add_long(&g_errs, 1, xtc_mo_seq_cst);
-			err = sx_errmsg(g_c[me]);
-			if (err == NULL ||
-			    strstr(err, "UNIQUE constraint failed: d.a, d.b") == NULL) {
-				fprintf(stderr, "  unexpected error: %s\n", err ? err : "?");
+			if (strstr(err, "UNIQUE constraint failed: d.a, d.b") ==
+			    NULL) {
+				fprintf(stderr, "  unexpected error: %s\n", err);
 				xtc_atomic_fetch_add_long(&g_other, 1,
 				    xtc_mo_seq_cst);
 			}
