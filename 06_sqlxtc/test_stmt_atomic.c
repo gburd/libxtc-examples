@@ -397,8 +397,8 @@ main(void)
 		"INSERT INTO d SELECT k, v FROM s",
 		"UPDATE s SET v = v + 1",
 		"DELETE FROM s WHERE v > 0",
-		"INSERT INTO d SELECT k, (SELECT x FROM cw WHERE cw.x = co.j) "
-		"FROM co",
+		("INSERT INTO d SELECT k, (SELECT x FROM cw WHERE cw.x = co.j) "
+		"FROM co"),
 	};
 	/* Over s's 405 rows (d's key 9 and value 30 are out of the way). */
 	static const char *const kills[] = {
