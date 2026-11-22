@@ -1889,6 +1889,48 @@ nat_create_table(struct sx_stmt *st)
 		(void)xstore_drop_table(st->db, st->ddl_name);
 	return rc;
 }
+
+/* One DDL statement (CREATE / DROP TABLE, ALTER TABLE RENAME, CREATE /
+ * DROP INDEX), run under the DDL lock (xstore_ddl_lock) by sx_step. */
+static int
+nat_ddl(struct sx_stmt *st)
+{
+	char m[96];
+	int dr;
+	switch (st->nkind) {
+	case SXN_CREATE:
+		return nat_create_table(st);
+	case SXN_DROP:
+		return xstore_drop_table(st->db, st->ddl_name) == 0
+		    ? SX_DONE : SX_ERROR;
+	case SXN_ALTER:
+		return xstore_rename_table(st->db, st->ddl_name, st->ddl_cols) == 0
+		    ? SX_DONE : SX_ERROR;
+	case SXN_CREATE_INDEX: {
+		/* ddl_cols packs "table\0c1,c2\0unique\0descmask". */
+		const char *table = st->ddl_cols;
+		const char *cl = table + strlen(table) + 1;
+		const char *uq = cl + strlen(cl) + 1;
+		const char *dm = uq + strlen(uq) + 1;
+		return nat_create_index(st, st->ddl_name, table, cl, uq[0] == '1',
+		    (uint32_t)strtoul(dm, NULL, 10), 'i');
+	}
+	case SXN_DROP_INDEX:
+		/* Idempotent: dropping an unknown index is not an error. */
+		dr = xstore_drop_index(st->db, st->ddl_name);
+		if (dr < -1) {
+			snprintf(m, sizeof m, "cannot read the catalog: %s",
+			    xtc_strerror(dr));
+			return nat_set_err(st->db, m, SX_ERROR);
+		}
+		if (dr < 0)
+			return nat_set_err(st->db, "index associated with UNIQUE or "
+			    "PRIMARY KEY constraint cannot be dropped", SX_ERROR);
+		return SX_DONE;
+	default:
+		return SX_ERROR;
+	}
+}
 #endif
 
 static int sx_step_body(sx_stmt *st);
@@ -2126,42 +2168,22 @@ sx_step_body(sx_stmt *st)
 			return SX_DONE;
 		}
 		case SXN_CREATE:
-			return nat_create_table(st);
 		case SXN_DROP:
-			return xstore_drop_table(st->db, st->ddl_name) == 0
-			    ? SX_DONE : SX_ERROR;
+		case SXN_ALTER:
+		case SXN_CREATE_INDEX:
+		case SXN_DROP_INDEX: {
+			int drc;
+			xstore_ddl_lock();
+			drc = nat_ddl(st);
+			xstore_ddl_unlock();
+			return drc;
+		}
 		case SXN_CREATE_VIEW:
 			return xstore_create_view(st->db, st->ddl_name, st->ddl_cols) != 0
 			    ? SX_DONE : SX_ERROR;
 		case SXN_DROP_VIEW:
 			return xstore_drop_view(st->db, st->ddl_name) != 0
 			    ? SX_DONE : SX_ERROR;
-		case SXN_ALTER:
-			return xstore_rename_table(st->db, st->ddl_name, st->ddl_cols) == 0
-			    ? SX_DONE : SX_ERROR;
-		case SXN_CREATE_INDEX: {
-			/* ddl_cols packs "table\0c1,c2\0unique\0descmask". */
-			const char *table = st->ddl_cols;
-			const char *cl = table + strlen(table) + 1;
-			const char *uq = cl + strlen(cl) + 1;
-			const char *dm = uq + strlen(uq) + 1;
-			return nat_create_index(st, st->ddl_name, table, cl, uq[0] == '1',
-			    (uint32_t)strtoul(dm, NULL, 10), 'i');
-		}
-		case SXN_DROP_INDEX: {
-			/* Idempotent: dropping an unknown index is not an error. */
-			char m[96];
-			int dr = xstore_drop_index(st->db, st->ddl_name);
-			if (dr < -1) {
-				snprintf(m, sizeof m, "cannot read the catalog: %s",
-				    xtc_strerror(dr));
-				return nat_set_err(st->db, m, SX_ERROR);
-			}
-			if (dr < 0)
-				return nat_set_err(st->db, "index associated with UNIQUE or "
-				    "PRIMARY KEY constraint cannot be dropped", SX_ERROR);
-			return SX_DONE;
-		}
 		case SXN_PRAGMA_NOP:
 			return SX_DONE;   /* value-setting PRAGMA: no-op, no rows */
 		default:

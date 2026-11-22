@@ -54,6 +54,13 @@ int  xstore_wal_failed(void);
  * keep running.  Pair with xstore_quiesce_end.  Call from a proc or off
  * a loop, holding no engine lock. */
 void xstore_quiesce_begin(void);
+/* Serialize DDL statements (the engine holds it across one CREATE /
+ * DROP / ALTER, including a CREATE TABLE's autoindex build and its
+ * clean-up), so a concurrent CREATE of the same table cannot find a
+ * half-made one and report it created.  A parking lock: hold it on a
+ * proc or an OS thread, never across a wait on another DDL. */
+void xstore_ddl_lock(void);
+void xstore_ddl_unlock(void);
 void xstore_quiesce_end(void);
 
 /* Recover the B-tree from the log at `wal_path`: replay every committed

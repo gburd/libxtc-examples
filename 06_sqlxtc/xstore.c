@@ -84,6 +84,7 @@
 #define XS_LK_SSI  9u   /* SSI registry */
 /* slot 10 (XS_LK_SNAP, the snapshot registry) retired: lock-free now */
 #define XS_LK_COMMIT 11u /* commit validation + timestamp + in-flight registry */
+#define XS_LK_DDL  12u  /* one DDL statement at a time (xstore_ddl_lock) */
 static uint64_t g_cat_locks; /* XS_LK_CAT acquisitions (metric) */
 static uint64_t g_cat_scans; /* catalog-tree scans (metric) */
 /*
@@ -4472,6 +4473,22 @@ void
 xstore_quiesce_begin(void)
 {
 	(void)xs_quiesce_begin(0);
+}
+
+/* One DDL statement at a time (see xstore.h).  Ranks before every
+ * other engine lock: a DDL statement takes it first and holds it across
+ * the cat and commit locks its steps take, and the parks of an index
+ * build. */
+void
+xstore_ddl_lock(void)
+{
+	xs_lk(XS_LK_DDL);
+}
+
+void
+xstore_ddl_unlock(void)
+{
+	xs_unlk(XS_LK_DDL);
 }
 
 void

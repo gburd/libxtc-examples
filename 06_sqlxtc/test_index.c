@@ -40,6 +40,12 @@
  *	     write through it fails (it cannot prove the key absent), and the
  *	     store does not mark the indexes trusted; a rebuild that
  *	     succeeds puts it back.
+ *	  8. Two connections on three loops: while A's CREATE TABLE u fails
+ *	     its autoindex build, B runs CREATE TABLE u and INSERTs into it.
+ *	     B's CREATE waits for A's to finish (one DDL at a time), so a
+ *	     table B was told it created, and its row, are never dropped by
+ *	     A's clean-up (before: B's CREATE found A's index and returned
+ *	     OK, its INSERT went in, and A then dropped u).
  */
 
 #include <assert.h>
@@ -55,6 +61,9 @@
 #include "xstore.h"
 #include "xtc.h"
 #include "wal.h"
+#include "xtc_exec.h"
+#include "xtc_proc.h"
+#include "xtc_runtime.h"
 #include "t_tmp.h"
 
 #define PAGE_SZ  4096
@@ -610,14 +619,149 @@ scenario_rebuild_error(void)
 	return 0;
 }
 
+/* Scenario 8's shared state: A creates u with its build failing, B
+ * creates u and inserts once A's index is listed, C keeps commits in
+ * flight so A's build waits (the window). */
+static struct {
+	bt_t  *bt;
+	wal_t *wal;
+	sx_db *a, *b, *c;
+	int    adone, left, saw, bcreate, binsert;
+} g_s8;
+
+static void
+s8_exit(void)
+{
+	if (xtc_atomic_fetch_sub_i32(&g_s8.left, 1, xtc_mo_seq_cst) == 1)
+		(void)wal_writer_stop(g_s8.wal);
+}
+
+static void
+s8_a(void *arg)
+{
+	(void)arg;
+	(void)xtc_proc_sleep(2LL * 1000 * 1000);
+	xstore_scan_read_fail_at(1);
+	(void)sx_exec(g_s8.a, "CREATE TABLE u(a INTEGER, b INTEGER, "
+	    "PRIMARY KEY(a, b))", NULL);
+	xstore_scan_read_fail_at(0);
+	xtc_atomic_store_i32(&g_s8.adone, 1, xtc_mo_seq_cst);
+	s8_exit();
+}
+
+static void
+s8_b(void *arg)
+{
+	xstore_index_info_t ix[4];
+	(void)arg;
+	while (!xtc_atomic_load_i32(&g_s8.adone, xtc_mo_seq_cst)) {
+		if (xstore_index_list(g_s8.bt, "u", ix, 4) > 0) {
+			g_s8.saw = 1;
+			g_s8.bcreate = sx_exec(g_s8.b, "CREATE TABLE u(a INTEGER, "
+			    "b INTEGER, PRIMARY KEY(a, b))", NULL);
+			g_s8.binsert = sx_exec(g_s8.b, "INSERT INTO u VALUES(7, 7)",
+			    NULL);
+			break;
+		}
+		(void)xtc_proc_sleep(20LL * 1000);
+	}
+	s8_exit();
+}
+
+static void
+s8_c(void *arg)
+{
+	(void)arg;
+	while (!xtc_atomic_load_i32(&g_s8.adone, xtc_mo_seq_cst))
+		(void)sx_exec(g_s8.c, "INSERT INTO c(v) VALUES(1)", NULL);
+	s8_exit();
+}
+
+/* One run of scenario 8.  Returns 1 if B ran in the window, 0 if not,
+ * -1 on a setup failure. */
+static int
+s8_run(void)
+{
+	static void (*const fn[3])(void *) = { s8_a, s8_b, s8_c };
+	char logp[256], pg[256];
+	wal_opts_t wo = { 0 };
+	bm_opts_t bo = BM_OPTS_DEFAULT;
+	bm_t *bm = NULL;
+	xtc_exec_t *ex = NULL;
+	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "s8" };
+	xtc_pid_t pid;
+	int fd, i, saw;
+	t_tmpl(logp, sizeof logp, "sqlxtc-index-s8-log");
+	t_tmpl(pg, sizeof pg, "sqlxtc-index-s8-pg");
+	if ((fd = mkstemp(logp)) < 0) return -1;
+	close(fd);
+	if ((fd = mkstemp(pg)) < 0) return -1;
+	close(fd);
+	memset(&g_s8, 0, sizeof g_s8);
+	g_s8.left = 3;
+	wo.path = logp;
+	if (wal_open(&wo, &g_s8.wal) != XTC_OK) return -1;
+	bo.path = pg; bo.page_size = PAGE_SZ; bo.n_frames = 256;
+	if (bm_create(&bo, &bm) != XTC_OK || bt_open(bm, &g_s8.bt) != XTC_OK)
+		return -1;
+	xstore_set_wal((struct wal *)g_s8.wal);
+	if (sx_open_bt(g_s8.bt, &g_s8.a) != SX_OK ||
+	    sx_open_bt(g_s8.bt, &g_s8.b) != SX_OK ||
+	    sx_open_bt(g_s8.bt, &g_s8.c) != SX_OK)
+		return -1;
+	CK(sx_exec(g_s8.c, "CREATE TABLE c(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	if (xtc_exec_create(&(xtc_exec_opts_t){ .size = sizeof(xtc_exec_opts_t),
+	    .n_loops = 3 }, &ex) != XTC_OK ||
+	    wal_writer_spawn(g_s8.wal, xtc_exec_loop(ex, 0), NULL) != XTC_OK)
+		return -1;
+	for (i = 0; i < 3; i++)
+		if (xtc_proc_spawn(xtc_exec_loop(ex, i), fn[i], NULL, &po,
+		    &pid) != XTC_OK)
+			return -1;
+	if (xtc_exec_run(ex) != XTC_OK) return -1;
+	xtc_exec_destroy(ex);
+	saw = g_s8.saw;
+	if (saw) {
+		/* B was told its CREATE and INSERT went in: they stay. */
+		CK(g_s8.bcreate == SX_OK && g_s8.binsert == SX_OK);
+		CK(first_int_i(g_s8.a, "SELECT count(*) FROM u WHERE a = ?", 7)
+		    == 1);
+	}
+	sx_close(g_s8.a); sx_close(g_s8.b); sx_close(g_s8.c);
+	xstore_set_wal(NULL);
+	bt_close(g_s8.bt); bm_destroy(bm);
+	wal_close(g_s8.wal);
+	unlink(logp); unlink(pg);
+	return saw;
+}
+
+/* 8: a concurrent CREATE of the same table during a failing build. */
+static int
+scenario_create_race(void)
+{
+	int i, r, hits = 0;
+	for (i = 0; i < 200 && hits < 5; i++) {
+		if ((r = s8_run()) < 0) return 1;
+		hits += r;
+	}
+	CK(hits > 0);
+	if (g_fail) return 1;
+	printf("  ok   index: a CREATE TABLE racing a failing one (%d of %d "
+	    "runs in the window) keeps its table and rows\n", hits, i);
+	return 0;
+}
+
 int
 main(void)
 {
+	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK) return 1;
 	if (scenario_index() != 0) return 1;
 	if (scenario_recover() != 0) return 1;
 	if (scenario_scan_error() != 0) return 1;
 	if (scenario_create_table_error() != 0) return 1;
 	if (scenario_rebuild_error() != 0) return 1;
+	if (scenario_create_race() != 0) return 1;
 	printf("test_index: OK\n");
 	return 0;
 }
