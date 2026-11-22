@@ -60,6 +60,9 @@
  *	     table resolve (a catalog read) fails fails with "cannot read the
  *	     catalog" (before: the table was "unknown", so MAX(k) and a
  *	     parallel count(*) read it as empty and returned NULL and 0).
+ *	 11. A correlated subquery (EXISTS, NOT EXISTS, scalar) whose inner
+ *	     run fails a read fails the statement (before: the inner result
+ *	     was NULL / no row, and the statement answered with it).
  */
 
 #include <stdint.h>
@@ -597,6 +600,52 @@ case_catcache(sx_db *db)
 	    perrs);
 }
 
+/* 11: a correlated subquery's inner run reads with the n-th base-scan
+ * read failing (xstore_scan_read_fail_at).  The inner run cannot fail
+ * its outer expression, so the statement must fail at its end; it never
+ * answers with the inner result taken for NULL or "no row". */
+static void
+case_corr(sx_db *db)
+{
+	static const struct { const char *sql; int64_t want; } q[] = {
+		{ "SELECT count(*) FROM co WHERE EXISTS (SELECT 1 FROM cw "
+		    "WHERE cw.x = co.j)", 3 },
+		{ "SELECT count(*) FROM co WHERE NOT EXISTS (SELECT 1 FROM cw "
+		    "WHERE cw.x = co.j)", 0 },
+		{ "SELECT sum((SELECT x FROM cw WHERE cw.x = co.j)) FROM co", 6 },
+	};
+	int i, n, errs = 0;
+	int64_t got;
+	CK(sx_exec(db, "CREATE TABLE co(k INTEGER PRIMARY KEY, j INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO co VALUES(1, 1), (2, 2), (3, 3)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "CREATE TABLE cw(k INTEGER PRIMARY KEY, x INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO cw VALUES(1, 1), (2, 2), (3, 3)",
+	    NULL) == SX_OK);
+	for (i = 0; i < (int)(sizeof q / sizeof q[0]); i++)
+		for (n = 1; n < 100; n++) {
+			xstore_scan_read_fail_at(n);
+			got = one_int(db, q[i].sql);
+			if (xstore_scan_read_fail_at(0) > 0) {   /* none failed */
+				CK(got == q[i].want);
+				break;
+			}
+			errs++;
+			if (got != -2) {
+				fprintf(stderr, "  %s: scan read %d failed, got %lld\n",
+				    q[i].sql, n, (long long)got);
+				g_fail = 1;
+			} else {
+				ck_read_msg(db, q[i].sql, n);
+			}
+		}
+	CK(errs > 0);
+	printf("  ok   read errors: correlated subqueries with each of %d scan "
+	    "reads failing fail\n", errs);
+}
+
 /* The catalog as a string: every table's id, then every index. */
 static void
 cat_snap(sx_db *db, bt_t *bt, char *out, size_t cap)
@@ -835,6 +884,7 @@ main(void)
 	case_gc(db);
 	case_reuse(db, bt);
 	case_catcache(db);
+	case_corr(db);
 	sx_close(db);
 	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);

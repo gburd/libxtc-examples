@@ -1721,6 +1721,15 @@ nat_select_run(struct sx_stmt *st)
 		vx_result_free(st->vres);
 		st->vres = NULL;
 	}
+	/* A read that failed anywhere in the run (a correlated subquery's
+	 * inner run, which cannot fail its outer expression, leaves only
+	 * this): the result may be missing rows.  nat_set_run_error reports
+	 * it. */
+	if (xstore_read_err((struct xsql *)st->db)[0] != '\0' &&
+	    st->vres != NULL) {
+		vx_result_free(st->vres);
+		st->vres = NULL;
+	}
 	return (rc == 1 && st->vres != NULL);
 }
 
@@ -1971,7 +1980,10 @@ sx_step_body(sx_stmt *st)
 			/* A page failed its checksum: a read may have missed rows
 			 * (an UPDATE that found none would say "0 changed").  Undo
 			 * the statement and report the damage. */
-			if (g_xbm != NULL && bm_cksum_failures(g_xbm, NULL) != ck0) {
+			if ((g_xbm != NULL && bm_cksum_failures(g_xbm, NULL) != ck0) ||
+			    (rc == 1 && xstore_read_err(st->db)[0] != '\0')) {
+				/* Or a read failed where it could not fail its own
+				 * step (a correlated subquery): undo all the same. */
 				xstore_stmt_undo(st->db, mark);
 				free(verr);
 				return nat_set_run_error(st);
@@ -2459,6 +2471,8 @@ sx_vexec_try(sx_db *h, const char *sql, int n_workers, sx_vx_result **out)
 	rc = vx_run((struct xsql *)h, sql, n_workers, &r, &verr);
 	xstore_stmt_end((struct xsql *)h);
 	if (verr) free(verr);          /* the caller falls back; no message needed */
+	if (rc == 1 && xstore_read_err((struct xsql *)h)[0] != '\0')
+		rc = -1;                   /* a read failed: rows may be missing */
 	if (rc == 1) { *out = (sx_vx_result *)r; return 1; }
 	if (r) vx_result_free(r);
 	return rc;                     /* 0 fallback / <0 error */
@@ -2479,6 +2493,8 @@ sx_vexec_try_p(sx_db *h, const char *sql, const void *binds, int nbinds,
 	              n_workers, &r, &verr);
 	xstore_stmt_end((struct xsql *)h);
 	if (verr) free(verr);
+	if (rc == 1 && xstore_read_err((struct xsql *)h)[0] != '\0')
+		rc = -1;                   /* a read failed: rows may be missing */
 	if (rc == 1) { *out = (sx_vx_result *)r; return 1; }
 	if (r) vx_result_free(r);
 	return rc;
