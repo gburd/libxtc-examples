@@ -1395,29 +1395,61 @@ xstore_read_errors(void)
 	return xtc_atomic_load_u64(&g_rd_errors, xtc_mo_relaxed);
 }
 
+/* Open a cursor over catalog `cat` (from its first key) for a walk of
+ * its entries; one read of the row-read fault hook.  XTC_OK or the
+ * error, counted. */
+static int
+xs_cat_open(bt_t *bt, uint32_t cat, bt_cursor_t **cur)
+{
+	uint8_t startk[XS_VKLEN];
+	int rc;
+	enc_vkey(cat, INT64_MIN, ~(uint64_t)0, startk);
+	rc = bt_cursor_open(bt, startk, XS_VKLEN, cur);
+	if (rc == XTC_OK && xs_row_fault()) {
+		bt_cursor_close(*cur);
+		*cur = NULL;
+		rc = XTC_E_IO;
+	}
+	return xs_rd_count(rc);
+}
+
+/* The next entry of a catalog walk: XTC_OK, XTC_E_NOTFOUND at the end of
+ * the tree, or a read's error, counted. */
+static int
+xs_cat_next(bt_cursor_t *cur, const void **k, uint16_t *klen,
+    const void **vv, uint16_t *vl)
+{
+	return xs_rd_count(bt_cursor_next(cur, k, klen, vv, vl));
+}
+
 /* Look up `name` in the persisted catalog (table-id 0): the newest
  * non-tombstone catalog row whose value equals `name`.  Returns its id
- * (the row's rowid), or 0 if the catalog has no override for it. */
+ * (the row's rowid), or 0 if the catalog has no row for it; a read that
+ * failed returns 0 with its XTC_E_* code in *err (the name may well be
+ * taken: a caller must not create it or call it gone). */
 static uint32_t
-xs_cat_lookup(bt_t *bt, const char *name)
+xs_cat_lookup(bt_t *bt, const char *name, int *err)
 {
 	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
 	size_t want = strlen(name);
-	int64_t last_rowid = 0; int have_last = 0;
+	int64_t last_rowid = 0; int have_last = 0, rc;
 	uint32_t found = 0;
 
+	*err = 0;
 	xtc_atomic_fetch_add_u64(&g_cat_scans, 1, xtc_mo_relaxed);
-	enc_vkey(XS_CAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
+	if ((rc = xs_cat_open(bt, XS_CAT_TABLEID, &cur)) != XTC_OK) {
+		*err = rc;
 		return 0;
+	}
 	for (;;) {
 		const void *k = NULL, *vv = NULL;
 		uint16_t klen = 0, vl = 0;
 		const uint8_t *kb, *vb;
 		int64_t rid;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN)
+		rc = xs_cat_next(cur, &k, &klen, &vv, &vl);
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+			*err = rc;
+		if (rc != XTC_OK || klen != XS_VKLEN)
 			break;
 		kb = (const uint8_t *)k; vb = (const uint8_t *)vv;
 		if (dec_tableid(kb) != XS_CAT_TABLEID)
@@ -1464,6 +1496,8 @@ xs_cat_prime(bt_t *bt, const char *name, uint32_t id)
 	int vlen, i, j;
 	if (id == 0 || strlen(name) >= sizeof g_cat[0].name) return;
 	vlen = xs_cat_value(bt, name, val, (int)sizeof val - 1);
+	if (vlen < 0)
+		return;      /* unread: a cache entry would lack the schema */
 	xs_cat_lock();
 	for (i = 0; i < g_cat_n; i++)
 		if (g_cat[i].bt == bt && strcasecmp(g_cat[i].name, name) == 0) {
@@ -1489,18 +1523,19 @@ xs_cat_prime(bt_t *bt, const char *name, uint32_t id)
 
 static int xs_put(bt_t *bt, uint32_t tableid, int64_t rowid,
     const void *blob, int n, int deleted);   /* defined below */
-static uint32_t xs_cat_high(bt_t *bt, uint32_t cat);   /* defined below */
+static int xs_cat_high(bt_t *bt, uint32_t cat, uint32_t *out);   /* below */
 
 /* Map (bt, name) to its allocated table-id: the in-process cache, then
  * the persisted catalog, else allocate a fresh dense id and persist it.
- * Returns the id (>= 1), or 0 only if a new id could not be written.
- * *created (if not NULL) is set to 1 when this call allocated the id. */
+ * Returns the id (>= 1), or 0 if a new id could not be written or the
+ * catalog could not be read.  *created (if not NULL) is set to 1 when
+ * this call allocated the id. */
 static uint32_t
 xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs,
     int *created)
 {
-	uint32_t id = 0, maxid;
-	int i, do_persist = 0;
+	uint32_t id = 0, maxid = 0;
+	int i, do_persist = 0, err;
 
 	if (created != NULL) *created = 0;
 	xs_cat_lock();
@@ -1510,11 +1545,16 @@ xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs,
 			xs_cat_unlock();
 			return id;
 		}
-	id = xs_cat_lookup(bt, name);            /* persisted (create/rename/recovery)? */
-	if (id == 0) {
+	id = xs_cat_lookup(bt, name, &err);      /* persisted (create/rename/recovery)? */
+	if (err == 0 && id == 0)
 		/* New table: allocate past both the persisted high-water id
 		 * and any id reserved in-process but not yet written. */
-		maxid = xs_cat_high(bt, XS_CAT_TABLEID);
+		err = xs_cat_high(bt, XS_CAT_TABLEID, &maxid);
+	if (err != 0) {                          /* unread: nothing known */
+		xs_cat_unlock();
+		return 0;
+	}
+	if (id == 0) {
 		for (i = 0; i < g_cat_n; i++)
 			if (g_cat[i].bt == bt && g_cat[i].tableid > maxid)
 				maxid = g_cat[i].tableid;
@@ -3819,7 +3859,7 @@ int
 xstore_table_id(bt_t *bt, const char *name, uint32_t *tableid)
 {
 	uint32_t id;
-	int i;
+	int i, err;
 	if (bt == NULL || name == NULL) return 0;
 	if (xs_tcat_get(bt, name, &id, NULL)) {      /* this thread's copy */
 		if (tableid) *tableid = id;
@@ -3840,8 +3880,8 @@ xstore_table_id(bt_t *bt, const char *name, uint32_t *tableid)
 			return 1;
 		}
 	xs_cat_unlock();
-	id = xs_cat_lookup(bt, name);
-	if (id == 0) return 0;
+	id = xs_cat_lookup(bt, name, &err);
+	if (id == 0) return 0;   /* unknown, or unread (err): not resolved */
 	xs_cat_prime(bt, name, id);
 	if (tableid) *tableid = id;
 	return 1;
@@ -3868,25 +3908,28 @@ xs_affinity_of(const char *ty)
 }
 
 /* Read the catalog value (name + optional NUL + coldefs) for the newest
- * live entry whose name matches `name`.  Returns the value length into
- * *vlen with the bytes copied to `out` (capacity `cap`), or 0 if not
- * found. */
+ * live entry whose name matches `name`.  Returns the value length with
+ * the bytes copied to `out` (capacity `cap`), 0 if not found, or a
+ * read's XTC_E_* code. */
 static int
 xs_cat_value(bt_t *bt, const char *name, uint8_t *out, int cap)
 {
 	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
 	size_t want = strlen(name);
-	int64_t last_rowid = 0; int have_last = 0, got = 0;
+	int64_t last_rowid = 0; int have_last = 0, got = 0, rc;
 
-	enc_vkey(XS_CAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
 	xtc_atomic_fetch_add_u64(&g_cat_scans, 1, xtc_mo_relaxed);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) return 0;
+	if ((rc = xs_cat_open(bt, XS_CAT_TABLEID, &cur)) != XTC_OK)
+		return rc == XTC_E_NOTFOUND ? 0 : rc;
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
 		const uint8_t *kb, *vb; int64_t rid; size_t nlen, j;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN) break;
+		rc = xs_cat_next(cur, &k, &klen, &vv, &vl);
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+			got = rc;
+			break;
+		}
+		if (rc != XTC_OK || klen != XS_VKLEN) break;
 		kb = (const uint8_t *)k; vb = (const uint8_t *)vv;
 		if (dec_tableid(kb) != XS_CAT_TABLEID) break;
 		rid = dec_rowid(kb);
@@ -7295,7 +7338,8 @@ xs_hw_parse(const uint8_t *p, int n)
  * writes its tombstone, so a crash between the two leaves the object in
  * place and the mark already past it.  Holds the cat lock across the
  * read and the write, so two DROPs cannot lower the mark.  Returns
- * SX_OK, or the xs_put error (the DROP must then fail).
+ * SX_OK, or the xs_put error or the read's XTC_E_* code (the DROP must
+ * then fail).
  */
 static int
 xs_hw_raise(bt_t *bt, uint32_t cat, uint32_t id)
@@ -7303,7 +7347,12 @@ xs_hw_raise(bt_t *bt, uint32_t cat, uint32_t id)
 	uint8_t cur[16], val[16];
 	int n, rc = SX_OK;
 	xs_cat_lock();
-	n = xs_read_rec(bt, cat, 0, cur, (int)sizeof cur);
+	n = xs_row_fault() ? XTC_E_IO : xs_read_rec(bt, cat, 0, cur,
+	    (int)sizeof cur);
+	if (n < 0) {                  /* the mark is unknown: do not lower it */
+		xs_cat_unlock();
+		return xs_rd_count(n);
+	}
 	if (xs_hw_parse(cur, n) < id) {
 		val[0] = 0;
 		n = 1 + snprintf((char *)val + 1, sizeof val - 1, "%u",
@@ -7332,17 +7381,24 @@ xs_drop_gap(const char *site)
  * Version keys of the user tables sort below the index namespace
  * (XS_IDX_LEAD), so this is the key just below it: one descent.  It
  * covers a store from before the high-water row, where GC already
- * removed a dropped table's tombstone and left its rows.
+ * removed a dropped table's tombstone and left its rows.  XTC_OK with
+ * *out, or a read's XTC_E_* code.
  */
-static uint32_t
-xs_data_max_id(bt_t *bt)
+static int
+xs_data_max_id(bt_t *bt, uint32_t *out)
 {
 	uint8_t hi[1] = { XS_IDX_LEAD }, k[XS_VKLEN + 8];
 	uint16_t klen = 0;
-	if (bt_seek_lt(bt, hi, 1, k, (uint16_t)sizeof k, &klen, NULL, 0,
-	    NULL) != XTC_OK || klen != XS_VKLEN)
-		return 0;
-	return dec_tableid(k);
+	int rc;
+	*out = 0;
+	rc = bt_seek_lt(bt, hi, 1, k, (uint16_t)sizeof k, &klen, NULL, 0, NULL);
+	if (rc == XTC_OK && xs_row_fault())
+		rc = XTC_E_IO;
+	if (rc != XTC_OK)
+		return rc == XTC_E_NOTFOUND ? XTC_OK : xs_rd_count(rc);
+	if (klen == XS_VKLEN)
+		*out = dec_tableid(k);
+	return XTC_OK;
 }
 
 /*
@@ -7350,25 +7406,25 @@ xs_data_max_id(bt_t *bt)
  * high-water row, and (for the table catalog) the largest table id with
  * rows left in the tree.  The next allocation takes one past it.  Covers
  * ids recovered from the WAL, since the catalog is replayed before any
- * connect.
+ * connect.  XTC_OK with *out, or a read's XTC_E_* code: an id read as
+ * "max 0" would hand out one already in use.
  */
-static uint32_t
-xs_cat_high(bt_t *bt, uint32_t cat)
+static int
+xs_cat_high(bt_t *bt, uint32_t cat, uint32_t *out)
 {
 	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
-	uint32_t maxid = 0, hw = 0, data;
-	int seen0 = 0;
+	uint32_t maxid = 0, hw = 0, data = 0;
+	int seen0 = 0, rc;
 
-	enc_vkey(cat, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
+	*out = 0;
+	if ((rc = xs_cat_open(bt, cat, &cur)) != XTC_OK)
+		return rc == XTC_E_NOTFOUND ? XTC_OK : rc;
 	for (;;) {
 		const void *k = NULL, *vv = NULL;
 		uint16_t klen = 0, vl = 0;
 		int64_t rid;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN)
+		rc = xs_cat_next(cur, &k, &klen, &vv, &vl);
+		if (rc != XTC_OK || klen != XS_VKLEN)
 			break;
 		if (dec_tableid((const uint8_t *)k) != cat)
 			break;                       /* past the catalog */
@@ -7383,29 +7439,37 @@ xs_cat_high(bt_t *bt, uint32_t cat)
 			maxid = (uint32_t)rid;
 	}
 	bt_cursor_close(cur);
-	data = cat == XS_CAT_TABLEID ? xs_data_max_id(bt) : 0;
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+		return rc;
+	if (cat == XS_CAT_TABLEID && (rc = xs_data_max_id(bt, &data)) != XTC_OK)
+		return rc;
 	if (data > hw)
 		hw = data;
 #if XTC_DST_BUG(XTC_DST_BUG_IDREUSE)
 	hw = 0;       /* planted: a dropped id comes back after GC */
 #endif
-	return hw > maxid ? hw : maxid;
+	*out = hw > maxid ? hw : maxid;
+	return XTC_OK;
 }
 
 /* The largest index id handed out (xs_cat_high over the index catalog),
  * or a larger one allocated in-process whose catalog row is not visible
- * yet.  The next index takes one past it, so an id is never reused. */
-static uint32_t
-xs_idxcat_max_id(bt_t *bt)
+ * yet.  The next index takes one past it, so an id is never reused.
+ * XTC_OK with *out, or a read's XTC_E_* code. */
+static int
+xs_idxcat_max_id(bt_t *bt, uint32_t *out)
 {
-	uint32_t maxid = xs_cat_high(bt, XS_IDXCAT_TABLEID);
-	int i;
+	uint32_t maxid;
+	int i, rc = xs_cat_high(bt, XS_IDXCAT_TABLEID, &maxid);
+	if (rc != XTC_OK)
+		return rc;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id > maxid)
 			maxid = g_idx[i].rt.idx_id;
 	xs_cat_unlock();
-	return maxid;
+	*out = maxid;
+	return XTC_OK;
 }
 
 /* Split a comma-joined column list into col[] (up to XS_IDX_NCOL).
@@ -8004,7 +8068,9 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	xs_cat_unlock();
 	if (exists) return 1;
 
-	idx_id = xs_idxcat_max_id(bt) + 1u;
+	if ((rc = xs_idxcat_max_id(bt, &idx_id)) != XTC_OK)
+		return rc;                      /* the ids in use are unknown */
+	idx_id++;
 	if (idx_id == 0u) idx_id = 1u;
 
 	/* Persist "<name>\0<table>\0<c1,c2,..>\0<u>\0<descmask>\0<kind>\0
@@ -9871,9 +9937,11 @@ xstore_drop_table(struct xsql *db, const char *name)
 	uint32_t id;
 	uint8_t vbuf[256];
 	size_t nlen;
+	int err;
 	xs_cat_gen_bump();
 	if (bt == NULL || name == NULL) return -1;
-	id = xs_cat_lookup(bt, name);
+	id = xs_cat_lookup(bt, name, &err);
+	if (err != 0) return -1;             /* unread: not known to be gone */
 	if (id == 0) return 0;               /* not present: idempotent */
 	/* Tombstone the catalog row: a new version at (XS_CAT_TABLEID, id)
 	 * marked deleted, so xs_cat_lookup skips it.  Keep the name as the
@@ -9902,19 +9970,24 @@ xstore_rename_table(struct xsql *db, const char *oldname, const char *newname)
 	bt_t *bt = xstore_bt_of(db);
 	uint32_t id, exists;
 	uint8_t val[1024], vbuf[1024];
-	int vlen, i;
+	int vlen, i, err;
 	const char *coldefs = NULL;
 	size_t nlen, clen = 0, total;
 	xs_cat_gen_bump();
 	if (bt == NULL || oldname == NULL || newname == NULL) return -1;
-	id = xs_cat_lookup(bt, oldname);
+	id = xs_cat_lookup(bt, oldname, &err);
+	if (err != 0) return -1;                     /* unread */
 	if (id == 0) return 0;                       /* unknown: idempotent */
-	exists = xs_cat_lookup(bt, newname);
+	exists = xs_cat_lookup(bt, newname, &err);
+	if (err != 0) return -1;
 	if (exists != 0 && exists != id) return -1;  /* target name taken */
 
 	/* Recover the column schema from the persisted catalog value
-	 * (name\0coldefs); fall back to the cached coldefs. */
+	 * (name\0coldefs); fall back to the cached coldefs.  A value that
+	 * cannot be read fails the rename: a new row without the schema
+	 * would lose the table's columns. */
 	vlen = xs_cat_value(bt, oldname, val, (int)sizeof val - 1);
+	if (vlen < 0) return -1;
 	if (vlen > 0) {
 		val[vlen] = '\0';      /* the value is not NUL-terminated */
 		for (i = 0; i < vlen; i++) if (val[i] == 0) break;

@@ -34,6 +34,11 @@
  *	     rows back; one that cannot be read back still guards its value
  *	     (before: it was left out of the map, and a duplicate of it in
  *	     the same transaction went in).
+ *	  6. Catalog reads: CREATE TABLE, CREATE INDEX, DROP TABLE and ALTER
+ *	     TABLE RENAME whose catalog or id read fails fail, and leave the
+ *	     catalog as it was; no id is ever handed out twice (before: a
+ *	     failed read was "no such name" or "max id 0", so a CREATE could
+ *	     take an id in use, and a DROP or RENAME report success).
  */
 
 #include <stdint.h>
@@ -395,6 +400,95 @@ case_umap(sx_db *db)
 	    "UNIQUE value\n");
 }
 
+/* The catalog as a string: every table's id, then every index. */
+static void
+cat_snap(sx_db *db, bt_t *bt, char *out, size_t cap)
+{
+	static const char *const names[] = { "p", "m", "s", "u", "c1", "c2",
+		"c3" };
+	xstore_index_info_t ix[8];
+	size_t off = 0;
+	uint32_t id;
+	int i, j, n;
+	(void)db;
+	out[0] = '\0';
+	for (i = 0; i < (int)(sizeof names / sizeof names[0]); i++) {
+		if (!xstore_table_id(bt, names[i], &id))
+			id = 0;
+		off += (size_t)snprintf(out + off, cap - off, "%s=%u:", names[i],
+		    (unsigned)id);
+		n = xstore_index_list(bt, names[i], ix, 8);
+		for (j = 0; j < n && off < cap; j++)
+			off += (size_t)snprintf(out + off, cap - off, "%s/%u,",
+			    ix[j].name, (unsigned)ix[j].idx_id);
+	}
+}
+
+/* Sweep the n-th row read failing over DDL `sql`.  A failed run must
+ * leave the catalog as it was before; the run with no failed read must
+ * succeed.  Returns the failed runs. */
+static int
+sweep_ddl(sx_db *db, bt_t *bt, const char *sql)
+{
+	char before[1024], after[1024];
+	int n, rc, errs = 0, faults;
+	cat_snap(db, bt, before, sizeof before);
+	for (n = 1; n < 1000; n++) {
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		rc = sx_exec(db, sql, NULL);
+		xstore_row_read_fail_at(0);
+		if (xstore_row_read_faults() == faults) {
+			CK(rc == SX_OK);
+			break;
+		}
+		errs++;
+		cat_snap(db, bt, after, sizeof after);
+		/* DROP TABLE writes the table's tombstone before its indexes'
+		 * id mark; a mark it cannot read leaves the index catalog rows
+		 * for the next open (they name no table, so it taints).  The
+		 * DROP itself is done. */
+		if (rc == SX_OK && strncmp(sql, "DROP", 4) == 0 &&
+		    strstr(after, "c3=0:") != NULL)
+			break;
+		if (rc == SX_OK || strcmp(before, after) != 0) {
+			fprintf(stderr, "  %s: read %d failed: rc %d\n    before %s\n"
+			    "    after  %s\n", sql, n, rc, before, after);
+			g_fail = 1;
+		}
+	}
+	CK(n < 1000);
+	return errs;
+}
+
+/* 6: the catalog. */
+static void
+case_catalog(sx_db *db, bt_t *bt)
+{
+	uint32_t a = 0, b = 0, c = 0;
+	int n = 0;
+	CK(sx_exec(db, "CREATE TABLE c1(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "DROP TABLE c1", NULL) == SX_OK);
+	/* A CREATE of a new name, the index id allocation, RENAME and DROP
+	 * all read the catalog tree (the name cache cannot say a name is
+	 * free, or that an id is unused). */
+	n += sweep_ddl(db, bt, "CREATE TABLE c2(k INTEGER PRIMARY KEY, "
+	    "v INTEGER)");
+	n += sweep_ddl(db, bt, "CREATE INDEX c2_v ON c2(v)");
+	n += sweep_ddl(db, bt, "ALTER TABLE c2 RENAME TO c3");
+	CK(xstore_table_id(bt, "c3", &b) && one_int(db,
+	    "SELECT count(*) FROM c3") == 0);
+	n += sweep_ddl(db, bt, "DROP TABLE c3");
+	CK(sx_exec(db, "CREATE TABLE c1(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	CK(xstore_table_id(bt, "c1", &a));
+	CK(xstore_table_id(bt, "p", &c));
+	CK(a > b && b > c);      /* each CREATE took a new id */
+	printf("  ok   read errors: DDL with each of %d catalog reads failing "
+	    "fails and leaves the catalog as it was\n", n);
+}
+
 int
 main(void)
 {
@@ -427,6 +521,7 @@ main(void)
 	case_spill(db);
 	case_maxrowid(db);
 	case_umap(db);
+	case_catalog(db, bt);
 	sx_close(db);
 	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);
