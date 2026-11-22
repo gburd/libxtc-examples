@@ -8772,8 +8772,6 @@ xs_point_get(bt_t *bt, uint32_t tid, int64_t rid, uint64_t snap, uint8_t *buf,
 	enc_vkey(tid, rid, snap, probe);
 	rc = bt_seek_ge(bt, probe, XS_VKLEN, k, (uint16_t)sizeof k, &kl, buf,
 	    (uint16_t)(cap > 0xFFFF ? 0xFFFF : cap), &vl);
-	if (err != NULL && xs_rd_fault())
-		rc = XTC_E_IO;
 	if (rc != XTC_OK && rc != XTC_E_NOTFOUND && err != NULL)
 		*err = rc;
 	if (rc != XTC_OK || kl != XS_VKLEN || dec_tableid(k) != tid ||
@@ -9457,6 +9455,8 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 				return -1;
 			rl = xs_point_get(s->bt, s->rt.tableid, s->crid,
 			    s->snap, s->rec, 1 + XS_VMAX, &s->err);
+			if (s->err == 0 && xs_rd_fault())
+				s->err = XTC_E_IO;
 			if (s->err != 0)
 				return -1;
 			if (rl == 0) continue;
