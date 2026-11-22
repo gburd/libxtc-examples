@@ -5628,8 +5628,10 @@ is_col_ref(const sql_expr_t *e)
  * collect_columns' supported-construct gate. */
 /* Load each side's catalog schema into jc (heap).  A side whose schema
  * is unknown keeps nsc == 0 (unqualified names then fail to resolve
- * there).  Pair with jc_schema_free on every exit. */
-static void
+ * there).  Returns 0, or -1 when a side's catalog read failed (an
+ * unqualified name would then resolve to the other side alone).  Pair
+ * with jc_schema_free on every exit. */
+static int
 jc_schema_load(struct xsql *db, struct vx_joinctx *jc)
 {
 	bt_t *bt = xstore_bt_of(db);
@@ -5641,8 +5643,11 @@ jc_schema_load(struct xsql *db, struct vx_joinctx *jc)
 		jc->sc[side] = (xstore_col_t *)malloc(sizeof(xstore_col_t) * 64);
 		if (jc->sc[side] == NULL) continue;
 		n = vx_table_schema(db, bt, jc->tab[side], jc->sc[side], 64);
+		if (n < -1)
+			return -1;
 		jc->nsc[side] = n > 0 ? n : 0;
 	}
+	return 0;
 }
 
 static void
@@ -5887,7 +5892,7 @@ vx_try_prepare_join(struct xsql *db, sql_arena_t *ast, const sql_select_t *sel,
 	memcpy(jc.tab[1], s1->table.p, s1->table.len); jc.tab[1][s1->table.len] = '\0';
 	if (s0->alias.len && s0->alias.len < 64) { memcpy(jc.alias[0], s0->alias.p, s0->alias.len); jc.alias[0][s0->alias.len] = '\0'; }
 	if (s1->alias.len && s1->alias.len < 64) { memcpy(jc.alias[1], s1->alias.p, s1->alias.len); jc.alias[1][s1->alias.len] = '\0'; }
-	jc_schema_load(db, &jc);
+	if (jc_schema_load(db, &jc) != 0) { rc = -1; goto fallback; }
 
 	/* SELECT * is not supported on the join path (column expansion +
 	 * dedup across two tables); fall back. */
@@ -6202,7 +6207,7 @@ vx_try_prepare_njoin(struct xsql *db, sql_arena_t *ast, const sql_select_t *sel,
 			jc.alias[side][src[side]->alias.len] = '\0';
 		}
 	}
-	jc_schema_load(db, &jc);
+	if (jc_schema_load(db, &jc) != 0) { rc = -1; goto fallback; }
 
 	/* SELECT * + aggregates fall back on the join path. */
 	for (it = sel->cols ? sel->cols->head : NULL; it; it = it->next) {
@@ -8537,7 +8542,9 @@ morsel_bounds(bt_t *bt, uint32_t tid, int64_t lo, int64_t hi, int n_workers,
 	if (b == NULL) return -1;
 	b[0] = lo;
 	if (nm > 1)
-		got = xstore_rowid_split_points(bt, tid, lo, hi, nm - 1, b + 1);
+		/* A hint: with too few cut points the split is uniform. */
+		got = xstore_rowid_split_points(bt, tid, lo, hi, /* RDERR_OK: hint */
+		    nm - 1, b + 1);
 	if (got != nm - 1)                     /* too few separators: uniform */
 		for (i = 1; i < nm; i++) b[i] = lo + (int64_t)i * target;
 	b[nm] = hi;
@@ -10497,8 +10504,9 @@ vx_unknown_table(struct xsql *db, const char *sql)
 		if (fr->subquery || fr->table.len == 0 || fr->table.len >= sizeof t)
 			continue;
 		memcpy(t, fr->table.p, fr->table.len); t[fr->table.len] = '\0';
-		/* RDERR_OK: message only; an unread name is not named missing. */
-		if (xstore_table_id(bt, t, &id) != 0) continue;     /* exists */
+		/* A message only: an unread name is not named missing. */
+		if (xstore_table_id(bt, t, &id) != 0) /* RDERR_OK: message */
+			continue;
 		if (xstore_view_sql(bt, t, vtmp, (int)sizeof vtmp)) continue; /* view */
 		snprintf(namebuf, sizeof namebuf, "%s", t);
 		found = namebuf;

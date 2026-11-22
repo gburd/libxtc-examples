@@ -319,6 +319,12 @@ test_torn_smo: test_torn_smo.c $(ENGINE_NATIVE)
 test-torn-smo: test_torn_smo
 	./test_torn_smo
 
+# Read-error gate: every B-tree read's error propagates or carries an
+# RDERR_OK marker (test/test_rderr_sites.py).
+test: test-rderr-sites
+test-rderr-sites:
+	python3 test/test_rderr_sites.py .
+
 # Elias-Fano chunks, the keydir's static stage (STORAGE_DESIGN 5.2).
 test: test-ef
 test_ef: test_ef.c ef.o
@@ -1190,6 +1196,7 @@ test/test_sql_parse: test/test_sql_parse.c \
         sql_parse.o $(LIME_OBJ)
 	$(CC) $(CFLAGS) -o $@ $< sql_parse.o $(LIME_OBJ)
 
+.PHONY: test-rderr-sites
 .PHONY: test-quack test-quack-range test-sql-parse-par-ord-join-run test-oracle test-compat
 
 # ---- NUMA buffer-pool sharing-degree PREMISE PROBE (research spike) ----

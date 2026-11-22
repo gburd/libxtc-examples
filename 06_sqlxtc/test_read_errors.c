@@ -589,6 +589,8 @@ case_catcache(sx_db *db)
 	 * failing only leaves the cache cold. */
 	errs = sweep_val_ex(db, "SELECT max(k) FROM zt", 3, 1);
 	errs += sweep_val_ex(db, "SELECT count(*) FROM zt", 3, 1);
+	errs += sweep_val_ex(db, "SELECT count(*) FROM zt JOIN z1 ON zt.k = z1.k",
+	    0, 1);
 	for (n = 1; n < 100; n++) {
 		faults = xstore_row_read_faults();
 		xstore_row_read_fail_at(n);
