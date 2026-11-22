@@ -6202,7 +6202,7 @@ xstore_read_err(struct xsql *db)
 		snprintf(cx->rd_err, sizeof cx->rd_err,
 		    "cannot read the catalog: %s", xtc_strerror(cx->rd_rc));
 	} else if (cx->rd_err[0] == '\0' && cx->rd_rc != 0) {
-		snprintf(name, sizeof name, "%u", (unsigned)cx->rd_tid);
+		snprintf(name, sizeof name, "id %u", (unsigned)cx->rd_tid);
 		xs_cat_lock();
 		for (i = 0; i < g_cat_n; i++)
 			if (g_cat[i].bt == cx->bt && g_cat[i].tableid == cx->rd_tid) {
@@ -6210,7 +6210,9 @@ xstore_read_err(struct xsql *db)
 				break;
 			}
 		xs_cat_unlock();
+		/* Out of memory is not a failed read: say so. */
 		snprintf(cx->rd_err, sizeof cx->rd_err,
+		    cx->rd_rc == XTC_E_NOMEM ? "cannot load table %s: %s" :
 		    "cannot read table %s: %s", name, xtc_strerror(cx->rd_rc));
 	}
 	return cx->rd_err;
@@ -8715,7 +8717,11 @@ static void
 xs_idx_err_msg(bt_t *bt, uint32_t idx_id, int rc, char *out, size_t cap)
 {
 	struct xs_idx_ent e;
-	if (xs_idx_get(bt, idx_id, &e))
+	if (xs_idx_get(bt, idx_id, &e) && e.rt.broken != 0)
+		snprintf(out, cap, "index error: index %.48s is incomplete "
+		    "(%s); a restart rebuilds it", e.name,
+		    xtc_strerror(e.rt.broken));
+	else if (xs_idx_get(bt, idx_id, &e))
 		snprintf(out, cap, "index error: cannot check UNIQUE %s.%s: %s",
 		    e.table, e.col[0], xtc_strerror(rc));
 	else

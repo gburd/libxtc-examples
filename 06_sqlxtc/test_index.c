@@ -618,9 +618,12 @@ scenario_rebuild_error(void)
 		CK(xstore_index_trust_tag(bt) == 0);
 		CK(count_rows_i(db, "SELECT k FROM t WHERE g = ?", 3) == 100);
 		CK(sx_exec(db, "INSERT INTO t VALUES(2000, 1, 5)", NULL) != SX_OK);
+		/* The UNIQUE index is the one out: the refusal names it. */
+		CK(strcmp(ix[0].name, "t_g") != 0 ||
+		    strstr(sx_errmsg(db), "is incomplete") != NULL);
 		CK(count_rows_i(db, "SELECT k FROM t WHERE k = ?", 2000) == 0);
 		if (strcmp(ix[0].name, "t_g") == 0)
-			broke_u++;             /* the UNIQUE index is the one out */
+			broke_u++;
 	}
 	CK(errs > 1 && broke_u > 0 && broke_u < errs);
 
