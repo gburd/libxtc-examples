@@ -223,9 +223,10 @@ frame is a cheap state flip plus a page-table removal.  A second
 xtc_proc, the trickler, paces background writeback.
 
 Page reads and writes are submitted to xtc_aio (io_uring on Linux,
-kqueue file-AIO on the BSDs) through xtc_dio_sched, so the reactor
-thread never blocks on disk: the calling fiber parks until the
-completion arrives and the loop keeps serving peers.  A double-write
+kqueue file-AIO on the BSDs, the blocking pool elsewhere), so the
+reactor thread never blocks on disk: the calling fiber parks until the
+completion arrives and the loop keeps serving peers.  With adaptive
+writeback the trickler tunes its pacing with xtc_dio_sched.  A double-write
 buffer guards against torn pages: a page is written to the double-write
 area and fsynced before it overwrites its home location, so a crash
 mid-write can always be repaired during recovery.

@@ -24,8 +24,15 @@
  *	(2Q probation) and promoted to HOT only on a second access, so a
  *	one-touch scan fills and drains the cool stage without displacing
  *	the hot working set.  A background trickler (an xtc_proc) writes
- *	dirty pages out ahead of demand; page I/O is offloaded
- *	(xtc_blocking) so the loop never stalls; metrics go to xtc_stats.
+ *	dirty pages out ahead of demand; page I/O goes through xtc_aio
+ *	(io_uring natively, else the blocking pool) and parks only the
+ *	calling fiber, so the loop never stalls; metrics go to xtc_stats.
+ *
+ *	BM_SAMPLED_EVICT (a test build only) replaces the CLOCK sweep under
+ *	scan resistance with sampled eviction: 16 random frames, the
+ *	lowest-scored clean COOL one evicted, and a sweep of every frame
+ *	when the sample has none, so the hot set is cooled only when no
+ *	clean COOL victim exists anywhere (bm_opts_t.evict_seed).
  */
 
 #ifndef SQLXTC_BUFMGR_H
