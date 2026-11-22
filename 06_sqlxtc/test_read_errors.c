@@ -339,14 +339,15 @@ case_spill(sx_db *db)
 
 /* Sweep the n-th row read failing over `sql`, whose first column must
  * be `want` in every run that succeeds.  With `may_pass`, a run whose
- * failed read only filled a cache may succeed (with `want`).  Returns
- * the failed runs. */
+ * failed read only filled a cache may succeed (with `want`), and n
+ * steps by 7 past the first 8 (a catalog walk of hundreds of entries).
+ * Returns the failed runs. */
 static int
 sweep_val_ex(sx_db *db, const char *sql, int64_t want, int may_pass)
 {
 	int n, errs = 0, faults;
 	int64_t got;
-	for (n = 1; n < 1000; n++) {
+	for (n = 1; n < 4000; n += may_pass && n >= 8 ? 7 : 1) {
 		faults = xstore_row_read_faults();
 		xstore_row_read_fail_at(n);
 		got = one_int(db, sql);
@@ -366,7 +367,7 @@ sweep_val_ex(sx_db *db, const char *sql, int64_t want, int may_pass)
 			ck_read_msg(db, sql, n);
 		}
 	}
-	CK(n < 1000);
+	CK(n < 4000);
 	return errs;
 }
 
@@ -593,7 +594,7 @@ case_catcache(sx_db *db)
 	errs += sweep_val_ex(db, "SELECT count(*) FROM zt", 3, 1);
 	errs += sweep_val_ex(db, "SELECT count(*) FROM zt JOIN z1 ON zt.k = z1.k",
 	    0, 1);
-	for (n = 1; n < 100; n++) {
+	for (n = 1; n < 4000; n += n >= 8 ? 7 : 1) {
 		faults = xstore_row_read_faults();
 		xstore_row_read_fail_at(n);
 		rc = sx_vexec_try(db, "SELECT count(*) FROM zt", 4, &r);
@@ -613,10 +614,10 @@ case_catcache(sx_db *db)
 		if (r != NULL) sx_vexec_free(r);
 		r = NULL;
 	}
-	CK(n < 100 && errs > 0 && perrs > 0);
+	CK(n < 4000 && errs > 0 && perrs > 0);
 	/* CREATE INDEX resolves the table again to enter its cache: a run
 	 * that succeeded has the index in use. */
-	for (n = 1; n < 100; n++) {
+	for (n = 1; n < 4000; n += n >= 8 ? 7 : 1) {
 		snprintf(sql, sizeof sql, "CREATE INDEX zt_v%d ON zt(v)", n);
 		faults = xstore_row_read_faults();
 		xstore_row_read_fail_at(n);
@@ -626,11 +627,15 @@ case_catcache(sx_db *db)
 		    "WHERE v = 2") != 1)
 			CK(0);
 		CK(rc != SX_OK || zt_has_index(db, n));
+		if (rc == SX_OK) {            /* keep zt's index list short */
+			snprintf(sql, sizeof sql, "DROP INDEX zt_v%d", n);
+			CK(sx_exec(db, sql, NULL) == SX_OK);
+		}
 		if (xstore_row_read_faults() == faults)
 			break;
 		errs++;
 	}
-	CK(n < 100);
+	CK(n < 4000);
 	printf("  ok   read errors: with the catalog cache full, %d statement "
 	    "and %d parallel runs with a failed catalog read fail\n", errs,
 	    perrs);
@@ -778,8 +783,10 @@ case_idxcat(sx_db *db, bt_t *bt)
 	xstore_index_info_t ix[4];
 	char sql[96];
 	int n, rc, errs = 0, faults;
+	/* Two definitions, so a failed read can land between them. */
 	CK(sx_exec(db, "CREATE INDEX p_v ON p(v)", NULL) == SX_OK);
-	CK(xstore_index_list(bt, "p", ix, 4) == 1);
+	CK(sx_exec(db, "CREATE INDEX p_kv ON p(k, v)", NULL) == SX_OK);
+	CK(xstore_index_list(bt, "p", ix, 4) == 2);
 	for (n = 1; n < 1000; n++) {
 		faults = xstore_row_read_faults();
 		xstore_row_read_fail_at(n);
@@ -793,8 +800,8 @@ case_idxcat(sx_db *db, bt_t *bt)
 		CK(rc == XTC_E_IO);
 		CK(xstore_index_trust_tag(bt) == 0);
 	}
-	CK(n < 1000 && errs > 0);
-	CK(xstore_index_list(bt, "p", ix, 4) == 1);
+	CK(n < 1000 && errs > 2);
+	CK(xstore_index_list(bt, "p", ix, 4) == 2);
 	snprintf(sql, sizeof sql, "SELECT count(*) FROM p WHERE v = %lld",
 	    (long long)g_v);
 	CK(one_int(db, sql) == 1);         /* through the index */

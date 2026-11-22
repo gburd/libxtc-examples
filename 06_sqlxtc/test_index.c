@@ -523,6 +523,9 @@ scenario_create_table_error(void)
 	 * but never without its constraint, and a rebuild (what the next
 	 * open runs) finds the persisted autoindex. */
 	for (n = 1, kept = 0; n < 1000; n++) {
+		/* GC first: each failed CREATE leaves catalog versions, and
+		 * without it the reads before the drop grow faster than n. */
+		CK(xstore_gc_run((struct xsql *)db) >= 0);
 		xstore_scan_read_fail_at(1);
 		xstore_row_read_fail_at(n);
 		rc = sx_exec(db, "CREATE TABLE u(a INTEGER, b INTEGER, "

@@ -1415,12 +1415,16 @@ xs_cat_open(bt_t *bt, uint32_t cat, bt_cursor_t **cur)
 }
 
 /* The next entry of a catalog walk: XTC_OK, XTC_E_NOTFOUND at the end of
- * the tree, or a read's error, counted. */
+ * the tree, or a read's error, counted.  One read of the row-read fault
+ * hook per entry, so a test can fail a walk between entries. */
 static int
 xs_cat_next(bt_cursor_t *cur, const void **k, uint16_t *klen,
     const void **vv, uint16_t *vl)
 {
-	return xs_rd_count(bt_cursor_next(cur, k, klen, vv, vl));
+	int rc = bt_cursor_next(cur, k, klen, vv, vl);
+	if (rc == XTC_OK && xs_row_fault())
+		rc = XTC_E_IO;
+	return xs_rd_count(rc);
 }
 
 /* Look up `name` in the persisted catalog (table-id 0): the newest
