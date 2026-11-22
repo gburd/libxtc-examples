@@ -28,7 +28,9 @@
  *	     failed" with no cause).
  *	  4. SELECT max(rowid) (one descent per rowid, no scan) fails when a
  *	     read fails (before: the table read as empty, or the MAX as an
- *	     older rowid).
+ *	     older rowid).  An auto-rowid INSERT in a transaction whose
+ *	     max rowid read fails fails (before: the table read as empty,
+ *	     the INSERT took rowid 1, and COMMIT overwrote committed row 1).
  *	  5. In a transaction whose rows were spilled, a statement that is
  *	     undone rebuilds the own-write UNIQUE map, reading the spilled
  *	     rows back; one that cannot be read back still guards its value
@@ -364,6 +366,64 @@ case_maxrowid(sx_db *db)
 	    "fails\n", n);
 }
 
+/* Rows 1 and 2 of a hold their first values. */
+static int
+a_intact(sx_db *db)
+{
+	return one_int(db, "SELECT v FROM a WHERE k = 1") == 1 &&
+	    one_int(db, "SELECT v FROM a WHERE k = 2") == 2 ? 0 : -1;
+}
+
+/* 4b: the auto-rowid base of an INSERT in a transaction.  The INSERT
+ * names no key, so nothing probes the key it takes: a max rowid read as
+ * 0 would take rowid 1, and COMMIT would replace committed row 1. */
+static void
+case_autorowid(sx_db *db)
+{
+	static const char *const ins[] = { "BEGIN",
+		"INSERT INTO a(v) VALUES(9)", "COMMIT" };
+	sx_vx_result *r = NULL;
+	int n, i, rc = SX_OK, errs = 0, faults;
+	CK(sx_exec(db, "CREATE TABLE a(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO a VALUES(1, 1), (2, 2)", NULL) == SX_OK);
+	for (n = 1; n < 1000; n++) {
+		faults = xstore_row_read_faults();
+		xstore_row_read_fail_at(n);
+		for (i = 0; i < 3; i++)
+			if ((rc = sx_exec(db, ins[i], NULL)) != SX_OK)
+				break;
+		if (rc != SX_OK)
+			ck_read_msg(db, ins[i], n);
+		if (rc != SX_OK)
+			(void)sx_exec(db, "ROLLBACK", NULL);
+		xstore_row_read_fail_at(0);
+		CK(a_intact(db) == 0);
+		if (xstore_row_read_faults() == faults)
+			break;
+		errs++;
+		CK(rc != SX_OK);
+	}
+	CK(n < 1000 && errs > 0 && rc == SX_OK);
+	CK(one_int(db, "SELECT count(*) FROM a") == 3);
+	CK(one_int(db, "SELECT v FROM a WHERE k = 3") == 9);
+	/* The morsel-parallel scan bounds its rowid span by the same read:
+	 * failed, it is an error, never an empty table. */
+	xstore_row_read_fail_at(1);
+	rc = sx_vexec_try(db, "SELECT count(*) FROM a", 4, &r);
+	xstore_row_read_fail_at(0);
+	CK(rc < 0 && r == NULL);
+	if (r != NULL)
+		sx_vexec_free(r);
+	CK(sx_vexec_try(db, "SELECT count(*) FROM a", 4, &r) == 1 && r != NULL &&
+	    sx_vexec_int64(r, 0, 0) == 3);
+	if (r != NULL)
+		sx_vexec_free(r);
+	printf("  ok   read errors: an auto-rowid INSERT in a transaction with "
+	    "each of %d reads failing fails, no row overwritten; a parallel "
+	    "scan whose bound read fails fails\n", errs);
+}
+
 /* 5: the own-write UNIQUE map after an undo in a spilled transaction. */
 static void
 case_umap(sx_db *db)
@@ -645,6 +705,7 @@ main(void)
 	case_ww(db);
 	case_spill(db);
 	case_maxrowid(db);
+	case_autorowid(db);
 	case_umap(db);
 	case_catalog(db, bt);
 	case_idxcat(db, bt);

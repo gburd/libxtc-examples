@@ -8566,7 +8566,12 @@ run_parallel_plan(vx_stmt_t *plan, struct xsql *db, int n_workers,
 	 * start of the table for lo -- no SQLite call.  An empty table gives
 	 * max 0 -> hi 0 -> no rows. */
 	if (bt != NULL && xstore_table_id(bt, plan->table, &tid)) {
-		int64_t mx = xstore_max_rowid(bt, tid);
+		int64_t mx;
+		/* The _txn variant sets the statement's read error; its bound
+		 * also covers buffered rows, still a safe upper bound. */
+		if (xstore_max_rowid_txn(db, tid, &mx) != 0) {
+			rc = -1; goto cleanup;   /* unread: not an empty table */
+		}
 		lo = (mx > 0) ? 1 : 0;
 		hi = (mx > 0) ? mx + 1 : 0;   /* empty -> no scan */
 	}
@@ -9540,7 +9545,9 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	/* Auto-rowid base includes this txn's buffered rows (so an in-txn
 	 * auto-PK INSERT does not reuse a buffered rowid); outside a txn this
 	 * is the committed max. */
-	maxr = xstore_max_rowid_txn(db, tableid);
+	if (xstore_max_rowid_txn(db, tableid, &maxr) != 0) {
+		rc = -1; goto done;   /* unread: not "empty", rowid 1 may be taken */
+	}
 
 	/* ---- INSERT INTO t DEFAULT VALUES -------------------------------
 	 * One row: PK auto-assigned (max committed + 1), every non-PK column

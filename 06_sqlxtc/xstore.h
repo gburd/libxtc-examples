@@ -273,8 +273,11 @@ int xstore_table_id(bt_t *bt, const char *name, uint32_t *tableid);
 /* The smallest rowid strictly greater than every existing rowid in the
  * table (max existing + 1, or 1 for an empty table) -- the value SQLite
  * would assign to a NULL INTEGER PRIMARY KEY.  Snapshot value; callers
- * needing concurrency-safe allocation must serialize. */
-int64_t xstore_max_rowid(bt_t *bt, uint32_t tableid);
+ * needing concurrency-safe allocation must serialize.  Sets *out to the
+ * largest rowid (0 for an empty table) and returns XTC_OK, or returns the
+ * XTC_E_* code of a read that failed (counted; *out is 0, and must not be
+ * taken for an empty table). */
+int xstore_max_rowid(bt_t *bt, uint32_t tableid, int64_t *out);
 /* Approximately equi-depth rowid cut points of `tableid` inside the
  * rowid range [lo, hi), from the B-tree's upper separators
  * (bt_sample_keys, O(fanout) page reads -- never a scan): up to n
@@ -287,8 +290,9 @@ int xstore_rowid_split_points(bt_t *bt, uint32_t tableid, int64_t lo,
                               int64_t hi, int n, int64_t *out);
 /* Largest rowid in `tableid` including this connection's uncommitted
  * buffered writes -- the auto-rowid base for an in-txn INSERT (a
- * db-handle variant of xstore_max_rowid that also scans the wbuf). */
-int64_t xstore_max_rowid_txn(struct xsql *db, uint32_t tableid);
+ * db-handle variant of xstore_max_rowid that also scans the wbuf).
+ * 0 with *out set, or -1 when a read failed (xstore_read_err says why). */
+int xstore_max_rowid_txn(struct xsql *db, uint32_t tableid, int64_t *out);
 /* Buffered writes examined by xstore_max_rowid_txn so far (metric: an
  * in-txn bulk INSERT must not rescan the buffer per row). */
 uint64_t xstore_wbuf_scan_count(void);

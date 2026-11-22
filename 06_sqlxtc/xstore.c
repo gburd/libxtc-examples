@@ -4084,8 +4084,8 @@ xs_table_schema_parse(bt_t *bt, const char *name, xstore_col_t *cols, int cap)
 	return ncol > 0 ? ncol : 0;
 }
 
-int64_t
-xstore_max_rowid(bt_t *bt, uint32_t tableid)
+int
+xstore_max_rowid(bt_t *bt, uint32_t tableid, int64_t *out)
 {
 	/* The largest rowid in the table sorts last within the table's key
 	 * range (keys are (tableid, rowid ^ signbit, ~ts), big-endian, so
@@ -4100,17 +4100,26 @@ xstore_max_rowid(bt_t *bt, uint32_t tableid)
 	 * empty table, 16.5 ms at 400k rows (review156 P1). */
 	uint8_t hi[XS_VKLEN + 1], k[XS_VKLEN + 8];
 	uint16_t klen = 0;
-	int i;
+	int i, rc;
 
-	if (bt == NULL) return 0;
+	*out = 0;
+	if (bt == NULL) return XTC_OK;
 	for (i = 3; i >= 0; i--) hi[3 - i] = (uint8_t)(tableid >> (8 * i));
 	memset(hi + 4, 0xFF, sizeof hi - 4);
-	if (bt_seek_lt(bt, hi, (uint16_t)sizeof hi, k, (uint16_t)sizeof k,
-	    &klen, NULL, 0, NULL) != XTC_OK)
-		return 0;
+	rc = bt_seek_lt(bt, hi, (uint16_t)sizeof hi, k, (uint16_t)sizeof k,
+	    &klen, NULL, 0, NULL);
+	if (rc == XTC_OK && xs_row_fault())
+		rc = XTC_E_IO;
+	/* A descent that failed is not an empty table: the caller would
+	 * hand out rowid 1 over a committed row. */
+	if (rc == XTC_E_NOTFOUND)
+		return XTC_OK;               /* nothing below: empty */
+	if (rc != XTC_OK)
+		return xs_rd_count(rc);
 	if (klen != XS_VKLEN || dec_tableid(k) != tableid)
-		return 0;                    /* empty table */
-	return dec_rowid(k) > 0 ? dec_rowid(k) : 0;
+		return XTC_OK;               /* empty table */
+	*out = dec_rowid(k) > 0 ? dec_rowid(k) : 0;
+	return XTC_OK;
 }
 
 int
@@ -6392,7 +6401,9 @@ xs_update(xsql_vtab *pv, int argc, xsql_value **argv,
 		uint8_t rec[XS_VMAX];
 		int reclen;
 		if (xsql_value_type(argv[2]) == SQLITE_NULL) {
-			int64_t mx = xstore_max_rowid(cx->bt, v->tableid), i;
+			int64_t mx, i;
+			if (xstore_max_rowid(cx->bt, v->tableid, &mx) != XTC_OK)
+				return SQLITE_IOERR;
 			for (i = 0; i < cx->wn; i++)
 				if (cx->wbuf[i].tableid == v->tableid &&
 				    cx->wbuf[i].rowid > mx)
@@ -7124,8 +7135,10 @@ xstore_rollback_to(struct xsql *db, int level)
 /* Largest rowid in `tableid` INCLUDING this connection's uncommitted
  * buffered writes -- the auto-rowid base for an in-txn INSERT, so a
  * buffered row's rowid is not reused (matching the vtab xUpdate auto-
- * rowid path).  Outside a txn this equals xstore_max_rowid.  Returns 0
- * for an empty table / unknown db. */
+ * rowid path).  Outside a txn this equals xstore_max_rowid.  Sets *out
+ * (0 for an empty table / unknown db) and returns 0, or -1 when a read
+ * failed (the statement's read error is set; *out is 0 and must not be
+ * used). */
 static uint64_t g_wmax_scanned; /* wbuf entries scanned (metric) */
 
 uint64_t
@@ -7134,14 +7147,19 @@ xstore_wbuf_scan_count(void)
 	return xtc_atomic_load_u64(&g_wmax_scanned, xtc_mo_relaxed);
 }
 
-int64_t
-xstore_max_rowid_txn(struct xsql *db, uint32_t tableid)
+int
+xstore_max_rowid_txn(struct xsql *db, uint32_t tableid, int64_t *out)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
 	int64_t mx;
-	int i;
+	int i, rc;
+	*out = 0;
 	if (cx == NULL) return 0;
-	mx = xstore_max_rowid(cx->bt, tableid);
+	rc = xstore_max_rowid(cx->bt, tableid, &mx);
+	if (rc != XTC_OK) {
+		xs_rd_err_tid(cx, tableid, rc);
+		return -1;
+	}
 	if (!cx->wmax_ok) {                  /* rebuild after a truncate */
 		cx->wmax_n = 0;
 		cx->wmax_ok = 1;
@@ -7155,14 +7173,16 @@ xstore_max_rowid_txn(struct xsql *db, uint32_t tableid)
 		for (i = 0; i < cx->wmax_n; i++)
 			if (cx->wmax[i].tableid == tableid && cx->wmax[i].max > mx)
 				mx = cx->wmax[i].max;
-		return mx;
+		*out = mx;
+		return 0;
 	}
 	for (i = 0; i < cx->wn; i++)        /* shortcut: > 8 tables in one txn scans */
 		if (cx->wbuf[i].tableid == tableid && cx->wbuf[i].rowid > mx)
 			mx = cx->wbuf[i].rowid;
 	xtc_atomic_fetch_add_u64(&g_wmax_scanned, (uint64_t)cx->wn,
 	    xtc_mo_relaxed);
-	return mx;
+	*out = mx;
+	return 0;
 }
 
 /* Is `rowid` a live committed row of `tableid` (newest version present
