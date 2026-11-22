@@ -392,7 +392,16 @@ int xstore_in_txn(struct xsql *db);
  * a transaction, where it does nothing), and ends it after its last
  * write, committing every row at one timestamp when ok and nothing
  * failed, else discarding them all.  end returns 0, 1 (a UNIQUE
- * violation at the commit; xstore_uniq_err), or -1.  See xstore.c. */
+ * violation at the commit; xstore_uniq_err), or -1.  See xstore.c.
+ *
+ * NB the one-fsync gain holds only while the statement's buffered rows
+ * stay under the 256 KiB spill mark (XS_SPILL_HI).  Past it, older rows
+ * spill (STEAL) as stage records, and each one waits for its own fsync
+ * (xs_wal_emit_stage), so a statement with large or many rows runs at
+ * about the per-row commit speed it had before: 1,443 rows/s for a
+ * 5,000-row UPDATE of 100-byte rows, against 117,000 for 40-byte ones.
+ * Memory at the commit is not bounded by the spill either: the commit
+ * reads every spilled row back and logs them in one record. */
 int xstore_stmt_implicit_begin(struct xsql *db);
 int xstore_stmt_implicit_end(struct xsql *db, int ok);
 
