@@ -567,6 +567,7 @@ typedef struct xstore_ctx {
 	int              wmap_n, wmap_cap, wmap_bad;
 	struct xs_umap { uint64_t h; uint32_t idx_id; int wi; } *umap;
 	int              umap_n, umap_cap;
+	int              umap_bad;    /* a row is missing from the umap */
 	uint64_t         uniq_vis;    /* horizon of the txn's UNIQUE checks */
 	uint64_t         uniq_gen;    /* index generation at those checks */
 	char             uniq_err[192]; /* last UNIQUE violation message */
@@ -673,6 +674,7 @@ wbuf_clear(xstore_ctx_t *c)
 	for (i = 0; i < c->umap_cap; i++) c->umap[i].wi = -1;
 	c->wmap_n = c->umap_n = 0;
 	c->wmap_bad = 0;
+	c->umap_bad = 0;
 	c->uniq_vis = 0;
 	c->wmax_n = 0;
 	c->wmax_ok = 1;
@@ -2552,7 +2554,7 @@ umap_put(xstore_ctx_t *c, uint64_t h, uint32_t idx_id, int wi)
 		int nc = c->umap_cap ? c->umap_cap * 2 : 64, k;
 		struct xs_umap *nm = malloc(sizeof *nm * (size_t)nc), *om = c->umap;
 		int ocap = c->umap_cap;
-		if (nm == NULL) return;   /* commit-time validation still catches it */
+		if (nm == NULL) { c->umap_bad = 1; return; }
 		for (k = 0; k < nc; k++) nm[k].wi = -1;
 		c->umap = nm; c->umap_cap = nc; c->umap_n = 0;
 		for (k = 0; k < ocap; k++)
@@ -2576,6 +2578,7 @@ wmaps_rebuild(xstore_ctx_t *c)
 	for (i = 0; i < c->umap_cap; i++) c->umap[i].wi = -1;
 	c->wmap_n = c->umap_n = 0;
 	c->wmap_bad = 0;
+	c->umap_bad = 0;
 	for (i = 0; i < c->wn; i++) {
 		wmap_put(c, c->wbuf[i].tableid, c->wbuf[i].rowid, i);
 		xs_umap_index(c, i);
@@ -8359,7 +8362,12 @@ xs_umap_index(xstore_ctx_t *c, int wi)
 	int nh, i, klen, isnull, rl = 0;
 	xs_wrec_t *w = &c->wbuf[wi];
 	if (w->deleted || g_idx_n == 0) return;
-	if (w->spilled && xs_wrec_ensure(c, w) != SX_OK) return;
+	/* A spilled payload that cannot be read back is left out: the
+	 * own-write UNIQUE check then walks the buffer (umap_bad). */
+	if (w->spilled && (xs_row_fault() || xs_wrec_ensure(c, w) != SX_OK)) {
+		c->umap_bad = 1;
+		return;
+	}
 	nh = xs_idx_for_table(c->bt, w->tableid, hits, 16);
 	rec = w->data; rl = (int)w->len;
 	for (i = 0; i < nh; i++) {
@@ -8475,6 +8483,33 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 	return dup;
 }
 
+/* xs_uniq_buffered_dup over the whole buffer, for when the umap misses
+ * a row: every newest live buffered row of the index's table.  Same
+ * answers. */
+static int
+xs_uniq_buffered_walk(xstore_ctx_t *c, const struct xs_idx_rt *rt,
+    const uint8_t *key, int klen, const struct xs_urow *w)
+{
+	uint8_t kk[XS_IDX_KMAX];
+	const uint8_t *rec;
+	int wi, rl, kl2, rc;
+	for (wi = 0; wi < c->wn; wi++) {
+		const xs_wrec_t *b = &c->wbuf[wi];
+		if (b->tableid != rt->tableid || b->rowid == w->rowid ||
+		    b->deleted || !wbuf_is_newest(c, wi))
+			continue;
+		rc = xs_wrec_payload(c, wi, &rec, &rl);
+		if (rc != XTC_OK)
+			return rc;
+		kl2 = xs_idx_rowkey(rt, rec, rl, b->rowid, 0, kk,
+		    (int)sizeof kk, NULL);
+		if (xs_uniq_same(rt, kk, kl2, key, klen, rec, rl,
+		        b->rowid, w))
+			return 1;
+	}
+	return 0;
+}
+
 /* Does a buffered row of this transaction other than `rowid` carry key
  * tuple `key` in index `rt`?  1, 0, or a negative XTC_E_* code if a
  * buffered row could not be read. */
@@ -8487,7 +8522,10 @@ xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
 	uint64_t h;
 	int i, m, wi, rl, kl2, rc;
 	const uint8_t *rec;
-	if (!c->in_txn || c->umap_cap == 0) return 0;
+	if (!c->in_txn) return 0;
+	if (c->umap_bad)
+		return xs_uniq_buffered_walk(c, rt, key, klen, w);
+	if (c->umap_cap == 0) return 0;
 	h = xs_bytes_hash(key, klen);
 	m = c->umap_cap - 1;
 	for (i = (int)(h & (uint64_t)m); c->umap[i].wi >= 0; i = (i + 1) & m) {
@@ -10228,7 +10266,7 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 	ctx->wmax_n = 0; ctx->wmax_ok = 1;
 	ctx->ilk_slot = 0; ctx->ilk_seq = 0; ctx->ilk = NULL;
 	ctx->ilk_n = ctx->ilk_cap = 0; ctx->ilk_skip = 0;
-	ctx->umap = NULL; ctx->umap_n = ctx->umap_cap = 0;
+	ctx->umap = NULL; ctx->umap_n = ctx->umap_cap = ctx->umap_bad = 0;
 	ctx->uniq_vis = ctx->uniq_gen = 0;
 	ctx->uniq_err[0] = '\0';
 	xs_rd_err_clear(ctx);

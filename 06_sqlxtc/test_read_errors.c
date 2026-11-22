@@ -29,6 +29,11 @@
  *	  4. SELECT max(rowid) (one descent per rowid, no scan) fails when a
  *	     read fails (before: the table read as empty, or the MAX as an
  *	     older rowid).
+ *	  5. In a transaction whose rows were spilled, a statement that is
+ *	     undone rebuilds the own-write UNIQUE map, reading the spilled
+ *	     rows back; one that cannot be read back still guards its value
+ *	     (before: it was left out of the map, and a duplicate of it in
+ *	     the same transaction went in).
  */
 
 #include <stdint.h>
@@ -345,6 +350,51 @@ case_maxrowid(sx_db *db)
 	    "fails\n", n);
 }
 
+/* 5: the own-write UNIQUE map after an undo in a spilled transaction. */
+static void
+case_umap(sx_db *db)
+{
+	static const int fail_at[] = { 1, 2, 3, 50, 199 };
+	sx_stmt *st = NULL;
+	char pad[1001], sql[96];
+	int r, i, rc, bad = 0;
+	memset(pad, 'p', sizeof pad - 1);
+	pad[sizeof pad - 1] = '\0';
+	CK(sx_exec(db, "CREATE TABLE u(k INTEGER PRIMARY KEY, c INTEGER UNIQUE, "
+	    "pad TEXT)", NULL) == SX_OK);
+	for (r = 0; r < (int)(sizeof fail_at / sizeof fail_at[0]); r++) {
+		CK(sx_exec(db, "BEGIN", NULL) == SX_OK);
+		CK(sx_prepare(db, "INSERT INTO u VALUES(?, ?, ?)", -1, &st,
+		    NULL) == SX_OK);
+		for (i = 1; i <= 300; i++) {   /* 300 KB: past the spill mark */
+			sx_bind_int64(st, 1, i);
+			sx_bind_int64(st, 2, i);
+			sx_bind_text(st, 3, pad, -1);
+			CK(sx_step(st) == SX_DONE);
+			sx_reset(st);
+		}
+		sx_finalize(st);
+		/* The second row is a duplicate: the statement is undone, and
+		 * the map is rebuilt from the buffer with a reload failing. */
+		xstore_row_read_fail_at(fail_at[r]);
+		CK(sx_exec(db, "INSERT INTO u VALUES(1001, 1001, 'x'), "
+		    "(1002, 3, 'x')", NULL) != SX_OK);
+		xstore_row_read_fail_at(0);
+		for (i = 1; i <= 300; i++) {
+			snprintf(sql, sizeof sql,
+			    "INSERT INTO u VALUES(%d, %d, 'y')", 2000 + i, i);
+			rc = sx_exec(db, sql, NULL);
+			if (rc == SX_OK) bad++;
+		}
+		CK(sx_exec(db, "ROLLBACK", NULL) == SX_OK);
+	}
+	CK(bad == 0);
+	if (bad != 0)
+		fprintf(stderr, "  %d duplicates of spilled rows went in\n", bad);
+	printf("  ok   read errors: an unreadable spilled row still guards its "
+	    "UNIQUE value\n");
+}
+
 int
 main(void)
 {
@@ -376,6 +426,7 @@ main(void)
 	case_ww(db);
 	case_spill(db);
 	case_maxrowid(db);
+	case_umap(db);
 	sx_close(db);
 	xstore_set_wal(NULL);
 	bt_close(bt); bm_destroy(bm);
