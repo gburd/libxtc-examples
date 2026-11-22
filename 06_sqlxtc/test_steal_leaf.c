@@ -44,7 +44,8 @@
  *	own address space at 256 MB (setrlimit(RLIMIT_AS)) BEFORE any
  *	recovery, so a regression that reintroduced the unbounded-alloc
  *	torn-base balloon fails cleanly (malloc NULL) instead of OOM-killing
- *	the machine.  Relaxed only under AddressSanitizer (huge shadow map).
+ *	the machine.  Relaxed only under AddressSanitizer and valgrind (both
+ *	keep a shadow map larger than the cap).
  *
  *	Low-level bt/bm harness (like test_inplace_redo / test_steal_page);
  *	no loop; the WAL is driven synchronously (wal_commit_sync).
@@ -90,6 +91,9 @@ cap_address_space(void)
 #endif
 #ifndef XTC_LEAF_UNDER_ASAN
 	struct rlimit rl;
+	/* valgrind's shadow memory does not fit in the cap either. */
+	if (getenv("XTC_UNDER_VALGRIND") != NULL)
+		return;
 	if (getrlimit(RLIMIT_AS, &rl) == 0) {
 		if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur > (rlim_t)AS_CAP) {
 			rl.rlim_cur = (rlim_t)AS_CAP;
