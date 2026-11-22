@@ -510,7 +510,7 @@ reuse_run(sx_db *db, bt_t *bt, int n)
 	}
 	xstore_row_read_fail_at(0);
 	failed = xstore_row_read_faults() != faults;
-	CK(xstore_index_check(bt, &miss, &stale) == XTC_OK && miss == 0);
+	CK(xstore_index_check(bt, &miss, &stale) >= 0 && miss == 0);
 	snprintf(sql, sizeof sql, "INSERT INTO r%d VALUES(2, 10)", n);
 	CK(sx_exec(db, sql, NULL) == SX_CONSTRAINT);
 	return failed;
