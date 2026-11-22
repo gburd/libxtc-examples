@@ -195,6 +195,18 @@ int xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
  * setting: still positive when fewer reads ran.  Note that the count is
  * one for the process. */
 int xstore_scan_read_fail_at(int n);
+/* Test hook, as xstore_scan_read_fail_at, for the reads of one row's or
+ * one catalog entry's versions outside a scan: the primary-key check of
+ * an INSERT, the write-write and serializable checks, a row's pre-image
+ * and a spilled payload brought back at COMMIT, MAX(rowid), the catalog
+ * lookups and id allocation, and version GC. */
+int xstore_row_read_fail_at(int n);
+/* Test hook: how many reads xstore_row_read_fail_at has failed so far. */
+int xstore_row_read_faults(void);
+/* Reads of the tree that failed with an error (not "no such key"), over
+ * the process: the read-error metric.  A read that GC could not make
+ * counts here too, though GC only stops early. */
+uint64_t xstore_read_errors(void);
 
 void xstore_scan_close(xstore_scan_t *s);
 

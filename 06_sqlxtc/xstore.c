@@ -1324,6 +1324,75 @@ xstore_ctx_of(struct xsql *db)
 	return e != NULL ? e->ctx : NULL;
 }
 
+static int g_row_failat;    /* test hook: the row read to fail, 1-based */
+static int g_row_faults;    /* test hook: reads it has failed */
+static uint64_t g_rd_errors; /* reads that failed (metric) */
+
+/* Count a read of the tree that failed with rc (any XTC_E_* but
+ * XTC_E_NOTFOUND): the read-error metric (xstore_read_errors).  Returns
+ * rc, so a caller can count and return in one step. */
+static int
+xs_rd_count(int rc)
+{
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+		xtc_atomic_fetch_add_u64(&g_rd_errors, 1, xtc_mo_relaxed);
+	return rc;
+}
+
+/* Should this read of one row's or one catalog entry's versions, outside
+ * a scan, fail (xstore_row_read_fail_at)?  One relaxed load when
+ * disarmed. */
+static int
+xs_row_fault(void)
+{
+	if (xtc_atomic_load_i32(&g_row_failat, xtc_mo_relaxed) <= 0 ||
+	    xtc_atomic_fetch_sub_i32(&g_row_failat, 1, xtc_mo_relaxed) != 1)
+		return 0;
+	(void)xtc_atomic_fetch_add_i32(&g_row_faults, 1, xtc_mo_relaxed);
+	return 1;
+}
+
+int
+xstore_row_read_fail_at(int n)
+{
+	return xtc_atomic_exchange_i32(&g_row_failat, n, xtc_mo_relaxed);
+}
+
+int
+xstore_row_read_faults(void)
+{
+	return xtc_atomic_load_i32(&g_row_faults, xtc_mo_relaxed);
+}
+
+/* Leave "cannot read table T: <rc>" in the connection's rd_err (the
+ * statement's first read error, which the engine reports), naming the
+ * table by id.  Takes the cat lock: never call it holding the commit
+ * lock. */
+static void
+xs_rd_err_tid(xstore_ctx_t *cx, uint32_t tid, int rc)
+{
+	char name[64];
+	int i;
+	if (cx == NULL || cx->rd_err[0] != '\0')
+		return;
+	snprintf(name, sizeof name, "%u", (unsigned)tid);
+	xs_cat_lock();
+	for (i = 0; i < g_cat_n; i++)
+		if (g_cat[i].bt == cx->bt && g_cat[i].tableid == tid) {
+			snprintf(name, sizeof name, "%s", g_cat[i].name);
+			break;
+		}
+	xs_cat_unlock();
+	snprintf(cx->rd_err, sizeof cx->rd_err, "cannot read table %s: %s",
+	    name, xtc_strerror(rc));
+}
+
+uint64_t
+xstore_read_errors(void)
+{
+	return xtc_atomic_load_u64(&g_rd_errors, xtc_mo_relaxed);
+}
+
 /* Look up `name` in the persisted catalog (table-id 0): the newest
  * non-tombstone catalog row whose value equals `name`.  Returns its id
  * (the row's rowid), or 0 if the catalog has no override for it. */
@@ -4900,7 +4969,8 @@ xs_put(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n, int d
 
 /* An INSERT reads "the key is absent".  Caller holds the commit lock.
  * Wait (dropping the lock) until no in-flight commit writes the key --
- * its outcome decides -- then report whether a live version exists.
+ * its outcome decides -- then report whether a live version exists
+ * (xs_row_live: 1, 0, or a read's XTC_E_* code).
  * In-flight commits never wait on an inserter, so this terminates. */
 static int
 xs_key_live_locked(bt_t *bt, uint32_t tableid, int64_t rowid)
@@ -4929,7 +4999,9 @@ xs_key_live_locked(bt_t *bt, uint32_t tableid, int64_t rowid)
  * vis: return only once the write is visible (the caller holds no
  * engine lock); else only once its in-flight entry is unlinked.
  * A UNIQUE conflict returns SX_CONSTRAINT and a UNIQUE probe that could
- * not run its negative XTC_E_* code, both with *ubad set to the index. */
+ * not run its negative XTC_E_* code, both with *ubad set to the index;
+ * a primary-key check that could not read the row returns its negative
+ * XTC_E_* code with *ubad left 0. */
 static int
 xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
     int deleted, uint64_t base, int insert, uint64_t *out_ts, uint32_t *ubad,
@@ -4961,9 +5033,9 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 		return SX_BUSY;
 	xs_commit_lock();
 	xs_gate_wait_locked();
-	if (insert && xs_key_live_locked(bt, tableid, rowid)) {
+	if (insert && (rc = xs_key_live_locked(bt, tableid, rowid)) != 0) {
 		xs_commit_unlock();
-		return SX_CONSTRAINT;
+		return rc > 0 ? SX_CONSTRAINT : rc;   /* rc < 0: unread */
 	}
 	/* UNIQUE indexes: the check and the in-flight registration are one
 	 * step, so two concurrent writers of one key cannot both pass. */
@@ -5772,6 +5844,8 @@ xs_put_pruned(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid, const void *blo
 		if (ubad != 0)
 			xs_idx_err_msg(cx->bt, ubad, rc, cx->uniq_err,
 			    sizeof cx->uniq_err);
+		else
+			xs_rd_err_tid(cx, tableid, rc);
 		rc = SX_ERROR;
 	}
 	if (rc == SX_OK) {
@@ -6942,7 +7016,10 @@ xstore_max_rowid_txn(struct xsql *db, uint32_t tableid)
 }
 
 /* Is `rowid` a live committed row of `tableid` (newest version present
- * and not a tombstone)?  Used by the in-txn uniqueness check. */
+ * and not a tombstone)?  1 if live, 0 if not, or the XTC_E_* code of a
+ * read that failed: the row is then unknown, and an INSERT that took it
+ * for absent would put in a duplicate primary key.  Used by the
+ * primary-key checks of INSERT. */
 static int
 xs_row_live(bt_t *bt, uint32_t tableid, int64_t rowid)
 {
@@ -6950,13 +7027,25 @@ xs_row_live(bt_t *bt, uint32_t tableid, int64_t rowid)
 	uint8_t startk[XS_VKLEN];
 	const void *k = NULL, *vv = NULL;
 	uint16_t klen = 0, vl = 0;
-	int live = 0;
+	int live = 0, rc;
 	if (bt == NULL) return 0;
 	enc_vkey(tableid, rowid, ~(uint64_t)0, startk);   /* newest version first */
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
-	if (bt_cursor_next(cur, &k, &klen, &vv, &vl) == XTC_OK &&
-	    klen == XS_VKLEN &&
+	rc = bt_cursor_open(bt, startk, XS_VKLEN, &cur);
+	if (rc == XTC_OK) {
+		rc = bt_cursor_next(cur, &k, &klen, &vv, &vl);
+		if (rc == XTC_OK && xs_row_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK)
+			bt_cursor_close(cur);
+	}
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+		(void)xs_rd_count(rc);
+		/* planted 83: the unread row is absent, so the key is free */
+		return XTC_DST_BUG(XTC_DST_BUG_PKREAD) ? 0 : rc;
+	}
+	if (rc != XTC_OK)
+		return 0;                       /* the end of the tree */
+	if (klen == XS_VKLEN &&
 	    dec_tableid((const uint8_t *)k) == tableid &&
 	    dec_rowid((const uint8_t *)k) == rowid)
 		live = !(vl >= 1 && (((const uint8_t *)vv)[0] & XS_F_DELETED));
@@ -6969,18 +7058,24 @@ xs_row_live(bt_t *bt, uint32_t tableid, int64_t rowid)
  * a committed row; a buffered upsert reveals one.  Lets the native
  * INSERT enforce PK uniqueness INSIDE a transaction (where a plain
  * committed-B-tree probe would miss buffered rows).  Returns 1 if live,
- * 0 otherwise. */
+ * 0 otherwise, or -1 when the row could not be read (rd_err says why). */
 int
 xstore_row_exists_txn(struct xsql *db, uint32_t tableid, int64_t rowid)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
+	int r;
 	if (cx == NULL) return 0;
 	if (cx->in_txn) {
 		const xs_wrec_t *w = wbuf_find(cx, tableid, rowid);
 		if (w != NULL)
 			return w->deleted ? 0 : 1;   /* buffered write decides */
 	}
-	return xs_row_live(cx->bt, tableid, rowid);
+	r = xs_row_live(cx->bt, tableid, rowid);
+	if (r < 0) {
+		xs_rd_err_tid(cx, tableid, r);
+		return -1;
+	}
+	return r;
 }
 
 /*

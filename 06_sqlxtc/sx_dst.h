@@ -32,5 +32,8 @@
 #define XTC_DST_BUG_IDREUSE    79  /* xstore.c: a new table / index takes a dropped one's id */
 #define XTC_DST_BUG_UNIQREAD   80  /* xstore.c: a UNIQUE candidate row that cannot be read reads as absent */
 #define XTC_DST_BUG_POINTEND   81  /* btree.c: a key prefix "ends" with its leaf, fence unchecked */
+#define XTC_DST_BUG_SCANSHORT  82  /* xstore.c: a failed base-scan read ends the scan as the table's end */
+#define XTC_DST_BUG_PKREAD     83  /* xstore.c: a row the INSERT key check cannot read is absent */
+#define XTC_DST_BUG_WWREAD     84  /* xstore.c: a row the write-write check cannot read has no newer version */
 
 #endif /* SQLXTC_SX_DST_H */
