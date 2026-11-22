@@ -16,8 +16,14 @@
  *	tables are compared with their state before it.  The failures:
  *	  (a) a read error: the n-th base-scan read, and separately the n-th
  *	      row read, fails (xstore_scan_read_fail_at,
- *	      xstore_row_read_fail_at), for every n until no read is left;
- *	  (b) a UNIQUE or PRIMARY KEY violation met by a later row;
+ *	      xstore_row_read_fail_at), for every n until no read is left.
+ *	      One statement reads through a correlated subquery, whose failed
+ *	      read yields NULL and fails no step: only the read-error check
+ *	      at the statement's end fails it;
+ *	  (b) a UNIQUE or PRIMARY KEY violation met by a later row, by a
+ *	      later tuple of an INSERT VALUES, or by the new row of a
+ *	      one-row UPDATE that moves the primary key (the old row's
+ *	      tombstone is written first);
  *	  (c) a row too large to store met by a later row (sqlxtc enforces
  *	      no NOT NULL or type constraint; this is its row-level error);
  *	  (d) a kill of the connection's proc that lands while the statement
@@ -117,13 +123,16 @@ rows_changed(const struct snap *a, const struct snap *b)
 
 /* Fresh tables: s(k, v, p) holds k = 1..5 with v = k and a short p; d
  * is empty but for key 9; u(k, c UNIQUE) holds (1,5), (2,7), (3,9),
- * (4,14), so c * 2 collides with row 4 at row 2. */
+ * (4,14), so c * 2 collides with row 4 at row 2.  co and cw, read only,
+ * feed the correlated subquery of (a). */
 static void
 fresh(sx_db *db)
 {
 	(void)sx_exec(db, "DROP TABLE s", NULL);
 	(void)sx_exec(db, "DROP TABLE d", NULL);
 	(void)sx_exec(db, "DROP TABLE u", NULL);
+	(void)sx_exec(db, "DROP TABLE co", NULL);
+	(void)sx_exec(db, "DROP TABLE cw", NULL);
 	CK(sx_exec(db, "CREATE TABLE s(k INTEGER PRIMARY KEY, v INTEGER, "
 	    "p TEXT)", NULL) == SX_OK);
 	CK(sx_exec(db, "INSERT INTO s VALUES(1, 1, 'a'), (2, 2, 'b'), "
@@ -135,6 +144,14 @@ fresh(sx_db *db)
 	    "UNIQUE)", NULL) == SX_OK);
 	CK(sx_exec(db, "INSERT INTO u VALUES(1, 5), (2, 7), (3, 9), (4, 14)",
 	    NULL) == SX_OK);
+	CK(sx_exec(db, "CREATE TABLE co(k INTEGER PRIMARY KEY, j INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO co VALUES(1, 1), (2, 2), (3, 3)", NULL) ==
+	    SX_OK);
+	CK(sx_exec(db, "CREATE TABLE cw(k INTEGER PRIMARY KEY, x INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO cw VALUES(1, 1), (2, 2), (3, 3)", NULL) ==
+	    SX_OK);
 }
 
 static struct snap g_before, g_after;
@@ -192,6 +209,7 @@ case_read(sx_db *db, const char *sql)
 				CK(rc == SX_OK);
 				break;
 			}
+			CK(rc != SX_OK);      /* a failed read fails it */
 			fails += rc != SX_OK;
 			bad += ch > 0;
 			if (ch > most) most = ch;
@@ -330,6 +348,8 @@ main(void)
 		"INSERT INTO d SELECT k, v FROM s",
 		"UPDATE s SET v = v + 1",
 		"DELETE FROM s WHERE v > 0",
+		"INSERT INTO d SELECT k, (SELECT x FROM cw WHERE cw.x = co.j) "
+		"FROM co",
 	};
 	/* Over s's 405 rows (d's key 9 and value 30 are out of the way). */
 	static const char *const kills[] = {
@@ -361,6 +381,10 @@ main(void)
 	case_fail(db, "(b)", "INSERT INTO d SELECT k, v * 10 FROM s", 0);
 	case_fail(db, "(b)", "UPDATE u SET c = c * 2", 0);
 	case_fail(db, "(b)", "INSERT INTO s SELECT k + 2, v FROM s", 0);
+	/* The second tuple's c = 9 is row 3's; the moved row's c = 7 is
+	 * row 2's. */
+	case_fail(db, "(b)", "INSERT INTO u VALUES(5, 20), (6, 9)", 0);
+	case_fail(db, "(b)", "UPDATE u SET k = 50, c = 7 WHERE k = 1", 0);
 	/* (c): row 3's p, 2500 bytes, doubles past the 4096-byte row;
 	 * rows 1 and 2 come first and fit. */
 	memset(big, 'x', 2500);
