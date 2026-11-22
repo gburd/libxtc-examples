@@ -1787,7 +1787,14 @@ struct xs_idx_ent {
 	char     col[XS_IDX_NCOL][64];
 };
 static struct xs_idx_ent g_idx[XS_IDX_MAX];
+/* g_idx[] and g_idx_n change only under the cat lock.  The "any index?"
+ * fast paths read g_idx_n without it, so every write of g_idx_n is a
+ * release store (XS_IDX_N_SET, after the entry it exposes is written) and
+ * every unlocked read an acquire load (XS_IDX_ANY).  Only the count is read
+ * without the lock; the entries are always read under it. */
 static int g_idx_n;
+#define XS_IDX_N_SET(v) xtc_atomic_store_i32(&g_idx_n, (v), xtc_mo_release)
+#define XS_IDX_ANY() (xtc_atomic_load_i32(&g_idx_n, xtc_mo_acquire) > 0)
 static uint64_t g_idx_gen; /* bumped by every index create */
 /* Set when an index entry may be missing (an insert failed, a build ran
  * short, an index is not maintained): the indexes are then not trusted at
@@ -1841,7 +1848,11 @@ xs_idx_cache_forget_locked(bt_t *bt)
 {
 	int i;
 	for (i = 0; i < g_idx_n; ) {
-		if (g_idx[i].bt == bt) { g_idx[i] = g_idx[--g_idx_n]; XS_CATC_BUMP(); }
+		if (g_idx[i].bt == bt) {
+			g_idx[i] = g_idx[g_idx_n - 1];
+			XS_IDX_N_SET(g_idx_n - 1);
+			XS_CATC_BUMP();
+		}
 		else i++;
 	}
 }
@@ -2188,7 +2199,7 @@ xs_idx_for_table(bt_t *bt, uint32_t tableid, struct xs_idx_rt *hits, int cap)
 	static _Thread_local unsigned tnext;
 	uint64_t g;
 	int n = 0, i, k;
-	if (g_idx_n == 0) return 0;
+	if (!XS_IDX_ANY()) return 0;
 	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_acquire);
 	for (k = 0; k < 4; k++)
 		if (tc[k].gen == g && tc[k].bt == bt && tc[k].tid == tableid &&
@@ -2534,7 +2545,7 @@ xs_idx_preimage(bt_t *bt, uint32_t tableid, int64_t rowid,
     uint8_t *buf, int cap)
 {
 	int n;
-	if (g_idx_n == 0) return 0;   /* no indexes: skip the read entirely */
+	if (!XS_IDX_ANY()) return 0;  /* no indexes: skip the read entirely */
 	n = xs_read_rec(bt, tableid, rowid, buf, cap);
 	if (n < 0) {
 		(void)xs_rd_count(n);
@@ -5190,7 +5201,7 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	fl.rid = rowid;
 	fl.rec = deleted ? NULL : (const uint8_t *)blob;
 	fl.reclen = deleted ? 0 : n;
-	if (!deleted && blob != NULL && g_idx_n > 0 &&
+	if (!deleted && blob != NULL && XS_IDX_ANY() &&
 	    tableid != XS_CAT_TABLEID && tableid < XS_IDXCAT_TABLEID)
 		nuq = xs_uniq_collect(bt, NULL, tableid, uq, 16);
 	memset(&probe, 0, sizeof probe);
@@ -5245,7 +5256,7 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	}
 	/* The pre-image for index maintenance: read while registered, so no
 	 * other writer of the row can interleave (first-committer-wins). */
-	idx = g_idx_n > 0 && tableid != XS_CAT_TABLEID &&
+	idx = XS_IDX_ANY() && tableid != XS_CAT_TABLEID &&
 	    tableid < XS_IDXCAT_TABLEID;
 	if (idx && (pre = malloc(XS_VMAX)) != NULL)
 		/* An unread pre-image taints the indexes (a rebuild follows). */
@@ -7697,8 +7708,8 @@ xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && strcmp(g_idx[i].name, name) == 0)
 			break;
-	if (i == g_idx_n && g_idx_n < XS_IDX_MAX) g_idx_n++;
 	if (i < XS_IDX_MAX) g_idx[i] = e;
+	if (i == g_idx_n && g_idx_n < XS_IDX_MAX) XS_IDX_N_SET(g_idx_n + 1);
 	XS_CATC_BUMP();
 	xs_cat_unlock();
 	return XTC_OK;
@@ -8017,7 +8028,8 @@ xs_idx_cache_drop(bt_t *bt, uint32_t idx_id)
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
-			g_idx[i] = g_idx[--g_idx_n];
+			g_idx[i] = g_idx[g_idx_n - 1];
+			XS_IDX_N_SET(g_idx_n - 1);
 			XS_CATC_BUMP();
 			break;
 		}
@@ -8322,7 +8334,7 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	if ((rc = xs_idx_cache_add(bt, idx_id, name, table, e.col, ncol,
 	    descmask, unique, kind ? (char)kind : 'i', sipk)) != XTC_OK)
 		return rc;
-	xtc_atomic_fetch_add_u64(&g_idx_gen, 1, xtc_mo_relaxed);
+	xtc_atomic_fetch_add_u64(&g_idx_gen, 1, xtc_mo_release);
 	xs_cat_gen_bump();
 	xstore_quiesce_begin();
 	xstore_quiesce_end();
@@ -8355,7 +8367,8 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 		xs_cat_lock();
 		for (i = 0; i < g_idx_n; i++)
 			if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
-				g_idx[i] = g_idx[--g_idx_n];
+				g_idx[i] = g_idx[g_idx_n - 1];
+				XS_IDX_N_SET(g_idx_n - 1);
 				XS_CATC_BUMP();
 				break;
 			}
@@ -8404,8 +8417,8 @@ xstore_drop_index(struct xsql *db, const char *name)
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
-			g_idx_n--;
-			if (i != g_idx_n) g_idx[i] = g_idx[g_idx_n];
+			if (i != g_idx_n - 1) g_idx[i] = g_idx[g_idx_n - 1];
+			XS_IDX_N_SET(g_idx_n - 1);
 			XS_CATC_BUMP();
 			break;
 		}
@@ -8445,7 +8458,8 @@ xs_idx_drop_table(bt_t *bt, const char *table)
 	for (i = 0; i < g_idx_n; ) {
 		if (g_idx[i].bt == bt && strcmp(g_idx[i].table, table) == 0) {
 			ids[n++] = g_idx[i].rt.idx_id;
-			g_idx[i] = g_idx[--g_idx_n];
+			g_idx[i] = g_idx[g_idx_n - 1];
+			XS_IDX_N_SET(g_idx_n - 1);
 			XS_CATC_BUMP();
 		} else {
 			i++;
@@ -8693,7 +8707,7 @@ xs_umap_index(xstore_ctx_t *c, int wi)
 	const uint8_t *rec;
 	int nh, i, klen, isnull, rl = 0;
 	xs_wrec_t *w = &c->wbuf[wi];
-	if (w->deleted || g_idx_n == 0) return;
+	if (w->deleted || !XS_IDX_ANY()) return;
 	/* A spilled payload that cannot be read back is left out: the
 	 * own-write UNIQUE check then walks the buffer (umap_bad). */
 	if (w->spilled && (xs_row_fault() || xs_wrec_ensure(c, w) != SX_OK)) {
@@ -8902,7 +8916,7 @@ xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid,
 	uint8_t key[XS_IDX_KMAX];
 	uint64_t vis;
 	int nh, i, klen, isnull, d;
-	if (g_idx_n == 0 || rec == NULL) return 0;
+	if (!XS_IDX_ANY() || rec == NULL) return 0;
 	nh = xs_idx_for_table(cx->bt, tableid, hits, 16);
 	if (nh == 0) return 0;
 	vis = xs_visible();
@@ -8927,7 +8941,7 @@ xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid,
 	}
 	if (cx->in_txn && (cx->uniq_vis == 0 || vis < cx->uniq_vis)) {
 		cx->uniq_vis = vis;
-		cx->uniq_gen = xtc_atomic_load_u64(&g_idx_gen, xtc_mo_relaxed);
+		cx->uniq_gen = xtc_atomic_load_u64(&g_idx_gen, xtc_mo_acquire);
 	}
 	return 0;
 }
@@ -8983,7 +8997,7 @@ xs_uniq_collect(bt_t *bt, const xstore_ctx_t *cx, uint32_t tid1,
 	struct xs_idx_rt hits[16];
 	uint32_t seen[16];
 	int nseen = 0, n = 0, wi, nw, i, j, nh;
-	if (g_idx_n == 0) return 0;
+	if (!XS_IDX_ANY()) return 0;
 	nw = cx != NULL ? cx->wn : 1;
 	for (wi = 0; wi < nw; wi++) {
 		uint32_t tid = cx != NULL ? cx->wbuf[wi].tableid : tid1;
@@ -9021,7 +9035,7 @@ xs_uniq_validate_locked(bt_t *bt, xstore_ctx_t *cx, uint32_t tid1,
 	int skipok, d;
 	if (nu == 0) return 0;
 	skipok = cx != NULL && cx->uniq_vis != 0 &&
-	    cx->uniq_gen == xtc_atomic_load_u64(&g_idx_gen, xtc_mo_relaxed);
+	    cx->uniq_gen == xtc_atomic_load_u64(&g_idx_gen, xtc_mo_acquire);
 	for (wi = 0; wi < n; wi++) {
 		uint32_t tid = cx != NULL ? cx->wbuf[wi].tableid : tid1;
 		int64_t rid = cx != NULL ? cx->wbuf[wi].rowid : rid1;
