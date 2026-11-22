@@ -1549,11 +1549,11 @@ xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs,
 		}
 	/* Persisted (create/rename/recovery)?  An unread lookup or mark
 	 * returns id 0, this function's failure. */
-	id = xs_cat_lookup(bt, name, &err);   /* RDERR_OK: err returns 0 below */
+	id = xs_cat_lookup(bt, name, &err);   /* RDERR_OK: err: 0 */
 	if (err == 0 && id == 0)
 		/* New table: allocate past both the persisted high-water id
 		 * and any id reserved in-process but not yet written. */
-		err = xs_cat_high(bt, XS_CAT_TABLEID, &maxid);   /* RDERR_OK: as above */
+		err = xs_cat_high(bt, XS_CAT_TABLEID, &maxid);   /* RDERR_OK: err: 0 */
 	if (err != 0) {                          /* unread: nothing known */
 		xs_cat_unlock();
 		return 0;
