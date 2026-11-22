@@ -3437,8 +3437,9 @@ static int
 xs_scan_end(xstore_scan_t *s)
 {
 	s->done = 1;
-	if (s->c.err == 0)
-		return 0;
+	if (s->c.err == 0 || XTC_DST_BUG(XTC_DST_BUG_SCANSHORT))
+		return 0;   /* planted 82: a failed read is the table's end */
+	(void)xs_rd_count(s->c.err);
 	/* The statement's first read error is the one the client sees. */
 	if (s->err_cx != NULL && s->err_cx->rd_err[0] == '\0' &&
 	    s->err_cx->rd_rc == 0)
