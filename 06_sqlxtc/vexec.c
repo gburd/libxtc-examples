@@ -9019,9 +9019,9 @@ lit_int(const sql_expr_t *e, int64_t *out, const vx_cell_t *binds, int nbinds)
  * a rowid range or index prefix from it, and every candidate row is
  * re-checked against the full predicate.  The rows come from the
  * read-your-writes view at the statement snapshot (xstore_stmt_begin).
- * Returns the count into `out` (<= cap), -1 if more than cap rows match
- * OR the predicate is not compilable (the statement is declined), or -2
- * on a scan/setup error. */
+ * Returns the count into `out` (<= cap), -1 if the predicate is not
+ * compilable (the statement is declined), -3 if more than cap rows match
+ * (vx_too_many_err), or -2 on a scan/setup error. */
 static int
 collect_matching(struct xsql *db, bt_t *bt, const char *table,
                  const sql_expr_t *where, int64_t *out, int cap,
@@ -9072,7 +9072,7 @@ collect_matching(struct xsql *db, bt_t *bt, const char *table,
 			if (eval_bool(st, st->filter, st->srcrow, &rowarena) != 1)
 				continue;
 		}
-		if (n >= cap) { ret = -1; goto out; }   /* too many: decline */
+		if (n >= cap) { ret = -3; goto out; }   /* too many */
 		out[n++] = rid;
 	}
 	ret = (step < 0) ? -2 : n;
@@ -9084,6 +9084,20 @@ out:
 	free(st->srcrow);
 	free(st);
 	return ret;
+}
+
+/* The error of a statement that changes more than XS_NATIVE_MAX_ROWS
+ * rows: no other engine runs it, so it fails, and says why. */
+static void
+vx_too_many_err(char **errmsg, const char *verb, const char *table)
+{
+	char m[160];
+	if (errmsg == NULL) return;
+	free(*errmsg);
+	snprintf(m, sizeof m, "too many rows: %s on %s changes more than %d "
+	    "rows, the limit for one statement", verb, table,
+	    XS_NATIVE_MAX_ROWS);
+	*errmsg = strdup(m);
 }
 
 /* Read the current visible payload record of one rowid into buf (latest
@@ -9428,7 +9442,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		if (rids == NULL) { rc = -1; goto done; }
 		nr = collect_matching(db, bt, tabbuf, root->u.del->where,
 		                      rids, XS_NATIVE_MAX_ROWS, binds, nbinds);
-		if (nr == -1) { free(rids); sql_arena_destroy(arena); return 0; }  /* too many / not compilable -> VDBE */
+		if (nr == -1) { free(rids); sql_arena_destroy(arena); return 0; }  /* not compilable -> VDBE */
+		if (nr == -3) vx_too_many_err(errmsg, "DELETE", tabbuf);
 		if (nr < 0) { free(rids); rc = -1; goto done; }
 		if (nr > 1) (void)xstore_stmt_implicit_begin(db);
 		for (i = 0; i < nr; i++) {
@@ -9521,7 +9536,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		if (rids == NULL) { rc = -1; goto done; }
 		nr = collect_matching(db, bt, tabbuf, up->where,
 		                      rids, XS_NATIVE_MAX_ROWS, binds, nbinds);
-		if (nr == -1) { free(rids); rc = 0; goto done; }  /* too many / not compilable -> VDBE */
+		if (nr == -1) { free(rids); rc = 0; goto done; }  /* not compilable -> VDBE */
+		if (nr == -3) vx_too_many_err(errmsg, "UPDATE", tabbuf);
 		if (nr < 0) { free(rids); rc = -1; goto done; }
 
 		/* A pk reassign sets the primary key to a single constant.  More
@@ -9786,7 +9802,11 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 				if (nn == NULL) { free(buf2); vx_result_free(sres); rc = -1; goto done; }
 				buf2 = nn; cap2 = nc;
 			}
-			if (nb2 >= XS_NATIVE_MAX_ROWS) { free(buf2); vx_result_free(sres); rc = 0; goto done; }
+			if (nb2 >= XS_NATIVE_MAX_ROWS) {
+				free(buf2); vx_result_free(sres);
+				vx_too_many_err(errmsg, "INSERT", tabbuf);
+				rc = -1; goto done;
+			}
 			reclen = encode_payload(&cells[1], ws.n - 1, buf2[nb2].rec, (int)sizeof buf2[nb2].rec);
 			if (reclen < 0) {
 				free(buf2); vx_result_free(sres);

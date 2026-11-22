@@ -2093,6 +2093,7 @@ sx_step_body(sx_stmt *st)
 			if (verr != NULL &&
 			    (strncmp(verr, "UNIQUE", 6) == 0 ||
 			        strncmp(verr, "row too large", 13) == 0 ||
+			        strncmp(verr, "too many rows", 13) == 0 ||
 			        strncmp(verr, "index error", 11) == 0)) {
 				rc = nat_set_err(st->db, verr, verr[0] == 'U'
 				    ? SX_CONSTRAINT : SX_ERROR);

@@ -31,6 +31,9 @@
  *	      sx_step): the connection never hears an answer, and the
  *	      statement's rows must not be committed by a dead connection,
  *	      whether it changes one row or many.
+ *	And a statement that matches more than the native engine's row limit
+ *	(100,000) fails with a message that names the limit, and changes
+ *	nothing.
  *	A line per statement reports the failed runs and how many of them
  *	left rows committed; the test fails if any did.
  *
@@ -342,6 +345,51 @@ kill_run(const char *sql)
 	return ch;
 }
 
+/* Over the row limit: 102,400 rows, so a statement over all of them is
+ * refused, with a message, before it writes. */
+static void
+case_too_many(sx_db *db)
+{
+	static const char *const sql[] = {
+		"UPDATE big SET v = v + 1",
+		"DELETE FROM big",
+	};
+	sx_stmt *st = NULL;
+	char q[128];
+	size_t i;
+	int n;
+	CK(sx_exec(db, "CREATE TABLE big(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "INSERT INTO big VALUES(1, 1)", NULL) == SX_OK);
+	for (n = 1; n < 4096; n *= 2) {
+		snprintf(q, sizeof q, "INSERT INTO big SELECT k + %d, v FROM big",
+		    n);
+		CK(sx_exec(db, q, NULL) == SX_OK);
+	}
+	for (n = 1; n < 25; n++) {
+		snprintf(q, sizeof q, "INSERT INTO big SELECT k + %d, v FROM big "
+		    "WHERE k <= 4096", 4096 * n);
+		CK(sx_exec(db, q, NULL) == SX_OK);
+	}
+	for (i = 0; i < sizeof sql / sizeof sql[0]; i++) {
+		CK(sx_exec(db, sql[i], NULL) != SX_OK);
+		printf("  limit      %-46.46s \"%.60s\"\n", sql[i],
+		    sx_errmsg(db));
+		CK(strstr(sx_errmsg(db), "too many rows") != NULL);
+		CK(strstr(sx_errmsg(db), "100000") != NULL);
+		CK(strstr(sx_errmsg(db), " big ") != NULL);
+	}
+	CK(sx_prepare(db, "SELECT count(*), sum(v) FROM big", -1, &st, NULL) ==
+	    SX_OK);
+	CK(st != NULL && sx_step(st) == SX_ROW);
+	if (st != NULL) {
+		CK(sx_column_int64(st, 0) == 102400);    /* nothing changed */
+		CK(sx_column_int64(st, 1) == 102400);
+		sx_finalize(st);
+	}
+	(void)sx_exec(db, "DROP TABLE big", NULL);
+}
+
 int
 main(void)
 {
@@ -399,6 +447,7 @@ main(void)
 	fresh(db);
 	CK(sx_exec(db, sql, NULL) == SX_OK);
 	case_fail(db, "(c)", "UPDATE s SET p = p || p", 1);
+	case_too_many(db);
 	/* (d) */
 	for (i = 0; i < sizeof kills / sizeof kills[0]; i++) {
 		r = kill_run(kills[i]);
