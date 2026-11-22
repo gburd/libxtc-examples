@@ -387,6 +387,14 @@ int xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 
 /* True if the connection has an open (non-autocommit) transaction. */
 int xstore_in_txn(struct xsql *db);
+/* Statement atomicity in autocommit: a statement about to write more
+ * than one row opens an implicit transaction (begin returns 1; 0 inside
+ * a transaction, where it does nothing), and ends it after its last
+ * write, committing every row at one timestamp when ok and nothing
+ * failed, else discarding them all.  end returns 0, 1 (a UNIQUE
+ * violation at the commit; xstore_uniq_err), or -1.  See xstore.c. */
+int xstore_stmt_implicit_begin(struct xsql *db);
+int xstore_stmt_implicit_end(struct xsql *db, int ok);
 
 /*
  * 1 if the current transaction holds any buffered (uncommitted) write

@@ -563,6 +563,8 @@ typedef struct xstore_ctx {
 	 */
 	int              native_mode;       /* 1 == driver owns autocommit */
 	int              native_autocommit; /* 1 == autocommit (native_mode only) */
+	int              implicit;     /* an autocommit statement's own txn */
+	uint64_t         stmt_snap;    /* the statement's pinned snapshot */
 
 	/* (tableid,rowid) -> newest wbuf index (O(1) read-your-writes) and
 	 * (unique index, key tuple hash) -> wbuf index (own-write UNIQUE
@@ -6422,8 +6424,8 @@ xs_stmt_pin(xstore_ctx_t *cx, struct xsql *db)
 	xs_rd_err_clear(cx);
 	if (!cx->in_txn &&
 	    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed) == 0)
-		return snap_pin_visible(&cx->snap_slot);
-	return xs_visible();
+		return cx->stmt_snap = snap_pin_visible(&cx->snap_slot);
+	return cx->stmt_snap = xs_visible();
 }
 
 /* Pin only (no statement snapshot or conflict base), for a statement
@@ -6495,6 +6497,82 @@ xstore_stmt_restart(struct xsql *db)
 	cx->rn = 0;
 	cx->did_scan = 0;
 	return 1;
+}
+
+static int xs_commit_ctx(xstore_ctx_t *cx);
+
+/*
+ * Statement atomicity in autocommit.  A statement that writes more than
+ * one row runs as an implicit transaction: xstore_stmt_implicit_begin
+ * opens it before the first write, so each row is buffered and checked
+ * as a transaction's is (row intents, UNIQUE against committed rows and
+ * the statement's own), and xstore_stmt_implicit_end commits them at one
+ * timestamp or discards them all.  A one-row statement is atomic as it
+ * is and keeps the direct autocommit write.
+ *
+ * Its snapshot is the statement's own (stmt_snap, pinned before the
+ * statement read anything), at SNAPSHOT isolation, so every buffered
+ * write is checked against it: a row committed by another writer after
+ * the statement read it fails the commit (SX_BUSY, a conflict the
+ * engine re-runs the statement for), and so does a key another INSERT
+ * committed after this one's key check.  No SSI: an autocommit
+ * statement is not serializable today, and stays so.  The commit is the
+ * transaction commit (xs_commit_ctx), so the log holds the same record a
+ * BEGIN ... COMMIT of those rows writes.
+ */
+int
+xstore_stmt_implicit_begin(struct xsql *db)
+{
+	xstore_ctx_t *cx = xstore_ctx_of(db);
+	if (cx == NULL) return -1;
+	xs_enter_ctx(cx, db);
+	if (cx->in_txn) return 0;               /* a transaction is open */
+	if (XTC_DST_BUG(XTC_DST_BUG_STMTATOMIC))
+		return 0;     /* planted 87: each row commits on its own */
+	cx->native_autocommit = 0;              /* xs_enter_ctx keeps it open */
+	cx->in_txn = 1;
+	cx->implicit = 1;
+	cx->txn_snap = cx->stmt_snap != 0 ? cx->stmt_snap : xs_visible();
+	snap_set(&cx->snap_slot, cx->txn_snap);
+	wbuf_clear(cx);
+	cx->steal_txn = 0;
+	cx->rn = 0;
+	cx->did_scan = 0;
+	cx->txn_iso = XS_ISO_SNAPSHOT;
+	cx->touched = 0;
+	cx->serializable = 0;
+	cx->ssi = NULL;
+	/* Wait for a row's holder before checking the row, as a re-runnable
+	 * statement does (see xs_intent_take). */
+	cx->stmt_first = 1;
+	return 1;
+}
+
+/* End the implicit transaction, if one is open: commit its rows when
+ * `ok` (the statement succeeded), no read of the statement failed and no
+ * kill is pending for the connection's proc (a dead connection must not
+ * commit a statement it never answered), else discard them.  Returns 0
+ * (committed, or nothing to do), 1 for a UNIQUE violation at the commit
+ * (xstore_uniq_err says which), or -1 (discarded, or the commit failed:
+ * last_conflict, the read error or the log says why). */
+int
+xstore_stmt_implicit_end(struct xsql *db, int ok)
+{
+	xstore_ctx_t *cx = xstore_ctx_of(db);
+	int rc;
+	if (cx == NULL || !cx->implicit) return 0;
+	cx->implicit = 0;
+	cx->native_autocommit = 1;
+	if (!ok || cx->rd_rc != 0 || cx->rd_err[0] != '\0' ||
+	    xtc_cancel_requested()) {
+		(void)xs_rollback_ctx(cx);
+		return -1;
+	}
+	cx->uniq_err[0] = '\0';
+	rc = xs_commit_ctx(cx);
+	if (rc == SX_OK) return 0;
+	if (rc == SX_BUSY) cx->last_conflict = XS_CONFL_STALE;
+	return rc == SX_CONSTRAINT ? 1 : -1;
 }
 
 /* True if the connection currently has an open (non-autocommit)

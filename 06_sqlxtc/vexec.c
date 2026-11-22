@@ -9298,6 +9298,24 @@ vx_run_write_p(struct xsql *db, const char *sql,
 	return vx_run_write_ast(db, arena, root, binds, nbinds, nchanges, errmsg);
 }
 
+/* End the statement's implicit transaction (xstore_stmt_implicit_begin
+ * opened it) and return the statement's result: rc as it was when the
+ * statement failed (its rows are then discarded, so even a decline to
+ * another path is safe) or every row committed, or -1 when the commit
+ * failed.  A UNIQUE violation found by the commit gets the message the
+ * row's own check would have given. */
+static int
+vx_stmt_commit(struct xsql *db, int rc, const char *table, const char *pk,
+    char **errmsg)
+{
+	int e = xstore_stmt_implicit_end(db, rc == 1);
+	if (e == 0 || rc != 1)
+		return rc;          /* a failed statement's rows are discarded */
+	if (e == 1)
+		vx_write_uniq_err(db, errmsg, table, pk);
+	return -1;
+}
+
 /* The rowid of a keyless INSERT row of table `tableid`: past *maxr, the
  * largest rowid this statement has used or seen.  The table's largest
  * rowid (this transaction's buffered rows included) is read once, at the
@@ -9337,7 +9355,7 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	struct wschema ws;
 	struct vx_arena_blk *cell_arena = NULL, *rowarena = NULL;
 	struct vx_stmt *sst = NULL;     /* UPDATE: SET-expression plan */
-	int rc = 0, r, applied = 0, have_maxr = 0;
+	int rc = 0, r, applied = 0, have_maxr = 0, implicit = 0;
 	int64_t maxr = INT64_MIN;    /* see vx_auto_rowid */
 
 	if (nchanges) *nchanges = 0;
@@ -9412,6 +9430,7 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		                      rids, XS_NATIVE_MAX_ROWS, binds, nbinds);
 		if (nr == -1) { free(rids); sql_arena_destroy(arena); return 0; }  /* too many / not compilable -> VDBE */
 		if (nr < 0) { free(rids); rc = -1; goto done; }
+		if (nr > 1) implicit = xstore_stmt_implicit_begin(db) == 1;
 		for (i = 0; i < nr; i++) {
 			if (xstore_write_txn(db, tableid, rids[i], NULL, 0, 1) != 0) {
 				free(rids);
@@ -9521,6 +9540,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 				if (pl > 0) { free(rids); rc = 0; goto done; }  /* collision -> VDBE */
 			}
 		}
+		if (nr > 1 || (pk_reassign && nr == 1 && pk_newval.i != rids[0]))
+			implicit = xstore_stmt_implicit_begin(db) == 1;
 		for (i = 0; i < nr; i++) {
 			uint8_t cur[XS_REC_MAX]; int curlen;
 			vx_cell_t cells[64];
@@ -9776,6 +9797,7 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		}
 		vx_result_free(sres);
 
+		if (nb2 > 1) implicit = xstore_stmt_implicit_begin(db) == 1;
 		for (r = 0; r < nb2; r++) {
 			if (vx_insert_row(db, tableid, buf2[r].rowid, buf2[r].rec,
 			    buf2[r].reclen, ins->replace, tabbuf, ws.name[0],
@@ -9873,10 +9895,11 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 			nb++;
 		}
 
-		/* All rows validated: apply.  In a transaction each row is
-		 * buffered (atomic at COMMIT); in autocommit each row commits on
-		 * its own, and a key taken concurrently since the check above
-		 * fails the statement with a UNIQUE error (rows before it stay). */
+		/* All rows validated: apply.  Each row is buffered (atomic at
+		 * COMMIT): in a transaction, or in the statement's implicit one,
+		 * whose commit fails the whole statement if a key was taken
+		 * concurrently since the check above. */
+		if (nb > 1) implicit = xstore_stmt_implicit_begin(db) == 1;
 		for (r = 0; r < nb; r++) {
 			if (vx_insert_row(db, tableid, buf[r].rowid, buf[r].rec,
 			    buf[r].reclen, ins->replace, tabbuf, ws.name[0],
@@ -9893,6 +9916,10 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	rc = 1;
 
 done:
+	/* The statement's implicit transaction (vx_stmt_commit): its rows
+	 * commit now, all or none. */
+	if (implicit)
+		rc = vx_stmt_commit(db, rc, tabbuf, ws.name[0], errmsg);
 	arena_free(cell_arena);
 	arena_free(rowarena);
 	if (sst != NULL) {

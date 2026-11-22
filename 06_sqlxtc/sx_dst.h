@@ -42,5 +42,7 @@
 #define XTC_DST_BUG_MAXROWID   85
 /* xstore.c: a failed step of the UNIQUE reap's reuse check reads "not reused" */
 #define XTC_DST_BUG_REAPREAD   86
+/* xstore.c: a multi-row autocommit statement commits each row on its own */
+#define XTC_DST_BUG_STMTATOMIC 87
 
 #endif /* SQLXTC_SX_DST_H */
