@@ -10738,7 +10738,7 @@ xs_conn_rollback(void *p)
 static xstore_ctx_t *
 xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 {
-	xstore_ctx_t *ctx = malloc(sizeof *ctx);
+	xstore_ctx_t *ctx = calloc(1, sizeof *ctx);
 	int i, slot = -1;
 	if (ctx == NULL)
 		return NULL;
@@ -10757,43 +10757,16 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 		free(ctx);
 		return NULL;
 	}
-	xtc_atomic_store_u64(&ctx->read_snap, 0, xtc_mo_seq_cst);
-	ctx->in_txn = 0;
-	ctx->txn_snap = 0;
-	ctx->wbuf = NULL;
-	ctx->wn = ctx->wcap = 0;
-	ctx->serializable = 0;
+	/* Zeroed by calloc: every field not set here starts at 0 / NULL
+	 * (no transaction, empty buffers and maps, no read error), so a new
+	 * field is zero unless it is listed below. */
 	ctx->isolation = XS_ISO_SNAPSHOT;
 	ctx->txn_iso = XS_ISO_SNAPSHOT;
-	ctx->touched = 0;
-	ctx->stmt_base = 0;
-	ctx->last_ts = 0;
-	ctx->last_conflict = 0;
-	ctx->stmt_puts = 0;
-	ctx->stmt_first = 0;
-	ctx->rset = NULL;
-	ctx->rn = ctx->rcap = 0;
-	ctx->did_scan = 0;
-	ctx->ssi = NULL;
 	ctx->snap_slot = -1;
 	ctx->autovacuum = xtc_atomic_load_i32(&g_av_default, xtc_mo_relaxed);
-	ctx->steal_txn = 0;
-	ctx->wbuf_bytes = 0;
-	ctx->sp_wn = NULL;
-	ctx->sp_rn = NULL;
-	ctx->sp_n = ctx->sp_cap = 0;
 	ctx->native_mode = native ? 1 : 0;
 	ctx->native_autocommit = 1;
-	ctx->implicit = 0;
-	ctx->stmt_snap = 0;
-	ctx->wmap = NULL; ctx->wmap_n = ctx->wmap_cap = ctx->wmap_bad = 0;
-	ctx->wmax_n = 0; ctx->wmax_ok = 1;
-	ctx->ilk_slot = 0; ctx->ilk_seq = 0; ctx->ilk = NULL;
-	ctx->ilk_n = ctx->ilk_cap = 0; ctx->ilk_skip = 0;
-	ctx->umap = NULL; ctx->umap_n = ctx->umap_cap = ctx->umap_bad = 0;
-	ctx->uniq_vis = ctx->uniq_gen = 0;
-	ctx->uniq_err[0] = '\0';
-	xs_rd_err_clear(ctx);
+	ctx->wmax_ok = 1;
 	return ctx;
 }
 
