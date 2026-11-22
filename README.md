@@ -16,8 +16,9 @@ that is the normal way to build it:
 git clone --recurse-submodules https://codeberg.org/gregburd/libxtc.git
 cd libxtc/dist && autoreconf -i && cd ..
 mkdir build_unix && cd build_unix && ../dist/configure && make
-make examples          # the teaching examples 01-04, 08, 10, 17-19
-make check             # includes check-examples and check-rexis
+make examples          # the teaching examples 01-04, 08, 10, 17-20
+make check             # includes check-examples (the teaching examples, 12-16, 20)
+make check-rexis       # 05_rexis and its test suite (not part of make check)
 ```
 
 The larger examples build with their own Makefiles, against a libxtc build
@@ -53,16 +54,18 @@ History: split from libxtc's `examples/` (and `test/sqlxtc`, `test/m99`,
 | `01_hello_async.c` | Minimal coroutine: `xtc_coro_spawn`, `xtc_yield`, `xtc_coro_join`. ~30 LOC. |
 | `02_proc_pingpong.c` | Erlang-style processes: `xtc_proc_spawn`, `xtc_send`, `xtc_recv`. Bounce a counter 100 rounds. |
 | `03_supervised_app.c` | OTP application: `xtc_app` with a root supervisor (`one_for_all`), two workers, restart-on-crash. |
-| `04_lockmgr_demo.c` | Heavyweight lock manager: deadlock between two transactions; detector aborts the youngest. |
+| `04_lockmgr_demo.c` | Heavyweight lock manager: deadlock between two transactions; a custom victim picker (a shuffled deck dealt by an `xtc_proc`) chooses which one the detector aborts. |
 | `05_rexis/` | **Redis-compatible server** with hard resource budgets.  Drop-in for redis-cli. |
 | `06_sqlxtc/` | **A from-scratch SQL engine on libxtc** (Lime parser + vectorized executor + B-link/buffer-pool/WAL storage), served over the Quack JSON protocol.  Multi-client; uses xtc throughout. |
-| `07_kaka/` | **Kafka-shaped log broker** (Phase 0 scaffold): partitioned append-only logs with credit-based backpressure.  See its README for the design. |
+| `07_kaka/` | **Kafka-shaped log broker**: partitioned, segmented append-only logs, acks after fdatasync (group commit), and durable consumer-group offsets.  See its README for the design. |
 | `08_tnt/` | **The canonical echo demo for libxtc's Tina-faithful Isolate layer** (now a SUPPORTED library API: `src/orc/tnt.c`, `<xtc_tnt.h>`, `man xtc_tnt`).  Thread-per-core, shared-nothing, stackless state machines that return transitions; generational handles, drop-on-full mailboxes, stage-then-commit I/O.  TCP echo server.  See man xtc_tnt(3). |
 | `09_pgmock/` | **Mock PostgreSQL backend on the xtc scheduler** (M16.1a): a postmaster proc accepts and spawns one backend xtc_proc per connection, each speaking a hand-rolled minimal PG v3 wire handshake + `SELECT 1` -- ZERO PostgreSQL source.  Proves the runtime seam (no-fork multiplexing, `WaitLatchOrSocket` -> `xtc_proc_wait_fd`) for the future PG adapter.  See its README and the docs Examples page. |
 | `10_circuit_breaker.c` | **The circuit-breaker pattern as an `xtc_fsm` (gen_statem)**: CLOSED/OPEN/HALF_OPEN, tripping after N consecutive failures, failing fast while open, and half-opening after a cooldown *state timeout*.  Shows `state_enter`, state timeouts, and synchronous `xtc_fsm_call`/`xtc_fsm_reply` -- the three things hand-rolled breakers get wrong. |
-| `11_lorb/` | **A limit order book / matching engine** ported from C++ to C on libxtc: price-time (FIFO) priority, partial fills, and Market/Limit/Stop/Stop-Limit orders (add/cancel/modify).  AVL price-level trees + intrusive FIFO order lists, with `xtc_chash` for the id/price maps and `xtc_slab` for the order/level pools.  Ships a generate-and-process benchmark (throughput + p50/p99/p999), a ported unit-test suite, and a differential test against a reference matcher.  ~1.8-2.0M orders/s on a 32-vCPU host.  See its README. |
+| `11_lorb/` | **A limit order book / matching engine** ported from C++ to C on libxtc: price-time (FIFO) priority, partial fills, and Market/Limit/Stop/Stop-Limit orders (add/cancel/modify).  AVL price-level trees + intrusive FIFO order lists, with `xtc_chash` for the id/price maps and `xtc_slab` for the order/level pools.  Ships a generate-and-process benchmark (throughput + p50/p99/p999), a ported unit-test suite, and a differential test against a reference matcher.  ~1.8-2.0M orders/s on a 32-vCPU host (measured 2026-10 on libxtc 1.55).  See its README. |
 | `12_continuous_batching/` | **Continuous numerical batching**: shared coefficient setup, variable-length requests, bounded admission, cancellation and BLOCKED/resume. Compares static cohorts with continuous refill under default or batch-aware scheduling; two groups plus a heartbeat. Requires `--enable-sched-policy`; root `make check` runs its self-test in an enabled build. |
-| `16_l2book/` | **A level-2 limit order book venue using Isolates and fibers together**: one stackless `xtc_tnt` Isolate per symbol owns its book (single writer, no lock on the match path); supervised fibers run TCP order entry, market data, an HTTP + SSE console and the flow.  The engine is pure C and also compiles to a 50 KB wasm32 module the browser console runs.  The full order surface of intrepidkarthi/orderbook (stops, iceberg, OCO, pegged, STP, auction, ...); `docker compose up` gives a running market.  ~28 M ops/s bare engine; see its README. |
+| `13_gpu_batching/` | **Async batching on a GPU** (OpenCL Mandelbrot tiles): `xtc_batch_create_async`, the submit/collect split and the FUTURE exec kind, with one persistent waiter thread per device.  A deterministic CPU backend needs no GPU; `--self-test` runs it.  Requires `--enable-sched-policy`.  See its README. |
+| `14_hetero_batching/` | **A GPU (OpenCL) and an NPU (Level Zero) fed at once**, one batch group per loop, through the same FUTURE bridge.  The fake backend and `--self-test` need no device.  Requires `--enable-sched-policy`.  See its README. |
+| `16_l2book/` | **A level-2 limit order book venue using Isolates and fibers together**: one stackless `xtc_tnt` Isolate per symbol owns its book (single writer, no lock on the match path); supervised fibers run TCP order entry, market data, an HTTP + SSE console and the flow.  The engine is pure C and also compiles to a 50 KB wasm32 module the browser console runs.  The full order surface of intrepidkarthi/orderbook (stops, iceberg, OCO, pegged, STP, auction, ...); `docker compose up` gives a running market.  18.9 M ops/s bare engine on a cancel-heavy flow (measured 2026-11 on libxtc 2.1.1); see its README. |
 | `15_usdt/` | **A lock convoy and a lost reply, to find with the USDT probes** (`man xtc_usdt`): eight fibers sleep while holding one `xtc_amutex` (`convoy`), the same work done right (`fixed`), and a server that drops one reply in ten (`lostwake`).  Every mode exits 0; the bugs show only as time.  `tools/dtrace/xtc_lock_contention.d` and `xtc_park_latency.d` find them.  `make check` runs all three.  See its README and `docs/guide/12-tracing.md`. |
 | `17_checkout/` | **A checkout service: `xtc_saga` + `xtc_pool` + `xtc_pdict`.**  Six orders, each a proc running a four-step saga (quote, reserve, charge, ship) over two pooled backend connections; three fail at different steps and are compensated in reverse (refund, release).  The request context lives in the proc's dictionary.  Checks the ledger balances.  See its README. |
 | `18_clickstream/` | **Web analytics: `xtc_stream` + `xtc_bloom` + `xtc_hll`.**  Four front-end logs, one proc per loop, each a lazy map/filter pipeline; a Bloom filter drops lines the shipper delivered twice; per-shard HyperLogLog sketches merge into the distinct-user count.  Checked against an exact oracle.  See its README. |
@@ -97,9 +100,9 @@ re-arm the cooldown -- exactly the gen_statem trap.
 **05** -- the flagship demonstration: a Redis-compatible server
 implementing RESP2/RESP3 protocol with hard resource budgets
 enforced via `xtc_res`. Demonstrates the full xtc API surface:
-`xtc_loop`, `xtc_proc`, `xtc_lrlock`, `xtc_slab`, `xtc_res`,
-`xtc_log`, `xtc_cfg`, `xtc_app`, `xtc_supervisor`, and `xtc_inject`.
-Supports ~35 Redis commands including strings, lists, and hashes.
+`xtc_loop`, `xtc_proc`, `xtc_exec`, `xtc_lrlock`, `xtc_arwlock`, `xtc_res`,
+`xtc_log`, `xtc_stats`, `xtc_pg`, `xtc_app`, `xtc_supervisor`, and `xtc_inject`.
+Supports 37 Redis commands including strings, lists, hashes, and pub/sub.
 
 **11** -- a matching engine is a realistic non-actor workload for the
 map/pool primitives: `xtc_chash` as the order/price index (with the
@@ -150,8 +153,8 @@ The Makefile target `examples` is built by:
 
 ```
 make 01_hello 02_pingpong 03_supervised_app 04_lockmgr_demo 10_circuit_breaker
-make 17_checkout 18_clickstream 19_edgeacl
-cd 05_rexis && make
+make tnt_echo 17_checkout 18_clickstream 19_edgeacl 20_jobq
 ```
 
+The other examples build with their own Makefiles (`cd 05_rexis && make`).
 Each binary links statically against `libxtc.a` and pthread.
