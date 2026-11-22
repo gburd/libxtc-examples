@@ -562,7 +562,9 @@ main(int argc, char **argv)
 	const char *mode = argc > 1 ? argv[1] : "all";
 	int i, fail = 0;
 
-	g_ms = argc > 2 ? atol(argv[2]) : 600;
+	/* valgrind runs 20-50x slower: 600 ms can pass without one kill. */
+	g_ms = argc > 2 ? atol(argv[2]) :
+	    getenv("XTC_UNDER_VALGRIND") != NULL ? 6000 : 600;
 	g_seed = argc > 3 ? strtoull(argv[3], NULL, 0) : 0x5eed;
 	if (g_seed == 0)
 		g_seed = 1;

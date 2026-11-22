@@ -20,7 +20,8 @@
  *	insert evicts and yields; NC connection procs on NL loops each run a
  *	full-table SELECT then an INSERT (splits); a boss kills one every
  *	0.2-1 ms -- anywhere, not only in COMMIT -- and respawns it.  The
- *	watchdog fails the run when no statement completes for HANG_S s.
+ *	watchdog fails the run when no statement completes for HANG_S s
+ *	(20 times that under valgrind, XTC_UNDER_VALGRIND).
  *	At the end the table must still be fully readable and writable.
  *
  *	usage: test_kill_stmt [ms [seed]]
@@ -54,6 +55,7 @@ static int g_stop, g_done, g_final_ok;
 static uint64_t g_stmts, g_kills;
 static int64_t g_next = NROW + 1;
 static uint64_t         g_seed;
+static int              g_slow = 1;     /* x20 under valgrind */
 static int64_t          g_ms;
 
 static uint64_t
@@ -118,11 +120,11 @@ watchdog(void *arg)
 		if (c != last) {
 			last = c;
 			since = now;
-		} else if (now - since > (int64_t)HANG_S * 1000000000LL) {
+		} else if (now - since > (int64_t)HANG_S * g_slow * 1000000000LL) {
 			fprintf(stderr,
 			    "HANG (seed %llu): no statement for %d s; "
 			    "statements %llu kills %llu\n",
-			    (unsigned long long)g_seed, HANG_S,
+			    (unsigned long long)g_seed, HANG_S * g_slow,
 			    (unsigned long long)c,
 			    (unsigned long long)xtc_atomic_load_u64(&g_kills,
 			        xtc_mo_seq_cst));
@@ -214,6 +216,8 @@ main(int argc, char **argv)
 
 	g_ms = argc > 1 ? atol(argv[1]) : 1500;
 	g_seed = argc > 2 ? strtoull(argv[2], NULL, 0) : 0x5eed;
+	if (getenv("XTC_UNDER_VALGRIND") != NULL)
+		g_slow = 20;
 	if (g_seed == 0)
 		g_seed = 1;
 	if (xtc_runtime_set_stack_size(512u * 1024u) != XTC_OK)
