@@ -140,10 +140,10 @@ lookup counts vary from run to run and are printed only with `-v`.
 
 ## Cost, measured
 
-On a 48-core x86-64 host the whole run takes about 0.1 s.  Note that in
-libxtc 2.2.0 the read-side is cheaper off a fiber than on one:
-`xtc_rcu_read_lock` and `_read_unlock` on a fiber take a short internal
-mutex to find the fiber's reader slot, so fiber readers on many loops
-contend on it (measured at about 7 ns per empty bracket on eight OS
-threads and about 1.9 us on eight fibers on eight loops).  The example's
-correctness does not depend on that cost; its throughput does.
+The whole run takes well under a second (0.01-0.02 s on a 48-core
+x86-64 host, 2026-11, libxtc 2.3 development).  A fiber caches its RCU
+reader slot, so `xtc_rcu_read_lock` and `_read_unlock` on a fiber take
+no lock: libxtc's KNOWN_ISSUES entry "an RCU read-side on a fiber took
+a global lock" (fixed in 2.2) measured an empty bracket at 9.4-10.4 ns
+on one to eight fibers, against 1.9-2.1 us on eight fibers before the
+fix.
