@@ -8993,10 +8993,10 @@ encode_payload(const vx_cell_t *cells, int npay, uint8_t *out, int cap)
 #define VX_MSG_TOOBIG "row too large: the native engine stores at most " \
 	"4096 bytes per row (all columns, encoded)"
 
-/* Upper bound on rows a single native DELETE, UPDATE or INSERT ...
- * SELECT will change.  A statement over it fails with "too many rows"
- * (vx_too_many_err) before it writes anything, rather than run
- * unbounded work (and an unbounded native buffer) on one statement;
+/* Upper bound on rows a single native DELETE, UPDATE, INSERT ... SELECT
+ * or INSERT VALUES will change.  A statement over it fails with "too
+ * many rows" (vx_too_many_err) before it writes anything, rather than
+ * run unbounded work (and an unbounded native buffer) on one statement;
  * there is no other engine to take it. */
 #define XS_NATIVE_MAX_ROWS  100000
 
@@ -9751,6 +9751,13 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		scol = vx_result_ncol(sres);
 		if (scol != ncolmap) { vx_result_free(sres); rc = 0; goto done; }
 		srow = vx_result_nrow(sres);
+		/* Before the per-row key checks, which cost time in the row
+		 * count. */
+		if (srow > XS_NATIVE_MAX_ROWS) {
+			vx_result_free(sres);
+			vx_too_many_err(errmsg, "INSERT", tabbuf);
+			rc = -1; goto done;
+		}
 
 		for (sr = 0; sr < srow; sr++) {
 			vx_cell_t cells[64];
@@ -9806,11 +9813,6 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 				if (nn == NULL) { free(buf2); vx_result_free(sres); rc = -1; goto done; }
 				buf2 = nn; cap2 = nc;
 			}
-			if (nb2 >= XS_NATIVE_MAX_ROWS) {
-				free(buf2); vx_result_free(sres);
-				vx_too_many_err(errmsg, "INSERT", tabbuf);
-				rc = -1; goto done;
-			}
 			reclen = encode_payload(&cells[1], ws.n - 1, buf2[nb2].rec, (int)sizeof buf2[nb2].rec);
 			if (reclen < 0) {
 				free(buf2); vx_result_free(sres);
@@ -9839,11 +9841,18 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	/* Two passes: validate + buffer EVERY row first (no writes); only if
 	 * all rows are literal-only with the right arity and an integer/NULL
 	 * PK do we apply.  Any unsupported row -> return 0 with zero writes,
-	 * a clean VDBE fallback (never a partial native apply). */
+	 * a clean VDBE fallback (never a partial native apply).  More than
+	 * XS_NATIVE_MAX_ROWS tuples fail with "too many rows". */
 	{
 		struct { int64_t rowid; uint8_t rec[XS_REC_MAX]; int reclen; } *buf;
 		int nb = 0;
 
+		/* The buffer takes XS_REC_MAX bytes a tuple, so the limit
+		 * bounds it as it bounds the other statements' buffers. */
+		if (ins->n_rows > XS_NATIVE_MAX_ROWS) {
+			vx_too_many_err(errmsg, "INSERT", tabbuf);
+			rc = -1; goto done;
+		}
 		buf = (void *)calloc((size_t)ins->n_rows, sizeof *buf);
 		if (buf == NULL) { rc = -1; goto done; }
 

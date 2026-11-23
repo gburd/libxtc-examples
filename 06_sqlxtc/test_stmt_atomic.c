@@ -31,9 +31,9 @@
  *	      sx_step): the connection never hears an answer, and the
  *	      statement's rows must not be committed by a dead connection,
  *	      whether it changes one row or many.
- *	And a statement that matches more than the native engine's row limit
- *	(100,000) fails with a message that names the limit, and changes
- *	nothing.
+ *	And an UPDATE, DELETE, INSERT ... SELECT or INSERT VALUES over the
+ *	native engine's row limit (100,000) fails with a message that names
+ *	the limit, and changes nothing.
  *	A line per statement reports the failed runs and how many of them
  *	left rows committed; the test fails if any did.
  *
@@ -345,20 +345,36 @@ kill_run(const char *sql)
 	return ch;
 }
 
+/* The row limit's check on one statement: it fails with the message
+ * and changes nothing (the caller checks the tables). */
+static void
+too_many_one(sx_db *db, const char *sql)
+{
+	CK(sx_exec(db, sql, NULL) != SX_OK);
+	printf("  limit      %-46.46s \"%.60s\"\n", sql, sx_errmsg(db));
+	CK(strstr(sx_errmsg(db), "too many rows") != NULL);
+	CK(strstr(sx_errmsg(db), "100000") != NULL);
+	CK(strstr(sx_errmsg(db), " big") != NULL);
+}
+
 /* Over the row limit: 102,400 rows, so a statement over all of them is
- * refused, with a message, before it writes. */
+ * refused, with a message, before it writes; so is an INSERT VALUES of
+ * 100,001 tuples. */
 static void
 case_too_many(sx_db *db)
 {
 	static const char *const sql[] = {
 		"UPDATE big SET v = v + 1",
 		"DELETE FROM big",
+		"INSERT INTO big2 SELECT k, v FROM big",
 	};
 	sx_stmt *st = NULL;
-	char q[128];
-	size_t i;
+	char q[128], *vals;
+	size_t i, off;
 	int n;
 	CK(sx_exec(db, "CREATE TABLE big(k INTEGER PRIMARY KEY, v INTEGER)",
+	    NULL) == SX_OK);
+	CK(sx_exec(db, "CREATE TABLE big2(k INTEGER PRIMARY KEY, v INTEGER)",
 	    NULL) == SX_OK);
 	CK(sx_exec(db, "INSERT INTO big VALUES(1, 1)", NULL) == SX_OK);
 	for (n = 1; n < 4096; n *= 2) {
@@ -371,13 +387,18 @@ case_too_many(sx_db *db)
 		    "WHERE k <= 4096", 4096 * n);
 		CK(sx_exec(db, q, NULL) == SX_OK);
 	}
-	for (i = 0; i < sizeof sql / sizeof sql[0]; i++) {
-		CK(sx_exec(db, sql[i], NULL) != SX_OK);
-		printf("  limit      %-46.46s \"%.60s\"\n", sql[i],
-		    sx_errmsg(db));
-		CK(strstr(sx_errmsg(db), "too many rows") != NULL);
-		CK(strstr(sx_errmsg(db), "100000") != NULL);
-		CK(strstr(sx_errmsg(db), " big ") != NULL);
+	for (i = 0; i < sizeof sql / sizeof sql[0]; i++)
+		too_many_one(db, sql[i]);
+	/* 100,001 tuples, keys 1,000,001 up: "(1000001,1)," is 12 bytes. */
+	vals = malloc(32 + 12 * 100001);
+	CK(vals != NULL);
+	if (vals != NULL) {
+		off = (size_t)sprintf(vals, "INSERT INTO big2 VALUES");
+		for (n = 0; n < 100001; n++)
+			off += (size_t)sprintf(vals + off, "%s(%d,1)",
+			    n ? "," : "", 1000001 + n);
+		too_many_one(db, vals);
+		free(vals);
 	}
 	CK(sx_prepare(db, "SELECT count(*), sum(v) FROM big", -1, &st, NULL) ==
 	    SX_OK);
@@ -387,7 +408,16 @@ case_too_many(sx_db *db)
 		CK(sx_column_int64(st, 1) == 102400);
 		sx_finalize(st);
 	}
+	st = NULL;
+	CK(sx_prepare(db, "SELECT count(*) FROM big2", -1, &st, NULL) ==
+	    SX_OK);
+	CK(st != NULL && sx_step(st) == SX_ROW);
+	if (st != NULL) {
+		CK(sx_column_int64(st, 0) == 0);
+		sx_finalize(st);
+	}
 	(void)sx_exec(db, "DROP TABLE big", NULL);
+	(void)sx_exec(db, "DROP TABLE big2", NULL);
 }
 
 int
