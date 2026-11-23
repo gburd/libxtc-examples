@@ -37,9 +37,9 @@ and the per-group backend selection differ:
   NDRange per ready request and bridges the resulting `cl_event` to the
   engine's FUTURE exec kind through the group's one long-lived waiter
   thread, which `clWaitForEvents`, releases the event, then
-  `xtc_promise_set`. (A thread per op costs ~50-100 us per op; a persistent
-  waiter ~13-19 us. Use the FENCE kind where the runtime exports a fence
-  fd.)
+  `xtc_promise_set`.  (A thread per op cost 59-127 us per op; a persistent
+  waiter 13.7-20 us, measured 2026-10-12; see 13's README.  Use the FENCE
+  kind where the runtime exports a fence fd.)
 - **levelzero** (`XTC_WITH_LEVELZERO=1`): real NPU. `submit()` appends a small
   Level Zero workload to the NPU command list, executes it on the NPU command
   queue, and signals a `ze_event`; the group's waiter thread does
@@ -91,8 +91,8 @@ make XTC_BUILD=/abs/path/to/configured-build
 ./hetero --self-test
 ```
 
-The real GPU + NPU run on floki (Intel Lunar Lake). Both runtimes come from
-nix; the NPU userspace driver must be on the loader path via
+The real GPU + NPU run was on a laptop with an Intel Arc iGPU and an Intel
+NPU.  Both runtimes come from nix; the NPU userspace driver must be on the loader path via
 `ZE_ENABLE_ALT_DRIVERS`:
 
 ```sh
@@ -108,7 +108,7 @@ nix-shell -p opencl-headers ocl-icd intel-compute-runtime \
 "
 ```
 
-Expected tail (floki, Intel Arc GPU + Intel AI Boost NPU):
+Expected tail (Intel Arc GPU + Intel AI Boost NPU, 2026-10):
 
 ```
 group 0 (GPU) -> cl device 0 (Intel(R) Arc(TM) Graphics)
@@ -151,10 +151,10 @@ and asserts:
 
 It passes with no GPU/NPU present and is byte-identical across runs.
 
-## Driver notes (floki, Intel Lunar Lake)
+## Driver notes (Intel Arc iGPU and NPU)
 
-- **GPU readback.** On this compute-runtime (`intel-compute-runtime` 26.18 /
-  Lunar-Lake Arc), both `clEnqueueReadBuffer` **and** the staging path inside
+- **GPU readback.** On this compute-runtime (`intel-compute-runtime` 26.18,
+  the Arc iGPU), both `clEnqueueReadBuffer` **and** the staging path inside
   `clEnqueueMapBuffer` crash in a built-in copy-kernel build
   (`NEO::Zebin::decodeZeInfo`) under the batch engine's queue-usage pattern.
   The opencl backend therefore uses `CL_MEM_USE_HOST_PTR` and reads the shared
@@ -168,5 +168,5 @@ It passes with no GPU/NPU present and is byte-identical across runs.
 The OpenCL and Level Zero backends were changed after their last hardware
 run (persistent waiter, per-request NPU staging regions, event-index
 tracking, no polling feeder); they are compile-checked but have NOT been
-re-run on the Lunar Lake GPU/NPU since. The expected output above is from
+re-run on that GPU/NPU since.  The expected output above is from
 the earlier version.

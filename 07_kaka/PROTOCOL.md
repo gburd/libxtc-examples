@@ -1,7 +1,7 @@
 # kaka protocol
 
-A small length-framed binary protocol.  Defined incrementally as the
-phases land; this file is the stub for Phase 0.
+A small length-framed binary protocol.  frame.h and frame.c are the
+codec.
 
 ## Frame
 
@@ -36,7 +36,9 @@ partition logs reuse.
 
 Topic names are 1-63 bytes of `[A-Za-z0-9._-]` (not starting with
 `.`): they name a directory.  Group and topic names in COMMIT/OFFSETS
-are at most 31 bytes.  METADATA (0x05) is reserved, not implemented.
+are at most 31 bytes.  A connection handles one request at a time: it
+reads the next frame only after it has written the reply to the last.
+METADATA (0x05) is reserved, not implemented.
 
 ### Semantics
 

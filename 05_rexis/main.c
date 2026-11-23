@@ -786,9 +786,10 @@ main(int argc, char **argv)
 	srv->exec = xtc_app_exec(srv->app);   /* NULL with one loop */
 	loop_tasks_fit(srv, &cfg);
 
-	/* Setup supervised children: the listener starts with the app,
-	 * and the connection procs are added under it as clients arrive.
-	 * (A supervisor may also start with none; xtc_supervisor(3).) */
+	/* Setup supervised children: only the listener is supervised.
+	 * The connection procs are plain procs it spawns as clients
+	 * arrive.  (A supervisor may also start with none;
+	 * xtc_supervisor(3).) */
 	memset(kids, 0, sizeof kids);
 	kids[0].size = sizeof kids[0];
 	kids[0].name = "listener";

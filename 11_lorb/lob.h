@@ -6,8 +6,8 @@
  *
  * examples/11_lorb/lob.h
  *	A limit order book (matching engine) built on libxtc.  This is
- *	a faithful C port of the C++ engine at
- *	https://github.com/.../limit-order-book: a binary (AVL) tree of
+ *	a faithful C port of Matthew Ding's C++ Limit-Order-Book: a
+ *	binary (AVL) tree of
  *	price Limits per side, each Limit holding a FIFO doubly-linked
  *	list of Orders, with book-edge pointers for O(1) best-bid/offer
  *	and hash maps (xtc_chash) keyed by order id and price for O(1)

@@ -3,7 +3,7 @@
 l2book was built to the feature set of
 [intrepidkarthi/orderbook](https://github.com/intrepidkarthi/orderbook)
 (at `3fffc25`, v0.30.0). This page compares the two at three levels, all
-on one machine in one session:
+on one machine in one session (2026-11-05):
 
 1. the matching engine;
 2. single operations;
@@ -17,7 +17,7 @@ what that costs it here.
 
 **Host:** a bare-metal x86-64 server.
 
-- **CPU:** two Ice Lake Xeon sockets (64 cores, 128 threads, 1 TiB), two
+- **CPU:** two x86-64 sockets (64 cores, 128 threads, 1 TiB), two
   NUMA nodes. Everything below runs on node 0 unless a section says
   otherwise.
 - **OS:** Debian 13, kernel 6.12.
@@ -31,7 +31,7 @@ what that costs it here.
   the map had ever been used, live or not).
 
 Each engine runs pinned to one core. An earlier run of the same
-comparison on a one-socket 48-core Sapphire Rapids host, with the engine
+comparison on a one-socket 48-core x86-64 host (2026-11-04), with the engine
 before that fix, gave the same ranking at every level; its numbers were
 lower across the board (l2book's replay 2.76 ms, theirs 9.60 ms).
 
@@ -181,7 +181,7 @@ Measured on libxtc 2.1.1-37 (`a2134a08`) with examples `7748ab9` plus
 the fix that makes the order-id map reclaim deleted slots
 (backward-shift deletion; before it, a book refused every order once
 three quarters of the map had ever been used). Host: a two-socket
-64-core x86-64 bare-metal server (Ice Lake, 128 threads, 1 TiB),
+64-core x86-64 bare-metal server (128 threads, 1 TiB),
 Debian 13, kernel 6.12, the same tuning as above; obgw built from
 `3fffc25` with Go 1.24.4. Every round of every cell is within 6% of its
 median for round trips per second.

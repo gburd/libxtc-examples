@@ -30,7 +30,7 @@
  *	            exec kind via the group's one long-lived waiter thread
  *	            (clWaitForEvents then xtc_promise_set).  collect() reads back via clEnqueueMapBuffer
  *	            (NOT clEnqueueReadBuffer -- that path crashes inside the
- *	            Lunar-Lake compute-runtime; see README).
+ *	            integrated Arc GPU's compute-runtime; see README).
  *	  LEVELZERO -- real NPU (XTC_WITH_LEVELZERO=1): submit() appends a small
  *	            Level Zero compute workload to the NPU command list and
  *	            executes it on the NPU command queue, signalling a ze_event;
@@ -551,7 +551,7 @@ cl_group_init(struct group *g, int dev_index)
 		return XTC_E_IO;
 	/*
 	 * CL_MEM_USE_HOST_PTR over our own page-aligned host array.  On this
-	 * integrated Lunar-Lake GPU host and device share memory (UMA), so the
+	 * integrated GPU, host and device share memory (UMA), so the
 	 * host array is coherent after clFinish and we read it DIRECTLY -- no
 	 * clEnqueueReadBuffer and no clEnqueueMapBuffer.  Both of those route
 	 * through a built-in copy-kernel build that SEGFAULTS inside this

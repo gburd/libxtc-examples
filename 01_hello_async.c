@@ -5,8 +5,9 @@
  * examples/01_hello_async.c -- minimal coroutine: spawn an async
  * task, await its return value, tear everything down.
  *
- * Build:
- *   cc -I../src/inc 01_hello_async.c ../build_unix/libxtc.a -lpthread -o 01_hello
+ * Build (from a libxtc build tree, which adds the libraries the build
+ * links, such as -luring):
+ *   make 01_hello
  *
  * This is the first file most people copy, so it models the whole
  * lifecycle, including the failure paths: every call that can fail has

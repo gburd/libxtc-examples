@@ -877,8 +877,9 @@ conn_proc(void *arg)
 	/*
 	 * Resource scope (mechanism, not manner): register the connection
 	 * teardown ONCE, up front, so it runs on EVERY exit path -- a normal
-	 * return, an error, and -- crucially -- an ASYNCHRONOUS KILL from the
-	 * supervisor while this fiber is parked in xtc_proc_wait_fd below.
+	 * return, an error, and (crucially) an ASYNCHRONOUS KILL
+	 * (xtc_exit_pid) while this fiber is parked in xtc_proc_wait_fd
+	 * below; no supervisor supervises a connection proc.
 	 * Before xtc_scope, the cleanup block at the bottom of this function
 	 * was skipped on a kill, leaking the fd and both buffers; the scope
 	 * closes them LIFO no matter how the fiber leaves.  See

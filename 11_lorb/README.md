@@ -3,7 +3,7 @@
 `lorb` is a C port of a C++ limit-order-book / matching engine, built
 on libxtc's public primitives.  It is a faithful re-implementation of
 the data structures and matching semantics of
-[Matthew Ding's Limit-Order-Book](https://github.com/) -- price-time
+Matthew Ding's Limit-Order-Book (C++, on GitHub): price-time
 (FIFO) priority, partial fills, and the four order types a real
 exchange matching engine handles: Market, Limit, Stop, and Stop-Limit
 (each with add / cancel / modify).
@@ -152,10 +152,11 @@ throughput: ... orders/s (... M TPS)
 latency ns: mean=...  p50=...  p99=...  p999=...  max=...
 ```
 
-Measured: ~1.8-2.0 M orders/s on a 32-vCPU host (Sapphire Rapids;
-`./lorb 2000000`, gcc -O2, default `configure` build of libxtc, idle
-host); the 1.55.0 engine measured the same in interleaved runs, so the
-matching-rule fixes above cost nothing measurable.  A shared, busy host
+Measured 2026-10 on libxtc 1.55.0-5 (`dac18b60`): ~1.8-2.0 M orders/s
+on an idle 32-vCPU x86-64 host (`./lorb 2000000`, gcc -O2, default
+`configure` build of libxtc); the 1.55.0 engine measured the same in
+interleaved runs, so the matching-rule fixes above cost nothing
+measurable.  A shared, busy host
 of the same type measured lower (1.33-1.43 M/s for both engines).
 
 ## Design decisions and trade-offs vs the C++ original
@@ -199,8 +200,9 @@ because the original is wrong here:
     cannot occur.
 
 These tree changes do not affect matching (the trees are only a price
-index) and are validated by
-an invariant fuzzer: 30 seeds x 2,000,000 mixed operations each, with
+index).  When the port was written (2026-08) they were validated by an
+invariant fuzzer, which is not shipped here: 30 seeds x 2,000,000 mixed
+operations each, with
 every tree checked for BST order, AVL balance, parent-pointer
 consistency, and acyclicity -- all pass.  The stock C++ engine, built
 `-O2` and run on its *own* generator, hangs or crashes (use-after-free

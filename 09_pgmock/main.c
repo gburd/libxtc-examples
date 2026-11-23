@@ -14,8 +14,9 @@
  *	    pgmock-server [-h host] [-p port]      (TCP, default 127.0.0.1:15442)
  *	    pgmock-server -U /path/to/socket        (Unix domain socket)
  *
- *	Connect with psql or any raw v3 client, e.g.:
- *	    psql -h 127.0.0.1 -p 15442 -c 'select 1'
+ *	Connect with psql (SSL off: the mock closes an SSLRequest) or any
+ *	raw v3 client, e.g.:
+ *	    PGSSLMODE=disable psql -h 127.0.0.1 -p 15442 -c 'select 1'
  */
 
 #ifndef _GNU_SOURCE
