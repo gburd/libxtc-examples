@@ -51,10 +51,10 @@ History: split from libxtc's `examples/` (and `test/sqlxtc`, `test/m99`,
 
 | File | Demonstrates |
 |---|---|
-| `01_hello_async.c` | Minimal coroutine: `xtc_coro_spawn`, `xtc_yield`, `xtc_coro_join`, with every error checked. 75 lines. |
+| `01_hello_async.c` | Minimal coroutine: `xtc_coro_spawn`, `xtc_yield`, `xtc_coro_join`, with every error checked.  76 lines. |
 | `02_proc_pingpong.c` | Erlang-style processes: `xtc_proc_spawn`, `xtc_send`, `xtc_recv`. Bounce a counter 100 rounds. |
 | `03_supervised_app.c` | OTP application: `xtc_app` with a root supervisor (`one_for_all`), two workers, restart-on-crash. |
-| `04_lockmgr_demo.c` | Heavyweight lock manager: deadlock between two transactions; a custom victim picker (a shuffled deck dealt by an `xtc_proc`) chooses which one the detector aborts. |
+| `04_lockmgr_demo.c` | Heavyweight lock manager: deadlock between two transactions, six times; a custom victim picker (a card from a shuffled deck, mod the number of candidates) chooses which one the detector aborts, and an `xtc_proc` deals the cards a fiber-yielding quicksort sorts. |
 | `05_rexis/` | **Redis-compatible server** with hard resource budgets.  Drop-in for redis-cli. |
 | `06_sqlxtc/` | **A from-scratch SQL engine on libxtc** (Lime parser + vectorized executor + B-link/buffer-pool/WAL storage), served over the Quack JSON protocol.  Multi-client; uses xtc throughout. |
 | `07_kaka/` | **Kafka-shaped log broker**: partitioned, segmented append-only logs, acks after fdatasync (group commit), and durable consumer-group offsets.  See its README for the design. |
