@@ -344,6 +344,11 @@ test_ttl_range(const MunitParameter p[], void *f)
 	    "SET", "neg", "v", "EX", "12abc");
 	RT_EXPECT(t, "-ERR value is not an integer or out of range\r\n",
 	    "SET", "neg", "v", "EX", "99999999999999999999");
+	/* Redis's string2ll: no leading zeros, no "-0". */
+	RT_EXPECT(t, "-ERR value is not an integer or out of range\r\n",
+	    "SET", "neg", "v", "EX", "007");
+	RT_EXPECT(t, "-ERR value is not an integer or out of range\r\n",
+	    "SET", "neg", "v", "EX", "-0");
 	RT_EXPECT(t, ":0\r\n", "EXISTS", "neg");
 
 	RT_EXPECT(t, "+OK\r\n", "SET", "big", "v");
@@ -361,6 +366,8 @@ test_ttl_range(const MunitParameter p[], void *f)
 	RT_EXPECT(t, ":1\r\n", "EXPIRE", "z", "-5");    /* deletes */
 	RT_EXPECT(t, ":0\r\n", "EXISTS", "z");
 	RT_EXPECT(t, ":0\r\n", "EXPIRE", "z", "0");
+	RT_EXPECT(t, "-ERR value is not an integer or out of range\r\n",
+	    "EXPIRE", "big", "00");
 	rt_restart_same(t, probes);
 	RT_EXPECT(t, "$1\r\nv\r\n", "GET", "big");
 	return MUNIT_OK;

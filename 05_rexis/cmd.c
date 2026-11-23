@@ -43,10 +43,12 @@ static inline int64_t xtc_now_ns(void) {
 }
 
 /*
- * Parse a whole decimal integer (an optional '-', then digits) into
- * *out.  Returns 0, or -1 for anything else or a value outside
- * int64_t.  Unlike atoll, it does not stop at the first non-digit and
- * never overflows.
+ * Parse a whole decimal integer into *out, accepting exactly what
+ * Redis's string2ll accepts: "0", or an optional '-' and digits with no
+ * leading zero (so "007" and "-0" are refused), in under 21 characters.
+ * Returns 0, or -1 for anything else or a value outside int64_t.
+ * Unlike atoll, it does not stop at the first non-digit and never
+ * overflows.
  */
 static int
 parse_i64(const char *s, size_t len, int64_t *out)
@@ -55,12 +57,18 @@ parse_i64(const char *s, size_t len, int64_t *out)
 	size_t i = 0;
 	int neg = 0;
 
+	if (len == 1 && s[0] == '0') {
+		*out = 0;
+		return 0;
+	}
+	if (len >= 21)
+		return -1;
 	if (len > 0 && s[0] == '-') {
 		neg = 1;
 		lim++;                      /* -INT64_MIN */
 		i = 1;
 	}
-	if (i == len)
+	if (i == len || s[i] == '0')
 		return -1;
 	for (; i < len; i++) {
 		if (s[i] < '0' || s[i] > '9')
