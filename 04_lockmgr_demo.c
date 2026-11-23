@@ -14,11 +14,11 @@
  *      operators can install any decision function -- a fairness
  *      policy, a cost model, an external oracle.
  *
- *   2. The cards are dealt by an xtc_proc that acts as a generator.
- *      The lockmgr's victim callback sends a request and blocks on
- *      a reply.  Demonstrates that the deadlock detector's choice
- *      can integrate cleanly with the rest of the runtime, including
- *      cross-proc message passing.
+ *   2. The victim picker runs on the deadlock detector's own thread,
+ *      not in an xtc_proc, so it cannot message one; it draws from
+ *      its own deck behind a mutex.  The cards for the quicksort
+ *      below are dealt by an xtc_proc that acts as a generator: the
+ *      caller sends a request and blocks on the reply.
  *
  *   3. We sort 32 random ints with a quicksort whose comparator
  *      yields between partitions, demonstrating how to weave async
