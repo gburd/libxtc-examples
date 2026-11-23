@@ -6508,7 +6508,10 @@ xstore_last_conflict(struct xsql *db)
  *     (PostgreSQL takes a REPEATABLE READ snapshot at the first
  *     statement too).  Not SERIALIZABLE: its SSI slot holds the old one;
  *   - autocommit before the statement applied any row (applied rows
- *     cannot be undone).
+ *     cannot be undone), which covers every multi-row statement, since
+ *     its implicit transaction applies nothing until it commits (the
+ *     caller rolled that back).  The re-run first waits until every
+ *     commit so far is visible (below).
  * Returns 1 and prepares the re-run, or 0. */
 int
 xstore_stmt_restart(struct xsql *db)
@@ -6521,7 +6524,11 @@ xstore_stmt_restart(struct xsql *db)
 		 * (an older commit is still in flight).  A re-run before it is
 		 * would miss it again: an INSERT, which takes no row intent to
 		 * wait on, would re-run until the cap.  Nothing is held here,
-		 * and in-flight commits never wait on us. */
+		 * and in-flight commits never wait on us.  NB the wait is as
+		 * bounded as the commits it follows: a commit parked in
+		 * wal_commit with no log writer left never becomes visible, so
+		 * this wait does not return either, just as that commit's own
+		 * xs_wait_visible does not. */
 		xs_wait_visible(xtc_atomic_load_u64(&g_xclock, xtc_mo_seq_cst));
 		return 1;
 	}
