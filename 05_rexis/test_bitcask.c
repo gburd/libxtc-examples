@@ -474,6 +474,16 @@ test_adopt_v1_log(void)
 	assert_v1_keys(dir);
 	ASSERT(access(v1, F_OK) != 0);
 
+	/* A crash in a later bitcask_compact(): bitcask.v2 and part of the
+	 * temp, which is removed; and the same next to bitcask.v1. */
+	copy_prefix(conv, tmp, 30);
+	assert_v1_keys(dir);
+	ASSERT(access(tmp, F_OK) != 0);
+	copy_prefix(orig, v1, -1);
+	copy_prefix(conv, tmp, 30);
+	assert_v1_keys(dir);
+	ASSERT(access(v1, F_OK) != 0 && access(tmp, F_OK) != 0);
+
 	/* bitcask.data next to bitcask.v1: no step leaves both. */
 	copy_prefix(orig, v1, -1);
 	copy_prefix(orig, data, -1);

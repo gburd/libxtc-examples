@@ -348,7 +348,9 @@ them as records of the log.
 records: superseded values, deleted and flushed keys, tombstones and
 flush records drop out, a live key keeps its TTL, and an expired key is
 dropped.  The server never calls it, so the log grows until it is
-compacted.
+compacted.  It writes the new log to a temp file, `bitcask.compact`,
+and renames it to `bitcask.v2` when it is whole; a temp file found at
+the start is left over from a crash in the middle and is removed.
 
 **Format.**  A directory from an older rexis (`DIR/bitcask.data`,
 which logged only plain SET and DEL, with no header checksum) is

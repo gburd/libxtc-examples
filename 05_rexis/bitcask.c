@@ -755,12 +755,16 @@ __fsync_dir(const char *dir)
  * crash at any point resumes at the next open:
  *
  *   bitcask.data alone             renamed to bitcask.v1, then 1.
- *   bitcask.v1, no bitcask.v2      1.  A temp file a crash left in the
- *                                  middle of the merge is removed first.
+ *   bitcask.v1, no bitcask.v2      1.
  *   bitcask.v1 and bitcask.v2      bitcask.v2 appears only by the
  *                                  merge's rename, so it is whole:
  *                                  bitcask.v1 is removed, then 0.
  *   bitcask.data and bitcask.v1    refused: no step leaves both.
+ *
+ * In every state that is not refused, the merge's temp file is removed
+ * first: a crash in the middle of a conversion or a bitcask_compact()
+ * leaves it part written, and a whole one has always been renamed to
+ * bitcask.v2, so it is never needed.
  *
  * An older binary pointed at a converted directory finds no
  * bitcask.data and starts empty, but creates an empty one.  An EMPTY
@@ -789,14 +793,15 @@ __adopt_v1(const char *dir)
 		    "one: move one away\n", data, v1);
 		return -1;
 	}
+	if (has_data && has_v2 && sb.st_size != 0) {
+		fprintf(stderr, "bitcask: %s (%lld bytes, written by an "
+		    "older rexis) and %s both exist; refusing to pick one: "
+		    "move one away\n", data, (long long)sb.st_size, v2);
+		return -1;
+	}
+	if (unlink(tmp) != 0 && errno != ENOENT)
+		return -1;
 	if (has_data && has_v2) {
-		if (sb.st_size != 0) {
-			fprintf(stderr, "bitcask: %s (%lld bytes, written by "
-			    "an older rexis) and %s both exist; refusing to "
-			    "pick one: move one away\n", data,
-			    (long long)sb.st_size, v2);
-			return -1;
-		}
 		fprintf(stderr, "bitcask: removing the empty %s an older "
 		    "rexis left next to %s\n", data, v2);
 		if (unlink(data) != 0)
@@ -815,8 +820,6 @@ __adopt_v1(const char *dir)
 			return -1;
 		return 0;
 	}
-	if (unlink(tmp) != 0 && errno != ENOENT)
-		return -1;
 	return 1;
 }
 
