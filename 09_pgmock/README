@@ -48,11 +48,12 @@ Build and run
 
   # Unix domain socket (psql looks for DIR/.s.PGSQL.PORT):
   ./pgmock-server -U /tmp/.s.PGSQL.15442
-  PGSSLMODE=disable psql -h /tmp -p 15442 -c 'select 1'
+  psql -h /tmp -p 15442 -c 'select 1'
 
-The mock answers only a plain v3 StartupMessage.  psql's default
-sslmode (prefer) opens with an SSLRequest, which the mock closes, so
-psql needs PGSSLMODE=disable (or sslmode=disable in its conninfo).
+The mock answers only a plain v3 StartupMessage.  Over TCP, psql's
+default sslmode (prefer) opens with an SSLRequest, which the mock
+closes, so psql needs PGSSLMODE=disable there (or sslmode=disable in
+its conninfo).  Over a Unix socket psql sends no SSLRequest.
 
 Any query text returns a single-column, single-row result "1"; the mock
 does not parse SQL.  Terminate (X) or a client disconnect exits the
