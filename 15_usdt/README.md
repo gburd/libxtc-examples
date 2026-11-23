@@ -33,7 +33,7 @@ dtrace -qs ../tools/dtrace/xtc_lock_contention.d -c './usdt_convoy fixed'
 ```
 
 `convoy` reports one amutex with a contended wait on almost every
-acquisition (159 of 160 on a FreeBSD 15.1 host), most of them 1-2 ms: seven
+acquisition (159 of 160 on a FreeBSD 15.1 host, 2026-10), most of them 1-2 ms: seven
 fibers queued ahead, each sleeping 200 us under the lock.  `fixed` reports
 no contended waits, and the run drops from about 36 ms to about 4.5 ms.  The stack
 aggregation at the end points at `worker` in `convoy.c`.
