@@ -179,7 +179,8 @@ xtc primitives used:
 | `bitcask.h` | 97 | Its API |
 | `Makefile` | 94 | Build glue |
 
-Total: about 6,700 lines of C (the Makefile not counted).
+Total: about 6,700 lines of C, about 4,900 of them code (tokei over SRCS
+and the headers; the Makefile not counted).
 
 ## Tests
 

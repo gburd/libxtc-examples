@@ -112,8 +112,10 @@ To actually saturate four cores we would need either:
    producing ~200 K loop wakeups/sec).
 
 Both are libxtc-side improvements; sqlxtc itself is correct and
-caps-respecting under heavy load.  See README.md "Gaps in xtc
-surfaced" for the full list.
+caps-respecting under heavy load.  (This entry is an early-2026
+result kept as history; the README section it cited, "Gaps in xtc
+surfaced", has since been removed, and both improvements shipped:
+multi-loop executors and xtc_proc_wait_fd.)
 
 The big-picture proof: **a real SQL-over-network server, in 1.6 K
 lines of sqlxtc-side code (ex. SQLite + Lime), running 200 clients
