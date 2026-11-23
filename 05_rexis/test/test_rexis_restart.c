@@ -351,6 +351,9 @@ test_ttl_range(const MunitParameter p[], void *f)
 	RT_EXPECT(t, "-ERR invalid expire time in 'expire' command\r\n",
 	    "EXPIRE", "big", "8000000000");
 	RT_EXPECT(t, ":-1\r\n", "TTL", "big");
+	/* Below INT64_MIN / 1000: refused as in Redis, not a delete. */
+	RT_EXPECT(t, "-ERR invalid expire time in 'expire' command\r\n",
+	    "EXPIRE", "big", "-9223372036854775807");
 	RT_EXPECT(t, ":1\r\n", "EXPIRE", "big", "7000000000");  /* 221 y */
 	munit_assert_long(rt_ttl(t, "big"), >, 6999999000L);
 

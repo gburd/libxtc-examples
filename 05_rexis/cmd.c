@@ -369,9 +369,11 @@ cmd_decrby(cmd_ctx_t *ctx)
 
 /*
  * EXPIRE k s.  As in Redis: a non-integer is refused with "value is not
- * an integer or out of range", a TTL too far out to represent with
- * "invalid expire time in 'expire' command", and a TTL of zero or less
- * deletes the key (a tombstone in the log) and answers 1 if it existed.
+ * an integer or out of range", a TTL too far out to represent, or below
+ * INT64_MIN / 1000 (whose milliseconds Redis cannot hold), with
+ * "invalid expire time in 'expire' command", and any other TTL of zero
+ * or less deletes the key (a tombstone in the log) and answers 1 if it
+ * existed.
  */
 static int
 cmd_expire(cmd_ctx_t *ctx)
@@ -384,6 +386,11 @@ cmd_expire(cmd_ctx_t *ctx)
 	    &secs) != 0) {
 		resp_write_error(ctx->out,
 		    "value is not an integer or out of range");
+		return 0;
+	}
+	if (secs < INT64_MIN / 1000) {
+		resp_write_error(ctx->out,
+		    "invalid expire time in 'expire' command");
 		return 0;
 	}
 	if (secs <= 0) {
