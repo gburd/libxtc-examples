@@ -9,9 +9,10 @@
  *
  *	This is the artifact M16.1b (the real PostgreSQL bringup)
  *	reuses verbatim: PostgreSQL's Latch is a set-a-flag-and-wake
- *	object read by WaitLatch / WaitLatchOrSocket.  xtc has no
- *	xtc_notify; the equivalent is the proc mailbox (SetLatch ->
- *	xtc_send one byte) plus xtc_proc_wait_fd, which waits on
+ *	object read by WaitLatch / WaitLatchOrSocket.  xtc_notify cannot
+ *	be waited on together with a socket; the equivalent is the proc
+ *	mailbox (SetLatch -> xtc_send one byte) plus xtc_proc_wait_fd,
+ *	which waits on
  *	fd-readiness OR mailbox OR timeout in one call -- exactly the
  *	shape of WaitLatchOrSocket.
  *
