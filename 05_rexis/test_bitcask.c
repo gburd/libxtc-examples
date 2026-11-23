@@ -522,6 +522,84 @@ file_size(const char *path)
 	return sb.st_size;
 }
 
+/* The whole of `path`, in a malloc'd buffer; *len is its size. */
+static uint8_t *
+slurp(const char *path, off_t *len)
+{
+	uint8_t *b;
+	int fd;
+
+	*len = file_size(path);
+	b = malloc((size_t)*len + 1);
+	fd = open(path, O_RDONLY);
+	ASSERT(b != NULL && fd >= 0);
+	ASSERT(read(fd, b, (size_t)*len) == *len && close(fd) == 0);
+	return b;
+}
+
+/*
+ * Flip each bit of an older log (bitcask.data) and convert it.  An older
+ * header has no CRC, so a flipped length can make a record seem to run
+ * past the end of the file.  Each flip must refuse the open, leaving
+ * bitcask.v1 as it was (and no bitcask.v2), or, for a flip in the last
+ * record, convert everything before it.
+ */
+static void
+test_v1_flip_sweep(void)
+{
+	const char *dir = mkdir_temp();
+	char data[512], v1[512], v2[512];
+	uint8_t *img, *got;
+	bitcask_t *bc;
+	char buf[16];
+	off_t size, last, len;
+	size_t n;
+	int i, bit, fd, refused = 0, cut = 0;
+
+	snprintf(data, sizeof data, "%s/bitcask.data", dir);
+	snprintf(v1, sizeof v1, "%s/bitcask.v1", dir);
+	snprintf(v2, sizeof v2, "%s/bitcask.v2", dir);
+	v1_append(data, "k", "v1");
+	v1_append(data, "gone", "g");
+	v1_append(data, "x", "xyz");
+	v1_append(data, "gone", NULL);
+	last = file_size(data);
+	v1_append(data, "k", "v2");
+	img = slurp(data, &size);
+	ASSERT(unlink(data) == 0);
+
+	for (i = 0; i < size * 8; i++) {
+		bit = 1 << (i % 8);
+		img[i / 8] ^= (uint8_t)bit;
+		fd = open(data, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		ASSERT(fd >= 0 && write(fd, img, (size_t)size) == size);
+		ASSERT(close(fd) == 0);
+		if (bitcask_open(dir, &bc) != 0) {
+			ASSERT(i / 8 < last && access(v2, F_OK) != 0);
+			got = slurp(v1, &len);
+			ASSERT(len == size && memcmp(got, img, (size_t)len) == 0);
+			free(got);
+			ASSERT(unlink(v1) == 0);
+			refused++;
+		} else {
+			ASSERT(i / 8 >= last && access(v1, F_OK) != 0);
+			ASSERT(bitcask_get(bc, "k", 1, buf, sizeof buf,
+			    &n) == 0);
+			ASSERT(n == 2 && memcmp(buf, "v1", 2) == 0);
+			ASSERT(bitcask_get(bc, "x", 1, buf, sizeof buf,
+			    &n) == 0);
+			bitcask_close(bc);
+			ASSERT(unlink(v2) == 0);
+			cut++;
+		}
+		img[i / 8] ^= (uint8_t)bit;
+	}
+	free(img);
+	rmrf(dir);
+	printf("  ok   v1_flip_sweep (%d flips: %d refused, %d cut at the "
+	    "last record)\n", refused + cut, refused, cut);
+}
+
 /*
  * A crash tears only the last record, which recovery cuts off.  A bad
  * record with valid records after it is damage, not a crash: the open
@@ -659,21 +737,6 @@ test_flip_sweep(void)
 	    "record)\n", refused + cut, refused, cut);
 }
 
-/* The whole of `path`, in a malloc'd buffer; *len is its size. */
-static uint8_t *
-slurp(const char *path, off_t *len)
-{
-	uint8_t *b;
-	int fd;
-
-	*len = file_size(path);
-	b = malloc((size_t)*len + 1);
-	fd = open(path, O_RDONLY);
-	ASSERT(b != NULL && fd >= 0);
-	ASSERT(read(fd, b, (size_t)*len) == *len && close(fd) == 0);
-	return b;
-}
-
 /*
  * A bad record in the middle of the log, and the search for a valid
  * record after it fails (its allocation, then its read): the open must
@@ -796,6 +859,7 @@ main(void)
 	test_compaction();
 	test_meta_flush_expiry();
 	test_adopt_v1_log();
+	test_v1_flip_sweep();
 	test_corrupt_vs_torn();
 	test_flip_sweep();
 	test_scan_fault();

@@ -560,6 +560,33 @@ __scan_fault(void)
 }
 
 /*
+ * Check, in memory, whether a whole, valid record starts at `p`, with
+ * `avail` bytes of the scan's block and `left` bytes of the file from
+ * there (at least the header's size in both).  REC_OK if one does,
+ * REC_BAD if none can, and REC_TORN if the header passes but the body
+ * runs past the block: the caller then reads the record from the file.
+ * A body that runs past the end of the file is REC_BAD here: a torn
+ * record is not a valid one.
+ */
+static enum rec_state
+__scan_at(const struct bitcask *bc, const uint8_t *p, size_t avail,
+    uint64_t left)
+{
+	uint32_t hs = bc->hdr_size, body_len, crc;
+
+	if (hs == HDR_SIZE && !__hdr_ok(p, SEED_TOP))
+		return REC_BAD;
+	if (__rec_parse(get_u32(p + hs - 8), get_u32(p + hs - 4),
+	    hs == HDR_V1, &body_len) != 0 || left - hs < body_len)
+		return REC_BAD;
+	if (avail - hs < body_len)
+		return REC_TORN;
+	crc = hs == HDR_V1 ? crc32(p + 4, HDR_V1 - 4, 0) : get_u32(p);
+	crc = crc32(p + hs, body_len, crc);
+	return crc == get_u32(p + hs - 20) ? REC_OK : REC_BAD;
+}
+
+/*
  * Find the first offset after `bad` at which a whole, valid record
  * starts.  Returns 1 and sets *next if there is one, 0 if there is
  * none, and -1 if a read or an allocation failed: the caller must then
@@ -567,11 +594,12 @@ __scan_fault(void)
  * nothing valid follows.  A crash leaves a torn record only at the end
  * of the log, so a bad record with a valid one after it is damage.
  *
- * The file is read in SCAN_BLOCK blocks, and the header CRC is checked
- * in memory at every byte offset; only a header that passes is read in
- * full.  A random 16 bytes pass with odds of 2^-32, so a damaged tail
- * costs about one CRC of 16 bytes per byte (an older log, which has no
- * header CRC, reads every offset that parses).
+ * The file is read in SCAN_BLOCK blocks and every byte offset is
+ * checked in memory (__scan_at); only a record that runs past the
+ * block is read from the file.  A random 16 bytes pass the header CRC
+ * with odds of 2^-32, so a damaged tail costs about one CRC of 16 bytes
+ * per byte.  An older log has no header CRC: every offset whose
+ * lengths parse is a candidate, and its body CRC decides.
  */
 static int
 __next_valid(struct bitcask *bc, uint64_t bad, uint64_t fsize,
@@ -594,10 +622,10 @@ __next_valid(struct bitcask *bc, uint64_t bad, uint64_t fsize,
 			break;
 		}
 		for (i = 0; i + hs <= n; i++) {
-			if (hs == HDR_SIZE && !__hdr_ok(blk + i, SEED_TOP))
-				continue;
-			st = __rec_read(bc, q + i, fsize, hdr, &body, &cap,
-			    &body_len);
+			st = __scan_at(bc, blk + i, n - i, fsize - q - i);
+			if (st == REC_TORN)
+				st = __rec_read(bc, q + i, fsize, hdr, &body,
+				    &cap, &body_len);
 			if (st == REC_IOERR) {
 				rc = -1;
 				break;
@@ -620,8 +648,9 @@ __next_valid(struct bitcask *bc, uint64_t bad, uint64_t fsize,
  * middle of the last write) is cut off, and so is a bad record with no
  * valid record after it, since it cannot be told from one.  A bad
  * record with a valid record after it refuses the open with the
- * offset: cutting there would silently drop every later record.
- * Returns 0 or -1.
+ * offset: cutting there would silently drop every later record.  In an
+ * older log a torn record is treated as a bad one, since its lengths
+ * have no CRC.  Returns 0 or -1.
  */
 static int
 __recover(struct bitcask *bc)
@@ -649,11 +678,14 @@ __recover(struct bitcask *bc)
 			rc = -1;
 			break;
 		}
-		if (st == REC_TORN) {
+		if (st == REC_TORN && bc->hdr_size == HDR_SIZE) {
 			rc = __cut_tail(bc, off, fs);
 			break;
 		}
-		if (st == REC_BAD) {
+		/* An older log's lengths have no CRC, so a record there that
+		 * runs past the end of the file may be a damaged length: it
+		 * is cut only if nothing valid follows, as a bad record is. */
+		if (st != REC_OK) {
 			if ((rc = __next_valid(bc, off, fs, &next)) == 0) {
 				rc = __cut_tail(bc, off, fs);
 				break;
@@ -789,10 +821,15 @@ __adopt_v1(const char *dir)
 }
 
 /*
- * Convert the older log: read bitcask.v1 with its 20-byte headers (the
- * same torn and damaged rules as bitcask.v2), write the live keys to
- * bitcask.v2 with the merge, then remove bitcask.v1.  On return bc
- * holds bitcask.v2 open.  Returns 0 or -1.
+ * Convert the older log: read bitcask.v1 with its 20-byte headers, write
+ * the live keys to bitcask.v2 with the merge, then remove bitcask.v1.
+ * On return bc holds bitcask.v2 open.  Returns 0 or -1.
+ *
+ * The torn and damaged rules are those of bitcask.v2, except that an
+ * older header has no CRC: a record whose lengths run past the end of
+ * the file may be a damaged length, so it is cut only if no valid
+ * record follows it (see __recover).  A refusal leaves bitcask.v1 as
+ * it was, and the next open tries the conversion again.
  */
 static int
 __convert_v1(struct bitcask *bc)

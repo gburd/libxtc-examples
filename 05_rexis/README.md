@@ -361,6 +361,24 @@ is converted again; `bitcask.v1` next to `bitcask.v2` means the
 conversion finished, so `bitcask.v1` is removed.  `bitcask.data` next
 to `bitcask.v1` is refused, naming both files.
 
+The old log is read with the damage rule above, with one difference:
+its headers have no checksum, so a damaged length can make a record in
+the middle seem to run past the end of the file.  Such a record is cut
+as a torn tail only if no valid record (one whose checksum matches)
+follows it; otherwise the start is refused, naming both offsets, and
+`bitcask.v1` is left as it was, with no `bitcask.v2`.  A real torn
+tail is a prefix of the last write, so nothing valid should follow
+it, but the search can match by chance inside the torn bytes.  An
+offset there passes only if its lengths fit in the rest of the file
+and its checksum matches, which a chance offset does with odds of
+2^-32, so a tear of T bytes is refused with odds of at most
+T / 2^32 (one in 65,000 for 64 KiB), and far less in practice, since
+random bytes seldom parse as lengths that fit.  The other way to
+refuse a tear is a value that holds the image of an old record, as a
+client could send.  Such a refusal loses nothing: truncating
+`bitcask.v1` at the named offset by hand does what the older binary
+did on its own.
+
 An older binary cannot read a converted directory.  Pointed at one, it
 finds no log and starts empty, leaving `bitcask.v2` alone, though it
 creates an empty `bitcask.data`.  The next start of the new binary
@@ -376,8 +394,9 @@ crashes the server in the middle of a log write instead
 Nth `pwritev` and kills the process) during an RPUSH, LPUSH, HSET, HDEL
 and multi-key DEL, and requires the keyspace before or after the
 command.  `test_bitcask.c` checks the records through a merge, flips
-one bit of every byte of a log, and fails the damage search's
-allocation and read (`bitcask_scan_fail_at`).
+one bit of every byte of a log, flips every bit of an old log before
+its conversion, and fails the damage search's allocation and read
+(`bitcask_scan_fail_at`).
 
 ## Known limitations
 
