@@ -659,6 +659,63 @@ test_flip_sweep(void)
 	    "record)\n", refused + cut, refused, cut);
 }
 
+/* The whole of `path`, in a malloc'd buffer; *len is its size. */
+static uint8_t *
+slurp(const char *path, off_t *len)
+{
+	uint8_t *b;
+	int fd;
+
+	*len = file_size(path);
+	b = malloc((size_t)*len + 1);
+	fd = open(path, O_RDONLY);
+	ASSERT(b != NULL && fd >= 0);
+	ASSERT(read(fd, b, (size_t)*len) == *len && close(fd) == 0);
+	return b;
+}
+
+/*
+ * A bad record in the middle of the log, and the search for a valid
+ * record after it fails (its allocation, then its read): the open must
+ * fail and leave the file byte for byte as it was, never cut it as if
+ * nothing followed.
+ */
+static void
+test_scan_fault(void)
+{
+	const char *dir = mkdir_temp();
+	char path[512], key[16];
+	uint8_t *before, *after;
+	bitcask_t *bc;
+	off_t rec1, size, len;
+	int i, at;
+
+	snprintf(path, sizeof path, "%s/bitcask.v2", dir);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(bitcask_put(bc, "k0", 2, "v", 1) == 0);
+	rec1 = file_size(path);
+	for (i = 1; i <= 20; i++) {
+		snprintf(key, sizeof key, "k%d", i);
+		ASSERT(bitcask_put(bc, key, strlen(key), "v", 1) == 0);
+	}
+	bitcask_close(bc);
+	flip_byte(path, rec1 + 24);          /* record 1's key */
+	before = slurp(path, &size);
+
+	for (at = 1; at <= 2; at++) {
+		bitcask_scan_fail_at = at;
+		ASSERT(bitcask_open(dir, &bc) == -1);
+		ASSERT(bitcask_scan_fail_at == 0);
+		after = slurp(path, &len);
+		ASSERT(len == size && memcmp(before, after, (size_t)len) == 0);
+		free(after);
+	}
+	ASSERT(bitcask_open(dir, &bc) == -1);   /* refused for the damage */
+	free(before);
+	rmrf(dir);
+	printf("  ok   scan_fault\n");
+}
+
 /*
  * The in-memory index must grow with the key count.  A fixed 4,096-bucket
  * chained index walked ~N/4096 entries on EVERY put (to find the old
@@ -741,6 +798,7 @@ main(void)
 	test_adopt_v1_log();
 	test_corrupt_vs_torn();
 	test_flip_sweep();
+	test_scan_fault();
 	test_index_grows();
 	printf("All bitcask tests passed.\n");
 	return 0;

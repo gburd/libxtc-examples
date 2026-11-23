@@ -151,4 +151,10 @@ int   bitcask_compact(bitcask_t *bc);
 /* Stats snapshot. */
 void  bitcask_stat(bitcask_t *bc, bitcask_stats_t *out);
 
+/* Test hook: set to N > 0 and the Nth allocation or read of the next
+ * damage scan (the search for a valid record after a bad one, at open)
+ * fails, as an out-of-memory or an I/O error would.  0 (the default)
+ * injects nothing. */
+extern int bitcask_scan_fail_at;
+
 #endif

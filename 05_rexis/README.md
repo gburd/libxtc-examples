@@ -330,7 +330,9 @@ refuses the start: the server names the bad record's offset and the
 next valid one, and leaves the file as it was, since cutting there
 would silently drop every acknowledged write after it.  Restore the
 log, or truncate it at the named offset by hand to keep only what
-comes before.
+comes before.  If the search for a valid record after the damage
+cannot finish (a read fails, or memory runs out), the start is refused
+the same way, and the file is left as it was.
 
 Two cases sit at the edge of that rule.  Damage to the last record,
 with nothing valid after it, cannot be told from a torn write, so it
@@ -373,7 +375,9 @@ crashes the server in the middle of a log write instead
 (`test/rexis_killwrite.c`, loaded with `LD_PRELOAD`, writes half of the
 Nth `pwritev` and kills the process) during an RPUSH, LPUSH, HSET, HDEL
 and multi-key DEL, and requires the keyspace before or after the
-command.  `test_bitcask.c` checks the records through a merge.
+command.  `test_bitcask.c` checks the records through a merge, flips
+one bit of every byte of a log, and fails the damage search's
+allocation and read (`bitcask_scan_fail_at`).
 
 ## Known limitations
 

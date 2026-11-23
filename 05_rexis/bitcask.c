@@ -548,40 +548,63 @@ __rec_read(struct bitcask *bc, uint64_t off, uint64_t fsize, uint8_t *hdr,
 
 #define SCAN_BLOCK (1024u * 1024u)
 
+/* Test hook (bitcask.h): when it counts down to zero, the damage scan's
+ * allocation or read fails. */
+int bitcask_scan_fail_at;
+
+/* Whether the scan's next allocation or read must fail (the hook). */
+static int
+__scan_fault(void)
+{
+	return bitcask_scan_fail_at > 0 && --bitcask_scan_fail_at == 0;
+}
+
 /*
- * The first offset after `bad` at which a whole, valid record starts,
- * or 0 if there is none.  A crash leaves a torn record only at the end
+ * Find the first offset after `bad` at which a whole, valid record
+ * starts.  Returns 1 and sets *next if there is one, 0 if there is
+ * none, and -1 if a read or an allocation failed: the caller must then
+ * fail the open and leave the file alone, since it cannot know that
+ * nothing valid follows.  A crash leaves a torn record only at the end
  * of the log, so a bad record with a valid one after it is damage.
  *
  * The file is read in SCAN_BLOCK blocks, and the header CRC is checked
  * in memory at every byte offset; only a header that passes is read in
  * full.  A random 16 bytes pass with odds of 2^-32, so a damaged tail
  * costs about one CRC of 16 bytes per byte (an older log, which has no
- * header CRC, reads every offset that parses).  Returns 0 if a read
- * fails, too: the caller then cuts the tail as if nothing followed, the
- * same as before this scan, so the block reads only ever add refusals.
+ * header CRC, reads every offset that parses).
  */
-static uint64_t
-__next_valid(struct bitcask *bc, uint64_t bad, uint64_t fsize)
+static int
+__next_valid(struct bitcask *bc, uint64_t bad, uint64_t fsize,
+    uint64_t *next)
 {
 	uint8_t hdr[HDR_SIZE], *blk, *body = NULL;
 	size_t cap = 0, n, i;
 	uint32_t body_len, hs = bc->hdr_size;
-	uint64_t q = bad + 1, found = 0;
-	ssize_t got;
+	uint64_t q = bad + 1;
+	enum rec_state st;
+	int rc = 0;
 
-	if ((blk = malloc(SCAN_BLOCK)) == NULL)
-		return 0;
-	while (found == 0 && fsize - q >= hs) {
+	if (__scan_fault() || (blk = malloc(SCAN_BLOCK)) == NULL)
+		return -1;
+	while (rc == 0 && fsize - q >= hs) {
 		n = fsize - q < SCAN_BLOCK ? (size_t)(fsize - q) : SCAN_BLOCK;
-		if ((got = pread(bc->fd, blk, n, (off_t)q)) != (ssize_t)n)
+		if (__scan_fault() ||
+		    pread(bc->fd, blk, n, (off_t)q) != (ssize_t)n) {
+			rc = -1;
 			break;
+		}
 		for (i = 0; i + hs <= n; i++) {
 			if (hs == HDR_SIZE && !__hdr_ok(blk + i, SEED_TOP))
 				continue;
-			if (__rec_read(bc, q + i, fsize, hdr, &body, &cap,
-			    &body_len) == REC_OK) {
-				found = q + i;
+			st = __rec_read(bc, q + i, fsize, hdr, &body, &cap,
+			    &body_len);
+			if (st == REC_IOERR) {
+				rc = -1;
+				break;
+			}
+			if (st == REC_OK) {
+				*next = q + i;
+				rc = 1;
 				break;
 			}
 		}
@@ -589,7 +612,7 @@ __next_valid(struct bitcask *bc, uint64_t bad, uint64_t fsize)
 	}
 	free(body);
 	free(blk);
-	return found;
+	return rc;
 }
 
 /*
@@ -631,8 +654,17 @@ __recover(struct bitcask *bc)
 			break;
 		}
 		if (st == REC_BAD) {
-			if ((next = __next_valid(bc, off, fs)) == 0) {
+			if ((rc = __next_valid(bc, off, fs, &next)) == 0) {
 				rc = __cut_tail(bc, off, fs);
+				break;
+			}
+			if (rc < 0) {
+				fprintf(stderr, "bitcask: %s/%s: the record "
+				    "at offset %llu is corrupt, and the search "
+				    "for a valid record after it failed (a read "
+				    "or out of memory); refusing to open\n",
+				    bc->dir, __file_of(bc),
+				    (unsigned long long)off);
 				break;
 			}
 			fprintf(stderr, "bitcask: %s/%s: the record "
