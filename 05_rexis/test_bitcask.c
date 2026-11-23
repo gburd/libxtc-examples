@@ -24,7 +24,9 @@ static char *
 mkdir_temp(void)
 {
 	static char dir[256];
-	snprintf(dir, sizeof dir, "/tmp/bitcask-test-%d", (int)getpid());
+	const char *base = getenv("TMPDIR");
+	snprintf(dir, sizeof dir, "%s/bitcask-test-%d",
+	    base != NULL && *base != '\0' ? base : "/tmp", (int)getpid());
 	(void)rmdir(dir);
 	if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
 		perror("mkdir");
@@ -38,6 +40,8 @@ rmrf(const char *dir)
 {
 	char path[512];
 	snprintf(path, sizeof path, "%s/bitcask.data", dir);
+	(void)unlink(path);
+	snprintf(path, sizeof path, "%s/bitcask.v2", dir);
 	(void)unlink(path);
 	(void)rmdir(dir);
 }
@@ -261,6 +265,98 @@ test_compaction(void)
 }
 
 /*
+ * Meta, flush and expiry, across a reopen and across a merge: a flush
+ * makes every earlier record dead (a merge must not bring a flushed key
+ * back), a key with a future expiry keeps its tag and expiry through
+ * both, and a key whose expiry has passed is dropped by both.
+ */
+static void
+test_meta_flush_expiry(void)
+{
+	const char *dir = mkdir_temp();
+	bitcask_t *bc;
+	bitcask_meta_t m, live = { 7, 0 }, gone = { 0, 0 };
+	bitcask_stats_t st;
+	char buf[16];
+	size_t n;
+	int pass;
+
+	live.expire_at = xtc_clock_real() + 3600LL * 1000000000LL;
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(bitcask_put(bc, "old1", 4, "x", 1) == 0);
+	ASSERT(bitcask_put(bc, "old2", 4, "y", 1) == 0);
+	ASSERT(bitcask_flush(bc) == 0);
+	ASSERT(bitcask_get(bc, "old1", 4, buf, sizeof buf, &n) == 1);
+	ASSERT(bitcask_put_meta(bc, "ttl", 3, "t", 1, &live) == 0);
+	ASSERT(bitcask_put(bc, "plain", 5, "", 0) == 0);  /* empty value */
+	/* Expires 50 ms from now: alive at the put, gone by the checks. */
+	gone.expire_at = xtc_clock_real() + 50LL * 1000000LL;
+	ASSERT(bitcask_put_meta(bc, "short", 5, "s", 1, &gone) == 0);
+	bitcask_close(bc);
+	usleep(100 * 1000);
+
+	/* Pass 0 checks the reopened log, pass 1 the merged one, pass 2 a
+	 * reopen of the merged one. */
+	for (pass = 0; pass < 3; pass++) {
+		ASSERT(bitcask_open(dir, &bc) == 0);
+		if (pass == 1) {
+			ASSERT(bitcask_compact(bc) == 0);
+			bitcask_stat(bc, &st);
+			ASSERT(st.bytes_dead == 0);
+		}
+		ASSERT(bitcask_get(bc, "old1", 4, buf, sizeof buf, &n) == 1);
+		ASSERT(bitcask_get(bc, "old2", 4, buf, sizeof buf, &n) == 1);
+		ASSERT(bitcask_get(bc, "short", 5, buf, sizeof buf, &n) == 1);
+		ASSERT(bitcask_get(bc, "ttl", 3, buf, sizeof buf, &n) == 0);
+		ASSERT(n == 1 && buf[0] == 't');
+		ASSERT(bitcask_meta(bc, "ttl", 3, &m) == 0);
+		ASSERT(m.tag == 7 && m.expire_at == live.expire_at);
+		ASSERT(bitcask_get(bc, "plain", 5, buf, sizeof buf, &n) == 0);
+		ASSERT(n == 0);
+		ASSERT(bitcask_meta(bc, "plain", 5, &m) == 0);
+		ASSERT(m.tag == 0 && m.expire_at == 0);
+		bitcask_stat(bc, &st);
+		ASSERT(st.n_keys == 2);
+		bitcask_close(bc);
+	}
+	rmrf(dir);
+	printf("  ok   meta_flush_expiry\n");
+}
+
+/*
+ * A directory written by an older rexis (DIR/bitcask.data, v1 records)
+ * is adopted: renamed to bitcask.v2 with its keys intact.  Both files
+ * present is refused rather than one silently dropped.
+ */
+static void
+test_adopt_v1_log(void)
+{
+	const char *dir = mkdir_temp();
+	bitcask_t *bc;
+	char v1[512], v2[512], buf[16];
+	size_t n;
+
+	snprintf(v1, sizeof v1, "%s/bitcask.data", dir);
+	snprintf(v2, sizeof v2, "%s/bitcask.v2", dir);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(bitcask_put(bc, "k", 1, "v1", 2) == 0);
+	bitcask_close(bc);
+	ASSERT(rename(v2, v1) == 0);          /* now an old directory */
+
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(bitcask_get(bc, "k", 1, buf, sizeof buf, &n) == 0);
+	ASSERT(n == 2 && memcmp(buf, "v1", 2) == 0);
+	bitcask_close(bc);
+	ASSERT(access(v1, F_OK) != 0 && access(v2, F_OK) == 0);
+
+	ASSERT(close(open(v1, O_CREAT | O_WRONLY, 0644)) == 0);
+	ASSERT(bitcask_open(dir, &bc) == -1);
+	(void)unlink(v1);
+	rmrf(dir);
+	printf("  ok   adopt_v1_log\n");
+}
+
+/*
  * The in-memory index must grow with the key count.  A fixed 4,096-bucket
  * chained index walked ~N/4096 entries on EVERY put (to find the old
  * record), so a 5M-key load fell from 254k to 7.6k puts/s.  Time a fixed
@@ -338,6 +434,8 @@ main(void)
 	test_recovery_with_deletes_and_overwrites();
 	test_iterate_and_stats();
 	test_compaction();
+	test_meta_flush_expiry();
+	test_adopt_v1_log();
 	test_index_grows();
 	printf("All bitcask tests passed.\n");
 	return 0;

@@ -11,19 +11,35 @@
  *   uint32_t  crc;        // CRC32 of (timestamp .. value)
  *   uint64_t  timestamp;  // monotonic ns of write
  *   uint32_t  key_len;
- *   uint32_t  val_len;    // 0xFFFFFFFFu = tombstone
+ *   uint32_t  val_len;    // the record kind, see below
  *   uint8_t   key[key_len];
- *   uint8_t   val[val_len];   // omitted if tombstone
+ *   uint8_t   meta[9];    // v2 put only: tag, then expire_at (u64)
+ *   uint8_t   val[len];   // puts only
+ *
+ * val_len says which kind of record it is:
+ *
+ *   0 .. BITCASK_MAX_VAL     v1 put: val_len value bytes, no meta.
+ *                            The original format; a put with tag 0
+ *                            and no expiry is still written this way.
+ *   REC_V2 | len             v2 put: meta, then len value bytes.
+ *   REC_FLUSH (0xFFFFFFFE)   flush: key_len 0, no body.  Every
+ *                            earlier record is dead.
+ *   REC_TOMBSTONE (~0)       delete: key only.
+ *
+ * A binary that predates v2 and flush records would read either as a
+ * torn tail and truncate the log there, so the file has a new name
+ * (bitcask.v2, see bitcask.h): an older binary never opens it.
  *
  * Recovery on open: scan the file from start, rebuild the in-memory
  * hash index by replaying every record (the latest entry per key
- * wins; tombstones erase).
+ * wins; tombstones erase; a flush erases all; a put whose expiry has
+ * passed erases its key).
  *
- * v1 limitations:
- *   * single data file; no rotation, no merge.
+ * Limitations:
+ *   * single data file; no rotation.
  *   * one writer at a time (no concurrent put).  Multiple readers
  *     are fine.
- *   * value size capped at 16 MiB to limit recovery cost.
+ *   * value size capped at BITCASK_MAX_VAL to limit recovery cost.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -49,8 +65,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 
-#define MAX_VAL_LEN  (16u * 1024u * 1024u)
+#define MAX_VAL_LEN  BITCASK_MAX_VAL
 
 /* ---- CRC32 (IEEE 802.3) -------------------------------------- */
 
@@ -101,7 +118,11 @@ static uint64_t get_u64(const uint8_t *p) {
 }
 
 #define HDR_SIZE  (4 /*crc*/ + 8 /*ts*/ + 4 /*kl*/ + 4 /*vl*/)
+#define META_SIZE (1 /*tag*/ + 8 /*expire_at*/)
 #define TOMBSTONE 0xffffffffu
+#define REC_FLUSH 0xfffffffeu
+#define REC_V2    0x80000000u
+#define DATA_FILE "bitcask.v2"
 
 static int64_t
 now_ns(void)
@@ -112,6 +133,16 @@ now_ns(void)
 	 * on Windows -- libxtc smooths the platform difference. */
 	ns = xtc_clock_mono();
 	return ns;
+}
+
+/* The clock expiry times are in.  It must be the wall clock: an expiry
+ * has to mean the same instant after a restart or a reboot, and the
+ * monotonic clock restarts with the host.  The store is never run under
+ * the simulator, so the unvirtualized clock is fine here. */
+static int64_t
+wall_ns(void)
+{
+	return xtc_clock_real();
 }
 
 /* ---- in-memory index ----------------------------------------- */
@@ -129,7 +160,18 @@ struct idx_entry {
 	uint64_t            offset;    /* file offset of value */
 	uint32_t            val_len;   /* on-disk length */
 	uint64_t            timestamp;
+	int64_t             expire_at; /* wall ns; 0 = never */
+	uint8_t             tag;       /* caller's tag; 0 = plain */
 };
+
+/* Bytes the entry's record takes in the file. */
+static uint64_t
+__rec_size(const struct idx_entry *e)
+{
+	int v2 = e->tag != 0 || e->expire_at != 0;
+	return (uint64_t)HDR_SIZE + e->key_len + (v2 ? META_SIZE : 0) +
+	    e->val_len;
+}
 
 static uint64_t
 __hash_key(const void *key, size_t len)
@@ -186,28 +228,33 @@ __idx_lookup(struct bitcask *bc, const void *key, size_t key_len)
  * if any. */
 static int
 __idx_put(struct bitcask *bc, const void *key, size_t key_len,
-          uint64_t offset, uint32_t val_len, uint64_t ts)
+          uint64_t offset, uint32_t val_len, uint64_t ts,
+          const bitcask_meta_t *m)
 {
 	uint64_t h = __hash_key(key, key_len);
 	struct idx_entry *e = __idx_lookup(bc, key, key_len);
 	lh_node_t **slot;
 
 	if (e != NULL) {
-		bc->bytes_dead += HDR_SIZE + e->key_len + e->val_len;
+		bc->bytes_dead += __rec_size(e);
 		e->offset = offset;
 		e->val_len = val_len;
 		e->timestamp = ts;
+		e->tag = m->tag;
+		e->expire_at = m->expire_at;
 		return 0;
 	}
 	e = calloc(1, sizeof *e);
 	if (e == NULL) return -1;
-	e->key = malloc(key_len);
+	e->key = malloc(key_len > 0 ? key_len : 1);   /* "" is a key */
 	if (e->key == NULL) { free(e); return -1; }
 	memcpy(e->key, key, key_len);
 	e->key_len = key_len;
 	e->offset = offset;
 	e->val_len = val_len;
 	e->timestamp = ts;
+	e->tag = m->tag;
+	e->expire_at = m->expire_at;
 	e->node.hash = h;
 	slot = lh_slot(&bc->idx, h);
 	e->node.next = *slot;
@@ -231,7 +278,7 @@ __idx_del(struct bitcask *bc, const void *key, size_t key_len)
 		if (n->hash == h && e->key_len == key_len &&
 		    memcmp(e->key, key, key_len) == 0) {
 			*link = n->next;
-			bc->bytes_dead += HDR_SIZE + e->key_len + e->val_len;
+			bc->bytes_dead += __rec_size(e);
 			free(e->key); free(e);
 			bc->n_keys--;
 			return 0;
@@ -240,24 +287,110 @@ __idx_del(struct bitcask *bc, const void *key, size_t key_len)
 	return 1;
 }
 
+/* Drop every entry (a flush): each one's record becomes dead.  The
+ * table keeps its size. */
 static void
-__idx_free_all(struct bitcask *bc)
+__idx_clear(struct bitcask *bc)
 {
 	size_t i;
 	lh_node_t *n, *next;
-	if (bc->idx.dir == NULL) return;
 	for (i = 0; i < lh_buckets(&bc->idx); i++) {
 		for (n = *lh_bucket(&bc->idx, i); n != NULL; n = next) {
 			next = n->next;
+			bc->bytes_dead += __rec_size((struct idx_entry *)n);
 			free(((struct idx_entry *)n)->key);
 			free(n);
 		}
 		*lh_bucket(&bc->idx, i) = NULL;
 	}
+	bc->n_keys = 0;
+}
+
+static void
+__idx_free_all(struct bitcask *bc)
+{
+	if (bc->idx.dir == NULL) return;
+	__idx_clear(bc);
 	lh_destroy(&bc->idx, __idx_mfree, NULL);
 }
 
 /* ---- recovery ----------------------------------------------- */
+
+/*
+ * Check a record header's key_len and val_len and compute how many
+ * body bytes follow the header.  Returns -1 for a header no writer
+ * produces (a torn or corrupt tail): the caller truncates there.
+ */
+static int
+__rec_parse(uint32_t kl, uint32_t vl, uint32_t *body_len)
+{
+	if (vl == REC_FLUSH) {
+		*body_len = 0;
+		return kl == 0 ? 0 : -1;
+	}
+	if (kl > MAX_VAL_LEN)
+		return -1;
+	if (vl == TOMBSTONE) {
+		*body_len = kl;
+		return 0;
+	}
+	if ((vl & REC_V2) != 0) {
+		vl &= ~REC_V2;
+		if (vl > MAX_VAL_LEN)
+			return -1;
+		*body_len = kl + META_SIZE + vl;
+		return 0;
+	}
+	if (vl > MAX_VAL_LEN)
+		return -1;
+	*body_len = kl + vl;
+	return 0;
+}
+
+/*
+ * Apply one verified record, found at file offset `off`, to the index.
+ * A flush empties the index, a tombstone erases its key, and a put
+ * whose expiry is at or before `now` (wall ns) erases its key too: the
+ * key expired while nobody was serving it and must not come back.
+ */
+static void
+__rec_apply(struct bitcask *bc, uint64_t off, uint64_t ts, uint32_t kl,
+    uint32_t vl, const uint8_t *body, int64_t now)
+{
+	bitcask_meta_t m = { 0, 0 };
+	uint64_t voff = off + HDR_SIZE + kl;
+
+	if (vl == REC_FLUSH) {
+		__idx_clear(bc);
+		bc->bytes_dead += HDR_SIZE;
+		return;
+	}
+	if (vl == TOMBSTONE) {
+		(void)__idx_del(bc, body, kl);
+		bc->bytes_dead += HDR_SIZE + kl;
+		return;
+	}
+	if ((vl & REC_V2) != 0) {
+		vl &= ~REC_V2;
+		m.tag = body[kl];
+		m.expire_at = (int64_t)get_u64(body + kl + 1);
+		voff += META_SIZE;
+	}
+	if (m.expire_at != 0 && m.expire_at <= now) {
+		(void)__idx_del(bc, body, kl);
+		bc->bytes_dead += HDR_SIZE + kl + META_SIZE + vl;
+		return;
+	}
+	(void)__idx_put(bc, body, kl, voff, vl, ts, &m);
+}
+
+/* Cut a torn or corrupt tail off at `off`.  Returns 0, or -1 if the
+ * file cannot be truncated (the open then fails). */
+static int
+__cut_tail(struct bitcask *bc, uint64_t off)
+{
+	return ftruncate(bc->fd, (off_t)off) == 0 ? 0 : -1;
+}
 
 static int
 __recover(struct bitcask *bc)
@@ -268,6 +401,7 @@ __recover(struct bitcask *bc)
 	uint8_t *body = NULL;
 	size_t   body_cap = 0;
 	int      rc = 0;
+	int64_t  now = wall_ns();
 
 	if (fsize < 0) return -1;
 
@@ -275,20 +409,20 @@ __recover(struct bitcask *bc)
 		ssize_t n = pread(bc->fd, hdr, HDR_SIZE, (off_t)off);
 		if (n != (ssize_t)HDR_SIZE) {
 			/* Trailing garbage; truncate. */
-			(void)ftruncate(bc->fd, (off_t)off);
+			rc = __cut_tail(bc, off);
 			break;
 		}
 		uint32_t crc_stored = get_u32(hdr);
 		uint64_t ts         = get_u64(hdr + 4);
 		uint32_t kl         = get_u32(hdr + 12);
 		uint32_t vl         = get_u32(hdr + 16);
-		uint32_t body_len = kl + (vl == TOMBSTONE ? 0 : vl);
-		if (kl > MAX_VAL_LEN || (vl != TOMBSTONE && vl > MAX_VAL_LEN)) {
-			(void)ftruncate(bc->fd, (off_t)off);
+		uint32_t body_len;
+		if (__rec_parse(kl, vl, &body_len) != 0) {
+			rc = __cut_tail(bc, off);
 			break;
 		}
 		if ((uint64_t)fsize - off - HDR_SIZE < body_len) {
-			(void)ftruncate(bc->fd, (off_t)off);
+			rc = __cut_tail(bc, off);
 			break;
 		}
 		if (body_len > body_cap) {
@@ -301,7 +435,7 @@ __recover(struct bitcask *bc)
 			n = pread(bc->fd, body, body_len,
 			    (off_t)(off + HDR_SIZE));
 			if (n != (ssize_t)body_len) {
-				(void)ftruncate(bc->fd, (off_t)off);
+				rc = __cut_tail(bc, off);
 				break;
 			}
 		}
@@ -316,15 +450,11 @@ __recover(struct bitcask *bc)
 				/* Corrupt record at this offset; truncate
 				 * and stop -- subsequent records may also
 				 * be corrupt. */
-				(void)ftruncate(bc->fd, (off_t)off);
+				rc = __cut_tail(bc, off);
 				break;
 			}
 		}
-		if (vl == TOMBSTONE)
-			(void)__idx_del(bc, body, kl);
-		else
-			(void)__idx_put(bc, body, kl,
-			    off + HDR_SIZE + kl, vl, ts);
+		__rec_apply(bc, off, ts, kl, vl, body, now);
 		off += HDR_SIZE + body_len;
 	}
 	bc->write_offset = off;
@@ -333,6 +463,40 @@ __recover(struct bitcask *bc)
 }
 
 /* ---- public API --------------------------------------------- */
+
+/*
+ * A directory from before the v2 records holds DIR/bitcask.data.  Its
+ * records are valid v2 log content, so rename it to `path` (the v2
+ * name) and fsync the directory so the rename is durable.  An older
+ * binary that meets a v2 log then sees no file of its own and starts
+ * empty, rather than truncating the log at the first v2 record.
+ * Both files present means an older binary ran on a v2 directory and
+ * wrote its own log: neither may be dropped silently, so refuse.
+ * Returns 0, or -1 (refused, or the rename failed).
+ */
+static int
+__adopt_v1(const char *dir, const char *path)
+{
+	char v1[512];
+	int dfd, have_v2;
+
+	snprintf(v1, sizeof v1, "%s/bitcask.data", dir);
+	have_v2 = access(path, F_OK) == 0;
+	if (access(v1, F_OK) != 0)
+		return 0;
+	if (have_v2) {
+		fprintf(stderr, "bitcask: %s and %s both exist (an older "
+		    "binary wrote the first); move one away\n", v1, path);
+		return -1;
+	}
+	if (rename(v1, path) != 0)
+		return -1;
+	if ((dfd = open(dir, O_RDONLY)) >= 0) {
+		(void)fsync(dfd);
+		(void)close(dfd);
+	}
+	return 0;
+}
 
 int
 bitcask_open(const char *dir, bitcask_t **out)
@@ -349,7 +513,12 @@ bitcask_open(const char *dir, bitcask_t **out)
 	}
 	pthread_mutex_init(&bc->lock, NULL);
 	snprintf(bc->dir, sizeof bc->dir, "%s", dir);
-	snprintf(path, sizeof path, "%s/bitcask.data", dir);
+	snprintf(path, sizeof path, "%s/" DATA_FILE, dir);
+	if (__adopt_v1(dir, path) != 0) {
+		lh_destroy(&bc->idx, __idx_mfree, NULL);
+		free(bc);
+		return -1;
+	}
 	bc->fd = open(path, O_RDWR | O_CREAT, 0644);
 	if (bc->fd < 0) {
 		lh_destroy(&bc->idx, __idx_mfree, NULL);
@@ -374,52 +543,86 @@ bitcask_close(bitcask_t *bc)
 	free(bc);
 }
 
+/*
+ * Append one record (header, key, the optional meta, the value) at the
+ * write offset with one pwritev, under the lock, and advance the
+ * offset.  `extra` is the bytes after the key.  A short write leaves
+ * the offset alone: the next record overwrites the torn one, and a
+ * crash before that leaves a tail recovery truncates.
+ */
+static int
+__rec_append(struct bitcask *bc, struct iovec *iov, int iovcnt,
+    size_t total)
+{
+	ssize_t n;
+	n = pwritev(bc->fd, iov, iovcnt, (off_t)bc->write_offset);
+	if (n != (ssize_t)total)
+		return -1;
+	bc->write_offset += total;
+	return 0;
+}
+
 int
 bitcask_put(bitcask_t *bc, const void *key, size_t key_len,
             const void *val, size_t val_len)
 {
-	uint8_t hdr[HDR_SIZE];
-	struct iovec { const void *base; size_t len; };
-	uint64_t ts = (uint64_t)now_ns();
-	uint32_t crc;
-	uint8_t hdr_for_crc[HDR_SIZE - 4];
-	ssize_t n;
-	uint64_t off;
+	bitcask_meta_t m = { 0, 0 };
+	return bitcask_put_meta(bc, key, key_len, val, val_len, &m);
+}
 
-	if (bc == NULL || key == NULL || val == NULL ||
-	    key_len == 0 || key_len > MAX_VAL_LEN ||
-	    val_len > MAX_VAL_LEN)
+int
+bitcask_put_meta(bitcask_t *bc, const void *key, size_t key_len,
+                 const void *val, size_t val_len, const bitcask_meta_t *m)
+{
+	uint8_t hdr[HDR_SIZE], meta[META_SIZE];
+	uint8_t hdr_for_crc[HDR_SIZE - 4];
+	struct iovec iov[4];
+	uint64_t ts = (uint64_t)now_ns();
+	uint32_t crc, vl;
+	size_t meta_len = 0, total;
+	uint64_t voff;
+	int rc;
+
+	if (bc == NULL || key == NULL || (val == NULL && val_len > 0) ||
+	    m == NULL || key_len > MAX_VAL_LEN || val_len > MAX_VAL_LEN)
 		return -1;
+
+	/* A plain put (tag 0, no expiry) keeps the shorter v1 format. */
+	vl = (uint32_t)val_len;
+	if (m->tag != 0 || m->expire_at != 0) {
+		vl |= REC_V2;
+		meta[0] = m->tag;
+		put_u64(meta + 1, (uint64_t)m->expire_at);
+		meta_len = META_SIZE;
+	}
 
 	put_u64(hdr_for_crc + 0, ts);
 	put_u32(hdr_for_crc + 8, (uint32_t)key_len);
-	put_u32(hdr_for_crc + 12, (uint32_t)val_len);
+	put_u32(hdr_for_crc + 12, vl);
 	crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
 	crc = crc32(key, key_len, crc);
+	crc = crc32(meta, meta_len, crc);
 	crc = crc32(val, val_len, crc);
-
 	put_u32(hdr, crc);
 	memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
 
+	iov[0].iov_base = hdr;          iov[0].iov_len = HDR_SIZE;
+	iov[1].iov_base = (void *)key;  iov[1].iov_len = key_len;
+	iov[2].iov_base = meta;         iov[2].iov_len = meta_len;
+	iov[3].iov_base = (void *)val;  iov[3].iov_len = val_len;
+	total = HDR_SIZE + key_len + meta_len + val_len;
+
 	pthread_mutex_lock(&bc->lock);
-	off = bc->write_offset;
-	n = pwrite(bc->fd, hdr, HDR_SIZE, (off_t)off);
-	if (n != (ssize_t)HDR_SIZE) goto io_err;
-	n = pwrite(bc->fd, key, key_len, (off_t)(off + HDR_SIZE));
-	if (n != (ssize_t)key_len) goto io_err;
-	n = pwrite(bc->fd, val, val_len,
-	    (off_t)(off + HDR_SIZE + key_len));
-	if (n != (ssize_t)val_len) goto io_err;
-	bc->write_offset = off + HDR_SIZE + key_len + val_len;
-	__idx_put(bc, key, key_len, off + HDR_SIZE + key_len,
-	    (uint32_t)val_len, ts);
-	bc->bytes_used += HDR_SIZE + key_len + val_len;
-	bc->puts++;
+	voff = bc->write_offset + HDR_SIZE + key_len + meta_len;
+	rc = __rec_append(bc, iov, 4, total);
+	if (rc == 0) {
+		rc = __idx_put(bc, key, key_len, voff, (uint32_t)val_len,
+		    ts, m);
+		bc->bytes_used += total;
+		bc->puts++;
+	}
 	pthread_mutex_unlock(&bc->lock);
-	return 0;
-io_err:
-	pthread_mutex_unlock(&bc->lock);
-	return -1;
+	return rc;
 }
 
 int
@@ -467,43 +670,80 @@ bitcask_size(bitcask_t *bc, const void *key, size_t key_len, size_t *val_len)
 	return 0;
 }
 
-int
-bitcask_del(bitcask_t *bc, const void *key, size_t key_len)
+/* Append a record with no value bytes: a tombstone (key) or a flush
+ * (no key).  Returns 0 or -1. */
+static int
+__rec_marker(struct bitcask *bc, const void *key, size_t key_len,
+    uint32_t kind)
 {
 	uint8_t hdr[HDR_SIZE];
 	uint8_t hdr_for_crc[HDR_SIZE - 4];
+	struct iovec iov[2];
 	uint32_t crc;
 	uint64_t ts = (uint64_t)now_ns();
-	ssize_t n;
-	int found;
-	if (bc == NULL || key == NULL || key_len == 0) return -1;
 
 	put_u64(hdr_for_crc + 0, ts);
 	put_u32(hdr_for_crc + 8, (uint32_t)key_len);
-	put_u32(hdr_for_crc + 12, TOMBSTONE);
+	put_u32(hdr_for_crc + 12, kind);
 	crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
 	crc = crc32(key, key_len, crc);
 	put_u32(hdr, crc);
 	memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
+	iov[0].iov_base = hdr;          iov[0].iov_len = HDR_SIZE;
+	iov[1].iov_base = (void *)key;  iov[1].iov_len = key_len;
+	if (__rec_append(bc, iov, 2, HDR_SIZE + key_len) != 0)
+		return -1;
+	bc->bytes_used += HDR_SIZE + key_len;
+	bc->bytes_dead += HDR_SIZE + key_len;   /* a marker is never live */
+	return 0;
+}
+
+int
+bitcask_meta(bitcask_t *bc, const void *key, size_t key_len,
+             bitcask_meta_t *out)
+{
+	struct idx_entry *e;
+	if (bc == NULL || key == NULL || out == NULL) return -1;
+	pthread_mutex_lock(&bc->lock);
+	e = __idx_lookup(bc, key, key_len);
+	if (e != NULL) {
+		out->tag = e->tag;
+		out->expire_at = e->expire_at;
+	}
+	pthread_mutex_unlock(&bc->lock);
+	return e != NULL ? 0 : 1;
+}
+
+int
+bitcask_del(bitcask_t *bc, const void *key, size_t key_len)
+{
+	int found;
+	if (bc == NULL || key == NULL || key_len > MAX_VAL_LEN)
+		return -1;
 
 	pthread_mutex_lock(&bc->lock);
 	bc->dels++;
 	found = (__idx_lookup(bc, key, key_len) != NULL);
-	n = pwrite(bc->fd, hdr, HDR_SIZE, (off_t)bc->write_offset);
-	if (n != (ssize_t)HDR_SIZE) {
+	if (__rec_marker(bc, key, key_len, TOMBSTONE) != 0) {
 		pthread_mutex_unlock(&bc->lock);
 		return -1;
 	}
-	n = pwrite(bc->fd, key, key_len,
-	    (off_t)(bc->write_offset + HDR_SIZE));
-	if (n != (ssize_t)key_len) {
-		pthread_mutex_unlock(&bc->lock);
-		return -1;
-	}
-	bc->write_offset += HDR_SIZE + key_len;
 	if (found) __idx_del(bc, key, key_len);
 	pthread_mutex_unlock(&bc->lock);
 	return found ? 0 : 1;
+}
+
+int
+bitcask_flush(bitcask_t *bc)
+{
+	int rc;
+	if (bc == NULL) return -1;
+	pthread_mutex_lock(&bc->lock);
+	rc = __rec_marker(bc, "", 0, REC_FLUSH);
+	if (rc == 0)
+		__idx_clear(bc);
+	pthread_mutex_unlock(&bc->lock);
+	return rc;
 }
 
 int
@@ -535,7 +775,8 @@ bitcask_iterate(bitcask_t *bc, bitcask_iter_fn fn, void *user)
 			for (e = (struct idx_entry *)*lh_bucket(&bc->idx, i);
 			    e != NULL && nkeys < capacity;
 			    e = (struct idx_entry *)e->node.next) {
-				snap[nkeys].key = malloc(e->key_len);
+				snap[nkeys].key =
+				    malloc(e->key_len > 0 ? e->key_len : 1);
 				if (snap[nkeys].key == NULL) {
 					size_t j;
 					for (j = 0; j < nkeys; j++)
@@ -570,15 +811,74 @@ bitcask_sync(bitcask_t *bc)
 }
 
 /*
+ * Copy one live entry's record into the compacted file at `*off` and
+ * re-point the entry there.  The value is read back from the current
+ * data file; the meta (tag, expiry) comes from the index.  Returns 0
+ * or -1.
+ */
+static int
+__compact_one(struct bitcask *bc, int tfd, struct idx_entry *e,
+    uint64_t *off)
+{
+	uint8_t hdr[HDR_SIZE], hdr_for_crc[HDR_SIZE - 4], meta[META_SIZE];
+	struct iovec iov[4];
+	uint8_t *val = NULL;
+	size_t meta_len = 0, total;
+	uint32_t crc, vl = e->val_len;
+	ssize_t n;
+
+	if (e->val_len > 0) {
+		val = malloc(e->val_len);
+		if (val == NULL) return -1;
+		if (pread(bc->fd, val, e->val_len, (off_t)e->offset) !=
+		    (ssize_t)e->val_len) {
+			free(val);
+			return -1;
+		}
+	}
+	if (e->tag != 0 || e->expire_at != 0) {
+		vl |= REC_V2;
+		meta[0] = e->tag;
+		put_u64(meta + 1, (uint64_t)e->expire_at);
+		meta_len = META_SIZE;
+	}
+	put_u64(hdr_for_crc + 0, e->timestamp);
+	put_u32(hdr_for_crc + 8, (uint32_t)e->key_len);
+	put_u32(hdr_for_crc + 12, vl);
+	crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
+	crc = crc32(e->key, e->key_len, crc);
+	crc = crc32(meta, meta_len, crc);
+	crc = crc32(val, e->val_len, crc);
+	put_u32(hdr, crc);
+	memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
+
+	iov[0].iov_base = hdr;     iov[0].iov_len = HDR_SIZE;
+	iov[1].iov_base = e->key;  iov[1].iov_len = e->key_len;
+	iov[2].iov_base = meta;    iov[2].iov_len = meta_len;
+	iov[3].iov_base = val;     iov[3].iov_len = e->val_len;
+	total = HDR_SIZE + e->key_len + meta_len + e->val_len;
+	n = pwritev(tfd, iov, 4, (off_t)*off);
+	free(val);
+	if (n != (ssize_t)total)
+		return -1;
+	e->offset = *off + HDR_SIZE + e->key_len + meta_len;
+	*off += total;
+	return 0;
+}
+
+/*
  * Compaction (merge).  Rewrite the data file keeping only the live
- * records -- the current index entries -- so superseded versions and
- * deleted keys (the bytes_dead bytes) are reclaimed.  The live set is
- * written to a temp file, fsync'd, then renamed over the data file;
- * the in-memory index offsets are re-pointed into the new file as
- * each record is written.  Holds the write lock for the whole pass
- * (a single-file Bitcask cannot serve reads from the old file while
- * the new one is being built); a multi-file variant would merge
- * immutable segments in the background instead.
+ * records -- the current index entries -- so superseded versions,
+ * deleted keys, flushed keys and the tombstone and flush records
+ * themselves (the bytes_dead bytes) are reclaimed.  A live entry keeps
+ * its tag and expiry; an entry whose expiry has passed is dropped from
+ * the index and not copied.  The live set is written to a temp file,
+ * fsync'd, then renamed over the data file; the in-memory index
+ * offsets are re-pointed into the new file as each record is written.
+ * Holds the write lock for the whole pass (a single-file Bitcask
+ * cannot serve reads from the old file while the new one is being
+ * built); a multi-file variant would merge immutable segments in the
+ * background instead.
  */
 int
 bitcask_compact(bitcask_t *bc)
@@ -586,13 +886,14 @@ bitcask_compact(bitcask_t *bc)
 	char tmp_path[512], data_path[512];
 	int tfd;
 	uint64_t new_off = 0;
+	int64_t now = wall_ns();
 	size_t i;
 	int rc = -1;
 
 	if (bc == NULL) return -1;
 
 	snprintf(tmp_path, sizeof tmp_path, "%s/bitcask.compact", bc->dir);
-	snprintf(data_path, sizeof data_path, "%s/bitcask.data", bc->dir);
+	snprintf(data_path, sizeof data_path, "%s/" DATA_FILE, bc->dir);
 
 	pthread_mutex_lock(&bc->lock);
 
@@ -600,46 +901,21 @@ bitcask_compact(bitcask_t *bc)
 	if (tfd < 0) goto out;
 
 	for (i = 0; i < lh_buckets(&bc->idx); i++) {
-		struct idx_entry *e;
-		for (e = (struct idx_entry *)*lh_bucket(&bc->idx, i); e != NULL;
-		    e = (struct idx_entry *)e->node.next) {
-			uint8_t hdr[HDR_SIZE], hdr_for_crc[HDR_SIZE - 4];
-			uint8_t *val = NULL;
-			uint32_t crc;
-			uint64_t rec_off = new_off;
+		lh_node_t **link = lh_bucket(&bc->idx, i);
+		while (*link != NULL) {
+			struct idx_entry *e = (struct idx_entry *)*link;
 
-			if (e->val_len > 0) {
-				val = malloc(e->val_len);
-				if (val == NULL) goto fail;
-				if (pread(bc->fd, val, e->val_len,
-				    (off_t)e->offset) != (ssize_t)e->val_len) {
-					free(val); goto fail;
-				}
+			/* Expired: unlink and free it; nothing is copied. */
+			if (e->expire_at != 0 && e->expire_at <= now) {
+				*link = e->node.next;
+				free(e->key);
+				free(e);
+				bc->n_keys--;
+				continue;
 			}
-
-			put_u64(hdr_for_crc + 0, e->timestamp);
-			put_u32(hdr_for_crc + 8, (uint32_t)e->key_len);
-			put_u32(hdr_for_crc + 12, e->val_len);
-			crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
-			crc = crc32(e->key, e->key_len, crc);
-			if (e->val_len > 0) crc = crc32(val, e->val_len, crc);
-			put_u32(hdr, crc);
-			memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
-
-			if (pwrite(tfd, hdr, HDR_SIZE, (off_t)rec_off) !=
-			    (ssize_t)HDR_SIZE) { free(val); goto fail; }
-			if (pwrite(tfd, e->key, e->key_len,
-			    (off_t)(rec_off + HDR_SIZE)) !=
-			    (ssize_t)e->key_len) { free(val); goto fail; }
-			if (e->val_len > 0 &&
-			    pwrite(tfd, val, e->val_len,
-			    (off_t)(rec_off + HDR_SIZE + e->key_len)) !=
-			    (ssize_t)e->val_len) { free(val); goto fail; }
-			free(val);
-
-			/* Re-point the index at the new file's value offset. */
-			e->offset = rec_off + HDR_SIZE + e->key_len;
-			new_off += (uint64_t)HDR_SIZE + e->key_len + e->val_len;
+			if (__compact_one(bc, tfd, e, &new_off) != 0)
+				goto fail;
+			link = &e->node.next;
 		}
 	}
 

@@ -27,24 +27,33 @@
 
 static char dir[256];
 
+/* Remove the log files (the old and the current name). */
+static void
+clean_dir(void)
+{
+	char path[512];
+	snprintf(path, sizeof path, "%s/bitcask.data", dir);
+	(void)unlink(path);
+	snprintf(path, sizeof path, "%s/bitcask.v2", dir);
+	(void)unlink(path);
+}
+
 static void
 setup_dir(void)
 {
-	snprintf(dir, sizeof dir, "/tmp/rexis-persist-test-%d", (int)getpid());
+	const char *base = getenv("TMPDIR");
+
+	snprintf(dir, sizeof dir, "%s/rexis-persist-test-%d",
+	    base != NULL && *base != '\0' ? base : "/tmp", (int)getpid());
 	(void)unlink(dir);            /* in case it's a stale file */
-	if (mkdir(dir, 0700) != 0) {
-		char path[512];
-		snprintf(path, sizeof path, "%s/bitcask.data", dir);
-		(void)unlink(path);       /* directory exists; clean it */
-	}
+	if (mkdir(dir, 0700) != 0)
+		clean_dir();              /* directory exists; clean it */
 }
 
 static void
 teardown_dir(void)
 {
-	char path[512];
-	snprintf(path, sizeof path, "%s/bitcask.data", dir);
-	(void)unlink(path);
+	clean_dir();
 	(void)rmdir(dir);
 }
 

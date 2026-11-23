@@ -14,14 +14,28 @@
  *   * A get is an index lookup + one pread.
  *   * A put is an append + index update.
  *   * A delete is a tombstone append + index removal.
+ *   * A flush is one flush record + an emptied index.
  *
  * On crash, the index is rebuilt by scanning the data file at
- * startup.  Background merge (not implemented in this v1) reclaims
- * space when superseded entries accumulate.
+ * startup.  bitcask_compact (the merge) reclaims the space superseded
+ * entries hold; nothing calls it on a schedule.
  *
- * This v1 supports byte-string keys and values (no TTL / list /
- * hash types -- those layer on top in db_bitcask.c if/when wired
- * into rexis's full API).
+ * Keys and values are byte strings.  A put may carry meta: a one-byte
+ * tag the caller defines and an
+ * absolute expiry time in wall-clock nanoseconds.  An entry whose
+ * expiry has passed is dropped by recovery and by the merge.
+ *
+ * Writes go to the OS page cache with pwrite and are not fsync'd, so
+ * an acknowledged put survives the process being killed but not a
+ * power loss or a kernel crash (bitcask_sync forces it).  The I/O is
+ * synchronous on the calling thread.
+ *
+ * The data file is DIR/bitcask.v2.  A directory written by an older
+ * rexis holds DIR/bitcask.data, whose records are all still valid:
+ * bitcask_open renames it to bitcask.v2 and carries on.  An older
+ * binary then finds no bitcask.data and starts empty, leaving
+ * bitcask.v2 alone, instead of truncating the log at the first record
+ * it cannot parse.
  */
 
 #ifndef BITCASK_H
@@ -31,6 +45,16 @@
 #include <stdint.h>
 
 typedef struct bitcask bitcask_t;
+
+/* Largest key or value a record holds: rexis's largest bulk string
+ * (proto.c), so any value a client can SET can be logged. */
+#define BITCASK_MAX_VAL  (512u * 1024u * 1024u)
+
+/* A put's meta.  { 0, 0 } is a plain put. */
+typedef struct bitcask_meta {
+	uint8_t tag;         /* the caller's; bitcask only stores it */
+	int64_t expire_at;   /* wall-clock ns (xtc_clock_real); 0 = never */
+} bitcask_meta_t;
 
 typedef struct bitcask_stats {
 	uint64_t n_keys;
@@ -44,17 +68,29 @@ typedef struct bitcask_stats {
 } bitcask_stats_t;
 
 /* Open / create a Bitcask at the given directory.  The directory
- * must already exist; the data file is named "bitcask.data" inside. */
+ * must already exist; the data file is named "bitcask.v2" inside (an
+ * older "bitcask.data" is renamed to it, see above). */
 int   bitcask_open(const char *dir, bitcask_t **out);
 
 /* Close + flush.  Subsequent opens of the same directory will
  * recover state from the data file. */
 void  bitcask_close(bitcask_t *bc);
 
-/* Put.  Returns 0 on success, -1 on I/O error. */
+/* Put.  Returns 0 on success, -1 on I/O error or a key or value over
+ * BITCASK_MAX_VAL.  The key and the value may be empty. */
 int   bitcask_put(bitcask_t *bc,
                   const void *key, size_t key_len,
                   const void *val, size_t val_len);
+
+/* Put with meta (tag, expiry).  As bitcask_put otherwise. */
+int   bitcask_put_meta(bitcask_t *bc,
+                       const void *key, size_t key_len,
+                       const void *val, size_t val_len,
+                       const bitcask_meta_t *m);
+
+/* The meta of `key`'s live entry.  0 on hit, 1 on miss. */
+int   bitcask_meta(bitcask_t *bc, const void *key, size_t key_len,
+                   bitcask_meta_t *out);
 
 /* Get.  Caller-allocated `val_out` of `val_buf_size` bytes.  On
  * success, *val_len is the actual value size; if val_buf_size is
@@ -76,6 +112,10 @@ int   bitcask_size(bitcask_t *bc,
 int   bitcask_del(bitcask_t *bc,
                   const void *key, size_t key_len);
 
+/* Delete every key: one flush record, after which every earlier
+ * record is dead.  Returns 0, or -1 on I/O error. */
+int   bitcask_flush(bitcask_t *bc);
+
 /* Iterate all live keys.  Callback receives (key, key_len, user)
  * and returns nonzero to stop early. */
 typedef int (*bitcask_iter_fn)(const void *key, size_t key_len, void *user);
@@ -85,8 +125,9 @@ int   bitcask_iterate(bitcask_t *bc, bitcask_iter_fn fn, void *user);
 int   bitcask_sync(bitcask_t *bc);
 
 /* Compaction / merge: rewrite the data file keeping only the live
- * records, reclaiming the bytes_dead bytes left by overwrites and
- * deletes.  Returns 0 on success.  A failed compaction leaves the
+ * records, reclaiming the bytes_dead bytes left by overwrites, deletes
+ * and flushes.  A live entry keeps its meta; an expired one is dropped.
+ * Returns 0 on success.  A failed compaction leaves the
  * handle inconsistent and should be treated as fatal for it.  Holds
  * the write lock for the whole pass. */
 int   bitcask_compact(bitcask_t *bc);
