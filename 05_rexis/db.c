@@ -409,11 +409,11 @@ db_sync(void *dst, const void *src, size_t sz)
  * of a command leaves the log before it or after it, never between.
  * Bitcask keeps the latest record per key, so replay sets each
  * surviving key once, in its final form, and nothing depends on the
- * order of operations or on replaying them twice.  The value type travels in the record's tag and the expiry in
- * its expire_at (wall-clock ns, so it means the same instant after a
- * restart; the in-memory expiry is monotonic and is converted both
- * ways).  A key whose expiry has passed is dropped by bitcask's
- * recovery and merge.
+ * order of operations or on replaying them twice.  The value type
+ * travels in the record's tag and the expiry in its expire_at
+ * (wall-clock ns, so it means the same instant after a restart; the
+ * in-memory expiry is monotonic and is converted both ways).  A key
+ * whose expiry has passed is dropped by bitcask's recovery and merge.
  *
  * shortcut: a list or hash write logs the whole value, so the bytes
  * logged per command grow with the value's size; log per-element
@@ -567,8 +567,9 @@ persist_key(db_t *db, const char *key, size_t key_len)
 		xtc_free(buf);
 	}
 	if (rc != 0)
-		persist_fail(key, key_len, "the value (I/O error, or over "
-		    "the log's 512 MiB value limit)");
+		persist_fail(key, key_len, "the value (an I/O error, a "
+		    "value over the log's 512 MiB limit, or no memory for "
+		    "the log's index)");
 }
 
 /* Forward decls: the writes replay rebuilds an entry with. */

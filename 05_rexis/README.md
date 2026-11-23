@@ -292,24 +292,30 @@ expiry, so they stay gone.
 
 A TTL out of range is refused the way Redis refuses it, and the
 refused command changes nothing in memory or in the log.  SET with an
-EX or PX of zero or less, or one too far out to hold (the expiry, on
-the wall clock, in signed 64-bit nanoseconds: about 220 years), answers
+EX or PX of zero or less, or one too far out to hold, answers
 `-ERR invalid expire time in 'set' command`; EXPIRE too far out, or
 below -9223372036854775 (INT64_MIN / 1000, as in Redis), answers
 `-ERR invalid expire time in 'expire' command`.  An EX, PX or EXPIRE
 argument that is not an integer answers `-ERR value is not an integer
-or out of range`.  EXPIRE with any other value of zero or less deletes
-the key (a tombstone in the log) and answers 1 if it existed.
+or out of range`.  EXPIRE with any other value of zero or less
+deletes the key (a tombstone in the log) and answers 1 if it existed.
+
+Too far out means an expiry after April 2262, the last instant that
+signed 64-bit nanoseconds since 1970 can hold: in 2026 that caps a TTL
+at about 235 years, and the cap shrinks a year each year.  Redis counts
+milliseconds and allows TTLs far longer; those are the one range of
+TTLs Redis accepts and rexis refuses.
 
 **Durability.**  A record is written with `pwrite` before the reply,
 and is not fsync'd: an acknowledged command survives the server
 crashing or being killed (the kernel holds the write), but not a power
 loss or a kernel crash.  A clean shutdown (SIGTERM) fsyncs the log.
 There is no option for an fsync per command.  If the log cannot take a
-write (an I/O error, a value over 512 MiB, or no memory to build the
-record of a list, a hash or a multi-key DEL), the server prints the key
-and exits with status 74 before it answers, so no write it could not
-log is ever acknowledged.  A log that cannot be reloaded in full
+write (an I/O error, a value over 512 MiB, no memory to build the
+record of a list, a hash or a multi-key DEL, or no memory for the log's
+in-memory index of a new key), the server prints the key and exits
+with status 74 before it answers, so no write it could not log is ever
+acknowledged.  A log that cannot be reloaded in full
 (more keys or memory than `--max-keys` and `--max-memory` allow, or a
 malformed record) stops the server at startup rather than serving part
 of it.

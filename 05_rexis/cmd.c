@@ -85,7 +85,8 @@ parse_i64(const char *s, size_t len, int64_t *out)
  * The monotonic expiry `n` units (unit_ns each, n > 0) from now, in
  * *out.  Returns 0, or -1 if it is too far out: the expiry, and the
  * wall-clock time the log converts it to (db.c), must both fit in
- * int64_t nanoseconds, which caps a TTL at about 230 years.
+ * int64_t nanoseconds, so no expiry may fall after April 2262 (the
+ * last instant int64_t nanoseconds since 1970 can hold).
  */
 static int
 expire_from_now(int64_t n, int64_t unit_ns, int64_t *out)
