@@ -78,11 +78,11 @@ typedef struct db_opts {
 	size_t       max_keys;         /* 0 = unlimited */
 	int64_t      max_mem_bytes;    /* 0 = unlimited */
 	xtc_res_t   *res;              /* optional resource accountant */
-	const char  *persist_dir;      /* if non-NULL, enable Bitcask
-	                                * persistence in this directory.
-	                                * v1: only string SET/DEL are
-	                                * logged.  Other types remain
-	                                * memory-only. */
+	const char  *persist_dir;      /* if non-NULL, log every write
+	                                * (its key's resulting state, or
+	                                * a flush) to a Bitcask in this
+	                                * directory and reload it at
+	                                * create.  See db.c. */
 	int          shared;           /* 1 = used from more than one loop
 	                                * (OS thread): the keyspace is split
 	                                * into shards, each with a parking
@@ -118,7 +118,10 @@ typedef enum db_op_kind {
 /* Database handle */
 typedef struct db db_t;
 
-/* Create/destroy */
+/* Create/destroy.  With persist_dir, db_create reloads the log and
+ * fails (XTC_E_INTERNAL) if the log cannot be opened or a key in it
+ * cannot be rebuilt.  A write the log then refuses stops the process
+ * (exit 74) before the write is acknowledged. */
 int  db_create(const db_opts_t *opts, db_t **out);
 void db_destroy(db_t *db);
 

@@ -37,7 +37,8 @@ LDFLAGS  = $(XTC_LDFLAGS) $(XTC_BUILD)/libxtc.a -pthread $(LIBURING_LDFLAGS)
 # Proto object file from redis example
 PROTO_OBJ = $(REXIS_DIR)/proto.o
 
-TESTS = test_resp_parser test_rexis_loopback test_rexis_budgets test_rexis_pbt
+TESTS = test_resp_parser test_rexis_loopback test_rexis_budgets test_rexis_pbt \
+        test_rexis_restart
 
 .PHONY: all clean check FORCE
 
@@ -55,7 +56,11 @@ test_rexis_budgets: test_rexis_budgets.o munit.o
 test_rexis_pbt: test_rexis_pbt.o munit.o
 	$(CC) $(CFLAGS) -o $@ $^ -lpthread
 
-test_rexis_loopback.o test_rexis_budgets.o test_rexis_pbt.o: rexis_harness.h
+test_rexis_restart: test_rexis_restart.o munit.o
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread
+
+test_rexis_loopback.o test_rexis_budgets.o test_rexis_pbt.o \
+test_rexis_restart.o: rexis_harness.h
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -83,7 +88,9 @@ check: all
 	$(TIMEOUT) ./test_rexis_loopback
 	$(TIMEOUT) ./test_rexis_budgets
 	$(TIMEOUT) ./test_rexis_pbt
+	$(TIMEOUT) ./test_rexis_restart
 	REXIS_ARGS=--loops=2 $(TIMEOUT) ./test_rexis_loopback
 	REXIS_ARGS=--loops=2 $(TIMEOUT) ./test_rexis_budgets
 	REXIS_ARGS=--loops=2 $(TIMEOUT) ./test_rexis_pbt
+	REXIS_ARGS=--loops=2 $(TIMEOUT) ./test_rexis_restart
 	sh ./test_rexis_persist.sh

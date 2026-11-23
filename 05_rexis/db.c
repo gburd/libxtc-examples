@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include "db.h"
 #include "xtc_sync.h"
@@ -397,42 +398,275 @@ db_sync(void *dst, const void *src, size_t sz)
 	memcpy(dst, src, sz);
 }
 
-/* ----- Persistence (Bitcask) ----- */
+/* ----- Persistence (Bitcask) -----
+ *
+ * Every write logs the RESULTING state of the key it changed, not the
+ * operation: INCR logs the new number, LPUSH the whole list, a write
+ * that removes the key (DEL, the last LPOP or HDEL) a tombstone, and
+ * FLUSHDB one flush record.  Bitcask keeps the latest record per key,
+ * so replay sets each surviving key once, in its final form, and
+ * nothing depends on the order of operations or on replaying them
+ * twice.  The value type travels in the record's tag and the expiry in
+ * its expire_at (wall-clock ns, so it means the same instant after a
+ * restart; the in-memory expiry is monotonic and is converted both
+ * ways).  A key whose expiry has passed is dropped by bitcask's
+ * recovery and merge.
+ *
+ * shortcut: a list or hash write logs the whole value, so the bytes
+ * logged per command grow with the value's size; log per-element
+ * records (and replay them in order) if large lists or hashes need it.
+ *
+ * Value encodings (lengths are u32, network byte order):
+ *   string (tag 0)  the bytes.
+ *   list   (tag 2)  per element, head first: len, bytes.
+ *   hash   (tag 3)  per field, oldest first: key len, key, value len,
+ *                   value.  Replay HSETs them in that order, and HSET
+ *                   adds at the head, so the field order comes back.
+ */
 
-/* Forward decl: db_set without a persistence write-back, used
- * during replay. */
+static void
+put_be32(char *p, uint32_t v)
+{
+	p[0] = (char)(v >> 24); p[1] = (char)(v >> 16);
+	p[2] = (char)(v >> 8);  p[3] = (char)v;
+}
+
+static uint32_t
+get_be32(const char *p)
+{
+	const unsigned char *u = (const unsigned char *)p;
+	return ((uint32_t)u[0] << 24) | ((uint32_t)u[1] << 16) |
+	    ((uint32_t)u[2] << 8) | (uint32_t)u[3];
+}
+
+/* Wall-clock ns minus monotonic ns, now: adds to a monotonic expiry to
+ * give the wall-clock one. */
+static int64_t
+wall_offset(void)
+{
+	return xtc_clock_real() - xtc_clock_mono();
+}
+
+/*
+ * The log could not take a write that changed the keyspace.  The
+ * change is in memory but would not survive a restart, and the client
+ * has not been answered yet, so stop the server before it acknowledges
+ * a write it cannot keep (the same fail-stop a database takes on a WAL
+ * write error).
+ */
+static void
+persist_fail(const char *key, size_t key_len, const char *what)
+{
+	fprintf(stderr, "rexis: persistence: cannot log %s%s%.*s%s; "
+	    "stopping so no unlogged write is acknowledged\n", what,
+	    key_len > 0 ? " of key '" : "",
+	    (int)(key_len > 64 ? 64 : key_len), key,
+	    key_len > 0 ? "'" : "");
+	_exit(74);                      /* EX_IOERR */
+}
+
+/* Serialize a list or hash entry's value into a new xtc_malloc'd buffer
+ * (*len bytes).  NULL if out of memory. */
+static char *
+persist_encode(const db_entry_t *e, size_t *len)
+{
+	const db_list_node_t *ln;
+	const db_hash_field_t *hf, **fields;
+	size_t n = 0, i;
+	char *buf, *p;
+
+	/* Size it. */
+	if (e->type == DB_VAL_LIST) {
+		for (ln = e->val.list.head; ln; ln = ln->next)
+			n += 4 + ln->len;
+	} else {
+		for (hf = e->val.hash.head; hf; hf = hf->next)
+			n += 8 + hf->key_len + hf->val_len;
+	}
+	if ((buf = xtc_malloc(n > 0 ? n : 1)) == NULL)
+		return NULL;
+	p = buf;
+
+	/* A list goes head first. */
+	if (e->type == DB_VAL_LIST) {
+		for (ln = e->val.list.head; ln; ln = ln->next) {
+			put_be32(p, (uint32_t)ln->len);
+			memcpy(p + 4, ln->data, ln->len);
+			p += 4 + ln->len;
+		}
+		*len = n;
+		return buf;
+	}
+
+	/* A hash goes oldest (tail) first; the chain is singly linked, so
+	 * walk it into an array and write that backwards. */
+	fields = xtc_malloc((e->val.hash.count + 1) * sizeof *fields);
+	if (fields == NULL) {
+		xtc_free(buf);
+		return NULL;
+	}
+	i = 0;
+	for (hf = e->val.hash.head; hf; hf = hf->next)
+		fields[i++] = hf;
+	while (i-- > 0) {
+		hf = fields[i];
+		put_be32(p, (uint32_t)hf->key_len);
+		memcpy(p + 4, hf->data, hf->key_len);
+		p += 4 + hf->key_len;
+		put_be32(p, (uint32_t)hf->val_len);
+		memcpy(p + 4, hf->data + hf->key_len + 1, hf->val_len);
+		p += 4 + hf->val_len;
+	}
+	xtc_free(fields);
+	*len = n;
+	return buf;
+}
+
+/*
+ * Log `key`'s current state: its entry (value, type, expiry), or a
+ * tombstone if it no longer exists.  Called by every write after it
+ * changed the key, with the key's shard write-locked.  Does nothing
+ * without --persist, or while the log itself is being replayed (bc is
+ * NULL then).  A log write failure stops the server (persist_fail).
+ */
+static void
+persist_key(db_t *db, const char *key, size_t key_len)
+{
+	uint64_t h;
+	db_entry_t *e;
+	bitcask_meta_t m = { 0, 0 };
+	char *buf;
+	size_t len;
+	int rc;
+
+	if (db->bc == NULL)
+		return;
+	h = fnv1a(key, key_len);
+	e = entry_find(wtable(db, h), key, key_len, h);
+	if (e == NULL) {
+		if (bitcask_del(db->bc, key, key_len) < 0)
+			persist_fail(key, key_len, "the delete");
+		return;
+	}
+	if (e->expire_at_ns != 0) {
+		m.expire_at = e->expire_at_ns + wall_offset();
+		if (m.expire_at <= 0)
+			m.expire_at = 1;      /* long past, still "has expiry" */
+	}
+	if (e->type == DB_VAL_STRING) {
+		rc = bitcask_put_meta(db->bc, key, key_len, e->val.str.data,
+		    e->val.str.len, &m);
+	} else {
+		m.tag = (uint8_t)e->type;
+		if ((buf = persist_encode(e, &len)) == NULL)
+			persist_fail(key, key_len, "the value (out of memory)");
+		rc = bitcask_put_meta(db->bc, key, key_len, buf, len, &m);
+		xtc_free(buf);
+	}
+	if (rc != 0)
+		persist_fail(key, key_len, "the value (I/O error, or over "
+		    "the log's 512 MiB value limit)");
+}
+
+/* Forward decls: the writes replay rebuilds an entry with. */
 static int db_set_inmem(db_t *, const char *, size_t,
                         const char *, size_t);
+
+/* Rebuild one list or hash from its encoding (persist_encode).
+ * Returns 0, or -1 on a malformed encoding or a refused insert. */
+static int
+replay_decode(db_t *db, const char *key, size_t key_len, int type,
+    const char *v, size_t n)
+{
+	size_t off = 0;
+	uint32_t a, b;
+
+	while (off < n) {
+		if (n - off < 4 || (a = get_be32(v + off)) > n - off - 4)
+			return -1;
+		if (type == DB_VAL_LIST) {
+			if (db_rpush(db, key, key_len, v + off + 4, a) < 0)
+				return -1;
+			off += 4 + (size_t)a;
+			continue;
+		}
+		off += 4;
+		if (n - off - a < 4 ||
+		    (b = get_be32(v + off + a)) > n - off - a - 4)
+			return -1;
+		if (db_hset(db, key, key_len, v + off, a, v + off + a + 4,
+		    b) < 0)
+			return -1;
+		off += (size_t)a + 4 + b;
+	}
+	return 0;
+}
 
 struct __replay_ctx {
 	db_t      *db;
 	bitcask_t *bc;
+	int64_t    wall_off;   /* wall_offset() when the replay began */
+	int        failed;
 };
 
+/* Rebuild one key from its live log entry (bitcask_iterate callback).
+ * Returns nonzero to stop the iteration. */
 static int
 __replay_one(const void *key, size_t key_len, void *user)
 {
 	struct __replay_ctx *ctx = user;
+	bitcask_meta_t m = { 0, 0 };
 	size_t  vsz = 0;
 	char   *val = NULL;
+	int64_t exp;
 	int     rc;
 
-	if (bitcask_size(ctx->bc, key, key_len, &vsz) != 0)
+	if (bitcask_size(ctx->bc, key, key_len, &vsz) != 0 ||
+	    bitcask_meta(ctx->bc, key, key_len, &m) != 0)
 		return 0;
-	val = malloc(vsz + 1);
-	if (val == NULL) return 1;
-	rc = bitcask_get(ctx->bc, key, key_len, val, vsz, &vsz);
-	if (rc != 0) { free(val); return 1; }
-	(void)db_set_inmem(ctx->db, key, key_len, val, vsz);
-	free(val);
+	if ((val = xtc_malloc(vsz + 1)) == NULL)
+		goto fail;
+	if (bitcask_get(ctx->bc, key, key_len, val, vsz, &vsz) != 0)
+		goto fail;
+	if (m.tag == 0)
+		rc = db_set_inmem(ctx->db, key, key_len, val, vsz);
+	else if (m.tag == DB_VAL_LIST || m.tag == DB_VAL_HASH)
+		rc = replay_decode(ctx->db, key, key_len, m.tag, val, vsz);
+	else
+		rc = -1;
+	if (rc != 0)
+		goto fail;
+	if (m.expire_at != 0) {
+		/* A key that expires between recovery and here maps to a
+		 * monotonic time in the past: still an expiry (> 0). */
+		exp = m.expire_at - ctx->wall_off;
+		(void)db_expire(ctx->db, key, key_len, exp > 0 ? exp : 1);
+	}
+	xtc_free(val);
 	return 0;
+fail:
+	fprintf(stderr, "rexis: persistence: cannot rebuild key '%.*s' "
+	    "from the log (type %u, %zu bytes)\n",
+	    (int)(key_len > 64 ? 64 : key_len), (const char *)key,
+	    (unsigned)m.tag, vsz);
+	xtc_free(val);
+	ctx->failed = 1;
+	return 1;
 }
 
-static void
+/* Load the log into the keyspace.  Writes made here are not logged
+ * again: db->bc is cleared while it runs.  Returns 0, or -1 if a key
+ * could not be rebuilt (a budget too small for the data, or a
+ * malformed record). */
+static int
 db_persist_replay(db_t *db)
 {
-	struct __replay_ctx ctx = { db, db->bc };
-	(void)bitcask_iterate(db->bc, __replay_one, &ctx);
+	struct __replay_ctx ctx = { db, db->bc, wall_offset(), 0 };
+
+	db->bc = NULL;
+	(void)bitcask_iterate(ctx.bc, __replay_one, &ctx);
+	db->bc = ctx.bc;
+	return ctx.failed ? -1 : 0;
 }
 
 /* ----- Public API ----- */
@@ -553,16 +787,19 @@ db_create(const db_opts_t *opts, db_t **out)
 			return XTC_E_INTERNAL;
 		}
 		/* Replay live keys from the bitcask into the in-memory
-		 * table.  We use bitcask_iterate to visit each key; for
-		 * each, we read the value and call db_set without writing
-		 * back to bitcask.  The replay mutates the write copy, so
+		 * table (db_persist_replay: each key once, in its final
+		 * form, not written back to the log).  The replay mutates the write copy, so
 		 * it is a write transaction like any other: without the
 		 * publish in db_write_end the readers kept the empty
 		 * header (DBSIZE 0 after every restart until the first
 		 * write command). */
 		db_write_begin(db);
-		db_persist_replay(db);
+		rc = db_persist_replay(db);
 		db_write_end(db);
+		if (rc != 0) {
+			db_destroy(db);
+			return XTC_E_INTERNAL;
+		}
 	}
 
 	*out = db;
@@ -1033,12 +1270,7 @@ db_set_ex(db_t *db, const char *key, size_t key_len,
 	entry_link(db, tbl, e, h);
 
 persist:
-	/* Persist to bitcask if enabled.  TTLs are not persisted in v1
-	 * (the entry comes back without expire_at_ns after a restart);
-	 * documented in db.h. */
-	if (db->bc != NULL && expire_ns == 0) {
-		(void)bitcask_put(db->bc, key, key_len, val, val_len);
-	}
+	persist_key(db, key, key_len);
 	return 0;
 }
 
@@ -1052,10 +1284,7 @@ db_del(db_t *db, const char *key, size_t key_len)
 	if (!e)
 		return 0;
 	entry_remove(db, tbl, e);
-
-	if (db->bc != NULL) {
-		(void)bitcask_del(db->bc, key, key_len);
-	}
+	persist_key(db, key, key_len);
 	return 1;
 }
 
@@ -1069,6 +1298,7 @@ db_expire(db_t *db, const char *key, size_t key_len, int64_t expire_ns)
 	if (!e)
 		return -1;
 	e->expire_at_ns = expire_ns;
+	persist_key(db, key, key_len);
 	return 0;
 }
 
@@ -1122,10 +1352,12 @@ db_incr(db_t *db, const char *key, size_t key_len, int64_t delta)
 	if (!e->val.str.data) {
 		/* Entry is now corrupted; remove it */
 		entry_remove(db, tbl, e);
+		persist_key(db, key, key_len);
 		return -1;
 	}
 	memcpy(e->val.str.data, buf, (size_t)n + 1);
 	e->val.str.len = (size_t)n;
+	persist_key(db, key, key_len);
 
 	return val;
 }
@@ -1194,6 +1426,7 @@ db_lpush(db_t *db, const char *key, size_t key_len,
 		e->val.list.tail = n;
 	e->val.list.head = n;
 	e->val.list.count++;
+	persist_key(db, key, key_len);
 
 	return (int64_t)e->val.list.count;
 }
@@ -1223,6 +1456,7 @@ db_rpush(db_t *db, const char *key, size_t key_len,
 		e->val.list.head = n;
 	e->val.list.tail = n;
 	e->val.list.count++;
+	persist_key(db, key, key_len);
 
 	return (int64_t)e->val.list.count;
 }
@@ -1254,6 +1488,7 @@ db_lpop(db_t *db, const char *key, size_t key_len,
 	/* Remove empty list */
 	if (e->val.list.count == 0)
 		entry_remove(db, tbl, e);
+	persist_key(db, key, key_len);
 
 	return 1;
 }
@@ -1285,6 +1520,7 @@ db_rpop(db_t *db, const char *key, size_t key_len,
 	/* Remove empty list */
 	if (e->val.list.count == 0)
 		entry_remove(db, tbl, e);
+	persist_key(db, key, key_len);
 
 	return 1;
 }
@@ -1361,6 +1597,7 @@ db_hset(db_t *db, const char *key, size_t key_len,
 				e->val.hash.head = nf;
 			db_free(db, f,
 			        sizeof(*f) + f->key_len + f->val_len + 2);
+			persist_key(db, key, key_len);
 			return 0;
 		}
 	}
@@ -1379,6 +1616,7 @@ db_hset(db_t *db, const char *key, size_t key_len,
 	e->val.hash.head = f;
 	e->val.hash.count++;
 	added = 1;
+	persist_key(db, key, key_len);
 
 	return added;
 }
@@ -1406,6 +1644,7 @@ db_hdel(db_t *db, const char *key, size_t key_len,
 			/* Remove empty hash */
 			if (e->val.hash.count == 0)
 				entry_remove(db, tbl, e);
+			persist_key(db, key, key_len);
 			return 1;
 		}
 	}
@@ -1436,6 +1675,8 @@ db_flushdb(db_t *db)
 		    xtc_mo_seq_cst);
 		tbl->n_keys = 0;
 	}
+	if (db->bc != NULL && bitcask_flush(db->bc) != 0)
+		persist_fail("", 0, "the flush");
 }
 
 int

@@ -30,4 +30,5 @@
 05_rexis/test/test_rexis_loopback
 05_rexis/test/test_rexis_budgets
 05_rexis/test/test_rexis_pbt
+05_rexis/test/test_rexis_restart
 05_rexis/test/*.o

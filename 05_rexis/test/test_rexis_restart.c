@@ -1,0 +1,437 @@
+/*-
+ * Copyright (c) 2026, The XTC Project -- All rights reserved.
+ * Use of this source code is governed by the ISC License.
+ *
+ * 05_rexis/test/test_rexis_restart.c
+ *	--persist across a real server restart.  Each test starts
+ *	rexis-server-xtc with --persist=DIR, runs commands of one class
+ *	(counters, TTLs, FLUSHDB, lists, hashes, deletes), then stops the
+ *	server and starts a new one on the same directory, and checks that
+ *	the keyspace came back exactly as acknowledged: every probe (a read
+ *	command) must answer byte for byte what it answered before the
+ *	restart.
+ *
+ *	Each test runs twice: "term" stops the server with SIGTERM (a clean
+ *	shutdown), "kill" with SIGKILL between two commands (a crash).  The
+ *	log is written with pwrite and no fsync, so a crash of the process
+ *	keeps every acknowledged write (the page cache has it); a power loss
+ *	is not tested and not promised (05_rexis/README.md).
+ *
+ *	The log directory is under $TMPDIR (else /tmp) and is removed at the
+ *	end of each test.
+ */
+
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+#include "munit.h"
+
+#include "rexis_harness.h"
+
+/* One test's server and log directory. */
+typedef struct rt {
+	rexis_srv_t srv;
+	int         fd;          /* client connection to srv */
+	int         crash;       /* restart with SIGKILL, not SIGTERM */
+	char        dir[256];
+	char        arg[300];    /* --persist=DIR */
+} rt_t;
+
+static char *stop_modes[] = { "term", "kill", NULL };
+static MunitParameterEnum params[] = {
+	{ "stop", stop_modes },
+	{ NULL, NULL }
+};
+
+/* ----- RESP replies ----- */
+
+/* Read one CRLF-terminated line (CRLF included) into buf at *len.
+ * Returns 0, or -1 on EOF / timeout / overflow. */
+static int
+read_line(int fd, char *buf, size_t cap, size_t *len)
+{
+	while (*len + 1 < cap) {
+		if (recv(fd, buf + *len, 1, 0) != 1)
+			return -1;
+		(*len)++;
+		if (*len >= 2 && buf[*len - 2] == '\r' && buf[*len - 1] == '\n')
+			return 0;
+	}
+	return -1;
+}
+
+/* Read one whole RESP reply (nested arrays included) into buf, NUL
+ * terminated.  Returns 0, or -1. */
+static int
+read_reply(int fd, char *buf, size_t cap, size_t *len)
+{
+	size_t start = *len;
+	long n, i;
+
+	if (read_line(fd, buf, cap, len) != 0)
+		return -1;
+	buf[*len] = '\0';
+	n = strtol(buf + start + 1, NULL, 10);
+	if (buf[start] == '$' && n >= 0) {
+		if (*len + (size_t)n + 2 + 1 > cap ||
+		    rexis_read_n(fd, buf + *len, (size_t)n + 2, 3000) !=
+		    (size_t)n + 2)
+			return -1;
+		*len += (size_t)n + 2;
+	} else if (buf[start] == '*') {
+		for (i = 0; i < n; i++)
+			if (read_reply(fd, buf, cap, len) != 0)
+				return -1;
+	}
+	buf[*len] = '\0';
+	return 0;
+}
+
+/* Send a command of argc words (NULL-terminated array) and read its
+ * reply into out (cap bytes).  Fails the test on an I/O error. */
+static void
+rt_cmdv(rt_t *t, const char *const *argv, char *out, size_t cap)
+{
+	char cmd[4096];
+	size_t used = 0, len = 0;
+	int argc = 0, i;
+
+	while (argv[argc] != NULL)
+		argc++;
+	used = (size_t)snprintf(cmd, sizeof cmd, "*%d\r\n", argc);
+	for (i = 0; i < argc; i++)
+		used += (size_t)snprintf(cmd + used, sizeof cmd - used,
+		    "$%zu\r\n%s\r\n", strlen(argv[i]), argv[i]);
+	munit_assert_size(used, <, sizeof cmd);
+	munit_assert_int(rexis_send_all(t->fd, cmd, used), ==, 0);
+	munit_assert_int(read_reply(t->fd, out, cap, &len), ==, 0);
+}
+
+/* Run a command and require its exact reply. */
+#define RT_EXPECT(t, want, ...) do {                                    \
+	const char *const av_[] = { __VA_ARGS__, NULL };                \
+	char got_[4096];                                                 \
+	rt_cmdv((t), av_, got_, sizeof got_);                            \
+	munit_assert_string_equal(got_, (want));                         \
+} while (0)
+
+/* Run a command and return its reply in a static buffer. */
+static const char *
+rt_reply(rt_t *t, const char *const *argv)
+{
+	static char got[4096];
+	rt_cmdv(t, argv, got, sizeof got);
+	return got;
+}
+
+/* ----- Server lifecycle ----- */
+
+static void
+rt_connect(rt_t *t)
+{
+	t->fd = rexis_connect(&t->srv, 3000);
+	munit_assert_int(t->fd, >=, 0);
+}
+
+static void
+rt_start(rt_t *t)
+{
+	const char *const extra[] = { t->arg };
+
+	munit_assert_int(rexis_start(&t->srv, extra, 1), ==, 0);
+	rt_connect(t);
+}
+
+/* Stop the server: SIGTERM and require a clean exit, or SIGKILL. */
+static void
+rt_stop(rt_t *t)
+{
+	close(t->fd);
+	t->fd = -1;
+	if (!t->crash) {
+		munit_assert_int(rexis_stop(&t->srv), ==, 0);
+		return;
+	}
+	kill(t->srv.pid, SIGKILL);
+	munit_assert_int(waitpid(t->srv.pid, NULL, 0), ==, t->srv.pid);
+	t->srv.pid = -1;
+}
+
+static void
+rt_restart(rt_t *t)
+{
+	rt_stop(t);
+	rt_start(t);
+}
+
+static void *
+rt_setup(const MunitParameter p[], void *user)
+{
+	static int seq;
+	const char *base = getenv("TMPDIR");
+	rt_t *t = calloc(1, sizeof *t);
+	(void)user;
+
+	munit_assert_not_null(t);
+	t->crash = strcmp(munit_parameters_get(p, "stop"), "kill") == 0;
+	snprintf(t->dir, sizeof t->dir, "%s/rexis-restart-%d-%d",
+	    base != NULL && *base != '\0' ? base : "/tmp", (int)getpid(),
+	    ++seq);
+	munit_assert_int(mkdir(t->dir, 0700), ==, 0);
+	snprintf(t->arg, sizeof t->arg, "--persist=%s", t->dir);
+	rt_start(t);
+	return t;
+}
+
+static void
+rt_teardown(void *fixture)
+{
+	rt_t *t = fixture;
+	char path[512];
+
+	if (t->fd >= 0)
+		close(t->fd);
+	munit_assert_int(rexis_stop(&t->srv), ==, 0);
+	snprintf(path, sizeof path, "%s/bitcask.v2", t->dir);
+	(void)unlink(path);
+	(void)rmdir(t->dir);
+	free(t);
+}
+
+/*
+ * Run each probe (a NULL-terminated list of read commands, each a
+ * NULL-terminated word list), restart, run them again, and require the
+ * same replies.  This is the "exactly as acknowledged" check.
+ */
+static void
+rt_restart_same(rt_t *t, const char *const *const *probes)
+{
+	static char before[16][4096];
+	int i;
+
+	for (i = 0; probes[i] != NULL; i++) {
+		munit_assert_int(i, <, 16);
+		snprintf(before[i], sizeof before[i], "%s",
+		    rt_reply(t, probes[i]));
+	}
+	rt_restart(t);
+	for (i = 0; probes[i] != NULL; i++)
+		munit_assert_string_equal(rt_reply(t, probes[i]), before[i]);
+}
+
+/* Seconds left on key, from TTL. */
+static long
+rt_ttl(rt_t *t, const char *key)
+{
+	const char *const av[] = { "TTL", key, NULL };
+	const char *r = rt_reply(t, av);
+
+	munit_assert_char(r[0], ==, ':');
+	return strtol(r + 1, NULL, 10);
+}
+
+/* ----- The tests ----- */
+
+/* INCR/DECR/INCRBY/DECRBY log the resulting value. */
+static MunitResult
+test_counters(const MunitParameter p[], void *f)
+{
+	rt_t *t = f;
+	static const char *const a[] = { "GET", "a", NULL };
+	static const char *const c[] = { "GET", "c", NULL };
+	static const char *const n[] = { "GET", "neg", NULL };
+	static const char *const *const probes[] = { a, c, n, NULL };
+	(void)p;
+
+	RT_EXPECT(t, "+OK\r\n", "SET", "a", "1");
+	RT_EXPECT(t, ":2\r\n", "INCR", "a");
+	RT_EXPECT(t, ":3\r\n", "INCR", "a");
+	rt_restart(t);                    /* a crash between INCRs */
+	RT_EXPECT(t, "$1\r\n3\r\n", "GET", "a");
+	RT_EXPECT(t, ":13\r\n", "INCRBY", "a", "10");
+	RT_EXPECT(t, ":12\r\n", "DECR", "a");
+	RT_EXPECT(t, ":10\r\n", "DECRBY", "a", "2");
+	RT_EXPECT(t, ":1\r\n", "INCR", "c");          /* a new key */
+	RT_EXPECT(t, ":-5\r\n", "DECRBY", "neg", "5");
+	rt_restart_same(t, probes);
+	RT_EXPECT(t, "$2\r\n10\r\n", "GET", "a");
+	RT_EXPECT(t, ":11\r\n", "INCR", "a");     /* counts on from there */
+	return MUNIT_OK;
+}
+
+/* SET EX/PX and EXPIRE log an absolute expiry; a plain SET clears it;
+ * INCR keeps it; a key that expired while the server was down stays
+ * gone. */
+static MunitResult
+test_ttl(const MunitParameter p[], void *f)
+{
+	rt_t *t = f;
+	static const char *const g1[] = { "GET", "ex", NULL };
+	static const char *const g2[] = { "GET", "k", NULL };
+	static const char *const g3[] = { "GET", "cnt", NULL };
+	static const char *const t4[] = { "TTL", "plain", NULL };
+	static const char *const *const probes[] = { g1, g2, g3, t4, NULL };
+	(void)p;
+
+	RT_EXPECT(t, "+OK\r\n", "SET", "ex", "v", "EX", "100");
+	RT_EXPECT(t, "+OK\r\n", "SET", "k", "old");
+	rt_restart(t);
+	/* Over an older logged value: the new one, with its TTL, wins. */
+	RT_EXPECT(t, "+OK\r\n", "SET", "k", "new", "PX", "100000");
+	RT_EXPECT(t, "+OK\r\n", "SET", "cnt", "5", "EX", "100");
+	RT_EXPECT(t, ":6\r\n", "INCR", "cnt");
+	RT_EXPECT(t, "+OK\r\n", "SET", "plain", "v", "EX", "100");
+	RT_EXPECT(t, "+OK\r\n", "SET", "plain", "v");   /* clears the TTL */
+	RT_EXPECT(t, "+OK\r\n", "SET", "lst", "x");
+	RT_EXPECT(t, ":1\r\n", "EXPIRE", "lst", "100");
+	RT_EXPECT(t, "+OK\r\n", "SET", "short", "v", "PX", "400");
+	RT_EXPECT(t, ":1\r\n", "EXISTS", "short");
+	rt_stop(t);
+	usleep(700 * 1000);               /* "short" expires while down */
+	rt_start(t);
+	RT_EXPECT(t, ":0\r\n", "EXISTS", "short");
+	RT_EXPECT(t, ":5\r\n", "DBSIZE");  /* ex k cnt plain lst */
+	RT_EXPECT(t, "$3\r\nnew\r\n", "GET", "k");
+	RT_EXPECT(t, "$1\r\n6\r\n", "GET", "cnt");
+	munit_assert_long(rt_ttl(t, "ex"), >=, 90);
+	munit_assert_long(rt_ttl(t, "ex"), <=, 100);
+	munit_assert_long(rt_ttl(t, "k"), >=, 90);
+	munit_assert_long(rt_ttl(t, "cnt"), >=, 90);
+	munit_assert_long(rt_ttl(t, "lst"), >=, 90);
+	munit_assert_long(rt_ttl(t, "plain"), ==, -1);
+
+	/* A replayed TTL still runs out while the server serves. */
+	RT_EXPECT(t, "+OK\r\n", "SET", "soon", "v", "PX", "1200");
+	rt_restart(t);
+	RT_EXPECT(t, ":1\r\n", "EXISTS", "soon");
+	usleep(1500 * 1000);
+	RT_EXPECT(t, ":0\r\n", "EXISTS", "soon");
+	rt_restart_same(t, probes);
+	return MUNIT_OK;
+}
+
+/* FLUSHDB logs a flush record: the keys before it stay gone. */
+static MunitResult
+test_flush(const MunitParameter p[], void *f)
+{
+	rt_t *t = f;
+	(void)p;
+
+	RT_EXPECT(t, "+OK\r\n", "SET", "f1", "a");
+	RT_EXPECT(t, ":1\r\n", "RPUSH", "fl", "x");
+	RT_EXPECT(t, ":1\r\n", "HSET", "fh", "k", "v");
+	RT_EXPECT(t, "+OK\r\n", "SET", "f2", "b", "EX", "100");
+	rt_restart(t);
+	RT_EXPECT(t, ":4\r\n", "DBSIZE");
+	RT_EXPECT(t, "+OK\r\n", "FLUSHDB");
+	RT_EXPECT(t, "+OK\r\n", "SET", "after", "c");
+	rt_restart(t);
+	RT_EXPECT(t, ":1\r\n", "DBSIZE");
+	RT_EXPECT(t, "$-1\r\n", "GET", "f1");
+	RT_EXPECT(t, "$1\r\nc\r\n", "GET", "after");
+	RT_EXPECT(t, "+OK\r\n", "FLUSHDB");
+	rt_restart(t);
+	RT_EXPECT(t, ":0\r\n", "DBSIZE");
+	return MUNIT_OK;
+}
+
+/* LPUSH/RPUSH/LPOP/RPOP log the resulting list; emptying it deletes. */
+static MunitResult
+test_list(const MunitParameter p[], void *f)
+{
+	rt_t *t = f;
+	static const char *const r[] = { "LRANGE", "l", "0", "-1", NULL };
+	static const char *const e[] = { "EXISTS", "gone", NULL };
+	static const char *const *const probes[] = { r, e, NULL };
+	(void)p;
+
+	RT_EXPECT(t, ":3\r\n", "RPUSH", "l", "a", "b", "c");
+	RT_EXPECT(t, ":4\r\n", "LPUSH", "l", "z");
+	rt_restart(t);
+	RT_EXPECT(t, "*4\r\n$1\r\nz\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+	    "LRANGE", "l", "0", "-1");
+	RT_EXPECT(t, "$1\r\nz\r\n", "LPOP", "l");
+	RT_EXPECT(t, "$1\r\nc\r\n", "RPOP", "l");
+	RT_EXPECT(t, ":4\r\n", "RPUSH", "l", "", "d");   /* an empty item */
+	RT_EXPECT(t, ":1\r\n", "RPUSH", "gone", "x");
+	RT_EXPECT(t, "$1\r\nx\r\n", "LPOP", "gone");
+	rt_restart_same(t, probes);
+	RT_EXPECT(t, "*4\r\n$1\r\na\r\n$1\r\nb\r\n$0\r\n\r\n$1\r\nd\r\n",
+	    "LRANGE", "l", "0", "-1");
+	RT_EXPECT(t, ":0\r\n", "EXISTS", "gone");
+	RT_EXPECT(t, ":1\r\n", "DBSIZE");
+	return MUNIT_OK;
+}
+
+/* HSET/HDEL log the resulting hash, field order included. */
+static MunitResult
+test_hash(const MunitParameter p[], void *f)
+{
+	rt_t *t = f;
+	static const char *const g[] = { "HGETALL", "h", NULL };
+	static const char *const n[] = { "HLEN", "h", NULL };
+	static const char *const e[] = { "EXISTS", "gone", NULL };
+	static const char *const *const probes[] = { g, n, e, NULL };
+	(void)p;
+
+	RT_EXPECT(t, ":2\r\n", "HSET", "h", "f1", "v1", "f2", "v2");
+	rt_restart(t);
+	RT_EXPECT(t, ":0\r\n", "HSET", "h", "f1", "V1");    /* replace */
+	RT_EXPECT(t, ":1\r\n", "HDEL", "h", "f2");
+	RT_EXPECT(t, ":2\r\n", "HSET", "h", "f3", "v3", "f4", "");
+	RT_EXPECT(t, ":1\r\n", "HSET", "gone", "k", "v");
+	RT_EXPECT(t, ":1\r\n", "HDEL", "gone", "k");
+	rt_restart_same(t, probes);
+	RT_EXPECT(t, "$2\r\nV1\r\n", "HGET", "h", "f1");
+	RT_EXPECT(t, "$-1\r\n", "HGET", "h", "f2");
+	RT_EXPECT(t, ":3\r\n", "HLEN", "h");
+	RT_EXPECT(t, ":0\r\n", "EXISTS", "gone");
+	return MUNIT_OK;
+}
+
+/* DEL of each type logs a tombstone; a re-created key replaces it. */
+static MunitResult
+test_del(const MunitParameter p[], void *f)
+{
+	rt_t *t = f;
+	(void)p;
+
+	RT_EXPECT(t, "+OK\r\n", "SET", "s", "v");
+	RT_EXPECT(t, ":1\r\n", "RPUSH", "l", "x");
+	RT_EXPECT(t, ":1\r\n", "HSET", "h", "k", "v");
+	RT_EXPECT(t, "+OK\r\n", "SET", "", "empty key");
+	rt_restart(t);
+	RT_EXPECT(t, "$9\r\nempty key\r\n", "GET", "");
+	RT_EXPECT(t, ":4\r\n", "DEL", "s", "l", "h", "");
+	RT_EXPECT(t, ":1\r\n", "RPUSH", "s", "now a list");
+	rt_restart(t);
+	RT_EXPECT(t, ":1\r\n", "DBSIZE");
+	RT_EXPECT(t, "*1\r\n$10\r\nnow a list\r\n", "LRANGE", "s", "0", "-1");
+	return MUNIT_OK;
+}
+
+static MunitTest tests[] = {
+	{ "/counters", test_counters, rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
+	{ "/ttl",      test_ttl,      rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
+	{ "/flush",    test_flush,    rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
+	{ "/list",     test_list,     rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
+	{ "/hash",     test_hash,     rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
+	{ "/del",      test_del,      rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
+	{ NULL, NULL, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL }
+};
+
+static const MunitSuite suite = {
+	"/m99/rexis_restart", tests, NULL, 1, MUNIT_SUITE_OPTION_NONE
+};
+
+int
+main(int argc, char *argv[])
+{
+	return munit_suite_main(&suite, NULL, argc, argv);
+}

@@ -186,9 +186,10 @@ In `test/m99/`:
 | `test_rexis_loopback.c` | 17 | End-to-end round-trips, replies larger than any buffer, slow readers, uncapped LRANGE/KEYS/HGETALL |
 | `test_rexis_budgets.c` | 11 | Every `--max-*` cap, measured; request/output limits, client-buffer memory, idle timeout, EMFILE; clean SIGTERM |
 | `test_rexis_pbt.c` | 5 | properties (atomicity, idempotence, FIFO) |
+| `test_rexis_restart.c` | 12 | `--persist` across a real restart, per command class, SIGTERM and SIGKILL |
 
 Run via `make check-rexis` in a libxtc build dir (CI runs it in the
-examples job).  Loopback, budget and PBT tests spawn a real
+examples job).  Loopback, budget, PBT and restart tests spawn a real
 `rexis-server-xtc` on a kernel-chosen free port (see
 `test/m99/rexis_harness.h`); every test also requires the server to exit
 0 on SIGTERM.
@@ -258,18 +259,75 @@ shaped the library:
    (`conn.c`, `main.c`) instead of busy-polling.  The benchmark numbers
    below predate that change and should be re-measured.
 
+## Persistence (`--persist=DIR`)
+
+With `--persist=DIR` every command that changes the keyspace appends
+one record to `DIR/bitcask.v2` before its reply is sent, and a restart
+reloads the log.  The keyspace after a restart is the keyspace as of
+the last acknowledged command.
+
+What is logged is the key's resulting state, not the command: INCR,
+DECR, INCRBY and DECRBY log the new number; LPUSH, RPUSH, LPOP and RPOP
+the whole list; HSET and HDEL the whole hash (field order included);
+SET the value.  A command that removes a key (DEL, or the LPOP, RPOP
+or HDEL that empties it) logs a tombstone, and FLUSHDB logs one flush
+record that ends every key before it.  A record carries the key's type
+and its expiry.  The other commands do not change the keyspace and log
+nothing.  Since a list or hash write logs the whole value, a large list
+or hash costs its full size in log bytes per write.
+
+**Expiry.**  SET with EX or PX, and EXPIRE, log the key's absolute
+expiry time on the wall clock, so a TTL keeps running while the server
+is down.  A key whose expiry has passed is not reloaded: a key that
+expired while the server was stopped does not come back.  A plain SET
+clears the TTL, and INCR keeps it, as in Redis.  The expire process
+removes expired keys without logging them; their records carry the
+expiry, so they stay gone.
+
+**Durability.**  A record is written with `pwrite` before the reply,
+and is not fsync'd: an acknowledged command survives the server
+crashing or being killed (the kernel holds the write), but not a power
+loss or a kernel crash.  A clean shutdown (SIGTERM) fsyncs the log.
+There is no option for an fsync per command.  If the log cannot take a
+write (an I/O error, or a value over 512 MiB), the server prints the
+key and exits with status 74 before it answers, so no write it could
+not log is ever acknowledged.  A log that cannot be reloaded in full
+(more keys or memory than `--max-keys` and `--max-memory` allow, or a
+malformed record) stops the server at startup rather than serving part
+of it.  At the next start, a record that fails its checksum (what a
+crash in the middle of a write leaves at the end) is cut off, with
+everything after it.
+
+**Merge.**  `bitcask_compact()` rewrites the log with only the live
+records: superseded values, deleted and flushed keys, tombstones and
+flush records drop out, a live key keeps its TTL, and an expired key is
+dropped.  The server never calls it, so the log grows until it is
+compacted.
+
+**Format.**  A directory from an older rexis (`DIR/bitcask.data`, which
+logged only plain SET and DEL) is renamed to `bitcask.v2` at the first
+start and reloads as it was.  The new records (a value with a type or
+an expiry, a flush) are ones the older binary cannot parse and would
+cut off as a torn tail, which is why the file has a new name: an older
+binary pointed at a new directory finds no log and starts empty,
+leaving `bitcask.v2` alone.  If both files exist, the server refuses to
+start rather than pick one.
+
+`test/test_rexis_restart.c` checks each class (counters, TTLs, FLUSHDB,
+lists, hashes, deletes) against a real server restarted mid-test, once
+with SIGTERM and once with SIGKILL between commands; `test_bitcask.c`
+checks the records through a merge.
+
 ## Known limitations
 
 * Plaintext RESP only.  No TLS yet (TLS-Redis is a separate exercise;
   see libxtc's `docs/tls.md` and the existing `xtc_tls` API for the building
   blocks).
-* Persistence is a log-structured **bitcask** store (`bitcask.c`), not
-  Redis's AOF/RDB formats: run with `--persist=DIR` and the keyspace is
-  durable across restart (`db.c` replays the log at startup; covered by
-  `test/m99/test_rexis_persist.sh`).  Without `--persist` rexis is
-  RAM-only.  Note the store's file I/O is currently synchronous -- see
-  the note in `bitcask.h` about why, and `examples/06_sqlxtc/wal.c` for
-  the `xtc_aio_*` alternative.
+* Persistence is a log-structured **bitcask** store, not Redis's AOF/RDB
+  formats; see [Persistence](#persistence---persistdir) for what it
+  keeps.  Without `--persist` rexis is RAM-only.  The store's file I/O
+  is synchronous on the loop thread (a pwrite per write command, no
+  fsync); `examples/06_sqlxtc/wal.c` shows the `xtc_aio_*` alternative.
 * `KEYS pattern` is O(n) like real Redis -- documented, not a bug.
 * `--loops=N` spreads connections, and with N > 1 the keyspace is cut
   into 64 shards by key hash.  The lrlock guards only a table header;
