@@ -613,16 +613,21 @@ values_list(R) ::= TK_VALUES TK_LP expr_list(L) TK_RP. {
         if (R->rows) { R->rows[0] = L; R->n_rows = 1; }
     }
 }
+/* The row array doubles when n_rows reaches a power of two (its
+ * capacity), so N tuples cost O(N) copies and arena bytes, not O(N^2). */
 values_list(R) ::= values_list(P) TK_COMMA TK_LP expr_list(L) TK_RP. {
     R = P;
-    if (R) {
+    if (R && (R->n_rows & (R->n_rows - 1)) == 0) {
         sql_exprlist_t **nr = (sql_exprlist_t **)sql_arena_alloc(pstate->arena,
-            sizeof(sql_exprlist_t *) * (size_t)(R->n_rows + 1));
+            sizeof(sql_exprlist_t *) * (size_t)R->n_rows * 2);
         if (nr) {
             int i; for (i = 0; i < R->n_rows; i++) nr[i] = R->rows[i];
-            nr[R->n_rows] = L; R->rows = nr; R->n_rows++;
+            R->rows = nr;
+        } else {
+            R = NULL;
         }
     }
+    if (R) R->rows[R->n_rows++] = L;
 }
 
 /* ===== UPDATE ===== */

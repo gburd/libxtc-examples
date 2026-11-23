@@ -97,6 +97,38 @@ span_is(const char *sql, const char *want)
 	return ok;
 }
 
+/* 1 if INSERT ... VALUES(0),(1),...,(n-1) parses to n rows, each row
+ * holding its own literal: the row array grows by doubling, and the
+ * rows on each side of every boundary must survive the copy. */
+static int
+values_rows_ok(int n)
+{
+	char buf[256];
+	size_t len = (size_t)snprintf(buf, sizeof buf, "INSERT INTO t VALUES");
+	struct sql_arena *a = NULL;
+	struct sql_stmt *root = NULL;
+	const char *err = NULL;
+	const sql_insert_t *ins;
+	char want[16];
+	int r, ok;
+
+	for (r = 0; r < n; r++)
+		len += (size_t)snprintf(buf + len, sizeof buf - len, "%s(%d)",
+		    r ? "," : "", r);
+	if (sql_parse_ast(buf, len, &a, &root, &err) != 0 || root == NULL)
+		return 0;
+	ins = root->kind == SQL_KIND_INSERT ? root->u.insert : NULL;
+	ok = ins != NULL && ins->n_rows == n;
+	for (r = 0; ok && r < n; r++) {
+		const sql_expr_t *e = ins->rows[r]->head->expr;
+		snprintf(want, sizeof want, "%d", r);
+		ok = e->lit.len == strlen(want) &&
+		    memcmp(e->lit.p, want, e->lit.len) == 0;
+	}
+	sql_arena_destroy(a);
+	return ok;
+}
+
 int
 main(void)
 {
@@ -133,6 +165,9 @@ main(void)
 	      i.kind == SQL_KIND_INSERT, "insert_cols");
 	CHECK(parse("INSERT INTO t VALUES(1),(2),(3)", &i) == 0 &&
 	      i.kind == SQL_KIND_INSERT, "insert_bulk");
+	for (k = 1; k <= 9 && values_rows_ok(k); k++)
+		;
+	CHECK(k == 10, "insert_values_rows");
 	CHECK(parse("INSERT INTO t SELECT * FROM u", &i) == 0 &&
 	      i.kind == SQL_KIND_INSERT, "insert_select");
 	CHECK(parse("REPLACE INTO t VALUES(1,2)", &i) == 0 &&
