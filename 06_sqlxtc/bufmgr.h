@@ -24,8 +24,21 @@
  *	(2Q probation) and promoted to HOT only on a second access, so a
  *	one-touch scan fills and drains the cool stage without displacing
  *	the hot working set.  A background trickler (an xtc_proc) writes
- *	dirty pages out ahead of demand; page I/O is offloaded
- *	(xtc_blocking) so the loop never stalls; metrics go to xtc_stats.
+ *	dirty pages out ahead of demand; page I/O goes through xtc_aio
+ *	(io_uring natively, else the blocking pool) and parks only the
+ *	calling fiber, so the loop never stalls; metrics go to xtc_stats.
+ *
+ *	The page pool is not zeroed; a frame's bytes are defined once its
+ *	page is read or the caller fills it.  valgrind memcheck does not
+ *	see a read io_uring completes, so on an io_uring build it reports
+ *	every page read as uninitialised.  Run memcheck on a readiness
+ *	backend build (make test-valgrind), or set XTC_AIO_FORCE_OFFLOAD=1.
+ *
+ *	BM_SAMPLED_EVICT (a test build only) replaces the CLOCK sweep under
+ *	scan resistance with sampled eviction: 16 random frames, the
+ *	lowest-scored clean COOL one evicted, and a sweep of every frame
+ *	when the sample has none, so the hot set is cooled only when no
+ *	clean COOL victim exists anywhere (bm_opts_t.evict_seed).
  */
 
 #ifndef SQLXTC_BUFMGR_H
@@ -145,6 +158,13 @@ typedef struct bm_opts {
 	 * default) = no checksum. */
 	int         cksum_off;
 	uint32_t  (*cksum)(uint32_t crc, const void *p, size_t n);
+
+	/* Seed of the sampled evictor's PRNG (BM_SAMPLED_EVICT builds only;
+	 * the CLOCK evictor draws nothing).  0 (the default) takes a draw
+	 * from the run's stream under the simulator and a fixed constant
+	 * otherwise, so eviction choices never depend on the heap address
+	 * or the time.  A test that needs one sampling pattern sets it. */
+	uint64_t    evict_seed;
 } bm_opts_t;
 
 /* Opt in with 128 after measuring the workload's hit-rate trade-off. */
@@ -155,7 +175,7 @@ typedef struct bm_opts {
 	  .scan_resist = 1, .reopen = 0, .double_write = 0, .lsn_off = -1, \
 	  .direct = 0, .adaptive_writeback = 0, \
 	  .claim_threshold = BM_CLAIM_THRESHOLD_DEFAULT, \
-	  .cksum_off = -1, .cksum = NULL }
+	  .cksum_off = -1, .cksum = NULL, .evict_seed = 0 }
 
 /* Lifecycle. */
 int  bm_create(const bm_opts_t *opts, bm_t **out);

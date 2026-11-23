@@ -26,6 +26,7 @@
 #include "xtc_aio.h"
 #include "xtc_blocking.h"   /* xtc_blocking_run: page-file growth off the loop */
 #include "xtc_stats.h"
+#include "xtc_sim.h"        /* xtc_sim_active: the eviction seed */
 #include "xtc_sync.h"
 #include "xtc_dio_sched.h"
 #include "sx_dst.h"       /* DST planted bugs (no-op in prod) */
@@ -1386,6 +1387,7 @@ bm_cls_ensure(bm_t *bm)
 
 #ifdef BM_SAMPLED_EVICT
 #define BM_D_SAMPLE 16u
+#define BM_EVICT_SEED_DEFAULT 0x9E3779B97F4A7C15ull
 
 /* Lower score = better victim.  Weights follow the design's section-13
  * ratios, scaled to the signals available pre-classifier. */
@@ -1416,6 +1418,32 @@ sample_score(bm_t *bm, bm_frame_t *f)
 	return s;
 }
 
+/* One frame's eligibility as a sampled victim: COOL (never HOT here),
+ * unpinned, not in I/O, and clean (the trickler handles dirty pages).
+ * If it qualifies and scores below *best_score, it becomes the best so
+ * far, with its pid recorded for the revalidation under reservation. */
+static void
+sample_consider(bm_t *bm, bm_frame_t *f, bm_frame_t **best,
+    int64_t *best_score, bm_pid_t *best_pid)
+{
+	int64_t sc;
+
+	if (xtc_atomic_load_u8(&f->state, xtc_mo_acquire) != BM_COOL)
+		return;
+	if (xtc_atomic_load_i32(&f->pin, xtc_mo_acquire) != 0)
+		return;
+	if (xtc_atomic_load_i32(&f->io_busy, xtc_mo_acquire))
+		return;
+	if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire))
+		return;
+	sc = sample_score(bm, f);
+	if (sc < *best_score) {
+		*best_score = sc;
+		*best = f;
+		*best_pid = xtc_atomic_load_u64(&f->pid, xtc_mo_acquire);
+	}
+}
+
 static int
 sample_evict_one(bm_t *bm)
 {
@@ -1442,27 +1470,20 @@ sample_evict_one(bm_t *bm)
 		/* Sample D COOL candidates; score; pick the worst clean one. */
 		for (d = 0; d < BM_D_SAMPLE; d++) {
 			uint32_t i;
-			bm_frame_t *f;
 			rng = rng * 6364136223846793005ull + 1442695040888963407ull;
 			i = (uint32_t)((rng >> 33) % bm->n_frames);
-			f = &bm->frames[i];
-			if (xtc_atomic_load_u8(&f->state, xtc_mo_acquire) !=
-			    BM_COOL)
-				continue;            /* COOL only: never sample HOT here */
-			if (xtc_atomic_load_i32(&f->pin, xtc_mo_acquire) != 0)
-				continue;
-			if (xtc_atomic_load_i32(&f->io_busy, xtc_mo_acquire))
-				continue;
-			if (xtc_atomic_load_i32(&f->dirty, xtc_mo_acquire))
-				continue;            /* prefer clean; trickler handles dirty */
-			{
-				int64_t sc = sample_score(bm, f);
-				if (sc < best_score) {
-					best_score = sc; best = f;
-					best_pid = xtc_atomic_load_u64(&f->pid,
-					    xtc_mo_acquire);
-				}
-			}
+			sample_consider(bm, &bm->frames[i], &best, &best_score,
+			    &best_pid);
+		}
+		/* The sample can miss a sparse COOL victim (one COOL frame in
+		 * four is missed by all 16 draws about 1% of the time).  Before
+		 * cooling the hot set, sweep every frame once, so HOT is cooled
+		 * only when no clean COOL victim exists anywhere. */
+		if (best == NULL) {
+			uint32_t j;
+			for (j = 0; j < bm->n_frames; j++)
+				sample_consider(bm, &bm->frames[j], &best,
+				    &best_score, &best_pid);
 		}
 		if (best != NULL) {
 			if (xtc_atomic_exchange_i32(&best->ref, 0,
@@ -1848,6 +1869,9 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 	bm_t *bm;
 	uint32_t i;
 	int rc;
+#ifdef BM_SAMPLED_EVICT
+	uint64_t evict_seed;
+#endif
 
 	if (opts == NULL || out == NULL || opts->page_size < 64 ||
 	    opts->n_frames < 2)
@@ -1861,9 +1885,20 @@ bm_create(const bm_opts_t *opts, bm_t **out)
 	if (bm->cool_target < 1) bm->cool_target = 1;
 	bm->scan_resist = opts->scan_resist ? 1 : 0;
 	bm->claim_threshold = opts->claim_threshold;   /* 0 = unbounded */
-	xtc_atomic_store_u64(&bm->evict_rng,
-	    0x9E3779B97F4A7C15ull ^ ((uint64_t)(uintptr_t)bm),
-	    xtc_mo_relaxed); /* sampled-eviction PRNG seed (stage 2) */
+#ifdef BM_SAMPLED_EVICT
+	/* The sampled-eviction PRNG seed: the caller's, else a draw from the
+	 * run's seeded stream under the simulator (so a run replays), else a
+	 * fixed constant (so every run of a program evicts alike).  Drawn
+	 * only in this build, so the CLOCK build's xtc_rand stream is
+	 * unchanged. */
+	if (opts->evict_seed != 0)
+		evict_seed = opts->evict_seed;
+	else if (xtc_sim_active())
+		evict_seed = xtc_rand_u64();
+	else
+		evict_seed = BM_EVICT_SEED_DEFAULT;
+	xtc_atomic_store_u64(&bm->evict_rng, evict_seed, xtc_mo_relaxed);
+#endif
 #ifdef BM_CLASSIFY
 	{
 		int nc = xtc_ncpus();

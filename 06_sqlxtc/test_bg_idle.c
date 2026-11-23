@@ -91,6 +91,9 @@ main(void)
 	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "drv" };
 	xtc_pid_t pid;
 	int fd, bad = 0;
+	/* valgrind runs 20-50x slower: the write-back and stop latencies
+	 * measure it, not the back-off. */
+	int slow = getenv("XTC_UNDER_VALGRIND") != NULL;
 	/* Fixed cadence would be IDLE_MS / interval passes; allow a quarter. */
 	unsigned pp_cap = IDLE_MS / PP_IV_MS / 4, tr_cap = IDLE_MS / TR_IV_MS / 4;
 
@@ -129,12 +132,12 @@ main(void)
 		bad = 1;
 	}
 	/* Snap-back: within the cap's sleep plus a few base passes. */
-	if (g_wb_ms < 0 || g_wb_ms > BG_IDLE_MAX_NS / 1000000 + 50) {
+	if (g_wb_ms < 0 || (!slow && g_wb_ms > BG_IDLE_MAX_NS / 1000000 + 50)) {
 		fprintf(stderr, "FAIL: dirty page written back after %lld ms\n",
 		    (long long)g_wb_ms);
 		bad = 1;
 	}
-	if (g_stop_ms < 0 || g_stop_ms > 20) {
+	if (g_stop_ms < 0 || (!slow && g_stop_ms > 20)) {
 		fprintf(stderr, "FAIL: stopping backed-off procs took %lld ms\n",
 		    (long long)g_stop_ms);
 		bad = 1;

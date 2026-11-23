@@ -81,14 +81,36 @@ gen(struct num *n)
 	}
 }
 
-/* SQLite's numeric comparison (exact across INTEGER and REAL): an x86-64
- * long double holds every int64 and every double exactly. */
+/* An integer against a double, exactly.  Outside [-2^63, 2^63) the double
+ * wins on range alone; inside it, its truncation is an exact int64 and
+ * the remainder r - t is exact too, so no value is ever rounded. */
+static int
+int_real_cmp(int64_t i, double r)
+{
+	int64_t t;
+	double frac;
+
+	if (r >= 9223372036854775808.0) return -1;
+	if (r < -9223372036854775808.0) return 1;
+	t = (int64_t)r;
+	if (i != t) return i < t ? -1 : 1;
+	frac = r - (double)t;
+	return frac > 0 ? -1 : frac < 0 ? 1 : 0;
+}
+
+/* SQLite's numeric comparison, exact across INTEGER and REAL.  Not done
+ * in long double: valgrind computes it at double precision, and so does
+ * any target whose long double is a double. */
 static int
 ref_cmp(const struct num *a, const struct num *b)
 {
-	long double x = a->is_int ? (long double)a->i : (long double)a->r;
-	long double y = b->is_int ? (long double)b->i : (long double)b->r;
-	return x < y ? -1 : x > y ? 1 : 0;
+	if (a->is_int && b->is_int)
+		return a->i < b->i ? -1 : a->i > b->i ? 1 : 0;
+	if (a->is_int)
+		return int_real_cmp(a->i, b->r);
+	if (b->is_int)
+		return -int_real_cmp(b->i, a->r);
+	return a->r < b->r ? -1 : a->r > b->r ? 1 : 0;
 }
 
 static int

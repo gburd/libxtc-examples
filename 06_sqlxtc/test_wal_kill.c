@@ -75,6 +75,7 @@ static uint64_t g_kills, g_respawn, g_errs;
 static int g_final_ok;
 static uint64_t         g_seed;
 static int64_t          g_ms;
+static int              g_slow = 1;   /* x20 under valgrind */
 
 static uint64_t
 rng(uint64_t *s)
@@ -231,7 +232,8 @@ dump_state(const char *why)
 		(void)pthread_mutex_unlock(&w->fl_mu);
 }
 
-/* Fails the run (exit 3) when no commit is acked for HANG_S seconds. */
+/* Fails the run (exit 3) when no commit is acked for HANG_S seconds
+ * (20 times that under valgrind). */
 static void *
 watchdog(void *arg)
 {
@@ -244,7 +246,7 @@ watchdog(void *arg)
 		if (a != last) {
 			last = a;
 			since = now;
-		} else if (now - since > (int64_t)HANG_S * 1000000000LL) {
+		} else if (now - since > (int64_t)HANG_S * g_slow * 1000000000LL) {
 			dump_state("HANG: no commit acknowledged");
 			fprintf(stderr, "FAIL: test_wal_kill %s: hang\n", g_cfg.mode);
 			if (getenv("WAL_KILL_ABORT") != NULL)
@@ -562,7 +564,11 @@ main(int argc, char **argv)
 	const char *mode = argc > 1 ? argv[1] : "all";
 	int i, fail = 0;
 
-	g_ms = argc > 2 ? atol(argv[2]) : 600;
+	/* valgrind runs 20-50x slower: 600 ms can pass without one kill,
+	 * and 5 s without one flush. */
+	if (getenv("XTC_UNDER_VALGRIND") != NULL)
+		g_slow = 20;
+	g_ms = argc > 2 ? atol(argv[2]) : g_slow > 1 ? 6000 : 600;
 	g_seed = argc > 3 ? strtoull(argv[3], NULL, 0) : 0x5eed;
 	if (g_seed == 0)
 		g_seed = 1;

@@ -73,7 +73,7 @@ main(void)
 	bm_opts_t bo = BM_OPTS_DEFAULT;
 	char path[256], wal[288];
 	int64_t t0, ms[3];
-	int fd, i;
+	int fd, i, fast;
 
 	t_tmpl(path, sizeof path, "sqlxtc-grpx");
 	fd = mkstemp(path);
@@ -125,11 +125,14 @@ main(void)
 	t0 = xtc_clock_mono();
 	CK(nrows(db, "SELECT s.k FROM s JOIN s2 ON s.x = s2.x") == N_SPREAD);
 	ms[2] = (xtc_clock_mono() - t0) / 1000000;
-	/* Spread keys: ~20-40 ms each here; one bucket: 0.8-10 s. */
-	CK(ms[0] < 500 && ms[1] < 500 && ms[2] < 500);
+	/* Spread keys: ~20-40 ms each here; one bucket: 0.8-10 s.  valgrind
+	 * runs 20-50x slower, so there the timing says nothing. */
+	fast = getenv("XTC_UNDER_VALGRIND") != NULL ||
+	    (ms[0] < 500 && ms[1] < 500 && ms[2] < 500);
+	CK(fast);
 	printf("  %s   %d distinct integer keys: count(DISTINCT) %lld ms, GROUP BY "
 	    "%lld ms, join %lld ms (bound 500 ms each)\n",
-	    ms[0] < 500 && ms[1] < 500 && ms[2] < 500 ? "ok" : "FAIL", N_SPREAD,
+	    fast ? "ok" : "FAIL", N_SPREAD,
 	    (long long)ms[0], (long long)ms[1], (long long)ms[2]);
 
 	sx_close(db);

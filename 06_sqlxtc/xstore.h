@@ -571,6 +571,7 @@ typedef struct xstore_index_info {
 	uint32_t descmask;
 	int      unique;
 	char     kind;
+	uint64_t k0, k1;      /* SipHash key of truncated entries */
 } xstore_index_info_t;
 int xstore_index_list(bt_t *bt, const char *table, xstore_index_info_t *out,
                       int cap);

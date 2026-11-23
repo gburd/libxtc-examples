@@ -223,9 +223,10 @@ frame is a cheap state flip plus a page-table removal.  A second
 xtc_proc, the trickler, paces background writeback.
 
 Page reads and writes are submitted to xtc_aio (io_uring on Linux,
-kqueue file-AIO on the BSDs) through xtc_dio_sched, so the reactor
-thread never blocks on disk: the calling fiber parks until the
-completion arrives and the loop keeps serving peers.  A double-write
+kqueue file-AIO on the BSDs, the blocking pool elsewhere), so the
+reactor thread never blocks on disk: the calling fiber parks until the
+completion arrives and the loop keeps serving peers.  With adaptive
+writeback the trickler tunes its pacing with xtc_dio_sched.  A double-write
 buffer guards against torn pages: a page is written to the double-write
 area and fsynced before it overwrites its home location, so a crash
 mid-write can always be repaired during recovery.
@@ -380,6 +381,24 @@ which the agent harness cannot drive safely):
     serially, on a loop with offloaded I/O, under parallel writers and
     readers, and with delete-driven merges.
   - test_admin -- the SHOW PROCESSES introspection command.
+
+Under valgrind memcheck (make test-valgrind, test/test_valgrind.sh):
+every C test of make test runs once under memcheck and fails on any
+error.  It needs a libxtc built with --with-io-backend=epoll, as
+libxtc's own memcheck job does, and with <valgrind/valgrind.h> found by
+configure (which registers fiber stacks with valgrind).  valgrind does
+not model io_uring: a page the kernel reads into the buffer pool
+through a ring keeps the "undefined" shadow of the never-zeroed pool,
+so on an io_uring build memcheck reports tens of thousands of false
+uninitialised-value errors, all from bufmgr.c, and the socket tests can
+hang.  To check one test against an io_uring build instead, set
+XTC_AIO_FORCE_OFFLOAD=1: file I/O then goes through pread and pwrite on
+the blocking pool, which memcheck sees (sockets still use the ring).
+The script sets XTC_UNDER_VALGRIND=1, which relaxes the tests' timing
+and volume bounds but none of their correctness checks, and runs valgrind with
+--fair-sched=yes, without which a test whose threads spin on each other
+can run for hours.  A full run takes about 30 minutes on 16 cores (about
+100 minutes of CPU); it is not part of make test.
 
 Outside the in-process suite:
 

@@ -323,6 +323,19 @@ s2_key(int i, char *k)
 	snprintf(k, 16, "k%07d", i);
 }
 
+/* The index of an 8-byte key "kNNNNNNN" as a seek returns it: no NUL
+ * follows the key in the caller's buffer, so atoi() would read on into
+ * whatever bytes come after it. */
+static int
+s2_idx(const void *key)
+{
+	const char *k = key;
+	int i, v = 0;
+	for (i = 1; i < 8; i++)
+		v = v * 10 + (k[i] - '0');
+	return v;
+}
+
 static uint16_t
 s2_vlen(int i)
 {
@@ -405,7 +418,7 @@ reader(void *arg)
 			    xtc_mo_seq_cst); /* skipped a live key */
 			goto next;
 		}
-		gi = atoi(got + 1);
+		gi = s2_idx(got);
 		s2_val(gi, want);
 		if (vl != s2_vlen(gi) || memcmp(out, want, vl) != 0)
 			xtc_atomic_fetch_add_long(&g_bad_val, 1,
@@ -524,7 +537,7 @@ reader_lt(void *arg)
 		}
 		if (!bad) {
 			/* Every stable key in [last returned, bound) is present. */
-			lo = atoi((const char *)buf + off[got - 1] + 1);
+			lo = s2_idx(buf + off[got - 1]);
 			for (j = lo; j < i && !bad; j++) {
 				int t, hit = 0;
 				char k[16];
@@ -564,7 +577,7 @@ s5_bad(const char *q, uint16_t pl, const uint8_t *buf, const uint32_t *off,
 		    memcmp(buf + off[j], q, pl) != 0 ||
 		    (j > 0 && kcmp(buf + off[j], 8, buf + off[j - 1], 8) <= 0))
 			return 1;
-	top = got > 0 ? atoi((const char *)buf + off[got - 1] + 1) : i - 1;
+	top = got > 0 ? s2_idx(buf + off[got - 1]) : i - 1;
 	if (!more)
 		top = S2_N - 1;
 	for (j = i; j <= top; j++) {

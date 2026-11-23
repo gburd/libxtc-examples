@@ -8758,6 +8758,8 @@ xstore_index_list(bt_t *bt, const char *table, xstore_index_info_t *out,
 		out[n].descmask = g_idx[i].rt.descmask;
 		out[n].unique = g_idx[i].rt.unique;
 		out[n].kind = g_idx[i].rt.kind;
+		out[n].k0 = g_idx[i].rt.k0;
+		out[n].k1 = g_idx[i].rt.k1;
 		n++;
 	}
 	xs_cat_unlock();
