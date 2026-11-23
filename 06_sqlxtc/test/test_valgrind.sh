@@ -78,7 +78,8 @@ export VG_OUT_DIR="$out" VG_TIMEOUT="${VG_TIMEOUT:-3600}"
 run_one() {
 	local cmd=$1 name t rc s errs
 	name=$(printf '%s' "$cmd" | tr ' /' '__' | sed 's/^\._//')
-	t=$(mktemp -d "$VG_OUT_DIR/tmp.XXXXXX")
+	# Short: some tests build a file name in a 64-byte buffer.
+	t=$(mktemp -d "${TMPDIR:-/tmp}/vg.XXXXXX")
 	s=$(date +%s)
 	rc=0
 	# shellcheck disable=SC2086 # $cmd is a binary and its arguments
