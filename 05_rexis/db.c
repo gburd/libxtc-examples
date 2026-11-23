@@ -957,7 +957,7 @@ db_exists(db_t *db, const char *key, size_t key_len)
 	return 1;
 }
 
-int
+int64_t
 db_ttl(db_t *db, const char *key, size_t key_len)
 {
 	const db_entry_t *e = db_lookup(db, key, key_len);
@@ -970,7 +970,7 @@ db_ttl(db_t *db, const char *key, size_t key_len)
 	now = xtc_now_ns();
 	if (now >= e->expire_at_ns)
 		return -2;
-	return (int)((e->expire_at_ns - now) / (1000LL * 1000 * 1000));
+	return (e->expire_at_ns - now) / (1000LL * 1000 * 1000);
 }
 
 size_t

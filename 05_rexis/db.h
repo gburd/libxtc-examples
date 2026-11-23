@@ -175,7 +175,7 @@ void db_value_release(const char *data);
 int  db_exists(db_t *db, const char *key, size_t key_len);
 
 /* Get TTL in seconds (-2=not found, -1=no expiry, >=0=seconds left) */
-int  db_ttl(db_t *db, const char *key, size_t key_len);
+int64_t db_ttl(db_t *db, const char *key, size_t key_len);
 
 /* Get list length (0 if not found or not a list) */
 size_t db_llen(db_t *db, const char *key, size_t key_len);

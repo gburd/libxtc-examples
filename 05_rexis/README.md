@@ -290,6 +290,16 @@ clears the TTL, and INCR keeps it, as in Redis.  The expire process
 removes expired keys without logging them; their records carry the
 expiry, so they stay gone.
 
+A TTL out of range is refused the way Redis refuses it, and the
+refused command changes nothing in memory or in the log.  SET with an
+EX or PX of zero or less, or one too far out to hold (the expiry, on
+the wall clock, in signed 64-bit nanoseconds: about 220 years), answers
+`-ERR invalid expire time in 'set' command`; EXPIRE too far out answers
+`-ERR invalid expire time in 'expire' command`.  An EX, PX or EXPIRE
+argument that is not an integer answers `-ERR value is not an integer
+or out of range`.  EXPIRE with zero or less deletes the key (a
+tombstone in the log) and answers 1 if it existed.
+
 **Durability.**  A record is written with `pwrite` before the reply,
 and is not fsync'd: an acknowledged command survives the server
 crashing or being killed (the kernel holds the write), but not a power

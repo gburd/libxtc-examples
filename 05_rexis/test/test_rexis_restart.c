@@ -316,6 +316,53 @@ test_ttl(const MunitParameter p[], void *f)
 	return MUNIT_OK;
 }
 
+/*
+ * An out-of-range TTL is refused, as Redis refuses it, and changes
+ * nothing; EXPIRE of zero or less deletes the key.  Memory and the log
+ * agree on every one of them across a restart.
+ */
+static MunitResult
+test_ttl_range(const MunitParameter p[], void *f)
+{
+	rt_t *t = f;
+	static const char *const g1[] = { "GET", "neg", NULL };
+	static const char *const g2[] = { "GET", "big", NULL };
+	static const char *const t2[] = { "TTL", "big", NULL };
+	static const char *const g3[] = { "GET", "z", NULL };
+	static const char *const e4[] = { "EXISTS", "far", NULL };
+	static const char *const *const probes[] = { g1, g2, t2, g3, e4,
+	    NULL };
+	(void)p;
+
+	RT_EXPECT(t, "-ERR invalid expire time in 'set' command\r\n",
+	    "SET", "neg", "v", "EX", "-1000000000");
+	RT_EXPECT(t, "-ERR invalid expire time in 'set' command\r\n",
+	    "SET", "neg", "v", "PX", "0");
+	RT_EXPECT(t, "-ERR invalid expire time in 'set' command\r\n",
+	    "SET", "far", "v", "EX", "9223372036");
+	RT_EXPECT(t, "-ERR value is not an integer or out of range\r\n",
+	    "SET", "neg", "v", "EX", "12abc");
+	RT_EXPECT(t, "-ERR value is not an integer or out of range\r\n",
+	    "SET", "neg", "v", "EX", "99999999999999999999");
+	RT_EXPECT(t, ":0\r\n", "EXISTS", "neg");
+
+	RT_EXPECT(t, "+OK\r\n", "SET", "big", "v");
+	/* 253 years: past what int64_t wall-clock ns can hold. */
+	RT_EXPECT(t, "-ERR invalid expire time in 'expire' command\r\n",
+	    "EXPIRE", "big", "8000000000");
+	RT_EXPECT(t, ":-1\r\n", "TTL", "big");
+	RT_EXPECT(t, ":1\r\n", "EXPIRE", "big", "7000000000");  /* 221 y */
+	munit_assert_long(rt_ttl(t, "big"), >, 6999999000L);
+
+	RT_EXPECT(t, "+OK\r\n", "SET", "z", "v");
+	RT_EXPECT(t, ":1\r\n", "EXPIRE", "z", "-5");    /* deletes */
+	RT_EXPECT(t, ":0\r\n", "EXISTS", "z");
+	RT_EXPECT(t, ":0\r\n", "EXPIRE", "z", "0");
+	rt_restart_same(t, probes);
+	RT_EXPECT(t, "$1\r\nv\r\n", "GET", "big");
+	return MUNIT_OK;
+}
+
 /* FLUSHDB logs a flush record: the keys before it stay gone. */
 static MunitResult
 test_flush(const MunitParameter p[], void *f)
@@ -636,6 +683,7 @@ static MunitParameterEnum kill_params[] = {
 static MunitTest tests[] = {
 	{ "/counters", test_counters, rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
 	{ "/ttl",      test_ttl,      rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
+	{ "/ttl_range", test_ttl_range, rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
 	{ "/flush",    test_flush,    rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
 	{ "/list",     test_list,     rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },
 	{ "/hash",     test_hash,     rt_setup, rt_teardown, MUNIT_TEST_OPTION_NONE, params },

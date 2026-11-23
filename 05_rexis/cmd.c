@@ -42,6 +42,55 @@ static inline int64_t xtc_now_ns(void) {
 	int64_t t; t = xtc_clock_mono(); return t;
 }
 
+/*
+ * Parse a whole decimal integer (an optional '-', then digits) into
+ * *out.  Returns 0, or -1 for anything else or a value outside
+ * int64_t.  Unlike atoll, it does not stop at the first non-digit and
+ * never overflows.
+ */
+static int
+parse_i64(const char *s, size_t len, int64_t *out)
+{
+	uint64_t v = 0, lim = (uint64_t)INT64_MAX;
+	size_t i = 0;
+	int neg = 0;
+
+	if (len > 0 && s[0] == '-') {
+		neg = 1;
+		lim++;                      /* -INT64_MIN */
+		i = 1;
+	}
+	if (i == len)
+		return -1;
+	for (; i < len; i++) {
+		if (s[i] < '0' || s[i] > '9')
+			return -1;
+		if (v > (lim - (uint64_t)(s[i] - '0')) / 10)
+			return -1;
+		v = v * 10 + (uint64_t)(s[i] - '0');
+	}
+	*out = neg ? (int64_t)(0 - v) : (int64_t)v;
+	return 0;
+}
+
+/*
+ * The monotonic expiry `n` units (unit_ns each, n > 0) from now, in
+ * *out.  Returns 0, or -1 if it is too far out: the expiry, and the
+ * wall-clock time the log converts it to (db.c), must both fit in
+ * int64_t nanoseconds, which caps a TTL at about 230 years.
+ */
+static int
+expire_from_now(int64_t n, int64_t unit_ns, int64_t *out)
+{
+	int64_t mono = xtc_clock_mono(), wall = xtc_clock_real();
+	int64_t base = mono > wall ? mono : wall;
+
+	if (base < 0 || n > (INT64_MAX - base) / unit_ns)
+		return -1;
+	*out = mono + n * unit_ns;
+	return 0;
+}
+
 /* Case-insensitive compare */
 static int
 strcasecmp_n(const char *a, size_t alen, const char *b, size_t blen)
@@ -138,10 +187,17 @@ cmd_get(cmd_ctx_t *ctx)
 	return 0;
 }
 
+/*
+ * SET k v [EX s | PX ms].  As in Redis, an EX or PX that is not an
+ * integer is refused with "value is not an integer or out of range",
+ * and one that is not positive, or too far out to represent
+ * (expire_from_now), with "invalid expire time in 'set' command".  A
+ * refused SET changes nothing, in memory or in the log.
+ */
 static int
 cmd_set(cmd_ctx_t *ctx)
 {
-	int64_t expire_ns = 0;
+	int64_t expire_ns = 0, n, unit;
 	int i;
 	db_keyset_t ks = cmd_keyset(ctx, 0);
 
@@ -150,16 +206,26 @@ cmd_set(cmd_ctx_t *ctx)
 		const char *opt = ctx->argv[i].u.str.data;
 		size_t olen = ctx->argv[i].u.str.len;
 
-		if (strcasecmp_n(opt, olen, "EX", 2) == 0 && i + 1 < ctx->argc) {
-			i++;
-			expire_ns = xtc_now_ns() +
-			    atoll(ctx->argv[i].u.str.data) * 1000000000LL;
-		} else if (strcasecmp_n(opt, olen, "PX", 2) == 0 && i + 1 < ctx->argc) {
-			i++;
-			expire_ns = xtc_now_ns() +
-			    atoll(ctx->argv[i].u.str.data) * 1000000LL;
+		if (strcasecmp_n(opt, olen, "EX", 2) == 0)
+			unit = 1000000000LL;
+		else if (strcasecmp_n(opt, olen, "PX", 2) == 0)
+			unit = 1000000LL;
+		else
+			continue;           /* NX/XX ignored for simplicity */
+		if (i + 1 >= ctx->argc)
+			continue;
+		i++;
+		if (parse_i64(ctx->argv[i].u.str.data, ctx->argv[i].u.str.len,
+		    &n) != 0) {
+			resp_write_error(ctx->out,
+			    "value is not an integer or out of range");
+			return 0;
 		}
-		/* NX/XX ignored for simplicity */
+		if (n <= 0 || expire_from_now(n, unit, &expire_ns) != 0) {
+			resp_write_error(ctx->out,
+			    "invalid expire time in 'set' command");
+			return 0;
+		}
 	}
 
 	db_lock(ctx->db, ks, 1);
@@ -301,14 +367,38 @@ cmd_decrby(cmd_ctx_t *ctx)
 	return 0;
 }
 
+/*
+ * EXPIRE k s.  As in Redis: a non-integer is refused with "value is not
+ * an integer or out of range", a TTL too far out to represent with
+ * "invalid expire time in 'expire' command", and a TTL of zero or less
+ * deletes the key (a tombstone in the log) and answers 1 if it existed.
+ */
 static int
 cmd_expire(cmd_ctx_t *ctx)
 {
 	int64_t secs, expire_ns;
+	int n;
 	db_keyset_t ks = cmd_keyset(ctx, 0);
 
-	secs = atoll(ctx->argv[2].u.str.data);
-	expire_ns = xtc_now_ns() + secs * 1000000000LL;
+	if (parse_i64(ctx->argv[2].u.str.data, ctx->argv[2].u.str.len,
+	    &secs) != 0) {
+		resp_write_error(ctx->out,
+		    "value is not an integer or out of range");
+		return 0;
+	}
+	if (secs <= 0) {
+		db_lock(ctx->db, ks, 1);
+		n = db_del(ctx->db, ctx->argv[1].u.str.data,
+		    ctx->argv[1].u.str.len);
+		db_unlock(ctx->db, ks, 1);
+		resp_write_int(ctx->out, n);
+		return 0;
+	}
+	if (expire_from_now(secs, 1000000000LL, &expire_ns) != 0) {
+		resp_write_error(ctx->out,
+		    "invalid expire time in 'expire' command");
+		return 0;
+	}
 
 	db_lock(ctx->db, ks, 1);
 	if (db_expire(ctx->db, ctx->argv[1].u.str.data,
@@ -325,7 +415,7 @@ cmd_expire(cmd_ctx_t *ctx)
 static int
 cmd_ttl(cmd_ctx_t *ctx)
 {
-	int ttl;
+	int64_t ttl;
 	db_keyset_t ks = cmd_keyset(ctx, 0);
 
 	db_lock(ctx->db, ks, 0);
