@@ -37,7 +37,9 @@
  * bitcask_open renames it to bitcask.v2 and carries on.  An older
  * binary then finds no bitcask.data and starts empty, leaving
  * bitcask.v2 alone, instead of truncating the log at the first record
- * it cannot parse.
+ * it cannot parse.  It does create an empty bitcask.data; the next
+ * bitcask_open removes that, and refuses to open a directory whose
+ * bitcask.data holds records next to a bitcask.v2.
  */
 
 #ifndef BITCASK_H

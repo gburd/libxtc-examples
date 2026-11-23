@@ -334,8 +334,11 @@ start and reloads as it was.  The new records (a value with a type or
 an expiry, a flush) are ones the older binary cannot parse and would
 cut off as a torn tail, which is why the file has a new name: an older
 binary pointed at a new directory finds no log and starts empty,
-leaving `bitcask.v2` alone.  If both files exist, the server refuses to
-start rather than pick one.
+leaving `bitcask.v2` alone, though it creates an empty `bitcask.data`.
+The next start of the new binary removes that empty file, with a
+warning.  If `bitcask.data` holds records next to `bitcask.v2` (the
+older binary took writes there), the server refuses to start rather
+than pick one, and names both files.
 
 `test/test_rexis_restart.c` checks each class (counters, TTLs, FLUSHDB,
 lists, hashes, deletes) against a real server restarted mid-test, once

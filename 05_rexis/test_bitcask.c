@@ -325,8 +325,9 @@ test_meta_flush_expiry(void)
 
 /*
  * A directory written by an older rexis (DIR/bitcask.data, v1 records)
- * is adopted: renamed to bitcask.v2 with its keys intact.  Both files
- * present is refused rather than one silently dropped.
+ * is adopted: renamed to bitcask.v2 with its keys intact.  An empty
+ * bitcask.data next to bitcask.v2 is removed; a non-empty one is
+ * refused rather than one file silently dropped.
  */
 static void
 test_adopt_v1_log(void)
@@ -335,6 +336,7 @@ test_adopt_v1_log(void)
 	bitcask_t *bc;
 	char v1[512], v2[512], buf[16];
 	size_t n;
+	int fd;
 
 	snprintf(v1, sizeof v1, "%s/bitcask.data", dir);
 	snprintf(v2, sizeof v2, "%s/bitcask.v2", dir);
@@ -349,8 +351,19 @@ test_adopt_v1_log(void)
 	bitcask_close(bc);
 	ASSERT(access(v1, F_OK) != 0 && access(v2, F_OK) == 0);
 
+	/* An older binary run once on the v2 directory leaves an empty
+	 * bitcask.data: removed, and the open goes on. */
 	ASSERT(close(open(v1, O_CREAT | O_WRONLY, 0644)) == 0);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(bitcask_get(bc, "k", 1, buf, sizeof buf, &n) == 0);
+	bitcask_close(bc);
+	ASSERT(access(v1, F_OK) != 0);
+
+	/* One with records is refused, and both files are kept. */
+	fd = open(v1, O_CREAT | O_WRONLY, 0644);
+	ASSERT(fd >= 0 && write(fd, "x", 1) == 1 && close(fd) == 0);
 	ASSERT(bitcask_open(dir, &bc) == -1);
+	ASSERT(access(v1, F_OK) == 0 && access(v2, F_OK) == 0);
 	(void)unlink(v1);
 	rmrf(dir);
 	printf("  ok   adopt_v1_log\n");

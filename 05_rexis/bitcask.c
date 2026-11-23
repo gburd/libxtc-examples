@@ -582,32 +582,44 @@ __recover(struct bitcask *bc)
  * name) and fsync the directory so the rename is durable.  An older
  * binary that meets a v2 log then sees no file of its own and starts
  * empty, rather than truncating the log at the first v2 record.
- * Both files present means an older binary ran on a v2 directory and
- * wrote its own log: neither may be dropped silently, so refuse.
- * Returns 0, or -1 (refused, or the rename failed).
+ *
+ * Both files present means an older binary ran on a v2 directory.  It
+ * creates bitcask.data when it opens, so an EMPTY one holds nothing it
+ * acknowledged: it is removed, with a warning.  One with data holds
+ * writes neither file can drop silently, so the open is refused, with
+ * a message that names both files.  Returns 0, or -1 (refused, or a
+ * rename, unlink or directory fsync failed).
  */
 static int
 __adopt_v1(const char *dir, const char *path)
 {
 	char v1[512];
-	int dfd, have_v2;
+	struct stat sb;
+	int dfd, rc;
 
 	snprintf(v1, sizeof v1, "%s/bitcask.data", dir);
-	have_v2 = access(path, F_OK) == 0;
-	if (access(v1, F_OK) != 0)
+	if (stat(v1, &sb) != 0)
 		return 0;
-	if (have_v2) {
-		fprintf(stderr, "bitcask: %s and %s both exist (an older "
-		    "binary wrote the first); move one away\n", v1, path);
+	if (access(path, F_OK) == 0) {
+		if (sb.st_size != 0) {
+			fprintf(stderr, "bitcask: %s (%lld bytes, written by "
+			    "an older rexis) and %s both exist; refusing to "
+			    "pick one: move one away\n", v1,
+			    (long long)sb.st_size, path);
+			return -1;
+		}
+		fprintf(stderr, "bitcask: removing the empty %s an older "
+		    "rexis left next to %s\n", v1, path);
+		if (unlink(v1) != 0)
+			return -1;
+	} else if (rename(v1, path) != 0) {
 		return -1;
 	}
-	if (rename(v1, path) != 0)
+	if ((dfd = open(dir, O_RDONLY)) < 0)
 		return -1;
-	if ((dfd = open(dir, O_RDONLY)) >= 0) {
-		(void)fsync(dfd);
-		(void)close(dfd);
-	}
-	return 0;
+	rc = fsync(dfd);
+	(void)close(dfd);
+	return rc == 0 ? 0 : -1;
 }
 
 int
