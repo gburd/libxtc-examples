@@ -406,10 +406,10 @@ db_sync(void *dst, const void *src, size_t sz)
  * the command calls db_persist), a write that removes the key (DEL, the
  * last LPOP or HDEL) a tombstone, a multi-key DEL one batch record of
  * tombstones, and FLUSHDB one flush record.  So a crash in the middle
- * of a command leaves the log before it or after it, never between.  Bitcask keeps the latest record per key,
- * so replay sets each surviving key once, in its final form, and
- * nothing depends on the order of operations or on replaying them
- * twice.  The value type travels in the record's tag and the expiry in
+ * of a command leaves the log before it or after it, never between.
+ * Bitcask keeps the latest record per key, so replay sets each
+ * surviving key once, in its final form, and nothing depends on the
+ * order of operations or on replaying them twice.  The value type travels in the record's tag and the expiry in
  * its expire_at (wall-clock ns, so it means the same instant after a
  * restart; the in-memory expiry is monotonic and is converted both
  * ways).  A key whose expiry has passed is dropped by bitcask's
@@ -791,11 +791,11 @@ db_create(const db_opts_t *opts, db_t **out)
 		}
 		/* Replay live keys from the bitcask into the in-memory
 		 * table (db_persist_replay: each key once, in its final
-		 * form, not written back to the log).  The replay mutates the write copy, so
-		 * it is a write transaction like any other: without the
-		 * publish in db_write_end the readers kept the empty
-		 * header (DBSIZE 0 after every restart until the first
-		 * write command). */
+		 * form, not written back to the log).  The replay
+		 * mutates the write copy, so it is a write transaction
+		 * like any other: without the publish in db_write_end the
+		 * readers kept the empty header (DBSIZE 0 after every
+		 * restart until the first write command). */
 		db_write_begin(db);
 		rc = db_persist_replay(db);
 		db_write_end(db);

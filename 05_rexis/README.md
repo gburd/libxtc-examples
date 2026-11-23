@@ -305,9 +305,10 @@ and is not fsync'd: an acknowledged command survives the server
 crashing or being killed (the kernel holds the write), but not a power
 loss or a kernel crash.  A clean shutdown (SIGTERM) fsyncs the log.
 There is no option for an fsync per command.  If the log cannot take a
-write (an I/O error, or a value over 512 MiB), the server prints the
-key and exits with status 74 before it answers, so no write it could
-not log is ever acknowledged.  A log that cannot be reloaded in full
+write (an I/O error, a value over 512 MiB, or no memory to build the
+record of a list, a hash or a multi-key DEL), the server prints the key
+and exits with status 74 before it answers, so no write it could not
+log is ever acknowledged.  A log that cannot be reloaded in full
 (more keys or memory than `--max-keys` and `--max-memory` allow, or a
 malformed record) stops the server at startup rather than serving part
 of it.
