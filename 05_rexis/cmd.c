@@ -42,6 +42,64 @@ static inline int64_t xtc_now_ns(void) {
 	int64_t t; t = xtc_clock_mono(); return t;
 }
 
+/*
+ * Parse a whole decimal integer into *out, accepting exactly what
+ * Redis's string2ll accepts: "0", or an optional '-' and digits with no
+ * leading zero (so "007" and "-0" are refused), in under 21 characters.
+ * Returns 0, or -1 for anything else or a value outside int64_t.
+ * Unlike atoll, it does not stop at the first non-digit and never
+ * overflows.
+ */
+static int
+parse_i64(const char *s, size_t len, int64_t *out)
+{
+	uint64_t v = 0, lim = (uint64_t)INT64_MAX;
+	size_t i = 0;
+	int neg = 0;
+
+	if (len == 1 && s[0] == '0') {
+		*out = 0;
+		return 0;
+	}
+	if (len >= 21)
+		return -1;
+	if (len > 0 && s[0] == '-') {
+		neg = 1;
+		lim++;                      /* -INT64_MIN */
+		i = 1;
+	}
+	if (i == len || s[i] == '0')
+		return -1;
+	for (; i < len; i++) {
+		if (s[i] < '0' || s[i] > '9')
+			return -1;
+		if (v > (lim - (uint64_t)(s[i] - '0')) / 10)
+			return -1;
+		v = v * 10 + (uint64_t)(s[i] - '0');
+	}
+	*out = neg ? (int64_t)(0 - v) : (int64_t)v;
+	return 0;
+}
+
+/*
+ * The monotonic expiry `n` units (unit_ns each, n > 0) from now, in
+ * *out.  Returns 0, or -1 if it is too far out: the expiry, and the
+ * wall-clock time the log converts it to (db.c), must both fit in
+ * int64_t nanoseconds, so no expiry may fall after April 2262 (the
+ * last instant int64_t nanoseconds since 1970 can hold).
+ */
+static int
+expire_from_now(int64_t n, int64_t unit_ns, int64_t *out)
+{
+	int64_t mono = xtc_clock_mono(), wall = xtc_clock_real();
+	int64_t base = mono > wall ? mono : wall;
+
+	if (base < 0 || n > (INT64_MAX - base) / unit_ns)
+		return -1;
+	*out = mono + n * unit_ns;
+	return 0;
+}
+
 /* Case-insensitive compare */
 static int
 strcasecmp_n(const char *a, size_t alen, const char *b, size_t blen)
@@ -138,10 +196,17 @@ cmd_get(cmd_ctx_t *ctx)
 	return 0;
 }
 
+/*
+ * SET k v [EX s | PX ms].  As in Redis, an EX or PX that is not an
+ * integer is refused with "value is not an integer or out of range",
+ * and one that is not positive, or too far out to represent
+ * (expire_from_now), with "invalid expire time in 'set' command".  A
+ * refused SET changes nothing, in memory or in the log.
+ */
 static int
 cmd_set(cmd_ctx_t *ctx)
 {
-	int64_t expire_ns = 0;
+	int64_t expire_ns = 0, n, unit;
 	int i;
 	db_keyset_t ks = cmd_keyset(ctx, 0);
 
@@ -150,16 +215,26 @@ cmd_set(cmd_ctx_t *ctx)
 		const char *opt = ctx->argv[i].u.str.data;
 		size_t olen = ctx->argv[i].u.str.len;
 
-		if (strcasecmp_n(opt, olen, "EX", 2) == 0 && i + 1 < ctx->argc) {
-			i++;
-			expire_ns = xtc_now_ns() +
-			    atoll(ctx->argv[i].u.str.data) * 1000000000LL;
-		} else if (strcasecmp_n(opt, olen, "PX", 2) == 0 && i + 1 < ctx->argc) {
-			i++;
-			expire_ns = xtc_now_ns() +
-			    atoll(ctx->argv[i].u.str.data) * 1000000LL;
+		if (strcasecmp_n(opt, olen, "EX", 2) == 0)
+			unit = 1000000000LL;
+		else if (strcasecmp_n(opt, olen, "PX", 2) == 0)
+			unit = 1000000LL;
+		else
+			continue;           /* NX/XX ignored for simplicity */
+		if (i + 1 >= ctx->argc)
+			continue;
+		i++;
+		if (parse_i64(ctx->argv[i].u.str.data, ctx->argv[i].u.str.len,
+		    &n) != 0) {
+			resp_write_error(ctx->out,
+			    "value is not an integer or out of range");
+			return 0;
 		}
-		/* NX/XX ignored for simplicity */
+		if (n <= 0 || expire_from_now(n, unit, &expire_ns) != 0) {
+			resp_write_error(ctx->out,
+			    "invalid expire time in 'set' command");
+			return 0;
+		}
 	}
 
 	db_lock(ctx->db, ks, 1);
@@ -175,18 +250,32 @@ cmd_set(cmd_ctx_t *ctx)
 	return 0;
 }
 
+/* DEL k...: the deletes are one log record (db_del_keys). */
 static int
 cmd_del(cmd_ctx_t *ctx)
 {
-	int i, count = 0;
+	const char **keys;
+	size_t *lens;
+	int i, n = ctx->argc - 1, count = -1;
 	db_keyset_t ks = cmd_keyset(ctx, 1);
 
-	db_lock(ctx->db, ks, 1);
-	for (i = 1; i < ctx->argc; i++) {
-		count += db_del(ctx->db, ctx->argv[i].u.str.data,
-		                ctx->argv[i].u.str.len);
+	keys = xtc_malloc((size_t)n * sizeof *keys);
+	lens = xtc_malloc((size_t)n * sizeof *lens);
+	if (keys != NULL && lens != NULL) {
+		for (i = 0; i < n; i++) {
+			keys[i] = ctx->argv[i + 1].u.str.data;
+			lens[i] = ctx->argv[i + 1].u.str.len;
+		}
+		db_lock(ctx->db, ks, 1);
+		count = db_del_keys(ctx->db, keys, lens, n);
+		db_unlock(ctx->db, ks, 1);
 	}
-	db_unlock(ctx->db, ks, 1);
+	xtc_free(keys);
+	xtc_free(lens);
+	if (count < 0) {
+		resp_write_error_n(ctx->out, "OOM", "out of memory");
+		return 0;
+	}
 	resp_write_int(ctx->out, count);
 	return 0;
 }
@@ -287,14 +376,45 @@ cmd_decrby(cmd_ctx_t *ctx)
 	return 0;
 }
 
+/*
+ * EXPIRE k s.  As in Redis: a non-integer is refused with "value is not
+ * an integer or out of range", a TTL too far out to represent, or below
+ * INT64_MIN / 1000 (whose milliseconds Redis cannot hold), with
+ * "invalid expire time in 'expire' command", and any other TTL of zero
+ * or less deletes the key (a tombstone in the log) and answers 1 if it
+ * existed.
+ */
 static int
 cmd_expire(cmd_ctx_t *ctx)
 {
 	int64_t secs, expire_ns;
+	int n;
 	db_keyset_t ks = cmd_keyset(ctx, 0);
 
-	secs = atoll(ctx->argv[2].u.str.data);
-	expire_ns = xtc_now_ns() + secs * 1000000000LL;
+	if (parse_i64(ctx->argv[2].u.str.data, ctx->argv[2].u.str.len,
+	    &secs) != 0) {
+		resp_write_error(ctx->out,
+		    "value is not an integer or out of range");
+		return 0;
+	}
+	if (secs < INT64_MIN / 1000) {
+		resp_write_error(ctx->out,
+		    "invalid expire time in 'expire' command");
+		return 0;
+	}
+	if (secs <= 0) {
+		db_lock(ctx->db, ks, 1);
+		n = db_del(ctx->db, ctx->argv[1].u.str.data,
+		    ctx->argv[1].u.str.len);
+		db_unlock(ctx->db, ks, 1);
+		resp_write_int(ctx->out, n);
+		return 0;
+	}
+	if (expire_from_now(secs, 1000000000LL, &expire_ns) != 0) {
+		resp_write_error(ctx->out,
+		    "invalid expire time in 'expire' command");
+		return 0;
+	}
 
 	db_lock(ctx->db, ks, 1);
 	if (db_expire(ctx->db, ctx->argv[1].u.str.data,
@@ -311,7 +431,7 @@ cmd_expire(cmd_ctx_t *ctx)
 static int
 cmd_ttl(cmd_ctx_t *ctx)
 {
-	int ttl;
+	int64_t ttl;
 	db_keyset_t ks = cmd_keyset(ctx, 0);
 
 	db_lock(ctx->db, ks, 0);
@@ -401,13 +521,16 @@ cmd_lpush(cmd_ctx_t *ctx)
 		               ctx->argv[1].u.str.len,
 		               ctx->argv[i].u.str.data,
 		               ctx->argv[i].u.str.len);
-		if (len < 0) {
-			db_unlock(ctx->db, ks, 1);
-			resp_write_error_n(ctx->out, "OOM", "out of memory");
-			return 0;
-		}
+		if (len < 0)
+			break;
 	}
+	/* One record for the whole command, even a partial one. */
+	db_persist(ctx->db, ctx->argv[1].u.str.data, ctx->argv[1].u.str.len);
 	db_unlock(ctx->db, ks, 1);
+	if (len < 0) {
+		resp_write_error_n(ctx->out, "OOM", "out of memory");
+		return 0;
+	}
 	resp_write_int(ctx->out, len);
 	return 0;
 }
@@ -425,13 +548,16 @@ cmd_rpush(cmd_ctx_t *ctx)
 		               ctx->argv[1].u.str.len,
 		               ctx->argv[i].u.str.data,
 		               ctx->argv[i].u.str.len);
-		if (len < 0) {
-			db_unlock(ctx->db, ks, 1);
-			resp_write_error_n(ctx->out, "OOM", "out of memory");
-			return 0;
-		}
+		if (len < 0)
+			break;
 	}
+	/* One record for the whole command, even a partial one. */
+	db_persist(ctx->db, ctx->argv[1].u.str.data, ctx->argv[1].u.str.len);
 	db_unlock(ctx->db, ks, 1);
+	if (len < 0) {
+		resp_write_error_n(ctx->out, "OOM", "out of memory");
+		return 0;
+	}
 	resp_write_int(ctx->out, len);
 	return 0;
 }
@@ -526,13 +652,18 @@ cmd_hset(cmd_ctx_t *ctx)
 		                ctx->argv[i].u.str.data, ctx->argv[i].u.str.len,
 		                ctx->argv[i+1].u.str.data, ctx->argv[i+1].u.str.len);
 		if (r < 0) {
-			db_unlock(ctx->db, ks, 1);
-			resp_write_error_n(ctx->out, "OOM", "out of memory");
-			return 0;
+			added = -1;
+			break;
 		}
 		added += r;
 	}
+	/* One record for the whole command, even a partial one. */
+	db_persist(ctx->db, ctx->argv[1].u.str.data, ctx->argv[1].u.str.len);
 	db_unlock(ctx->db, ks, 1);
+	if (added < 0) {
+		resp_write_error_n(ctx->out, "OOM", "out of memory");
+		return 0;
+	}
 	resp_write_int(ctx->out, added);
 	return 0;
 }
@@ -568,6 +699,9 @@ cmd_hdel(cmd_ctx_t *ctx)
 		                 ctx->argv[1].u.str.data, ctx->argv[1].u.str.len,
 		                 ctx->argv[i].u.str.data, ctx->argv[i].u.str.len);
 	}
+	if (count > 0)
+		db_persist(ctx->db, ctx->argv[1].u.str.data,
+		    ctx->argv[1].u.str.len);
 	db_unlock(ctx->db, ks, 1);
 	resp_write_int(ctx->out, count);
 	return 0;

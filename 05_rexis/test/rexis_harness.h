@@ -273,7 +273,7 @@ rexis_connect(const rexis_srv_t *s, int rcv_timeout_ms)
 }
 
 /* Build one RESP command array into buf; returns its length. */
-static int
+static inline int
 rexis_build(char *buf, size_t cap, int argc, ...)
 {
 	va_list ap;

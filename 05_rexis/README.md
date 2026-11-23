@@ -1,7 +1,7 @@
 # examples/05_rexis -- rexis (Redis-protocol-compatible) server built on xtc
 
 A drop-in replacement for a meaningful subset of `redis-server`, implemented
-in about 6,700 lines of C (tests not counted) using xtc primitives.  Demonstrates how to build a
+in about 7,900 lines of C (tests not counted) using xtc primitives.  Demonstrates how to build a
 production-shaped network service with hard resource budgets.
 
 ## Quick start
@@ -163,24 +163,25 @@ xtc primitives used:
 
 | File | Lines | Purpose |
 |---|---|---|
-| `main.c` | 839 | Entry point, arg parsing, app bringup |
+| `main.c` | 851 | Entry point, arg parsing, app bringup |
 | `proto.c` | 500 | RESP2/RESP3 parser + response builder |
 | `proto.h` | 176 | Protocol type definitions |
-| `db.c` | 1,486 | Database (linear-hash table + lrlock) |
+| `db.c` | 1,773 | Database (linear-hash table + lrlock) |
 | `lhash.h` | 169 | Linear hashing: the growing table under db.c and the bitcask index |
-| `db.h` | 267 | Database API |
-| `cmd.c` | 981 | Command dispatch + 37 handlers |
+| `db.h` | 286 | Database API |
+| `cmd.c` | 1,115 | Command dispatch + 37 handlers |
 | `cmd.h` | 81 | Command type definitions |
-| `conn.c` | 1,100 | Per-connection xtc_proc |
+| `conn.c` | 1,101 | Per-connection xtc_proc |
 | `conn.h` | 111 | Connection API |
 | `expire.c` | 75 | TTL expiration timer |
 | `metrics.c` | 137 | Periodic res-stats logging |
-| `bitcask.c` | 685 | The `--persist` append-only store |
-| `bitcask.h` | 97 | Its API |
+| `bitcask.c` | 1,386 | The `--persist` append-only store |
+| `bitcask.h` | 160 | Its API |
 | `Makefile` | 94 | Build glue |
 
-Total: about 6,700 lines of C, about 4,900 of them code (tokei over SRCS
-and the headers; the Makefile not counted).
+Total: about 7,900 lines of C, about 5,700 of them code (tokei over the
+Makefile's SRCS and the server headers listed above; the Makefile and the
+tests not counted).
 
 ## Tests
 
@@ -192,9 +193,10 @@ In `test/`:
 | `test_rexis_loopback.c` | 19 | End-to-end round-trips, replies larger than any buffer, slow readers, uncapped LRANGE/KEYS/HGETALL, zero-copy GET |
 | `test_rexis_budgets.c` | 17 | Every `--max-*` cap, measured; request/output limits, client-buffer memory, idle timeout, idle wakeups, EMFILE; clean SIGTERM |
 | `test_rexis_pbt.c` | 6 | properties (atomicity, idempotence, FIFO, pipelined overwrite) |
+| `test_rexis_restart.c` | 8 | `--persist` across a real restart, per command class; each case under SIGTERM and SIGKILL, and a kill in the middle of a command |
 
 Run via `make check-rexis` in a libxtc build dir (CI runs it in the
-examples job).  Loopback, budget and PBT tests spawn a real
+examples job).  Loopback, budget, PBT and restart tests spawn a real
 `rexis-server-xtc` on a kernel-chosen free port (see
 `test/rexis_harness.h`); every test also requires the server to exit
 0 on SIGTERM.
@@ -264,18 +266,171 @@ shaped the library:
    by name, and the listener + per-connection procs park on it
    (`conn.c`, `main.c`) instead of busy-polling.
 
+## Persistence (`--persist=DIR`)
+
+With `--persist=DIR` every command that changes the keyspace appends
+one record to `DIR/bitcask.v2` before its reply is sent, and a restart
+reloads the log.  The keyspace after a restart is the keyspace as of
+the last acknowledged command.
+
+One command is one record, written with one `pwritev`, so a crash in
+the middle of a command leaves the keyspace before it or after it,
+never a part of it: an `RPUSH l a b c` comes back with all three
+elements or none, and a `DEL a b c` deletes all three keys or none (its
+tombstones go in one batch record).
+
+What is logged is the key's resulting state, not the command: INCR,
+DECR, INCRBY and DECRBY log the new number; LPUSH, RPUSH, LPOP and RPOP
+the whole list; HSET and HDEL the whole hash (field order included);
+SET the value.  A command that removes a key (DEL, or the LPOP, RPOP
+or HDEL that empties it) logs a tombstone, and FLUSHDB logs one flush
+record that ends every key before it.  A record carries the key's type
+and its expiry.  The other commands do not change the keyspace and log
+nothing.  Since a list or hash write logs the whole value, a large list
+or hash costs its full size in log bytes per write.
+
+**Expiry.**  SET with EX or PX, and EXPIRE, log the key's absolute
+expiry time on the wall clock, so a TTL keeps running while the server
+is down.  A key whose expiry has passed is not reloaded: a key that
+expired while the server was stopped does not come back.  A plain SET
+clears the TTL, and INCR keeps it, as in Redis.  The expire process
+removes expired keys without logging them; their records carry the
+expiry, so they stay gone.
+
+A TTL out of range is refused the way Redis refuses it, and the
+refused command changes nothing in memory or in the log.  SET with an
+EX or PX of zero or less, or one too far out to hold, answers
+`-ERR invalid expire time in 'set' command`; EXPIRE too far out, or
+below -9223372036854775 (INT64_MIN / 1000, as in Redis), answers
+`-ERR invalid expire time in 'expire' command`.  An EX, PX or EXPIRE
+argument that is not an integer answers `-ERR value is not an integer
+or out of range`.  EXPIRE with any other value of zero or less
+deletes the key (a tombstone in the log) and answers 1 if it existed.
+
+Too far out means an expiry after April 2262, the last instant that
+signed 64-bit nanoseconds since 1970 can hold: in 2026 that caps a TTL
+at about 235 years, and the cap shrinks a year each year.  Redis counts
+milliseconds and allows TTLs far longer; those are the one range of
+TTLs Redis accepts and rexis refuses.
+
+**Durability.**  A record is written with `pwrite` before the reply,
+and is not fsync'd: an acknowledged command survives the server
+crashing or being killed (the kernel holds the write), but not a power
+loss or a kernel crash.  A clean shutdown (SIGTERM) fsyncs the log.
+There is no option for an fsync per command.  If the log cannot take a
+write (an I/O error, a value over 512 MiB, no memory to build the
+record of a list, a hash or a multi-key DEL, or no memory for the log's
+in-memory index of a new key), the server prints the key and exits
+with status 74 before it answers, so no write it could not log is ever
+acknowledged.  A log that cannot be reloaded in full
+(more keys or memory than `--max-keys` and `--max-memory` allow, or a
+malformed record) stops the server at startup rather than serving part
+of it.
+
+**Damage.**  Every record's header carries its own checksum, over the
+timestamp and the two length fields, and the lengths are believed only
+when it matches.  The rule at startup: a crash or kill -9 leaves a torn
+tail (a last record whose header checks out but whose body runs past
+the end of the file), which is cut off, with a line on stderr naming
+the offset and the bytes cut, and the server starts.  Any other damage
+refuses the start: the server names the bad record's offset and the
+next valid one, and leaves the file as it was, since cutting there
+would silently drop every acknowledged write after it.  Restore the
+log, or truncate it at the named offset by hand to keep only what
+comes before.  If the search for a valid record after the damage
+cannot finish (a read fails, or memory runs out), the start is refused
+the same way, and the file is left as it was.
+
+What decides between a cut and a refusal is a search: from the first
+bad record, the rest of the file is searched, byte by byte, for a
+whole record whose checksums match.  If one starts anywhere after the
+bad record's first byte, even inside the bad record itself, the start
+is refused; if none does, the file is cut at the bad record.  Two
+cases follow from it.
+
+Damage to the last record cannot be told from a torn write, so it is
+cut like one, and only that record is lost.  The exception is a last
+record whose own bytes hold a valid record, which a client can send as
+a value: then the start is refused, naming that offset inside the
+value.
+
+A power loss is not a crash: the log is not fsync'd (see Durability),
+and the kernel may have written some pages of the recent writes and
+not others, so a power loss can leave a hole (bytes never written)
+before the last record.  If a whole valid record follows the hole, the
+start is refused and needs an operator.  If nothing valid follows it
+(the hole is in the last record, or only torn or unwritten bytes come
+after it), the log is cut at the hole, like a torn tail.
+
+The records inside a multi-key DEL carry a checksum of their own kind,
+so damage to that batch never exposes them as records of the log.
+
+**Merge.**  `bitcask_compact()` rewrites the log with only the live
+records: superseded values, deleted and flushed keys, tombstones and
+flush records drop out, a live key keeps its TTL, and an expired key is
+dropped.  The server never calls it, so the log grows until it is
+compacted.  It writes the new log to a temp file, `bitcask.compact`,
+and renames it to `bitcask.v2` when it is whole; a temp file found at
+the start is left over from a crash in the middle and is removed.
+
+**Format.**  A directory from an older rexis (`DIR/bitcask.data`,
+which logged only plain SET and DEL, with no header checksum) is
+converted at the first start: the old log is renamed to `bitcask.v1`,
+its live keys are written to `bitcask.v2` (through a temp file that is
+renamed into place, so `bitcask.v2` only ever exists whole), and
+`bitcask.v1` is removed, with a line on stderr.  A crash at any step
+resumes at the next start: `bitcask.v1` alone, or with the temp file,
+is converted again; `bitcask.v1` next to `bitcask.v2` means the
+conversion finished, so `bitcask.v1` is removed.  `bitcask.data` next
+to `bitcask.v1` is refused, naming both files.
+
+The old log is read with the damage rule above, with one difference:
+its headers have no checksum, so a damaged length can make a record in
+the middle seem to run past the end of the file.  Such a record is cut
+as a torn tail only if no valid record (one whose checksum matches)
+follows it; otherwise the start is refused, naming both offsets, and
+`bitcask.v1` is left as it was, with no `bitcask.v2`.  A real torn
+tail is a prefix of the last write, so nothing valid should follow
+it, but the search can match by chance inside the torn bytes.  An
+offset there passes only if its lengths fit in the rest of the file
+and its checksum matches, which a chance offset does with odds of
+2^-32, so a tear of T bytes is refused with odds of at most
+T / 2^32 (one in 65,000 for 64 KiB), and far less in practice, since
+random bytes seldom parse as lengths that fit.  The other way to
+refuse a tear is a value that holds the image of an old record, as a
+client could send.  Such a refusal loses nothing: truncating
+`bitcask.v1` at the named offset by hand does what the older binary
+did on its own.
+
+An older binary cannot read a converted directory.  Pointed at one, it
+finds no log and starts empty, leaving `bitcask.v2` alone, though it
+creates an empty `bitcask.data`.  The next start of the new binary
+removes that empty file, with a warning.  If `bitcask.data` holds
+records next to `bitcask.v2` (the older binary took writes there), the
+server refuses to start rather than pick one, and names both files.
+
+`test/test_rexis_restart.c` checks each class (counters, TTLs, FLUSHDB,
+lists, hashes, deletes) against a real server restarted mid-test, once
+with SIGTERM and once with SIGKILL between commands.  Its `midcmd` case
+crashes the server in the middle of a log write instead
+(`test/rexis_killwrite.c`, loaded with `LD_PRELOAD`, writes half of the
+Nth `pwritev` and kills the process) during an RPUSH, LPUSH, HSET, HDEL
+and multi-key DEL, and requires the keyspace before or after the
+command.  `test_bitcask.c` checks the records through a merge, flips
+one bit of every byte of a log, flips every bit of an old log before
+its conversion, and fails the damage search's allocation and read
+(`bitcask_scan_fail_at`).
+
 ## Known limitations
 
 * Plaintext RESP only.  No TLS yet (TLS-Redis is a separate exercise;
   see libxtc's `docs/tls.md` and the existing `xtc_tls` API for the building
   blocks).
-* Persistence is a log-structured **bitcask** store (`bitcask.c`), not
-  Redis's AOF/RDB formats: run with `--persist=DIR` and the keyspace is
-  durable across restart (`db.c` replays the log at startup; covered by
-  `test/test_rexis_persist.sh`).  Only string SET and DEL are logged
-  (no TTLs, lists or hashes).  Without `--persist` rexis is RAM-only.
-  The store's file I/O is synchronous `pread`/`pwrite` on the loop
-  thread; `06_sqlxtc/wal.c` shows the `xtc_aio_*` alternative.
+* Persistence is a log-structured **bitcask** store, not Redis's AOF/RDB
+  formats; see [Persistence](#persistence---persistdir) for what it
+  keeps.  Without `--persist` rexis is RAM-only.  The store's file I/O
+  is synchronous on the loop thread (a pwrite per write command, no
+  fsync); `examples/06_sqlxtc/wal.c` shows the `xtc_aio_*` alternative.
 * `KEYS pattern` is O(n) like real Redis -- documented, not a bug.
 * `--loops=N` spreads connections, and with N > 1 the keyspace is cut
   into 64 shards by key hash.  The lrlock guards only a table header;

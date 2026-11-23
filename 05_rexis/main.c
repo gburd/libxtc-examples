@@ -420,7 +420,8 @@ usage(FILE *fp, const char *prog)
 	    "      --max-output=N    Per-client unsent reply limit, bytes (default\n"
 	    "                        128 MiB; a reply past it becomes an error)\n"
 	    "      --timeout=SECS    Close a connection idle for SECS (0 = never)\n"
-	    "      --persist=DIR     Enable Bitcask persistence in DIR (string SET/DEL only)\n"
+	    "      --persist=DIR     Log every keyspace change to DIR (Bitcask); a restart\n"
+	    "                        reloads it.  Survives a crash, not a power loss.\n"
 	    "  -v, --verbose         Verbose logging\n"
 	    "      --help            Show this help\n"
 	    "\n"
@@ -737,9 +738,19 @@ main(int argc, char **argv)
 	db_opts.res = srv->res;
 	db_opts.persist_dir = cfg.persist_dir;
 	db_opts.shared = cfg.loops > 1;
-	if (db_create(&db_opts, &srv->db) != XTC_OK) {
-		fprintf(stderr, "failed to create database (a --max-memory "
-		    "below the empty keyspace's bucket array?)\n");
+	if ((rc = db_create(&db_opts, &srv->db)) != XTC_OK) {
+		/* XTC_E_INTERNAL is the log (db_create): its open or its
+		 * replay failed, and bitcask or db.c already said why. */
+		if (rc == XTC_E_INTERNAL)
+			fprintf(stderr, "failed to load --persist=%s (see the "
+			    "message above)\n", cfg.persist_dir);
+		else if (rc == XTC_E_RESOURCE)
+			fprintf(stderr, "failed to create database: "
+			    "--max-memory is below the empty keyspace's "
+			    "bucket array\n");
+		else
+			fprintf(stderr, "failed to create database: %s\n",
+			    xtc_strerror(rc));
 		return 1;
 	}
 	if (cfg.persist_dir != NULL) {
