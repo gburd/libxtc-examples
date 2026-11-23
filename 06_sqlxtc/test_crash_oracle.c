@@ -59,7 +59,10 @@
  *	The plans cycle through the three kinds and both points; a plan that
  *	did not fire is tried again in the next odd round.  The run reports
  *	which of the six landed, and a run of 6 seeds or more fails unless
- *	all six did.
+ *	all six did.  Round 0 of the first seed also plans one: a kill before
+ *	the log record of the last lane's first multi-row UPDATE, the one
+ *	case where none of that lane's UPDATEs has committed (the verify must
+ *	still find that lane's op and settle it gone).
  *	Usage: test_crash_oracle [seeds [first-seed]] (default 3 1).
  */
 
@@ -106,6 +109,7 @@ static int g_wfd = -1;             /* child: pipe to the parent */
 /* A planned kill (see the header): the op kind and the commit point, or
  * kind -1 for a timed kill.  Set by the parent before the fork. */
 static int g_plan_kind = -1, g_plan_phase;
+static int g_plan_lane = -1;       /* the lane to kill in, or -1: any */
 /* Each lane's proc, and the multi-row op it is running (kind -1: none),
  * for the commit hook to know whose commit it is in. */
 static xtc_pid_t g_lane_pid[NLANE];
@@ -135,7 +139,8 @@ commit_hook(int phase)
 	if (phase != g_plan_phase)
 		return;
 	for (l = 0; l < NLANE; l++)
-		if (xtc_pid_eq(me, g_lane_pid[l]) && g_lane_kind[l] == g_plan_kind) {
+		if (xtc_pid_eq(me, g_lane_pid[l]) && g_lane_kind[l] == g_plan_kind &&
+		    (g_plan_lane < 0 || l == g_plan_lane)) {
 			send_msg('H', phase, g_lane_id[l], 0);
 			(void)kill(getpid(), SIGKILL);
 		}
@@ -826,7 +831,12 @@ main(int argc, char **argv)
 			/* Odd rounds plan a kill: the next plan not yet done in
 			 * this cycle. */
 			g_plan_kind = -1;
-			if (r % 2 == 1) {
+			g_plan_lane = -1;
+			if (r == 0 && seed == first) {
+				g_plan_kind = K_MUPD;
+				g_plan_phase = XS_ICOMMIT_PRELOG;
+				g_plan_lane = NLANE - 1;
+			} else if (r % 2 == 1) {
 				if (g_plans_cycle == 0x3f)
 					g_plans_cycle = 0;
 				while (g_plans_cycle & (1 << plan))
