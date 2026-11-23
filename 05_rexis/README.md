@@ -310,9 +310,17 @@ key and exits with status 74 before it answers, so no write it could
 not log is ever acknowledged.  A log that cannot be reloaded in full
 (more keys or memory than `--max-keys` and `--max-memory` allow, or a
 malformed record) stops the server at startup rather than serving part
-of it.  At the next start, a record that fails its checksum (what a
-crash in the middle of a write leaves at the end) is cut off, with
-everything after it.
+of it.
+
+**Damage.**  A crash in the middle of a write leaves a torn record at
+the end of the log.  At the next start that tail is cut off, with a
+line on stderr naming the offset and the bytes cut, and the server
+starts.  A record that fails its checksum anywhere else, with a valid
+record after it, is not a crash: the log is damaged.  The server then
+refuses to start, names the bad record's offset and the next valid
+one, and leaves the file as it was, since cutting there would silently
+drop every acknowledged write after it.  Restore the log, or truncate
+it at the named offset by hand to keep only what comes before.
 
 **Merge.**  `bitcask_compact()` rewrites the log with only the live
 records: superseded values, deleted and flushed keys, tombstones and

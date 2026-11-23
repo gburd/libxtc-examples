@@ -356,6 +356,95 @@ test_adopt_v1_log(void)
 	printf("  ok   adopt_v1_log\n");
 }
 
+/* Flip one byte of the file at `off`. */
+static void
+flip_byte(const char *path, off_t off)
+{
+	int fd = open(path, O_RDWR);
+	unsigned char c;
+
+	ASSERT(fd >= 0);
+	ASSERT(pread(fd, &c, 1, off) == 1);
+	c ^= 0xff;
+	ASSERT(pwrite(fd, &c, 1, off) == 1);
+	ASSERT(close(fd) == 0);
+}
+
+static off_t
+file_size(const char *path)
+{
+	struct stat sb;
+
+	ASSERT(stat(path, &sb) == 0);
+	return sb.st_size;
+}
+
+/*
+ * A crash tears only the last record, which recovery cuts off.  A bad
+ * record with valid records after it is damage, not a crash: the open
+ * is refused and the file is left as it was.  Also checks that a batch
+ * of deletes (bitcask_del_many) survives a reopen, and that a batch
+ * torn at the tail is cut off whole.
+ */
+static void
+test_corrupt_vs_torn(void)
+{
+	const char *dir = mkdir_temp();
+	const void *keys[3] = { "a", "b", "c" };
+	const size_t lens[3] = { 1, 1, 1 };
+	char path[512], key[16], buf[16];
+	bitcask_t *bc;
+	off_t mid, size;
+	size_t n;
+	int i;
+
+	snprintf(path, sizeof path, "%s/bitcask.v2", dir);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	for (i = 0; i < 20; i++) {
+		snprintf(key, sizeof key, "key-%02d", i);
+		ASSERT(bitcask_put(bc, key, strlen(key), "value", 5) == 0);
+	}
+	bitcask_close(bc);
+
+	/* A byte flipped in the 10th record's value: refused, untouched. */
+	size = file_size(path);
+	mid = size / 2;
+	flip_byte(path, mid);
+	ASSERT(bitcask_open(dir, &bc) == -1);
+	ASSERT(file_size(path) == size);
+	flip_byte(path, mid);
+
+	/* The same flip in the last record: a torn tail, cut off. */
+	flip_byte(path, size - 1);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(bitcask_get(bc, "key-19", 6, buf, sizeof buf, &n) == 1);
+	ASSERT(bitcask_get(bc, "key-18", 6, buf, sizeof buf, &n) == 0);
+
+	/* A batch of deletes, reopened; then one torn at the tail. */
+	ASSERT(bitcask_put(bc, "a", 1, "1", 1) == 0);
+	ASSERT(bitcask_put(bc, "b", 1, "2", 1) == 0);
+	ASSERT(bitcask_put(bc, "c", 1, "3", 1) == 0);
+	size = file_size(path);
+	ASSERT(bitcask_del_many(bc, keys, lens, 2) == 0);
+	bitcask_close(bc);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(bitcask_get(bc, "a", 1, buf, sizeof buf, &n) == 1);
+	ASSERT(bitcask_get(bc, "b", 1, buf, sizeof buf, &n) == 1);
+	ASSERT(bitcask_get(bc, "c", 1, buf, sizeof buf, &n) == 0);
+	ASSERT(bitcask_put(bc, "a", 1, "1", 1) == 0);
+	size = file_size(path);
+	ASSERT(bitcask_del_many(bc, keys, lens, 3) == 0);
+	bitcask_close(bc);
+	ASSERT(truncate(path, file_size(path) - 3) == 0);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(file_size(path) == size);
+	ASSERT(bitcask_get(bc, "a", 1, buf, sizeof buf, &n) == 0);
+	ASSERT(bitcask_get(bc, "c", 1, buf, sizeof buf, &n) == 0);
+	bitcask_close(bc);
+	rmrf(dir);
+	printf("  ok   corrupt_vs_torn\n");
+}
+
 /*
  * The in-memory index must grow with the key count.  A fixed 4,096-bucket
  * chained index walked ~N/4096 entries on EVERY put (to find the old
@@ -436,6 +525,7 @@ main(void)
 	test_compaction();
 	test_meta_flush_expiry();
 	test_adopt_v1_log();
+	test_corrupt_vs_torn();
 	test_index_grows();
 	printf("All bitcask tests passed.\n");
 	return 0;

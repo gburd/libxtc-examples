@@ -422,85 +422,148 @@ __batch_apply(struct bitcask *bc, uint64_t off, const uint8_t *body,
 	return 0;
 }
 
-/* Cut a torn or corrupt tail off at `off`.  Returns 0, or -1 if the
- * file cannot be truncated (the open then fails). */
+/* Cut a torn tail off at `off`.  Returns 0, or -1 if the file cannot
+ * be truncated (the open then fails). */
 static int
-__cut_tail(struct bitcask *bc, uint64_t off)
+__cut_tail(struct bitcask *bc, uint64_t off, uint64_t fsize)
 {
+	if (fsize > off)
+		fprintf(stderr, "bitcask: %s/" DATA_FILE ": cut a torn tail "
+		    "of %llu bytes at offset %llu\n", bc->dir,
+		    (unsigned long long)(fsize - off),
+		    (unsigned long long)off);
 	return ftruncate(bc->fd, (off_t)off) == 0 ? 0 : -1;
 }
 
+/* What __rec_read found at an offset. */
+enum rec_state {
+	REC_OK,         /* a whole record with a good CRC */
+	REC_TORN,       /* a good header whose record runs past EOF */
+	REC_BAD,        /* a header no writer produces, or a bad CRC */
+	REC_IOERR       /* a read failed, or out of memory */
+};
+
+/*
+ * Read the record at `off` of a file of `fsize` bytes: its header into
+ * hdr, its body into *body (grown as needed; *cap is its size, and it
+ * is never left NULL on REC_OK, so an empty key has a valid pointer),
+ * its body length into *body_len.  At least HDR_SIZE bytes must remain
+ * at `off`.
+ */
+static enum rec_state
+__rec_read(struct bitcask *bc, uint64_t off, uint64_t fsize, uint8_t *hdr,
+    uint8_t **body, size_t *cap, uint32_t *body_len)
+{
+	uint8_t hdr_for_crc[HDR_SIZE - 4];
+	uint32_t crc;
+	void *nb;
+
+	if (pread(bc->fd, hdr, HDR_SIZE, (off_t)off) != (ssize_t)HDR_SIZE)
+		return REC_IOERR;
+	if (__rec_parse(get_u32(hdr + 12), get_u32(hdr + 16), body_len) != 0)
+		return REC_BAD;
+	if (fsize - off - HDR_SIZE < *body_len)
+		return REC_TORN;
+	if (*body_len > *cap || *body == NULL) {
+		nb = realloc(*body, *body_len > 0 ? *body_len : 1);
+		if (nb == NULL)
+			return REC_IOERR;
+		*body = nb;
+		*cap = *body_len;
+	}
+	if (*body_len > 0 && pread(bc->fd, *body, *body_len,
+	    (off_t)(off + HDR_SIZE)) != (ssize_t)*body_len)
+		return REC_IOERR;
+	memcpy(hdr_for_crc, hdr + 4, HDR_SIZE - 4);
+	crc = crc32(hdr_for_crc, HDR_SIZE - 4, 0);
+	crc = crc32(*body, *body_len, crc);
+	return crc == get_u32(hdr) ? REC_OK : REC_BAD;
+}
+
+/*
+ * The first offset after `bad` at which a whole, valid record starts,
+ * or 0 if there is none.  A crash leaves a torn record only at the end
+ * of the log, so a bad record with a valid one after it is corruption.
+ *
+ * shortcut: tries every byte offset after the bad record, with a
+ * pread of the header (and of the body where the bytes parse as a
+ * header), so it is slow on a large damaged log; scan the file in
+ * large blocks if that matters.  It runs only when a record is bad.
+ */
+static uint64_t
+__next_valid(struct bitcask *bc, uint64_t bad, uint64_t fsize)
+{
+	uint8_t hdr[HDR_SIZE], *body = NULL;
+	size_t cap = 0;
+	uint32_t body_len;
+	uint64_t q;
+
+	for (q = bad + 1; fsize - q >= HDR_SIZE; q++)
+		if (__rec_read(bc, q, fsize, hdr, &body, &cap, &body_len) ==
+		    REC_OK)
+			break;
+	free(body);
+	return fsize - q >= HDR_SIZE ? q : 0;
+}
+
+/*
+ * Rebuild the index from the data file.  A torn tail (a crash in the
+ * middle of the last write) is cut off.  A bad record anywhere else,
+ * one with a valid record after it, refuses the open with the offset:
+ * cutting there would silently drop every later record.  Returns 0 or
+ * -1.
+ */
 static int
 __recover(struct bitcask *bc)
 {
 	off_t fsize = lseek(bc->fd, 0, SEEK_END);
-	uint64_t off = 0;
+	uint64_t off = 0, next, fs;
 	uint8_t  hdr[HDR_SIZE];
 	uint8_t *body = NULL;
 	size_t   body_cap = 0;
+	uint32_t body_len, kl, vl;
+	enum rec_state st;
 	int      rc = 0;
 	int64_t  now = wall_ns();
 
 	if (fsize < 0) return -1;
+	fs = (uint64_t)fsize;
 
-	while ((uint64_t)fsize - off >= HDR_SIZE) {
-		ssize_t n = pread(bc->fd, hdr, HDR_SIZE, (off_t)off);
-		if (n != (ssize_t)HDR_SIZE) {
-			/* Trailing garbage; truncate. */
-			rc = __cut_tail(bc, off);
+	while (fs - off >= HDR_SIZE) {
+		st = __rec_read(bc, off, fs, hdr, &body, &body_cap, &body_len);
+		if (st == REC_IOERR) {
+			rc = -1;
 			break;
 		}
-		uint32_t crc_stored = get_u32(hdr);
-		uint64_t ts         = get_u64(hdr + 4);
-		uint32_t kl         = get_u32(hdr + 12);
-		uint32_t vl         = get_u32(hdr + 16);
-		uint32_t body_len;
-		if (__rec_parse(kl, vl, &body_len) != 0) {
-			rc = __cut_tail(bc, off);
+		if (st == REC_TORN) {
+			rc = __cut_tail(bc, off, fs);
 			break;
 		}
-		if ((uint64_t)fsize - off - HDR_SIZE < body_len) {
-			rc = __cut_tail(bc, off);
-			break;
-		}
-		/* Always a buffer, even for an empty body: an empty key
-		 * with an empty value is a put of 0 body bytes, and its key
-		 * pointer must not be NULL (memcpy in __idx_put). */
-		if (body_len > body_cap || body == NULL) {
-			void *nb = realloc(body, body_len > 0 ? body_len : 1);
-			if (nb == NULL) { rc = -1; break; }
-			body = nb;
-			body_cap = body_len;
-		}
-		if (body_len > 0) {
-			n = pread(bc->fd, body, body_len,
-			    (off_t)(off + HDR_SIZE));
-			if (n != (ssize_t)body_len) {
-				rc = __cut_tail(bc, off);
+		if (st == REC_BAD) {
+			if ((next = __next_valid(bc, off, fs)) == 0) {
+				rc = __cut_tail(bc, off, fs);
 				break;
 			}
+			fprintf(stderr, "bitcask: %s/" DATA_FILE ": the record "
+			    "at offset %llu is corrupt and a valid record "
+			    "follows at offset %llu; refusing to open (the "
+			    "log is damaged, not torn: restore it, or cut it "
+			    "at %llu by hand to drop everything from there)\n",
+			    bc->dir, (unsigned long long)off,
+			    (unsigned long long)next, (unsigned long long)off);
+			rc = -1;
+			break;
 		}
-		/* Verify CRC. */
-		{
-			uint32_t crc_calc;
-			uint8_t hdr_for_crc[HDR_SIZE - 4];
-			memcpy(hdr_for_crc, hdr + 4, HDR_SIZE - 4);
-			crc_calc = crc32(hdr_for_crc, HDR_SIZE - 4, 0);
-			crc_calc = crc32(body, body_len, crc_calc);
-			if (crc_calc != crc_stored) {
-				/* Corrupt record at this offset; truncate
-				 * and stop -- subsequent records may also
-				 * be corrupt. */
-				rc = __cut_tail(bc, off);
-				break;
-			}
-		}
+		kl = get_u32(hdr + 12);
+		vl = get_u32(hdr + 16);
 		if (vl != REC_BATCH) {
-			__rec_apply(bc, off, ts, kl, vl, body, now);
+			__rec_apply(bc, off, get_u64(hdr + 4), kl, vl, body,
+			    now);
 		} else if (__batch_apply(bc, off + HDR_SIZE, body, body_len,
 		    now) != 0) {
-			fprintf(stderr, "bitcask: malformed batch record at "
-			    "offset %llu\n", (unsigned long long)off);
+			fprintf(stderr, "bitcask: %s/" DATA_FILE ": malformed "
+			    "batch record at offset %llu\n", bc->dir,
+			    (unsigned long long)off);
 			rc = -1;
 			break;
 		}
