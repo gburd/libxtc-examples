@@ -37,7 +37,7 @@ and the per-group backend selection differ:
   NDRange per ready request and bridges the resulting `cl_event` to the
   engine's FUTURE exec kind through the group's one long-lived waiter
   thread, which `clWaitForEvents`, releases the event, then
-  `xtc_promise_set`. (A thread per op cost 59-127 us per op; a persistent
+  `xtc_promise_set`.  (A thread per op cost 59-127 us per op; a persistent
   waiter 13.7-20 us, measured 2026-10-12; see 13's README.  Use the FENCE
   kind where the runtime exports a fence fd.)
 - **levelzero** (`XTC_WITH_LEVELZERO=1`): real NPU. `submit()` appends a small
@@ -168,5 +168,5 @@ It passes with no GPU/NPU present and is byte-identical across runs.
 The OpenCL and Level Zero backends were changed after their last hardware
 run (persistent waiter, per-request NPU staging regions, event-index
 tracking, no polling feeder); they are compile-checked but have NOT been
-re-run on that GPU/NPU since. The expected output above is from
+re-run on that GPU/NPU since.  The expected output above is from
 the earlier version.

@@ -26,7 +26,7 @@ differs:
   device: `submit()` hands it the event and a promise, it `clWaitForEvents`,
   releases the event, and calls `xtc_promise_set`. `collect()` reads back each
   tile's buffer region and decides DONE (converged) vs CONTINUE (needs more
-  passes). This is the pattern to copy: a thread created per device op cost
+  passes).  This is the pattern to copy: a thread created per device op cost
   59-127 us per op (at most 16,851 ops/s), a persistent waiter 13.7-20 us
   (measured 2026-10-12 with the libxtc 1.55 review's bridge harness, for
   the fix in e35b7b6).  If your runtime can export a pollable fence fd,
