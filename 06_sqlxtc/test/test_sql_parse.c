@@ -122,7 +122,7 @@ values_rows_ok(int n)
 	for (r = 0; ok && r < n; r++) {
 		const sql_expr_t *e = ins->rows[r]->head->expr;
 		snprintf(want, sizeof want, "%d", r);
-		ok = e->lit.len == strlen(want) &&
+		ok = e->op == SX_E_NUMBER && e->lit.len == strlen(want) &&
 		    memcmp(e->lit.p, want, e->lit.len) == 0;
 	}
 	sql_arena_destroy(a);
