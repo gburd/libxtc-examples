@@ -193,6 +193,13 @@ test_iterate_and_stats(void)
 	ASSERT(s.puts == 3);
 	ASSERT(s.dels == 1);
 	bitcask_close(bc);
+
+	/* After a reopen the log's bytes are all counted as used, and the
+	 * superseded ones (b's put and its tombstone) also as dead. */
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	bitcask_stat(bc, &s);
+	ASSERT(s.bytes_used > s.bytes_dead && s.bytes_dead > 0);
+	bitcask_close(bc);
 	rmrf(dir);
 	printf("  ok   iterate_and_stats\n");
 }

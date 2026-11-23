@@ -570,11 +570,26 @@ __recover(struct bitcask *bc)
 		off += HDR_SIZE + body_len;
 	}
 	bc->write_offset = off;
+	bc->bytes_used = off;           /* every record kept is in use */
 	free(body);
 	return rc;
 }
 
 /* ---- public API --------------------------------------------- */
+
+/* fsync the directory, so a rename or unlink in it is durable.
+ * Returns 0 or -1. */
+static int
+__fsync_dir(const char *dir)
+{
+	int dfd, rc;
+
+	if ((dfd = open(dir, O_RDONLY)) < 0)
+		return -1;
+	rc = fsync(dfd);
+	(void)close(dfd);
+	return rc == 0 ? 0 : -1;
+}
 
 /*
  * A directory from before the v2 records holds DIR/bitcask.data.  Its
@@ -595,7 +610,6 @@ __adopt_v1(const char *dir, const char *path)
 {
 	char v1[512];
 	struct stat sb;
-	int dfd, rc;
 
 	snprintf(v1, sizeof v1, "%s/bitcask.data", dir);
 	if (stat(v1, &sb) != 0)
@@ -615,11 +629,7 @@ __adopt_v1(const char *dir, const char *path)
 	} else if (rename(v1, path) != 0) {
 		return -1;
 	}
-	if ((dfd = open(dir, O_RDONLY)) < 0)
-		return -1;
-	rc = fsync(dfd);
-	(void)close(dfd);
-	return rc == 0 ? 0 : -1;
+	return __fsync_dir(dir);
 }
 
 int
@@ -1066,8 +1076,9 @@ __compact_one(struct bitcask *bc, int tfd, struct idx_entry *e,
  * themselves (the bytes_dead bytes) are reclaimed.  A live entry keeps
  * its tag and expiry; an entry whose expiry has passed is dropped from
  * the index and not copied.  The live set is written to a temp file,
- * fsync'd, then renamed over the data file; the in-memory index
- * offsets are re-pointed into the new file as each record is written.
+ * fsync'd, then renamed over the data file, and the directory is
+ * fsync'd; the in-memory index offsets are re-pointed into the new file
+ * as each record is written.
  * Holds the write lock for the whole pass (a single-file Bitcask
  * cannot serve reads from the old file while the new one is being
  * built); a multi-file variant would merge immutable segments in the
@@ -1077,7 +1088,7 @@ int
 bitcask_compact(bitcask_t *bc)
 {
 	char tmp_path[512], data_path[512];
-	int tfd;
+	int tfd, dir_rc;
 	uint64_t new_off = 0;
 	int64_t now = wall_ns();
 	size_t i;
@@ -1114,6 +1125,11 @@ bitcask_compact(bitcask_t *bc)
 
 	if (fsync(tfd) != 0) goto fail;
 	if (rename(tmp_path, data_path) != 0) goto fail;
+	/* Make the rename durable: without it a power loss after the
+	 * merge can bring back the old file under the data file's name.
+	 * The new file is in place by now, so a failure here leaves the
+	 * handle consistent; it is reported, not undone. */
+	dir_rc = __fsync_dir(bc->dir);
 
 	/* Swap to the compacted file. */
 	(void)close(bc->fd);
@@ -1121,7 +1137,7 @@ bitcask_compact(bitcask_t *bc)
 	bc->write_offset = new_off;
 	bc->bytes_used = new_off;
 	bc->bytes_dead = 0;
-	rc = 0;
+	rc = dir_rc;
 	pthread_mutex_unlock(&bc->lock);
 	return rc;
 
