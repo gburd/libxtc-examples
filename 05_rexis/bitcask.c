@@ -24,6 +24,11 @@
  *   REC_V2 | len             v2 put: meta, then len value bytes.
  *   REC_FLUSH (0xFFFFFFFE)   flush: key_len 0, no body.  Every
  *                            earlier record is dead.
+ *   REC_BATCH (0xFFFFFFFD)   batch: key_len is the length of the
+ *                            body, which is whole records of the
+ *                            other kinds, back to back.  The CRC
+ *                            covers the body, so recovery applies a
+ *                            batch whole or cuts it off whole.
  *   REC_TOMBSTONE (~0)       delete: key only.
  *
  * A binary that predates v2 and flush records would read either as a
@@ -121,6 +126,7 @@ static uint64_t get_u64(const uint8_t *p) {
 #define META_SIZE (1 /*tag*/ + 8 /*expire_at*/)
 #define TOMBSTONE 0xffffffffu
 #define REC_FLUSH 0xfffffffeu
+#define REC_BATCH 0xfffffffdu
 #define REC_V2    0x80000000u
 #define DATA_FILE "bitcask.v2"
 
@@ -330,6 +336,10 @@ __rec_parse(uint32_t kl, uint32_t vl, uint32_t *body_len)
 	}
 	if (kl > MAX_VAL_LEN)
 		return -1;
+	if (vl == REC_BATCH) {
+		*body_len = kl;
+		return 0;
+	}
 	if (vl == TOMBSTONE) {
 		*body_len = kl;
 		return 0;
@@ -382,6 +392,34 @@ __rec_apply(struct bitcask *bc, uint64_t off, uint64_t ts, uint32_t kl,
 		return;
 	}
 	(void)__idx_put(bc, body, kl, voff, vl, ts, &m);
+}
+
+/*
+ * Apply a batch record's body (`len` bytes, already checked against
+ * the batch's CRC), found at file offset `off`.  The body holds whole
+ * records, none of them a batch.  Returns 0, or -1 for a body no writer
+ * produces: the open then fails rather than guess.
+ */
+static int
+__batch_apply(struct bitcask *bc, uint64_t off, const uint8_t *body,
+    uint32_t len, int64_t now)
+{
+	uint32_t pos = 0, kl, vl, blen;
+
+	while (pos < len) {
+		if (len - pos < HDR_SIZE)
+			return -1;
+		kl = get_u32(body + pos + 12);
+		vl = get_u32(body + pos + 16);
+		if (vl == REC_BATCH || __rec_parse(kl, vl, &blen) != 0 ||
+		    len - pos - HDR_SIZE < blen)
+			return -1;
+		__rec_apply(bc, off + pos, get_u64(body + pos + 4), kl, vl,
+		    body + pos + HDR_SIZE, now);
+		pos += HDR_SIZE + blen;
+	}
+	bc->bytes_dead += HDR_SIZE;           /* the batch's own header */
+	return 0;
 }
 
 /* Cut a torn or corrupt tail off at `off`.  Returns 0, or -1 if the
@@ -454,7 +492,15 @@ __recover(struct bitcask *bc)
 				break;
 			}
 		}
-		__rec_apply(bc, off, ts, kl, vl, body, now);
+		if (vl != REC_BATCH) {
+			__rec_apply(bc, off, ts, kl, vl, body, now);
+		} else if (__batch_apply(bc, off + HDR_SIZE, body, body_len,
+		    now) != 0) {
+			fprintf(stderr, "bitcask: malformed batch record at "
+			    "offset %llu\n", (unsigned long long)off);
+			rc = -1;
+			break;
+		}
 		off += HDR_SIZE + body_len;
 	}
 	bc->write_offset = off;
@@ -670,6 +716,28 @@ bitcask_size(bitcask_t *bc, const void *key, size_t key_len, size_t *val_len)
 	return 0;
 }
 
+/*
+ * Fill hdr with the header of a record whose body is `body` (`len`
+ * bytes) and whose key_len and val_len fields are kl and kind: a
+ * tombstone (kl = len, the key), a flush (no body) or a batch (kl =
+ * len, the inner records).
+ */
+static void
+__marker_hdr(uint8_t *hdr, const void *body, size_t len, uint32_t kl,
+    uint32_t kind)
+{
+	uint8_t hdr_for_crc[HDR_SIZE - 4];
+	uint32_t crc;
+
+	put_u64(hdr_for_crc + 0, (uint64_t)now_ns());
+	put_u32(hdr_for_crc + 8, kl);
+	put_u32(hdr_for_crc + 12, kind);
+	crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
+	crc = crc32(body, len, crc);
+	put_u32(hdr, crc);
+	memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
+}
+
 /* Append a record with no value bytes: a tombstone (key) or a flush
  * (no key).  Returns 0 or -1. */
 static int
@@ -677,18 +745,9 @@ __rec_marker(struct bitcask *bc, const void *key, size_t key_len,
     uint32_t kind)
 {
 	uint8_t hdr[HDR_SIZE];
-	uint8_t hdr_for_crc[HDR_SIZE - 4];
 	struct iovec iov[2];
-	uint32_t crc;
-	uint64_t ts = (uint64_t)now_ns();
 
-	put_u64(hdr_for_crc + 0, ts);
-	put_u32(hdr_for_crc + 8, (uint32_t)key_len);
-	put_u32(hdr_for_crc + 12, kind);
-	crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
-	crc = crc32(key, key_len, crc);
-	put_u32(hdr, crc);
-	memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
+	__marker_hdr(hdr, key, key_len, (uint32_t)key_len, kind);
 	iov[0].iov_base = hdr;          iov[0].iov_len = HDR_SIZE;
 	iov[1].iov_base = (void *)key;  iov[1].iov_len = key_len;
 	if (__rec_append(bc, iov, 2, HDR_SIZE + key_len) != 0)
@@ -731,6 +790,62 @@ bitcask_del(bitcask_t *bc, const void *key, size_t key_len)
 	if (found) __idx_del(bc, key, key_len);
 	pthread_mutex_unlock(&bc->lock);
 	return found ? 0 : 1;
+}
+
+/*
+ * Delete several keys with one batch record (one pwritev): a crash
+ * keeps every tombstone or none.  The record is built in one buffer:
+ * the batch header, then a tombstone per key.
+ */
+int
+bitcask_del_many(bitcask_t *bc, const void *const *keys,
+    const size_t *lens, size_t n)
+{
+	uint8_t *buf, *p;
+	struct iovec iov[1];
+	size_t i, inner = 0;
+	int rc;
+
+	if (bc == NULL || keys == NULL || lens == NULL)
+		return -1;
+	if (n == 1)
+		return bitcask_del(bc, keys[0], lens[0]) < 0 ? -1 : 0;
+	for (i = 0; i < n; i++) {
+		if (keys[i] == NULL || lens[i] > MAX_VAL_LEN)
+			return -1;
+		inner += HDR_SIZE + lens[i];
+		if (inner > MAX_VAL_LEN)
+			return -1;
+	}
+	if (n == 0)
+		return 0;
+	if ((buf = malloc(HDR_SIZE + inner)) == NULL)
+		return -1;
+
+	/* The tombstones, then the batch header over them. */
+	p = buf + HDR_SIZE;
+	for (i = 0; i < n; i++) {
+		__marker_hdr(p, keys[i], lens[i], (uint32_t)lens[i],
+		    TOMBSTONE);
+		memcpy(p + HDR_SIZE, keys[i], lens[i]);
+		p += HDR_SIZE + lens[i];
+	}
+	__marker_hdr(buf, buf + HDR_SIZE, inner, (uint32_t)inner, REC_BATCH);
+	iov[0].iov_base = buf;
+	iov[0].iov_len = HDR_SIZE + inner;
+
+	pthread_mutex_lock(&bc->lock);
+	rc = __rec_append(bc, iov, 1, HDR_SIZE + inner);
+	if (rc == 0) {
+		for (i = 0; i < n; i++)
+			(void)__idx_del(bc, keys[i], lens[i]);
+		bc->bytes_used += HDR_SIZE + inner;
+		bc->bytes_dead += HDR_SIZE + inner;   /* never live */
+		bc->dels += n;
+	}
+	pthread_mutex_unlock(&bc->lock);
+	free(buf);
+	return rc;
 }
 
 int

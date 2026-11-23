@@ -234,13 +234,28 @@ int  db_set_ex(db_t *db, const char *key, size_t key_len,
 /* Returns 1 if deleted, 0 if not found */
 int  db_del(db_t *db, const char *key, size_t key_len);
 
+/* Delete n keys (a multi-key DEL), logged as ONE record: after a crash
+ * either every delete is in the log or none is.  Returns the number
+ * deleted, or -1 if out of memory (nothing deleted). */
+int  db_del_keys(db_t *db, const char *const *keys, const size_t *lens,
+                 int n);
+
+/* Log key's current state (its value, or a tombstone if it is gone).
+ * The list and hash element writers below (db_lpush, db_rpush, db_hset,
+ * db_hdel) do NOT log: a command that calls them once per argument
+ * calls db_persist once, after the last one, with the key's shard
+ * still write-locked, so the command is one record in the log and a
+ * crash keeps all of it or none.  A no-op without persist_dir. */
+void db_persist(db_t *db, const char *key, size_t key_len);
+
 /* Returns 0 on success, -1 if key not found */
 int  db_expire(db_t *db, const char *key, size_t key_len, int64_t expire_ns);
 
 /* Returns new value on success, -1 on type error */
 int64_t db_incr(db_t *db, const char *key, size_t key_len, int64_t delta);
 
-/* List operations.  Returns new list length, or -1 on error. */
+/* List operations.  Returns new list length, or -1 on error.  Not
+ * logged: see db_persist. */
 int64_t db_lpush(db_t *db, const char *key, size_t key_len,
                  const char *val, size_t val_len);
 int64_t db_rpush(db_t *db, const char *key, size_t key_len,
@@ -254,7 +269,8 @@ int db_lpop(db_t *db, const char *key, size_t key_len,
 int db_rpop(db_t *db, const char *key, size_t key_len,
             db_pop_cb cb, void *user);
 
-/* Hash write operations.  Returns field count added (0 if exists). */
+/* Hash write operations.  Returns field count added (0 if exists).
+ * Not logged: see db_persist. */
 int db_hset(db_t *db, const char *key, size_t key_len,
             const char *field, size_t field_len,
             const char *val, size_t val_len);

@@ -13,7 +13,9 @@
  *   * An in-memory hash index maps key -> (offset, len, timestamp).
  *   * A get is an index lookup + one pread.
  *   * A put is an append + index update.
- *   * A delete is a tombstone append + index removal.
+ *   * A delete is a tombstone append + index removal.  Several
+ *     deletes can go in one batch record, which a crash keeps whole
+ *     or not at all.
  *   * A flush is one flush record + an emptied index.
  *
  * On crash, the index is rebuilt by scanning the data file at
@@ -111,6 +113,12 @@ int   bitcask_size(bitcask_t *bc,
 /* Delete.  Returns 0 if the key existed, 1 if not, -1 on I/O. */
 int   bitcask_del(bitcask_t *bc,
                   const void *key, size_t key_len);
+
+/* Delete n keys with one record (a batch of tombstones), so a crash
+ * keeps all of the deletes or none.  Returns 0, or -1 on I/O error or
+ * a key over BITCASK_MAX_VAL (nothing is deleted then). */
+int   bitcask_del_many(bitcask_t *bc, const void *const *keys,
+                       const size_t *lens, size_t n);
 
 /* Delete every key: one flush record, after which every earlier
  * record is dead.  Returns 0, or -1 on I/O error. */

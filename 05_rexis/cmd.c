@@ -175,18 +175,32 @@ cmd_set(cmd_ctx_t *ctx)
 	return 0;
 }
 
+/* DEL k...: the deletes are one log record (db_del_keys). */
 static int
 cmd_del(cmd_ctx_t *ctx)
 {
-	int i, count = 0;
+	const char **keys;
+	size_t *lens;
+	int i, n = ctx->argc - 1, count = -1;
 	db_keyset_t ks = cmd_keyset(ctx, 1);
 
-	db_lock(ctx->db, ks, 1);
-	for (i = 1; i < ctx->argc; i++) {
-		count += db_del(ctx->db, ctx->argv[i].u.str.data,
-		                ctx->argv[i].u.str.len);
+	keys = xtc_malloc((size_t)n * sizeof *keys);
+	lens = xtc_malloc((size_t)n * sizeof *lens);
+	if (keys != NULL && lens != NULL) {
+		for (i = 0; i < n; i++) {
+			keys[i] = ctx->argv[i + 1].u.str.data;
+			lens[i] = ctx->argv[i + 1].u.str.len;
+		}
+		db_lock(ctx->db, ks, 1);
+		count = db_del_keys(ctx->db, keys, lens, n);
+		db_unlock(ctx->db, ks, 1);
 	}
-	db_unlock(ctx->db, ks, 1);
+	xtc_free(keys);
+	xtc_free(lens);
+	if (count < 0) {
+		resp_write_error_n(ctx->out, "OOM", "out of memory");
+		return 0;
+	}
 	resp_write_int(ctx->out, count);
 	return 0;
 }
@@ -401,13 +415,16 @@ cmd_lpush(cmd_ctx_t *ctx)
 		               ctx->argv[1].u.str.len,
 		               ctx->argv[i].u.str.data,
 		               ctx->argv[i].u.str.len);
-		if (len < 0) {
-			db_unlock(ctx->db, ks, 1);
-			resp_write_error_n(ctx->out, "OOM", "out of memory");
-			return 0;
-		}
+		if (len < 0)
+			break;
 	}
+	/* One record for the whole command, even a partial one. */
+	db_persist(ctx->db, ctx->argv[1].u.str.data, ctx->argv[1].u.str.len);
 	db_unlock(ctx->db, ks, 1);
+	if (len < 0) {
+		resp_write_error_n(ctx->out, "OOM", "out of memory");
+		return 0;
+	}
 	resp_write_int(ctx->out, len);
 	return 0;
 }
@@ -425,13 +442,16 @@ cmd_rpush(cmd_ctx_t *ctx)
 		               ctx->argv[1].u.str.len,
 		               ctx->argv[i].u.str.data,
 		               ctx->argv[i].u.str.len);
-		if (len < 0) {
-			db_unlock(ctx->db, ks, 1);
-			resp_write_error_n(ctx->out, "OOM", "out of memory");
-			return 0;
-		}
+		if (len < 0)
+			break;
 	}
+	/* One record for the whole command, even a partial one. */
+	db_persist(ctx->db, ctx->argv[1].u.str.data, ctx->argv[1].u.str.len);
 	db_unlock(ctx->db, ks, 1);
+	if (len < 0) {
+		resp_write_error_n(ctx->out, "OOM", "out of memory");
+		return 0;
+	}
 	resp_write_int(ctx->out, len);
 	return 0;
 }
@@ -526,13 +546,18 @@ cmd_hset(cmd_ctx_t *ctx)
 		                ctx->argv[i].u.str.data, ctx->argv[i].u.str.len,
 		                ctx->argv[i+1].u.str.data, ctx->argv[i+1].u.str.len);
 		if (r < 0) {
-			db_unlock(ctx->db, ks, 1);
-			resp_write_error_n(ctx->out, "OOM", "out of memory");
-			return 0;
+			added = -1;
+			break;
 		}
 		added += r;
 	}
+	/* One record for the whole command, even a partial one. */
+	db_persist(ctx->db, ctx->argv[1].u.str.data, ctx->argv[1].u.str.len);
 	db_unlock(ctx->db, ks, 1);
+	if (added < 0) {
+		resp_write_error_n(ctx->out, "OOM", "out of memory");
+		return 0;
+	}
 	resp_write_int(ctx->out, added);
 	return 0;
 }
@@ -568,6 +593,9 @@ cmd_hdel(cmd_ctx_t *ctx)
 		                 ctx->argv[1].u.str.data, ctx->argv[1].u.str.len,
 		                 ctx->argv[i].u.str.data, ctx->argv[i].u.str.len);
 	}
+	if (count > 0)
+		db_persist(ctx->db, ctx->argv[1].u.str.data,
+		    ctx->argv[1].u.str.len);
 	db_unlock(ctx->db, ks, 1);
 	resp_write_int(ctx->out, count);
 	return 0;

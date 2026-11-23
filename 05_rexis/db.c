@@ -400,10 +400,13 @@ db_sync(void *dst, const void *src, size_t sz)
 
 /* ----- Persistence (Bitcask) -----
  *
- * Every write logs the RESULTING state of the key it changed, not the
- * operation: INCR logs the new number, LPUSH the whole list, a write
- * that removes the key (DEL, the last LPOP or HDEL) a tombstone, and
- * FLUSHDB one flush record.  Bitcask keeps the latest record per key,
+ * Every command logs the RESULTING state of the key it changed, not the
+ * operation, in ONE record: INCR logs the new number, LPUSH the whole
+ * list (once, after all its elements: the element writers do not log,
+ * the command calls db_persist), a write that removes the key (DEL, the
+ * last LPOP or HDEL) a tombstone, a multi-key DEL one batch record of
+ * tombstones, and FLUSHDB one flush record.  So a crash in the middle
+ * of a command leaves the log before it or after it, never between.  Bitcask keeps the latest record per key,
  * so replay sets each surviving key once, in its final form, and
  * nothing depends on the order of operations or on replaying them
  * twice.  The value type travels in the record's tag and the expiry in
@@ -1288,6 +1291,53 @@ db_del(db_t *db, const char *key, size_t key_len)
 	return 1;
 }
 
+/*
+ * Delete n keys and log the deletes as one batch record, so a crash
+ * keeps all of them or none.  Returns the number deleted, or -1 (out
+ * of memory, nothing deleted).
+ */
+int
+db_del_keys(db_t *db, const char *const *keys, const size_t *lens, int n)
+{
+	const void **gone;
+	size_t *gone_len;
+	uint64_t h;
+	db_table_t *tbl;
+	db_entry_t *e;
+	int i, count = 0;
+
+	/* Room for the deleted keys' names, before anything changes. */
+	gone = xtc_malloc((size_t)(n > 0 ? n : 1) * sizeof *gone);
+	gone_len = xtc_malloc((size_t)(n > 0 ? n : 1) * sizeof *gone_len);
+	if (gone == NULL || gone_len == NULL) {
+		xtc_free(gone);
+		xtc_free(gone_len);
+		return -1;
+	}
+	for (i = 0; i < n; i++) {
+		h = fnv1a(keys[i], lens[i]);
+		tbl = wtable(db, h);
+		if ((e = entry_find(tbl, keys[i], lens[i], h)) == NULL)
+			continue;
+		entry_remove(db, tbl, e);
+		gone[count] = keys[i];
+		gone_len[count] = lens[i];
+		count++;
+	}
+	if (db->bc != NULL && count > 0 &&
+	    bitcask_del_many(db->bc, gone, gone_len, (size_t)count) != 0)
+		persist_fail(keys[0], lens[0], "the deletes");
+	xtc_free(gone);
+	xtc_free(gone_len);
+	return count;
+}
+
+void
+db_persist(db_t *db, const char *key, size_t key_len)
+{
+	persist_key(db, key, key_len);
+}
+
 int
 db_expire(db_t *db, const char *key, size_t key_len, int64_t expire_ns)
 {
@@ -1426,7 +1476,6 @@ db_lpush(db_t *db, const char *key, size_t key_len,
 		e->val.list.tail = n;
 	e->val.list.head = n;
 	e->val.list.count++;
-	persist_key(db, key, key_len);
 
 	return (int64_t)e->val.list.count;
 }
@@ -1456,7 +1505,6 @@ db_rpush(db_t *db, const char *key, size_t key_len,
 		e->val.list.head = n;
 	e->val.list.tail = n;
 	e->val.list.count++;
-	persist_key(db, key, key_len);
 
 	return (int64_t)e->val.list.count;
 }
@@ -1597,7 +1645,6 @@ db_hset(db_t *db, const char *key, size_t key_len,
 				e->val.hash.head = nf;
 			db_free(db, f,
 			        sizeof(*f) + f->key_len + f->val_len + 2);
-			persist_key(db, key, key_len);
 			return 0;
 		}
 	}
@@ -1616,7 +1663,6 @@ db_hset(db_t *db, const char *key, size_t key_len,
 	e->val.hash.head = f;
 	e->val.hash.count++;
 	added = 1;
-	persist_key(db, key, key_len);
 
 	return added;
 }
@@ -1644,7 +1690,6 @@ db_hdel(db_t *db, const char *key, size_t key_len,
 			/* Remove empty hash */
 			if (e->val.hash.count == 0)
 				entry_remove(db, tbl, e);
-			persist_key(db, key, key_len);
 			return 1;
 		}
 	}

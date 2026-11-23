@@ -32,3 +32,4 @@
 05_rexis/test/test_rexis_pbt
 05_rexis/test/test_rexis_restart
 05_rexis/test/*.o
+05_rexis/test/rexis_killwrite.so

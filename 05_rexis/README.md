@@ -266,6 +266,12 @@ one record to `DIR/bitcask.v2` before its reply is sent, and a restart
 reloads the log.  The keyspace after a restart is the keyspace as of
 the last acknowledged command.
 
+One command is one record, written with one `pwritev`, so a crash in
+the middle of a command leaves the keyspace before it or after it,
+never a part of it: an `RPUSH l a b c` comes back with all three
+elements or none, and a `DEL a b c` deletes all three keys or none (its
+tombstones go in one batch record).
+
 What is logged is the key's resulting state, not the command: INCR,
 DECR, INCRBY and DECRBY log the new number; LPUSH, RPUSH, LPOP and RPOP
 the whole list; HSET and HDEL the whole hash (field order included);
@@ -315,8 +321,12 @@ start rather than pick one.
 
 `test/test_rexis_restart.c` checks each class (counters, TTLs, FLUSHDB,
 lists, hashes, deletes) against a real server restarted mid-test, once
-with SIGTERM and once with SIGKILL between commands; `test_bitcask.c`
-checks the records through a merge.
+with SIGTERM and once with SIGKILL between commands.  Its `midcmd` case
+crashes the server in the middle of a log write instead
+(`test/rexis_killwrite.c`, loaded with `LD_PRELOAD`, writes half of the
+Nth `pwritev` and kills the process) during an RPUSH, LPUSH, HSET, HDEL
+and multi-key DEL, and requires the keyspace before or after the
+command.  `test_bitcask.c` checks the records through a merge.
 
 ## Known limitations
 

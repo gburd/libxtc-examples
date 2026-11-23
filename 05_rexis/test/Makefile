@@ -42,7 +42,7 @@ TESTS = test_resp_parser test_rexis_loopback test_rexis_budgets test_rexis_pbt \
 
 .PHONY: all clean check FORCE
 
-all: $(TESTS)
+all: $(TESTS) rexis_killwrite.so
 
 test_resp_parser: test_resp_parser.o munit.o $(PROTO_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -59,6 +59,11 @@ test_rexis_pbt: test_rexis_pbt.o munit.o
 test_rexis_restart: test_rexis_restart.o munit.o
 	$(CC) $(CFLAGS) -o $@ $^ -lpthread
 
+# The LD_PRELOAD shim test_rexis_restart's mid-command cases load into
+# the server (it tears the Nth log write and kills the process).
+rexis_killwrite.so: rexis_killwrite.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -ldl
+
 test_rexis_loopback.o test_rexis_budgets.o test_rexis_pbt.o \
 test_rexis_restart.o: rexis_harness.h
 
@@ -72,7 +77,7 @@ $(PROTO_OBJ): FORCE
 FORCE:
 
 clean:
-	rm -f *.o $(TESTS)
+	rm -f *.o $(TESTS) rexis_killwrite.so
 
 # Build the server, then run every m99 test.  Any failure fails the
 # target.  (It used to append `|| echo "(some tests may fail...)"` to
