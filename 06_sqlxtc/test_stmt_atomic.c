@@ -30,7 +30,8 @@
  *	      runs (the kill is deferred to the statement's end, see
  *	      sx_step): the connection never hears an answer, and the
  *	      statement's rows must not be committed by a dead connection,
- *	      whether it changes one row or many.
+ *	      whether it changes one row or many, and it fails with the
+ *	      cancelled message an embedder may read before the proc dies.
  *	And an UPDATE, DELETE, INSERT ... SELECT or INSERT VALUES over the
  *	native engine's row limit (100,000) fails with a message that names
  *	the limit, and changes nothing.
@@ -242,6 +243,7 @@ static struct {
 	const char *sql;
 	xtc_loop_t *loop;
 	int         ready, ran, rc;
+	char        msg[128];          /* sx_errmsg after the statement */
 } g_k;
 
 static void
@@ -252,6 +254,7 @@ k_conn(void *arg)
 	xtc_atomic_store_i32(&g_k.ready, 1, xtc_mo_seq_cst);
 	(void)xtc_proc_sleep(50LL * 1000 * 1000);     /* killed in here */
 	g_k.rc = sx_exec(g_k.db, g_k.sql, NULL);
+	snprintf(g_k.msg, sizeof g_k.msg, "%s", sx_errmsg(g_k.db));
 	xtc_atomic_store_i32(&g_k.ran, 1, xtc_mo_seq_cst);
 	(void)xtc_mask_leave();                       /* dies here */
 	xtc_atomic_store_i32(&g_k.ran, 2, xtc_mo_seq_cst);   /* not killed */
@@ -335,6 +338,9 @@ kill_run(const char *sql)
 		return -1;
 	xtc_exec_destroy(ex);
 	CK(g_k.ran == 1);                  /* ran, then died at its end */
+	CK(g_k.rc != SX_OK);
+	CK(strcmp(g_k.msg, "statement cancelled: the connection was killed") ==
+	    0);
 	state(g_k.db, &g_after);
 	ch = rows_changed(&g_before, &g_after);
 	sx_close(g_k.db);

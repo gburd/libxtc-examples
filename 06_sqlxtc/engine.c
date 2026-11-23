@@ -1757,6 +1757,11 @@ nat_select_run(struct sx_stmt *st)
 	"update; transaction rolled back"
 #define SX_MSG_ABORTED "current transaction is aborted, commands ignored " \
 	"until end of transaction block"
+/* A write statement discarded because its connection's proc has a kill
+ * pending (xstore_write_txn, xstore_stmt_implicit_end).  The proc dies
+ * when sx_step returns, so only an embedder that reads sx_errmsg inside
+ * the mask sees it. */
+#define SX_MSG_CANCELLED "statement cancelled: the connection was killed"
 
 /* The page file failed a checksum (sx_cksum_cb): the error a statement
  * gets, naming the page.  Every later write is refused (the log is
@@ -1810,6 +1815,8 @@ nat_set_run_error(struct sx_stmt *st)
 	if (xstore_read_err((struct xsql *)st->db)[0] != '\0')
 		return nat_set_err(st->db,
 		    xstore_read_err((struct xsql *)st->db), SX_ERROR);
+	if (xtc_cancel_requested())
+		return nat_set_err(st->db, SX_MSG_CANCELLED, SX_ERROR);
 	nd = (struct sx_native_db *)st->db;
 	free(nd->errmsg);
 	/* A first unresolved base table name -> "no such table: NAME". */
@@ -1973,7 +1980,8 @@ static int sx_step_body(sx_stmt *st);
  * delivered when it returns -- kill latency is one statement.  A write
  * statement with a kill pending writes nothing: its rows are discarded
  * whether it changes one row or many (xstore_write_txn,
- * xstore_stmt_implicit_end).  Off a proc both calls are no-ops.
+ * xstore_stmt_implicit_end), and it fails with SX_MSG_CANCELLED.  Off a
+ * proc both calls are no-ops.
  */
 int
 sx_step(sx_stmt *st)
