@@ -28,8 +28,9 @@ differs:
   tile's buffer region and decides DONE (converged) vs CONTINUE (needs more
   passes). This is the pattern to copy: a thread created per device op cost
   59-127 us per op (at most 16,851 ops/s), a persistent waiter 13.7-20 us
-  (measured 2026-10 with the libxtc 1.56 review's bridge harness). If your runtime can export a pollable fence fd, use the
-  FENCE exec kind instead and no waiter thread is needed at all.
+  (measured 2026-10-12 with the libxtc 1.55 review's bridge harness, for
+  the fix in e35b7b6).  If your runtime can export a pollable fence fd,
+  use the FENCE exec kind instead and no waiter thread is needed at all.
 - FENCE kind is not used: OpenCL does not portably export a sync_file fd, so
   FUTURE is the portable path (the hardware note prescribes this).
 
@@ -88,9 +89,10 @@ feeds both concurrently -- both GPUs busy at once.
   tiles, maxiter 512 this gives 121 device ops (4.00 members/op) for
   continuous and 166 (2.92 members/op) for static. That is an op count,
   not a speed-up: on the tested GPUs (2026-10) neither mode was faster in
-  wall time at this size (1 GPU: 0.86 s both), and running on 2 GPUs is faster because
-  it uses two devices, not because of continuous batching. The self-test
-  checks both modes are correct; it does not assert one beats the other.
+  wall time at this size (1 GPU: 0.86 s both), and running on 2 GPUs is
+  faster because it uses two devices, not because of continuous
+  batching.  The self-test checks both modes are correct; it does not
+  assert one beats the other.
 - **The feeder does not poll:** it sleeps on an `xtc_notify` that
   `complete()` signals, and wakes only when a slot has freed.
 - **Exactly-once completion:** every accepted tile completes exactly once; the

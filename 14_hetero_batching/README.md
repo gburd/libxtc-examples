@@ -38,8 +38,8 @@ and the per-group backend selection differ:
   engine's FUTURE exec kind through the group's one long-lived waiter
   thread, which `clWaitForEvents`, releases the event, then
   `xtc_promise_set`. (A thread per op cost 59-127 us per op; a persistent
-  waiter 13.7-20 us, measured 2026-10. Use the FENCE kind where the
-  runtime exports a fence fd.)
+  waiter 13.7-20 us, measured 2026-10-12; see 13's README.  Use the FENCE
+  kind where the runtime exports a fence fd.)
 - **levelzero** (`XTC_WITH_LEVELZERO=1`): real NPU. `submit()` appends a small
   Level Zero workload to the NPU command list, executes it on the NPU command
   queue, and signals a `ze_event`; the group's waiter thread does
@@ -92,7 +92,7 @@ make XTC_BUILD=/abs/path/to/configured-build
 ```
 
 The real GPU + NPU run was on a laptop with an Intel Arc iGPU and an Intel
-NPU. Both runtimes come from nix; the NPU userspace driver must be on the loader path via
+NPU.  Both runtimes come from nix; the NPU userspace driver must be on the loader path via
 `ZE_ENABLE_ALT_DRIVERS`:
 
 ```sh
