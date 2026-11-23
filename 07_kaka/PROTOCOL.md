@@ -37,7 +37,8 @@ partition logs reuse.
 Topic names are 1-63 bytes of `[A-Za-z0-9._-]` (not starting with
 `.`): they name a directory.  Group and topic names in COMMIT/OFFSETS
 are at most 31 bytes.  A connection handles one request at a time: it
-reads the next frame only after it has written the reply to the last.  METADATA (0x05) is reserved, not implemented.
+reads the next frame only after it has written the reply to the last.
+METADATA (0x05) is reserved, not implemented.
 
 ### Semantics
 

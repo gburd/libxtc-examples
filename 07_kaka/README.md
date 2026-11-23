@@ -31,9 +31,10 @@ In scope:
   * Bounded memory under a producer flood -- records in closed (rolled)
     segments are evicted from RAM and cold reads go to the segment
     files through an offset index, so resident memory stays bounded
-    (~2 segments) no matter how many messages are appended.  Combined with credit-based
-    backpressure on in-flight requests, this is the property that is the
-    real test of an actor runtime.
+    (~2 segments) no matter how many messages are appended.  Combined
+    with one request in flight per connection (TCP holds back the
+    rest), this is the property that is the real test of an actor
+    runtime.
 
 Out of scope (documented, not built):
 
@@ -57,7 +58,7 @@ primitive, chosen deliberately.
 | Producer connection      | one `xtc_proc` per TCP connection    | Same per-connection model as rexis/sqlxtc; uses `xtc_proc_wait_fd` for idle-CPU-free I/O |
 | Consumer connection      | one `xtc_proc` per TCP connection    | As above |
 | Record append            | `xtc_send` to the partition proc     | The mailbox cap is the partition's in-flight write bound |
-| Backpressure             | one request in flight per connection, plus `xtc_credit` (see below) | The mailbox cap alone drops on overflow; a connection waits for each reply before reading the next frame, so producers throttle instead |
+| Backpressure             | one request in flight per connection; TCP holds the rest (`xtc_credit` shown in a self-test) | The mailbox cap alone drops on overflow; a connection waits for each reply before reading the next frame, so producers throttle instead |
 | Segmented log + index    | Bitcask-style records (from rexis)   | Reuses the CRC-framed append log; segments roll at a size threshold |
 | Offset / high-water mark | partition proc state                 | The partition proc is the sole writer and reader; FETCH asks it |
 | Consumer group state     | (not built)                          | Partition assignment / rebalancing is not implemented; consumers pick their partitions |
@@ -81,13 +82,16 @@ bounds what it accepts instead of dropping:
   1. A connection proc handles one request at a time: it reads a
      frame, sends it to the partition, and waits for the reply before
      it reads the next frame.  Each connection therefore has at most
-     one request in flight, and its unread frames stay in the socket.
+     one request in flight, and frames it has not reached stay in its
+     receive buffer or the socket.
   2. While it waits, it does not read from the socket, so a producer
      that sends faster than the partition acks is slowed by TCP flow
      control.  Between requests it parks on the socket with
      `xtc_proc_wait_fd` instead of spinning.
-  3. The partition acks only after the records are durable (fdatasync
-     before the ack), so a slow disk slows every producer behind it.
+  3. In the default mode the partition acks only after the records are
+     durable (fdatasync before the ack), so a slow disk slows every
+     producer behind it.  With `--fsync-interval-ms` the ack follows
+     write(2).
 
 The window shape a client with several requests in flight would use is
 shown with libxtc's `xtc_credit` regulator (`broker_credit_selftest`
@@ -134,8 +138,8 @@ truncated at the first bad record.
 
 ## Protocol
 
-A small length-framed binary protocol (PROTOCOL.md).  Request types: PRODUCE, FETCH, COMMIT, OFFSETS (METADATA is
-reserved).
+A small length-framed binary protocol (PROTOCOL.md).  Request types:
+PRODUCE, FETCH, COMMIT, OFFSETS (METADATA is reserved).
 Each frame is a 4-byte length, a 1-byte type, and a type-specific
 body.  The wire format is deliberately minimal; the example is about
 the broker internals, not protocol design.
@@ -164,7 +168,10 @@ the tree green.
   Phase 3 -- credit-based backpressure.  Producer credit budget,
     park-on-exhaustion via xtc_proc_wait_fd, credit return on durable
     append.  Bench harness: a flood producer against a throttled-disk
-    partition; assert broker RSS stays within a budget.
+    partition; assert broker RSS stays within a budget.  (Built
+    instead: no credit; a connection has one request in flight and
+    reads no more of its socket until the durable ack, so TCP slows
+    the producer.  The throttled-disk RSS bench was not built.)
 
   Phase 4 -- consumer groups.  Group state via xtc_lockmgr keyed by
     (group, partition); offset commits to a Bitcask KV store; rebalance
@@ -184,7 +191,7 @@ the tree green.
 
 rexis exercises the read-mostly KV path (xtc_lrlock, slab, res).
 sqlxtc exercises the request/reply path with a shared mutable storage
-engine.  kaka exercises the third shape -- a
+engine.  kaka exercises the third shape: a
 high-throughput streaming pipeline with ordering, persistence, and
 backpressure -- which is where actor runtimes either prove or
 disprove their bounded-resource claims.  It is also the example most
@@ -214,8 +221,9 @@ Built and tested (`make test`, in-process, no daemon):
 The networked paths (accept back-off under fd exhaustion, SIGTERM drain
 of a loaded broker, COMMIT/OFFSETS across a kill -9, kill -9 crash
 recovery of acked records, cold-FETCH latency) were exercised by an
-external harness against a running broker during the 1.56 review; that
-harness is not in this repository.  `make soak` (test_kaka_soak.sh) runs
+external harness against a running broker when the durable ack went in
+(2026-10-13, 4313594a, the fix round for the 1.55 review); that harness
+is not in this repository.  `make soak` (test_kaka_soak.sh) runs
 a real broker under 8 producers and 8 consumers over TCP and checks
 every offset and byte, and `make soak-plant` shows it fails on a broker
 that drops or corrupts records.
