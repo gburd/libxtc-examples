@@ -399,6 +399,10 @@ main(void)
 		"DELETE FROM s WHERE v > 0",
 		("INSERT INTO d SELECT k, (SELECT x FROM cw WHERE cw.x = co.j) "
 		"FROM co"),
+		/* One row: the direct autocommit write, which the failed
+		 * subquery read must refuse too. */
+		("INSERT INTO d SELECT k, (SELECT x FROM cw WHERE cw.x = co.j) "
+		"FROM co WHERE k = 1"),
 	};
 	/* Over s's 405 rows (d's key 9 and value 30 are out of the way). */
 	static const char *const kills[] = {

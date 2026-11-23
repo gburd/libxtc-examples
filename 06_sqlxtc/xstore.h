@@ -337,7 +337,9 @@ int xstore_row_exists_txn(struct xsql *db, uint32_t tableid, int64_t rowid);
  * statement included, the commit's write-write check refuses a row
  * committed since the snapshot (a stale conflict: the engine re-runs an
  * autocommit statement, whose key check then reports UNIQUE).  Returns
- * 0, 1 on a unique violation, -1 on any other error. */
+ * 0, 1 on a unique violation, -1 on any other error (an autocommit
+ * insert refuses to commit after a read error or with a kill pending,
+ * as xstore_write_txn does). */
 int xstore_insert_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
                       const uint8_t *rec, int reclen);
 /* Reserve an auto-assigned rowid for `tableid`: greater than `floor`
@@ -383,9 +385,13 @@ int xstore_delete_rec(bt_t *bt, uint32_t tableid, int64_t rowid);
  * set when a transaction is open, a BEGIN..COMMIT or a multi-row
  * statement's implicit one (committing atomically at one timestamp with
  * the transaction's other writes), or autocommits the row at once (a
- * one-row statement).  A row write with a kill pending for the
- * connection's proc fails instead of committing.  `deleted` writes a
- * tombstone (rec/reclen ignored).  Returns 0 on success, <0 on error. */
+ * one-row statement).  A one-row write fails instead of committing
+ * when the statement already recorded a read error (a failed subquery
+ * read that did not fail its own step; xstore_read_err) or a kill is
+ * pending for the connection's proc, as xstore_stmt_implicit_end
+ * discards a multi-row statement, so a failed statement leaves nothing.
+ * `deleted` writes a tombstone (rec/reclen ignored).  Returns 0 on
+ * success, <0 on error. */
 int xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
                      const uint8_t *rec, int reclen, int deleted);
 

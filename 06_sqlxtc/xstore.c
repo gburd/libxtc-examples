@@ -1414,6 +1414,19 @@ xs_rd_err_clear(xstore_ctx_t *cx)
 	cx->rd_rc = 0;
 }
 
+/* True if the running statement must not commit: one of its reads failed
+ * (a failed read need not fail the step that made it: a subquery reads
+ * as NULL), or a kill is pending for the connection's proc.  Every
+ * autocommit commit of a statement checks it, the one-row direct write
+ * and the implicit transaction alike, so a failed statement leaves
+ * nothing on every path. */
+static int
+xs_stmt_doomed(const xstore_ctx_t *cx)
+{
+	return cx->rd_rc != 0 || cx->rd_err[0] != '\0' ||
+	    xtc_cancel_requested();
+}
+
 uint64_t
 xstore_read_errors(void)
 {
@@ -6207,10 +6220,10 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		if (rc > 0) cx->last_conflict = rc;
 		return -1;
 	}
-	/* A kill pending once the row is ours (the wait above is the last
-	 * park) discards a one-row statement, as xstore_stmt_implicit_end
-	 * discards a multi-row one: a dead connection commits nothing. */
-	if (xtc_cancel_requested()) {
+	/* A read error the statement made, or a kill pending once the row
+	 * is ours (the wait above is the last park), discards a one-row
+	 * statement, as xstore_stmt_implicit_end discards a multi-row one. */
+	if (xs_stmt_doomed(cx)) {
 		xs_intents_release(cx);
 		return -1;
 	}
@@ -6253,7 +6266,7 @@ xstore_insert_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		cx->ilk_skip = 0;
 		return rc;
 	}
-	if (xtc_cancel_requested())
+	if (xs_stmt_doomed(cx))
 		return -1;            /* as in xstore_write_txn */
 	cx->uniq_err[0] = '\0';
 	rc = xs_put_pruned(cx, tableid, rowid, rec, reclen, 0, 1);
@@ -6599,8 +6612,7 @@ xstore_stmt_implicit_end(struct xsql *db, int ok)
 	if (cx == NULL || !cx->implicit) return 0;
 	cx->implicit = 0;
 	cx->native_autocommit = 1;
-	if (!ok || cx->rd_rc != 0 || cx->rd_err[0] != '\0' ||
-	    xtc_cancel_requested()) {
+	if (!ok || xs_stmt_doomed(cx)) {
 		(void)xs_rollback_ctx(cx);
 		return -1;
 	}

@@ -303,8 +303,10 @@ The engine provides:
     SNAPSHOT isolation on the statement's snapshot, committing every
     row at one timestamp or none of them.  A failure partway (a read
     error, a UNIQUE violation, a row too large, a kill of the
-    connection) leaves nothing.  A stale write-write conflict re-runs
-    the statement, so an INSERT that loses a key race to another
+    connection) leaves nothing; a one-row statement whose read failed
+    without failing its step (a correlated subquery), or with a kill
+    pending, commits nothing either.  A stale write-write conflict
+    re-runs the statement, so an INSERT that loses a key race to another
     session reports "UNIQUE constraint failed", as PostgreSQL does;
     a deadlock between two such statements fails the youngest with
     "could not serialize access".  The one-fsync commit holds while the
