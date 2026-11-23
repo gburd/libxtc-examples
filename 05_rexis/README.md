@@ -334,15 +334,29 @@ comes before.  If the search for a valid record after the damage
 cannot finish (a read fails, or memory runs out), the start is refused
 the same way, and the file is left as it was.
 
-Two cases sit at the edge of that rule.  Damage to the last record,
-with nothing valid after it, cannot be told from a torn write, so it
-is cut like one; only that record is lost.  A power loss is not a
-crash: the log is not fsync'd (see Durability), and the kernel may
-have written some pages of the recent writes and not others, so a
-power loss can leave a hole before the last record.  That refuses the
-start and needs an operator.  The records inside a multi-key DEL carry
-a checksum of their own kind, so damage to that batch never exposes
-them as records of the log.
+What decides between a cut and a refusal is a search: from the first
+bad record, the rest of the file is searched, byte by byte, for a
+whole record whose checksums match.  If one starts anywhere after the
+bad record's first byte, even inside the bad record itself, the start
+is refused; if none does, the file is cut at the bad record.  Two
+cases follow from it.
+
+Damage to the last record cannot be told from a torn write, so it is
+cut like one, and only that record is lost.  The exception is a last
+record whose own bytes hold a valid record, which a client can send as
+a value: then the start is refused, naming that offset inside the
+value.
+
+A power loss is not a crash: the log is not fsync'd (see Durability),
+and the kernel may have written some pages of the recent writes and
+not others, so a power loss can leave a hole (bytes never written)
+before the last record.  If a whole valid record follows the hole, the
+start is refused and needs an operator.  If nothing valid follows it
+(the hole is in the last record, or only torn or unwritten bytes come
+after it), the log is cut at the hole, like a torn tail.
+
+The records inside a multi-key DEL carry a checksum of their own kind,
+so damage to that batch never exposes them as records of the log.
 
 **Merge.**  `bitcask_compact()` rewrites the log with only the live
 records: superseded values, deleted and flushed keys, tombstones and
