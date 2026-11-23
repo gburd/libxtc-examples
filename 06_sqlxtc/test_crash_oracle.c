@@ -51,6 +51,15 @@
  *	The verify child dumps m and b's per-op counts: a lane's m rows must
  *	agree on v and the pad, b's count for an op is 0 or NM, and both
  *	must match the model.
+ *	A timed kill lands where it lands, so every odd round instead plans
+ *	its kill: the worker kills itself from xstore_implicit_commit_hook in
+ *	the first implicit commit of a chosen kind, either before its log
+ *	record is written (the op must be gone) or after it is durable and
+ *	before it is applied (the op must be all there, redone by recovery).
+ *	The plans cycle through the three kinds and both points; a plan that
+ *	did not fire is tried again in the next odd round.  The run reports
+ *	which of the six landed, and a run of 6 seeds or more fails unless
+ *	all six did.
  *	Usage: test_crash_oracle [seeds [first-seed]] (default 3 1).
  */
 
@@ -94,6 +103,15 @@ struct msg { int32_t tag; int32_t kind; int64_t id; int64_t tgt; };
 static char g_path[256];
 static int g_wfd = -1;             /* child: pipe to the parent */
 
+/* A planned kill (see the header): the op kind and the commit point, or
+ * kind -1 for a timed kill.  Set by the parent before the fork. */
+static int g_plan_kind = -1, g_plan_phase;
+/* Each lane's proc, and the multi-row op it is running (kind -1: none),
+ * for the commit hook to know whose commit it is in. */
+static xtc_pid_t g_lane_pid[NLANE];
+static int g_lane_kind[NLANE];
+static int64_t g_lane_id[NLANE];
+
 /* ---- child side --------------------------------------------------- */
 
 static void
@@ -105,6 +123,22 @@ send_msg(int tag, int kind, int64_t id, int64_t tgt)
 	do {
 		n = write(g_wfd, &m, sizeof m);   /* <= PIPE_BUF: atomic */
 	} while (n < 0 && errno == EINTR);
+}
+
+/* xstore_implicit_commit_hook: kill the worker in the planned commit,
+ * after telling the parent which op it was ("H"). */
+static void
+commit_hook(int phase)
+{
+	xtc_pid_t me = xtc_self();
+	int l;
+	if (phase != g_plan_phase)
+		return;
+	for (l = 0; l < NLANE; l++)
+		if (xtc_pid_eq(me, g_lane_pid[l]) && g_lane_kind[l] == g_plan_kind) {
+			send_msg('H', phase, g_lane_id[l], 0);
+			(void)kill(getpid(), SIGKILL);
+		}
 }
 
 struct seg { int64_t a, b, round_start; };
@@ -209,15 +243,24 @@ lane(void *arg)
 	long ln = (long)arg;
 	sx_db *h = NULL;
 	int64_t s, tseq;
-	int kind;
+	int kind, rc;
+	g_lane_pid[ln] = xtc_self();
+	g_lane_kind[ln] = -1;
 	if (sx_open(":memory:", &h) == SX_OK) {
 		for (s = g_seg.a; s < g_seg.b; s++) {
 			int64_t id = s * NLANE + ln, tgt;
 			kind = op_of(s, g_seg.round_start, &tseq);
 			tgt = kind == K_INS ? -1 : tseq * NLANE + ln;
 			send_msg('A', kind, id, tgt);
-			if ((kind >= K_MUPD ? run_multi(h, kind, id, tgt, ln) :
-			    run_op(h, kind, id, tgt)) == SX_OK)
+			if (kind >= K_MUPD) {
+				g_lane_kind[ln] = kind;
+				g_lane_id[ln] = id;
+				rc = run_multi(h, kind, id, tgt, ln);
+				g_lane_kind[ln] = -1;
+			} else {
+				rc = run_op(h, kind, id, tgt);
+			}
+			if (rc == SX_OK)
 				send_msg('K', kind, id, tgt);
 			else
 				send_msg('F', kind, id, tgt);   /* attempted, refused */
@@ -291,6 +334,8 @@ worker(int64_t round_start, const int64_t *cuts, int ncut, int create)
 	if (sx_init() != SX_OK) return 1;
 	sx_storage_set_checkpoint(64u << 10);   /* online checkpoints */
 	if (sx_storage_open(g_path, FRAMES) != SX_OK) return 1;
+	if (g_plan_kind >= 0)
+		xstore_implicit_commit_hook(commit_hook);
 	if (create) {
 		sx_db *h = NULL;
 		if (sx_open(":memory:", &h) != SX_OK ||
@@ -409,6 +454,13 @@ static uint8_t  g_kind[MAXID];
 static int64_t  g_tgt[MAXID];
 static int      g_fails;
 static uint64_t g_rng;
+/* Planned kills: plan p is kind K_MUPD + p / 2 at phase p % 2.  g_hit is
+ * the op the last planned kill landed in (-1: none), g_hit_want the
+ * status the verify must settle it to. */
+static int      g_plans_done;      /* bit p: plan p killed its op */
+static int      g_plans_cycle;     /* the same, for the current cycle */
+static int64_t  g_hit = -1;
+static int      g_hit_want;
 
 static uint64_t
 rnd(void)
@@ -640,6 +692,12 @@ verify(uint64_t seed, int64_t maxid, uint64_t *rows_out)
 				    (long long)g_row[i].w, eu, (long long)wg, (long long)ww2);
 		}
 	}
+	if (g_hit >= 0 && g_st[g_hit] != g_hit_want)
+		BAD("op %lld (kind %d), killed %s its commit record was durable, "
+		    "settled to status %d, want %d", (long long)g_hit,
+		    g_kind[g_hit], g_hit_want == S_APPLIED ? "after" : "before",
+		    g_st[g_hit], g_hit_want);
+	g_hit = -1;
 	*rows_out = nrows;
 	return 0;
 }
@@ -652,6 +710,8 @@ round_run(uint64_t seed, int64_t start, int64_t len, int create,
 	int fds[2], status, killed = 0, ready = 0, ncut = 2, i;
 	int64_t cuts[4];
 	int64_t kill_ms = (rnd() % 4 == 0) ? -1 : (int64_t)(rnd() % 1500) + 5;
+	if (g_plan_kind >= 0)
+		kill_ms = -1;                  /* the worker kills itself */
 	int64_t t0 = 0;
 	uint64_t rck = 0;                  /* checkpoints by this process */
 	pid_t p;
@@ -699,6 +759,13 @@ round_run(uint64_t seed, int64_t start, int64_t len, int create,
 				    "an index (%d indexes checked)", (long long)m.id, m.kind);
 		}
 		else if (m.tag == 'O') (*reopens)++;
+		else if (m.tag == 'H') {           /* a planned kill, about to land */
+			killed = 1;
+			g_hit = m.id;
+			g_hit_want = m.kind == XS_ICOMMIT_LOGGED ? S_APPLIED : S_GONE;
+			g_plans_done |= 1 << ((g_plan_kind - K_MUPD) * 2 + m.kind);
+			g_plans_cycle |= 1 << ((g_plan_kind - K_MUPD) * 2 + m.kind);
+		}
 		else if (m.tag == 'C') { if ((uint64_t)m.id > rck) rck = (uint64_t)m.id; }
 		else if (m.id >= 0 && m.id < MAXID) {
 			if (m.tag == 'A') {
@@ -720,6 +787,9 @@ round_run(uint64_t seed, int64_t start, int64_t len, int create,
 		BAD("worker exited with status %d", status);
 	if (killed && WIFEXITED(status) && WEXITSTATUS(status) == 0)
 		killed = 0;                        /* it had finished first */
+	if (g_hit >= 0 && !(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL))
+		BAD("planned kill of op %lld: worker status %d", (long long)g_hit,
+		    status);
 	return killed;
 }
 
@@ -729,7 +799,7 @@ main(int argc, char **argv)
 	int nseeds = argc > 1 ? atoi(argv[1]) : 3;
 	uint64_t first = argc > 2 ? strtoull(argv[2], NULL, 0) : 1, seed;
 	uint64_t tot_acked = 0, tot_ckpt = 0, tot_rows = 0;
-	int tot_kills = 0, tot_reopens = 0, tot_verifies = 0, fd, s;
+	int tot_kills = 0, tot_reopens = 0, tot_verifies = 0, fd, s, plan = 0;
 	char p2[320];
 	const char *sfx[] = { "", "-wal", ".dwb", "-wal.compact", "-wal.ocompact" };
 	t_tmpl(g_path, sizeof g_path, "sqlxtc-oracle");
@@ -751,12 +821,25 @@ main(int argc, char **argv)
 			int64_t len = 100 + (int64_t)(rnd() % 1200);
 			len = (len + 9) / 10 * 10;
 			if (start + len > MAXSEQ) break;
+			/* Odd rounds plan a kill: the next plan not yet done in
+			 * this cycle. */
+			g_plan_kind = -1;
+			if (r % 2 == 1) {
+				if (g_plans_cycle == 0x3f)
+					g_plans_cycle = 0;
+				while (g_plans_cycle & (1 << plan))
+					plan = (plan + 1) % 6;
+				g_plan_kind = K_MUPD + plan / 2;
+				g_plan_phase = plan % 2;
+			}
 			k = round_run(seed, start, len, r == 0, &tot_ckpt, &tot_reopens,
 			    &tot_acked, &maxid);
 			if (k < 0) { BAD("round setup failed"); break; }
 			tot_kills += k;
 			start += len;
-			if (r == rounds - 1 || !k || rnd() % 2) {
+			/* A planned kill is judged before a later round moves the
+			 * lane's rows on. */
+			if (r == rounds - 1 || !k || g_hit >= 0 || rnd() % 2) {
 				if (verify(seed, maxid, &rows) == 0) tot_verifies++;
 			}
 		}
@@ -775,6 +858,13 @@ main(int argc, char **argv)
 	    nseeds, (unsigned long long)tot_acked, tot_kills, tot_reopens,
 	    (unsigned long long)tot_ckpt, tot_verifies,
 	    (unsigned long long)tot_rows, g_fails);
+	printf("  planned kills in multi-row commits (UPDATE, INSERT ... SELECT, "
+	    "DELETE; before / after the record is durable): %d %d, %d %d, "
+	    "%d %d\n", g_plans_done & 1, (g_plans_done >> 1) & 1,
+	    (g_plans_done >> 2) & 1, (g_plans_done >> 3) & 1,
+	    (g_plans_done >> 4) & 1, (g_plans_done >> 5) & 1);
+	if (nseeds >= 6 && g_plans_done != 0x3f && !g_fails)
+		BAD("not every planned kill landed in %d seeds", nseeds);
 	if (g_fails) {
 		fprintf(stderr, "FAIL: test_crash_oracle\n");
 		return 1;

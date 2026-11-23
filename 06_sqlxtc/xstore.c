@@ -3013,6 +3013,14 @@ xs_stash(xstore_cursor_t *c, int64_t rowid, const uint8_t *val, uint16_t vl)
 }
 
 static int g_scan_failat;   /* test hook: the scan read to fail, 1-based */
+/* Test hook (xstore_implicit_commit_hook); NULL in production. */
+static void (*g_icommit_hook)(int phase);
+
+void
+xstore_implicit_commit_hook(void (*fn)(int phase))
+{
+	g_icommit_hook = fn;
+}
 
 /* Should this cursor read of a base-table scan fail
  * (xstore_scan_read_fail_at)?  One relaxed load when disarmed. */
@@ -6617,14 +6625,15 @@ xstore_stmt_implicit_end(struct xsql *db, int ok)
 	xstore_ctx_t *cx = xstore_ctx_of(db);
 	int rc;
 	if (cx == NULL || !cx->implicit) return 0;
-	cx->implicit = 0;
 	cx->native_autocommit = 1;
 	if (!ok || xs_stmt_doomed(cx)) {
+		cx->implicit = 0;
 		(void)xs_rollback_ctx(cx);
 		return -1;
 	}
 	cx->uniq_err[0] = '\0';
-	rc = xs_commit_ctx(cx);
+	rc = xs_commit_ctx(cx);   /* cx->implicit tells its test hook */
+	cx->implicit = 0;
 	if (rc == SX_OK) return 0;
 	if (rc == SX_BUSY) cx->last_conflict = XS_CONFL_STALE;
 	return rc == SX_CONSTRAINT ? 1 : -1;
@@ -7002,6 +7011,8 @@ xs_commit_ctx(xstore_ctx_t *cx)
 		xs_uniq_stamp_locked(cx, 0, NULL, 0, 0, uq, nuq, fl.ts);
 		xs_commit_unlock();
 		ts = fl.ts;
+		if (cx->implicit && g_icommit_hook != NULL)
+			g_icommit_hook(XS_ICOMMIT_PRELOG);
 		if (g_xwal != NULL) {
 			uint64_t clsn = 0;
 			/* Durable BEFORE apply.  If the log write fails the
@@ -7024,6 +7035,8 @@ xs_commit_ctx(xstore_ctx_t *cx)
 			if (clsn != 0)
 				bt_set_lsn(cx->bt, clsn);
 		}
+		if (cx->implicit && g_icommit_hook != NULL)
+			g_icommit_hook(XS_ICOMMIT_LOGGED);
 		for (i = 0; i < cx->wn; i++) {
 			uint8_t key[XS_VKLEN];
 			uint8_t buf[1 + XS_VMAX];

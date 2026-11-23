@@ -230,6 +230,17 @@ int xstore_row_read_fail_at(int n);
  * reads around them.  Its faults count in xstore_row_read_faults.
  * Returns the previous setting. */
 int xstore_reap_read_fail(int on);
+/* Test hook: fn(phase) runs inside the commit of a multi-row autocommit
+ * statement's implicit transaction, on the committing proc, at two
+ * points: XS_ICOMMIT_PRELOG once the commit has its timestamp and before
+ * its log record is written (a crash there must leave none of the
+ * statement's rows), and XS_ICOMMIT_LOGGED once the record is durable
+ * and before any row is applied (a crash there must leave all of them,
+ * redone by recovery).  The crash oracle kills its process from it.
+ * NULL disarms.  Note that the hook is one for the process. */
+#define XS_ICOMMIT_PRELOG 0
+#define XS_ICOMMIT_LOGGED 1
+void xstore_implicit_commit_hook(void (*fn)(int phase));
 /* Test hook: how many reads xstore_row_read_fail_at has failed so far. */
 int xstore_row_read_faults(void);
 /* Reads of the tree that failed with an error (not "no such key"), over
