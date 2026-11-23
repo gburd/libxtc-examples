@@ -52,12 +52,12 @@ primitive, chosen deliberately.
 
 | Kafka concept            | libxtc primitive                     | Why |
 |--------------------------|--------------------------------------|-----|
-| Broker process           | `xtc_app` + `xtc_supervisor`         | The broker is a supervised tree; a crashed partition log restarts without taking the broker down |
+| Broker process           | `xtc_app` + `xtc_supervisor`         | The listener is supervised; partition procs are plain procs, and a partition whose storage fails stays up answering STORAGE errors rather than being restarted |
 | Partition log            | one `xtc_proc` per partition         | Per-partition serialization falls out of the single-consumer mailbox: all writes to a partition are messages to its proc, so ordering is automatic and lock-free |
 | Producer connection      | one `xtc_proc` per TCP connection    | Same per-connection model as rexis/sqlxtc; uses `xtc_proc_wait_fd` for idle-CPU-free I/O |
 | Consumer connection      | one `xtc_proc` per TCP connection    | As above |
 | Record append            | `xtc_send` to the partition proc     | The mailbox cap is the partition's in-flight write bound |
-| Backpressure             | credit-based flow control (see below)| The mailbox cap alone drops on overflow; kaka adds credits so producers throttle instead |
+| Backpressure             | one request in flight per connection, plus `xtc_credit` (see below) | The mailbox cap alone drops on overflow; a connection waits for each reply before reading the next frame, so producers throttle instead |
 | Segmented log + index    | Bitcask-style records (from rexis)   | Reuses the CRC-framed append log; segments roll at a size threshold |
 | Offset / high-water mark | partition proc state                 | The partition proc is the sole writer and reader; FETCH asks it |
 | Consumer group state     | (not built)                          | Partition assignment / rebalancing is not implemented; consumers pick their partitions |
@@ -76,22 +76,25 @@ This is the BEAM insight applied to a Kafka partition.
 The review noted that libxtc's bounded mailbox drops messages with
 `XTC_E_AGAIN` when full; it does not throttle the sender.  For a log
 broker, dropping a produced record is data loss.  kaka therefore
-layers credit-based flow control on top of the mailbox:
+bounds what it accepts instead of dropping:
 
-  1. A partition proc grants each connected producer a credit budget
-     (records or bytes it may have in flight).
-  2. A producer that exhausts its credit stops reading from its
-     socket -- it removes the socket from the event loop via
-     `xtc_proc_wait_fd` so it parks instead of spinning.
-  3. As the partition proc durably appends records (fdatasync before
-     the ack), it returns credit to the producer (the ack), which
-     resumes reading.
+  1. A connection proc handles one request at a time: it reads a
+     frame, sends it to the partition, and waits for the reply before
+     it reads the next frame.  Each connection therefore has at most
+     one request in flight, and its unread frames stay in the socket.
+  2. While it waits, it does not read from the socket, so a producer
+     that sends faster than the partition acks is slowed by TCP flow
+     control.  Between requests it parks on the socket with
+     `xtc_proc_wait_fd` instead of spinning.
+  3. The partition acks only after the records are durable (fdatasync
+     before the ack), so a slow disk slows every producer behind it.
 
-The in-flight credit window is expressed with libxtc's
-`xtc_credit` regulator (`broker_credit_selftest` in broker.c): the
-producer takes a credit before each PRODUCE and returns it on each
-reply, so at most N requests are ever outstanding, and
-`xtc_credit_peak` reports the observed high-water for tuning.  This is
+The window shape a client with several requests in flight would use is
+shown with libxtc's `xtc_credit` regulator (`broker_credit_selftest`
+in broker.c, an in-process client): the producer takes a credit before
+each PRODUCE and returns it on each reply, so at most N requests are
+ever outstanding, and `xtc_credit_peak` reports the observed
+high-water for tuning.  This is
 the Erlang `:jobs` / RabbitMQ `credit_flow` / GenStage
 `max_demand` sliding-window pattern packaged as a primitive.
 
@@ -131,8 +134,7 @@ truncated at the first bad record.
 
 ## Protocol
 
-A small length-framed binary protocol (PROTOCOL.md, written in
-phase 1).  Request types: PRODUCE, FETCH, COMMIT, OFFSETS (METADATA is
+A small length-framed binary protocol (PROTOCOL.md).  Request types: PRODUCE, FETCH, COMMIT, OFFSETS (METADATA is
 reserved).
 Each frame is a 4-byte length, a 1-byte type, and a type-specific
 body.  The wire format is deliberately minimal; the example is about
@@ -167,7 +169,10 @@ the tree green.
   Phase 4 -- consumer groups.  Group state via xtc_lockmgr keyed by
     (group, partition); offset commits to a Bitcask KV store; rebalance
     on consumer join/leave.  Test: two consumers in a group split the
-    partitions, committed offsets survive a broker restart.
+    partitions, committed offsets survive a broker restart.  (Built
+    instead: one coordinator proc owns every committed offset, with no
+    lock, in a segmented log like a partition's; membership and
+    rebalancing were not built.)
 
   Phase 5 -- observability + budgets + docs.  xtc_stats for
     produce/consume rates and append latency; xtc_res caps on
@@ -178,8 +183,8 @@ the tree green.
 ## Why this example matters
 
 rexis exercises the read-mostly KV path (xtc_lrlock, slab, res).
-sqlxtc exercises the request/reply path with a shared mutable engine
-(xtc_lwlock around SQLite).  kaka exercises the third shape -- a
+sqlxtc exercises the request/reply path with a shared mutable storage
+engine.  kaka exercises the third shape -- a
 high-throughput streaming pipeline with ordering, persistence, and
 backpressure -- which is where actor runtimes either prove or
 disprove their bounded-resource claims.  It is also the example most
@@ -208,8 +213,12 @@ Built and tested (`make test`, in-process, no daemon):
 
 The networked paths (accept back-off under fd exhaustion, SIGTERM drain
 of a loaded broker, COMMIT/OFFSETS across a kill -9, kill -9 crash
-recovery of acked records, cold-FETCH latency) are exercised by an
-external harness against a running broker, not by `make test`.
+recovery of acked records, cold-FETCH latency) were exercised by an
+external harness against a running broker during the 1.56 review; that
+harness is not in this repository.  `make soak` (test_kaka_soak.sh) runs
+a real broker under 8 producers and 8 consumers over TCP and checks
+every offset and byte, and `make soak-plant` shows it fails on a broker
+that drops or corrupts records.
 
 Durability modes (main.c):
 
