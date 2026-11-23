@@ -1,7 +1,7 @@
 # examples/05_rexis -- rexis (Redis-protocol-compatible) server built on xtc
 
 A drop-in replacement for a meaningful subset of `redis-server`, implemented
-in about 6,800 lines of C (tests not counted) using xtc primitives.  Demonstrates how to build a
+in about 6,700 lines of C (tests not counted) using xtc primitives.  Demonstrates how to build a
 production-shaped network service with hard resource budgets.
 
 ## Quick start
@@ -149,15 +149,15 @@ xtc primitives used:
 * **xtc_loop / xtc_exec**: the event loop, or N of them with `--loops=N`
 * **xtc_net_listen / xtc_proc_wait_fd**: the listening socket, and parking a
   proc on its socket
-* **xtc_proc** -- one BEAM-style process per accepted connection
-* **xtc_lrlock** -- wait-free reads on the database
+* **xtc_proc**: one BEAM-style process per accepted connection
+* **xtc_lrlock**: wait-free reads on the database
 * **xtc_arwlock**: the per-shard reader/writer latch when `--loops` > 1
-* **xtc_res** -- the resource accountant; the centerpiece
+* **xtc_res**: the resource accountant; the centerpiece
 * **xtc_log / xtc_stats**: structured operational logging and counters
 * **xtc_pg / xtc_reg**: pub/sub channel groups
 * **xtc_scope**: the connection teardown that runs on every exit path
-* **xtc_app + xtc_supervisor** -- clean startup/shutdown
-* **xtc_inject** -- fault-injection hooks (unused in steady state, present for tests)
+* **xtc_app + xtc_supervisor**: clean startup/shutdown
+* **xtc_inject**: fault-injection hooks (unused in steady state, present for tests)
 
 ## Files
 
@@ -179,7 +179,7 @@ xtc primitives used:
 | `bitcask.h` | 97 | Its API |
 | `Makefile` | 94 | Build glue |
 
-Total: about 6,800 lines of source.
+Total: about 6,700 lines of C (the Makefile not counted).
 
 ## Tests
 
