@@ -1,7 +1,7 @@
 # examples/05_rexis -- rexis (Redis-protocol-compatible) server built on xtc
 
 A drop-in replacement for a meaningful subset of `redis-server`, implemented
-in ~2,000 lines of C using xtc primitives.  Demonstrates how to build a
+in about 6,800 lines of C (tests not counted) using xtc primitives.  Demonstrates how to build a
 production-shaped network service with hard resource budgets.
 
 ## Quick start
@@ -31,7 +31,7 @@ redis-cli -p 16379 GET hello
 
 ## What's supported
 
-35 commands across the major Redis data types:
+37 commands across the major Redis data types:
 
 | Category | Commands |
 |---|---|
@@ -56,7 +56,7 @@ channel it joined.  See the pubsub walkthrough in the docs example page.
 
 ## What's NOT supported (deliberately)
 
-Out of scope for a 2k-LOC example.  No Streams, no scripting
+Out of scope for an example.  No Streams, no scripting
 (EVAL/Lua), no cluster mode, no modules, no replication, no
 Redis-compatible persistence formats (no AOF, no RDB -- rexis has its
 own append-only bitcask store instead, see `--persist=DIR` below), no
@@ -92,8 +92,9 @@ nothing that is still being sent: the old value is freed by whichever
 of the two finishes last.  The bytes held this way count toward
 `--max-output`, the 1 MiB backpressure mark and the `--max-memory`
 client budget exactly as a copy would.  Smaller values are still
-copied; the copy is cheaper than the reference.  Measured (one loop,
-memtier GET-only, 32 connections, pipeline 8, 3 interleaved runs):
+copied; the copy is cheaper than the reference.  Measured 2026-10 on
+examples `bc19731` (one loop on one CPU, memtier GET-only, 32
+connections, pipeline 8, 3 interleaved runs):
 64 KiB GETs 55.7k -> 75.2k per second (+35%; the copy was 28% of the
 server's CPU samples, now 0.1%), 1 KiB unchanged within noise (592.6k ->
 635.4k).  `INFO` `reply_bytes_by_ref` counts the value bytes sent this
@@ -109,7 +110,7 @@ with an error and the connection is closed (the rest of the stream
 cannot be trusted).  Under fd exhaustion (EMFILE) the listener backs off
 10 ms per failed accept instead of spinning, and recovers when fds free.
 
-Verified by MEASUREMENT in `test/m99/test_rexis_budgets.c`: server RSS
+Verified by MEASUREMENT in `test/test_rexis_budgets.c`: server RSS
 growth while offered 4x the memory cap and while 100 clients each hold a
 990 KB partial command, the server's CPU affinity mask, connections
 actually served, the reply rate of a pipelined burst (<= 1.5x
@@ -126,11 +127,10 @@ bulk and under an fd flood, and the idle timeout.  Run with
 |  xtc_supervisor (one_for_one)
 |     |
 |     +-- listener_proc          accepts; spawns per-conn procs
-|     |
+|
+|  unsupervised procs (exit on the shutdown flag):
 |     +-- expire_proc            timer-driven TTL expiry
-|     |
 |     +-- metrics_proc           periodic xtc_log of res stats
-|     |
 |     +-- N x conn_proc          one xtc_proc per accepted client;
 |         (BEAM-style)           reads RESP cmds, dispatches, writes resp
 |
@@ -146,13 +146,16 @@ bulk and under an fd flood, and the idle timeout.  Run with
 
 xtc primitives used:
 
-* **xtc_loop / xtc_io_poll** -- event loop and TCP accept/read/write
-* **xtc_net_listen** -- listening socket with the standard knobs
+* **xtc_loop / xtc_exec** -- the event loop, or N of them with `--loops=N`
+* **xtc_net_listen / xtc_proc_wait_fd** -- the listening socket, and parking a
+  proc on its socket
 * **xtc_proc** -- one BEAM-style process per accepted connection
 * **xtc_lrlock** -- wait-free reads on the database
+* **xtc_arwlock** -- the per-shard reader/writer latch when `--loops` > 1
 * **xtc_res** -- the resource accountant; the centerpiece
-* **xtc_log** -- structured operational logging
-* **xtc_cfg** -- runtime configuration knobs
+* **xtc_log / xtc_stats** -- structured operational logging and counters
+* **xtc_pg / xtc_reg** -- pub/sub channel groups
+* **xtc_scope** -- the connection teardown that runs on every exit path
 * **xtc_app + xtc_supervisor** -- clean startup/shutdown
 * **xtc_inject** -- fault-injection hooks (unused in steady state, present for tests)
 
@@ -160,51 +163,54 @@ xtc primitives used:
 
 | File | Lines | Purpose |
 |---|---|---|
-| `main.c` | 486 | Entry point, arg parsing, app bringup |
-| `proto.c` | 387 | RESP2/RESP3 parser + response builder |
-| `proto.h` | 149 | Protocol type definitions |
-| `db.c` | 1,183 | Database (linear-hash table + lrlock) |
-| `lhash.h` | 166 | Linear hashing: the growing table under db.c and the bitcask index |
-| `db.h` | 209 | Database API |
-| `cmd.c` | 741 | Command dispatch + 35 handlers |
-| `cmd.h` | 64 | Command type definitions |
-| `conn.c` | 296 | Per-connection xtc_proc |
-| `conn.h` | 48 | Connection API |
-| `expire.c` | 64 | TTL expiration timer |
-| `metrics.c` | 77 | Periodic res-stats logging |
-| `Makefile` | 60 | Build glue |
+| `main.c` | 839 | Entry point, arg parsing, app bringup |
+| `proto.c` | 500 | RESP2/RESP3 parser + response builder |
+| `proto.h` | 176 | Protocol type definitions |
+| `db.c` | 1,486 | Database (linear-hash table + lrlock) |
+| `lhash.h` | 169 | Linear hashing: the growing table under db.c and the bitcask index |
+| `db.h` | 267 | Database API |
+| `cmd.c` | 981 | Command dispatch + 37 handlers |
+| `cmd.h` | 81 | Command type definitions |
+| `conn.c` | 1,100 | Per-connection xtc_proc |
+| `conn.h` | 111 | Connection API |
+| `expire.c` | 75 | TTL expiration timer |
+| `metrics.c` | 137 | Periodic res-stats logging |
+| `bitcask.c` | 685 | The `--persist` append-only store |
+| `bitcask.h` | 97 | Its API |
+| `Makefile` | 94 | Build glue |
 
-Total: ~3,600 LOC of source.
+Total: about 6,800 lines of source.
 
 ## Tests
 
-In `test/m99/`:
+In `test/`:
 
 | Test | Cases | Coverage |
 |---|---|---|
 | `test_resp_parser.c` | 39 | RESP2/RESP3 framing, inline commands, malformed input, integer overflow |
-| `test_rexis_loopback.c` | 17 | End-to-end round-trips, replies larger than any buffer, slow readers, uncapped LRANGE/KEYS/HGETALL |
-| `test_rexis_budgets.c` | 11 | Every `--max-*` cap, measured; request/output limits, client-buffer memory, idle timeout, EMFILE; clean SIGTERM |
-| `test_rexis_pbt.c` | 5 | properties (atomicity, idempotence, FIFO) |
+| `test_rexis_loopback.c` | 19 | End-to-end round-trips, replies larger than any buffer, slow readers, uncapped LRANGE/KEYS/HGETALL, zero-copy GET |
+| `test_rexis_budgets.c` | 17 | Every `--max-*` cap, measured; request/output limits, client-buffer memory, idle timeout, idle wakeups, EMFILE; clean SIGTERM |
+| `test_rexis_pbt.c` | 6 | properties (atomicity, idempotence, FIFO, pipelined overwrite) |
 
 Run via `make check-rexis` in a libxtc build dir (CI runs it in the
 examples job).  Loopback, budget and PBT tests spawn a real
 `rexis-server-xtc` on a kernel-chosen free port (see
-`test/m99/rexis_harness.h`); every test also requires the server to exit
+`test/rexis_harness.h`); every test also requires the server to exit
 0 on SIGTERM.
 
 ## Bench
 
-In `bench/rexis_compat/`:
+In libxtc's `bench/rexis_compat/`:
 
 ```sh
 cd bench/rexis_compat
 make
-./bench --host=127.0.0.1 --port=16379 --pipeline=1 --requests=100000
+./bench --host=127.0.0.1 --port=16379 --clients=1 --requests=100000
 ```
 
-Reports ops/sec and p50/p99/p999 in the M17 conformance format.  When
-real `redis-server` is on `$PATH`, a side-by-side comparison can be run.
+Reports ops/sec and p50/p99/p999 in the M17 conformance format.
+`--compare` also benchmarks a `redis-server` already listening on port
+6379.
 
 ## Gaps in xtc surfaced by this example
 
@@ -222,7 +228,7 @@ shaped the library:
    and it grows one bucket at a time with no whole-table rehash.  Until
    2026-10 it was a FIXED 65,536-bucket array that never resized -- at 1M
    keys that cost 40% of its pipelined throughput, at 5M a 4.4x slower
-   load.  A consumer that shares a table across loops should reach for
+   load (measured 2026-10, examples `831d9b7`).  A consumer that shares a table across loops should reach for
    `xtc_chash`.
 
 2. **No token-bucket rate limiter.**  Still true.  The IOPS cap is
@@ -255,8 +261,7 @@ shaped the library:
    **SHIPPED, and rexis now uses it.**  `xtc_proc_wait_fd(fd, interest,
    timeout_ns, &revents)` is exactly the primitive this entry asked for
    by name, and the listener + per-connection procs park on it
-   (`conn.c`, `main.c`) instead of busy-polling.  The benchmark numbers
-   below predate that change and should be re-measured.
+   (`conn.c`, `main.c`) instead of busy-polling.
 
 ## Known limitations
 
@@ -266,10 +271,10 @@ shaped the library:
 * Persistence is a log-structured **bitcask** store (`bitcask.c`), not
   Redis's AOF/RDB formats: run with `--persist=DIR` and the keyspace is
   durable across restart (`db.c` replays the log at startup; covered by
-  `test/m99/test_rexis_persist.sh`).  Without `--persist` rexis is
-  RAM-only.  Note the store's file I/O is currently synchronous -- see
-  the note in `bitcask.h` about why, and `examples/06_sqlxtc/wal.c` for
-  the `xtc_aio_*` alternative.
+  `test/test_rexis_persist.sh`).  Only string SET and DEL are logged
+  (no TTLs, lists or hashes).  Without `--persist` rexis is RAM-only.
+  The store's file I/O is synchronous `pread`/`pwrite` on the loop
+  thread; `06_sqlxtc/wal.c` shows the `xtc_aio_*` alternative.
 * `KEYS pattern` is O(n) like real Redis -- documented, not a bug.
 * `--loops=N` spreads connections, and with N > 1 the keyspace is cut
   into 64 shards by key hash.  The lrlock guards only a table header;
@@ -287,7 +292,7 @@ shaped the library:
   | server cores busy | 1.0 | 1.9 | 3.4 | 6.0 | 10.3 | 16.7 |
 
   Measured on libxtc 2.1.1-37 (`a2134a08`, examples `7748ab9`) on a
-  two-socket 64-core x86-64 bare-metal host (Ice Lake, 128 threads),
+  two-socket 64-core x86-64 bare-metal host (128 threads), in 2026-11,
   Debian 13, the server on NUMA node 0 (its first N cores, then their
   SMT siblings) and the client on node 1.  A client four times as wide
   (--threads 32 -c 512) is no faster (2.40M at 8 loops, 2.93M at 16,
@@ -297,7 +302,8 @@ shaped the library:
   client against DragonFly (`--proactor_threads N`): 0.38M, 0.72M,
   1.36M, 2.57M, 4.33M, 4.30M; against Valkey (`--io-threads N`) at most
   0.87M (at 2).  rexis leads to 4, they are level at 8, and DragonFly
-  leads at 16 and 32.  On a 32-vCPU host, one latch
+  leads at 16 and 32.  On a 32-vCPU host in 2026-10 (examples
+  `5759d79`), one latch
   for the whole keyspace gave 0.23M at `--loops=2` and 0.14M at
   `--loops=4` (one loop: 0.89M).  The shards are not
   a DragonFly design: any loop runs any command on any shard, so a hot
@@ -307,14 +313,15 @@ shaped the library:
   fiber stack and per-connection state; Valkey: 0.9 KB): the query and
   output buffers are allocated by the first read and the first reply
   (20,000 idle connections on `--loops=2`: 15.7 KB each when both
-  16 KiB buffers were allocated at accept).  It does not wake: with no
+  16 KiB buffers were allocated at accept; both figures measured
+  2026-10 on a 32-vCPU host).  It does not wake: with no
   `--timeout` and nothing buffered its proc parks on the socket with no
   deadline, and shutdown wakes it explicitly (an fd -> pid table in
   `conn.c`).  Each idle proc used to wake once a second to look at the
   shutdown flag; with 100,000 idle connections on `--loops=2` that cost
   526 CPU ticks per 10 s with no traffic and held memtier to 134k ops/s.
   Now: 8 ticks (the same as with no connections) and 179k ops/s (medians
-  of 3 interleaved runs).
+  of 3 interleaved runs, 2026-10, examples `7f1b7a5`, a 32-vCPU host).
 * A client that pipelines an unbounded stream and never reads stalls
   once the socket buffers fill (backpressure, above); Redis instead
   buffers replies without limit for normal clients by default.
@@ -325,7 +332,7 @@ shaped the library:
 ## Comparison vs Valkey and DragonFly
 
 Measured 2026-11 on libxtc 2.1.1-37 (`a2134a08`, examples `7748ab9`), a
-two-socket 64-core x86-64 bare-metal host (Ice Lake, 128 threads),
+two-socket 64-core x86-64 bare-metal host (128 threads),
 Debian 13, loopback, memtier_benchmark GET:SET 10:1, 32 B values, 1M
 keys prefilled, the server on NUMA node 0 and the client on node 1,
 medians of 3 interleaved runs (the method, every thread count, the
