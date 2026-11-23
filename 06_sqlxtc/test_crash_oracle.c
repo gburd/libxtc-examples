@@ -527,7 +527,9 @@ check_m(uint64_t seed, int64_t maxid, long ln)
 		    (long long)g_mpad[ln * NM], (long long)v);
 	if (v != 0)
 		settle(v, 1);
-	for (i = v + NLANE; i < maxid; i += NLANE)    /* later: not applied */
+	/* Later ones were not applied; v 0 is no UPDATE, so all of the
+	 * lane's (ids ln, ln + NLANE, ...) are later. */
+	for (i = v != 0 ? v + NLANE : ln; i < maxid; i += NLANE)
 		if (g_st[i] != S_NONE && g_kind[i] == K_MUPD)
 			settle(i, 0);
 }
