@@ -3,7 +3,7 @@
 `lorb` is a C port of a C++ limit-order-book / matching engine, built
 on libxtc's public primitives.  It is a faithful re-implementation of
 the data structures and matching semantics of
-Matthew Ding's Limit-Order-Book (C++, on GitHub) -- price-time
+Matthew Ding's Limit-Order-Book (C++, on GitHub): price-time
 (FIFO) priority, partial fills, and the four order types a real
 exchange matching engine handles: Market, Limit, Stop, and Stop-Limit
 (each with add / cancel / modify).
