@@ -313,15 +313,27 @@ log is ever acknowledged.  A log that cannot be reloaded in full
 malformed record) stops the server at startup rather than serving part
 of it.
 
-**Damage.**  A crash in the middle of a write leaves a torn record at
-the end of the log.  At the next start that tail is cut off, with a
-line on stderr naming the offset and the bytes cut, and the server
-starts.  A record that fails its checksum anywhere else, with a valid
-record after it, is not a crash: the log is damaged.  The server then
-refuses to start, names the bad record's offset and the next valid
-one, and leaves the file as it was, since cutting there would silently
-drop every acknowledged write after it.  Restore the log, or truncate
-it at the named offset by hand to keep only what comes before.
+**Damage.**  Every record's header carries its own checksum, over the
+timestamp and the two length fields, and the lengths are believed only
+when it matches.  The rule at startup: a crash or kill -9 leaves a torn
+tail (a last record whose header checks out but whose body runs past
+the end of the file), which is cut off, with a line on stderr naming
+the offset and the bytes cut, and the server starts.  Any other damage
+refuses the start: the server names the bad record's offset and the
+next valid one, and leaves the file as it was, since cutting there
+would silently drop every acknowledged write after it.  Restore the
+log, or truncate it at the named offset by hand to keep only what
+comes before.
+
+Two cases sit at the edge of that rule.  Damage to the last record,
+with nothing valid after it, cannot be told from a torn write, so it
+is cut like one; only that record is lost.  A power loss is not a
+crash: the log is not fsync'd (see Durability), and the kernel may
+have written some pages of the recent writes and not others, so a
+power loss can leave a hole before the last record.  That refuses the
+start and needs an operator.  The records inside a multi-key DEL carry
+a checksum of their own kind, so damage to that batch never exposes
+them as records of the log.
 
 **Merge.**  `bitcask_compact()` rewrites the log with only the live
 records: superseded values, deleted and flushed keys, tombstones and
@@ -329,17 +341,23 @@ flush records drop out, a live key keeps its TTL, and an expired key is
 dropped.  The server never calls it, so the log grows until it is
 compacted.
 
-**Format.**  A directory from an older rexis (`DIR/bitcask.data`, which
-logged only plain SET and DEL) is renamed to `bitcask.v2` at the first
-start and reloads as it was.  The new records (a value with a type or
-an expiry, a flush) are ones the older binary cannot parse and would
-cut off as a torn tail, which is why the file has a new name: an older
-binary pointed at a new directory finds no log and starts empty,
-leaving `bitcask.v2` alone, though it creates an empty `bitcask.data`.
-The next start of the new binary removes that empty file, with a
-warning.  If `bitcask.data` holds records next to `bitcask.v2` (the
-older binary took writes there), the server refuses to start rather
-than pick one, and names both files.
+**Format.**  A directory from an older rexis (`DIR/bitcask.data`,
+which logged only plain SET and DEL, with no header checksum) is
+converted at the first start: the old log is renamed to `bitcask.v1`,
+its live keys are written to `bitcask.v2` (through a temp file that is
+renamed into place, so `bitcask.v2` only ever exists whole), and
+`bitcask.v1` is removed, with a line on stderr.  A crash at any step
+resumes at the next start: `bitcask.v1` alone, or with the temp file,
+is converted again; `bitcask.v1` next to `bitcask.v2` means the
+conversion finished, so `bitcask.v1` is removed.  `bitcask.data` next
+to `bitcask.v1` is refused, naming both files.
+
+An older binary cannot read a converted directory.  Pointed at one, it
+finds no log and starts empty, leaving `bitcask.v2` alone, though it
+creates an empty `bitcask.data`.  The next start of the new binary
+removes that empty file, with a warning.  If `bitcask.data` holds
+records next to `bitcask.v2` (the older binary took writes there), the
+server refuses to start rather than pick one, and names both files.
 
 `test/test_rexis_restart.c` checks each class (counters, TTLs, FLUSHDB,
 lists, hashes, deletes) against a real server restarted mid-test, once

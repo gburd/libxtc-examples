@@ -6,8 +6,9 @@
  *
  * examples/05_rexis/bitcask.c -- Bitcask-style on-disk KV.
  *
- * On-disk record format (network byte order; CRC32 over body):
+ * On-disk record format (network byte order):
  *
+ *   uint32_t  hcrc;       // CRC32 of (timestamp, key_len, val_len)
  *   uint32_t  crc;        // CRC32 of (timestamp .. value)
  *   uint64_t  timestamp;  // monotonic ns of write
  *   uint32_t  key_len;
@@ -16,12 +17,17 @@
  *   uint8_t   meta[9];    // v2 put only: tag, then expire_at (u64)
  *   uint8_t   val[len];   // puts only
  *
+ * The header CRC is checked before the lengths are believed, so a
+ * damaged length is a bad record, never a record that seems to run
+ * past the end of the file.  Both CRCs start from SEED_TOP, except in
+ * the records inside a batch, which start from SEED_INNER: a batch's
+ * inner records never pass for records of the log.
+ *
  * val_len says which kind of record it is:
  *
- *   0 .. BITCASK_MAX_VAL     v1 put: val_len value bytes, no meta.
- *                            The original format; a put with tag 0
- *                            and no expiry is still written this way.
- *   REC_V2 | len             v2 put: meta, then len value bytes.
+ *   0 .. BITCASK_MAX_VAL     plain put: val_len value bytes, no meta
+ *                            (a put with tag 0 and no expiry).
+ *   REC_V2 | len             put with meta: meta, then len value bytes.
  *   REC_FLUSH (0xFFFFFFFE)   flush: key_len 0, no body.  Every
  *                            earlier record is dead.
  *   REC_BATCH (0xFFFFFFFD)   batch: key_len is the length of the
@@ -31,9 +37,14 @@
  *                            batch whole or cuts it off whole.
  *   REC_TOMBSTONE (~0)       delete: key only.
  *
- * A binary that predates v2 and flush records would read either as a
- * torn tail and truncate the log there, so the file has a new name
- * (bitcask.v2, see bitcask.h): an older binary never opens it.
+ * The log of an older rexis (bitcask.data) has 20-byte headers with no
+ * header CRC: crc, timestamp, key_len, val_len, and only plain puts and
+ * tombstones.  It is converted, never mixed into bitcask.v2: a scan
+ * could not tell an old header from a damaged new one.  bitcask_open
+ * renames it to bitcask.v1, reads it with the old header, writes its
+ * live keys to bitcask.v2 through the merge (a temp file renamed into
+ * place, so bitcask.v2 exists only whole), and removes bitcask.v1.
+ * An older binary never opens bitcask.v2 (see bitcask.h).
  *
  * Recovery on open: scan the file from start, rebuild the in-memory
  * hash index by replaying every record (the latest entry per key
@@ -122,13 +133,44 @@ static uint64_t get_u64(const uint8_t *p) {
 	return ((uint64_t)get_u32(p) << 32) | (uint64_t)get_u32(p + 4);
 }
 
-#define HDR_SIZE  (4 /*crc*/ + 8 /*ts*/ + 4 /*kl*/ + 4 /*vl*/)
+#define HDR_SIZE  (4 /*hcrc*/ + 4 /*crc*/ + 8 /*ts*/ + 4 /*kl*/ + 4 /*vl*/)
+#define HDR_V1    (4 /*crc*/ + 8 /*ts*/ + 4 /*kl*/ + 4 /*vl*/)
+#define SEED_TOP   0x72780201u      /* CRC seed of a record of the log */
+#define SEED_INNER 0x72780202u      /* CRC seed of a record in a batch */
 #define META_SIZE (1 /*tag*/ + 8 /*expire_at*/)
 #define TOMBSTONE 0xffffffffu
 #define REC_FLUSH 0xfffffffeu
 #define REC_BATCH 0xfffffffdu
 #define REC_V2    0x80000000u
 #define DATA_FILE "bitcask.v2"
+#define V1_FILE   "bitcask.v1"      /* an older log being converted */
+#define TMP_FILE  "bitcask.compact" /* the merge's output, renamed in */
+
+/*
+ * Fill a record header's timestamp, key_len and val_len, and its header
+ * CRC (from `seed`).  Returns the header CRC: the caller runs the body
+ * CRC on from it over the body, and stores the result at hdr + 4.
+ */
+static uint32_t
+__hdr_seal(uint8_t *hdr, uint64_t ts, uint32_t kl, uint32_t vl,
+    uint32_t seed)
+{
+	uint32_t hcrc;
+
+	put_u64(hdr + 8, ts);
+	put_u32(hdr + 16, kl);
+	put_u32(hdr + 20, vl);
+	hcrc = crc32(hdr + 8, HDR_SIZE - 8, seed);
+	put_u32(hdr, hcrc);
+	return hcrc;
+}
+
+/* Whether a header's CRC matches its fields, from `seed`. */
+static int
+__hdr_ok(const uint8_t *hdr, uint32_t seed)
+{
+	return get_u32(hdr) == crc32(hdr + 8, HDR_SIZE - 8, seed);
+}
 
 static int64_t
 now_ns(void)
@@ -193,6 +235,7 @@ struct bitcask {
 	pthread_mutex_t      lock;
 	int                  fd;
 	char                 dir[480];
+	uint32_t             hdr_size;  /* HDR_SIZE; HDR_V1 converting */
 	uint64_t             write_offset;
 	lh_t                 idx;
 	uint64_t             n_keys;
@@ -325,11 +368,13 @@ __idx_free_all(struct bitcask *bc)
 /*
  * Check a record header's key_len and val_len and compute how many
  * body bytes follow the header.  Returns -1 for a header no writer
- * produces (a torn or corrupt tail): the caller truncates there.
+ * produces.  An older log (`v1`) holds only plain puts and tombstones.
  */
 static int
-__rec_parse(uint32_t kl, uint32_t vl, uint32_t *body_len)
+__rec_parse(uint32_t kl, uint32_t vl, int v1, uint32_t *body_len)
 {
+	if (v1 && vl != TOMBSTONE && vl > MAX_VAL_LEN)
+		return -1;
 	if (vl == REC_FLUSH) {
 		*body_len = 0;
 		return kl == 0 ? 0 : -1;
@@ -368,16 +413,17 @@ __rec_apply(struct bitcask *bc, uint64_t off, uint64_t ts, uint32_t kl,
     uint32_t vl, const uint8_t *body, int64_t now)
 {
 	bitcask_meta_t m = { 0, 0 };
-	uint64_t voff = off + HDR_SIZE + kl;
+	uint32_t hs = bc->hdr_size;
+	uint64_t voff = off + hs + kl;
 
 	if (vl == REC_FLUSH) {
 		__idx_clear(bc);
-		bc->bytes_dead += HDR_SIZE;
+		bc->bytes_dead += hs;
 		return;
 	}
 	if (vl == TOMBSTONE) {
 		(void)__idx_del(bc, body, kl);
-		bc->bytes_dead += HDR_SIZE + kl;
+		bc->bytes_dead += hs + kl;
 		return;
 	}
 	if ((vl & REC_V2) != 0) {
@@ -388,7 +434,7 @@ __rec_apply(struct bitcask *bc, uint64_t off, uint64_t ts, uint32_t kl,
 	}
 	if (m.expire_at != 0 && m.expire_at <= now) {
 		(void)__idx_del(bc, body, kl);
-		bc->bytes_dead += HDR_SIZE + kl + META_SIZE + vl;
+		bc->bytes_dead += hs + kl + META_SIZE + vl;
 		return;
 	}
 	(void)__idx_put(bc, body, kl, voff, vl, ts, &m);
@@ -409,17 +455,24 @@ __batch_apply(struct bitcask *bc, uint64_t off, const uint8_t *body,
 	while (pos < len) {
 		if (len - pos < HDR_SIZE)
 			return -1;
-		kl = get_u32(body + pos + 12);
-		vl = get_u32(body + pos + 16);
-		if (vl == REC_BATCH || __rec_parse(kl, vl, &blen) != 0 ||
+		kl = get_u32(body + pos + 16);
+		vl = get_u32(body + pos + 20);
+		if (vl == REC_BATCH || __rec_parse(kl, vl, 0, &blen) != 0 ||
 		    len - pos - HDR_SIZE < blen)
 			return -1;
-		__rec_apply(bc, off + pos, get_u64(body + pos + 4), kl, vl,
+		__rec_apply(bc, off + pos, get_u64(body + pos + 8), kl, vl,
 		    body + pos + HDR_SIZE, now);
 		pos += HDR_SIZE + blen;
 	}
 	bc->bytes_dead += HDR_SIZE;           /* the batch's own header */
 	return 0;
+}
+
+/* The name of the file being read: the older log while converting. */
+static const char *
+__file_of(const struct bitcask *bc)
+{
+	return bc->hdr_size == HDR_V1 ? V1_FILE : DATA_FILE;
 }
 
 /* Cut a torn tail off at `off`.  Returns 0, or -1 if the file cannot
@@ -428,8 +481,8 @@ static int
 __cut_tail(struct bitcask *bc, uint64_t off, uint64_t fsize)
 {
 	if (fsize > off)
-		fprintf(stderr, "bitcask: %s/" DATA_FILE ": cut a torn tail "
-		    "of %llu bytes at offset %llu\n", bc->dir,
+		fprintf(stderr, "bitcask: %s/%s: cut a torn tail "
+		    "of %llu bytes at offset %llu\n", bc->dir, __file_of(bc),
 		    (unsigned long long)(fsize - off),
 		    (unsigned long long)off);
 	return ftruncate(bc->fd, (off_t)off) == 0 ? 0 : -1;
@@ -437,32 +490,47 @@ __cut_tail(struct bitcask *bc, uint64_t off, uint64_t fsize)
 
 /* What __rec_read found at an offset. */
 enum rec_state {
-	REC_OK,         /* a whole record with a good CRC */
+	REC_OK,         /* a whole record with good CRCs */
 	REC_TORN,       /* a good header whose record runs past EOF */
-	REC_BAD,        /* a header no writer produces, or a bad CRC */
+	REC_BAD,        /* a bad header CRC, a header no writer produces,
+	                   or a bad body CRC */
 	REC_IOERR       /* a read failed, or out of memory */
 };
 
 /*
  * Read the record at `off` of a file of `fsize` bytes: its header into
- * hdr, its body into *body (grown as needed; *cap is its size, and it
- * is never left NULL on REC_OK, so an empty key has a valid pointer),
- * its body length into *body_len.  At least HDR_SIZE bytes must remain
- * at `off`.
+ * hdr (HDR_SIZE bytes, in the v2 layout), its body into *body (grown as
+ * needed; *cap is its size, and it is never left NULL on REC_OK, so an
+ * empty key has a valid pointer), its body length into *body_len.  At
+ * least bc->hdr_size bytes must remain at `off`.
+ *
+ * The header CRC is checked first, so the lengths are believed only
+ * when they are what was written: REC_TORN then means a header that
+ * checks out with too few bytes after it, which is what a crash in the
+ * middle of the last write leaves.  An older log (bc->hdr_size is
+ * HDR_V1) has no header CRC: its 20-byte header is read into hdr + 4,
+ * and its one CRC starts from seed 0 over the header fields.
  */
 static enum rec_state
 __rec_read(struct bitcask *bc, uint64_t off, uint64_t fsize, uint8_t *hdr,
     uint8_t **body, size_t *cap, uint32_t *body_len)
 {
-	uint8_t hdr_for_crc[HDR_SIZE - 4];
-	uint32_t crc;
+	uint32_t hs = bc->hdr_size, crc;
+	int v1 = hs == HDR_V1;
 	void *nb;
 
-	if (pread(bc->fd, hdr, HDR_SIZE, (off_t)off) != (ssize_t)HDR_SIZE)
+	if (pread(bc->fd, hdr + HDR_SIZE - hs, hs, (off_t)off) != (ssize_t)hs)
 		return REC_IOERR;
-	if (__rec_parse(get_u32(hdr + 12), get_u32(hdr + 16), body_len) != 0)
+	if (v1)
+		crc = crc32(hdr + 8, HDR_SIZE - 8, 0);
+	else if (__hdr_ok(hdr, SEED_TOP))
+		crc = get_u32(hdr);
+	else
 		return REC_BAD;
-	if (fsize - off - HDR_SIZE < *body_len)
+	if (__rec_parse(get_u32(hdr + 16), get_u32(hdr + 20), v1,
+	    body_len) != 0)
+		return REC_BAD;
+	if (fsize - off - hs < *body_len)
 		return REC_TORN;
 	if (*body_len > *cap || *body == NULL) {
 		nb = realloc(*body, *body_len > 0 ? *body_len : 1);
@@ -472,46 +540,65 @@ __rec_read(struct bitcask *bc, uint64_t off, uint64_t fsize, uint8_t *hdr,
 		*cap = *body_len;
 	}
 	if (*body_len > 0 && pread(bc->fd, *body, *body_len,
-	    (off_t)(off + HDR_SIZE)) != (ssize_t)*body_len)
+	    (off_t)(off + hs)) != (ssize_t)*body_len)
 		return REC_IOERR;
-	memcpy(hdr_for_crc, hdr + 4, HDR_SIZE - 4);
-	crc = crc32(hdr_for_crc, HDR_SIZE - 4, 0);
 	crc = crc32(*body, *body_len, crc);
-	return crc == get_u32(hdr) ? REC_OK : REC_BAD;
+	return crc == get_u32(hdr + 4) ? REC_OK : REC_BAD;
 }
+
+#define SCAN_BLOCK (1024u * 1024u)
 
 /*
  * The first offset after `bad` at which a whole, valid record starts,
  * or 0 if there is none.  A crash leaves a torn record only at the end
- * of the log, so a bad record with a valid one after it is corruption.
+ * of the log, so a bad record with a valid one after it is damage.
  *
- * shortcut: tries every byte offset after the bad record, with a
- * pread of the header (and of the body where the bytes parse as a
- * header), so it is slow on a large damaged log; scan the file in
- * large blocks if that matters.  It runs only when a record is bad.
+ * The file is read in SCAN_BLOCK blocks, and the header CRC is checked
+ * in memory at every byte offset; only a header that passes is read in
+ * full.  A random 16 bytes pass with odds of 2^-32, so a damaged tail
+ * costs about one CRC of 16 bytes per byte (an older log, which has no
+ * header CRC, reads every offset that parses).  Returns 0 if a read
+ * fails, too: the caller then cuts the tail as if nothing followed, the
+ * same as before this scan, so the block reads only ever add refusals.
  */
 static uint64_t
 __next_valid(struct bitcask *bc, uint64_t bad, uint64_t fsize)
 {
-	uint8_t hdr[HDR_SIZE], *body = NULL;
-	size_t cap = 0;
-	uint32_t body_len;
-	uint64_t q;
+	uint8_t hdr[HDR_SIZE], *blk, *body = NULL;
+	size_t cap = 0, n, i;
+	uint32_t body_len, hs = bc->hdr_size;
+	uint64_t q = bad + 1, found = 0;
+	ssize_t got;
 
-	for (q = bad + 1; fsize - q >= HDR_SIZE; q++)
-		if (__rec_read(bc, q, fsize, hdr, &body, &cap, &body_len) ==
-		    REC_OK)
+	if ((blk = malloc(SCAN_BLOCK)) == NULL)
+		return 0;
+	while (found == 0 && fsize - q >= hs) {
+		n = fsize - q < SCAN_BLOCK ? (size_t)(fsize - q) : SCAN_BLOCK;
+		if ((got = pread(bc->fd, blk, n, (off_t)q)) != (ssize_t)n)
 			break;
+		for (i = 0; i + hs <= n; i++) {
+			if (hs == HDR_SIZE && !__hdr_ok(blk + i, SEED_TOP))
+				continue;
+			if (__rec_read(bc, q + i, fsize, hdr, &body, &cap,
+			    &body_len) == REC_OK) {
+				found = q + i;
+				break;
+			}
+		}
+		q += i;
+	}
 	free(body);
-	return fsize - q >= HDR_SIZE ? q : 0;
+	free(blk);
+	return found;
 }
 
 /*
  * Rebuild the index from the data file.  A torn tail (a crash in the
- * middle of the last write) is cut off.  A bad record anywhere else,
- * one with a valid record after it, refuses the open with the offset:
- * cutting there would silently drop every later record.  Returns 0 or
- * -1.
+ * middle of the last write) is cut off, and so is a bad record with no
+ * valid record after it, since it cannot be told from one.  A bad
+ * record with a valid record after it refuses the open with the
+ * offset: cutting there would silently drop every later record.
+ * Returns 0 or -1.
  */
 static int
 __recover(struct bitcask *bc)
@@ -529,7 +616,11 @@ __recover(struct bitcask *bc)
 	if (fsize < 0) return -1;
 	fs = (uint64_t)fsize;
 
-	while (fs - off >= HDR_SIZE) {
+	while (off < fs) {
+		if (fs - off < bc->hdr_size) {
+			rc = __cut_tail(bc, off, fs);   /* a torn header */
+			break;
+		}
 		st = __rec_read(bc, off, fs, hdr, &body, &body_cap, &body_len);
 		if (st == REC_IOERR) {
 			rc = -1;
@@ -544,30 +635,30 @@ __recover(struct bitcask *bc)
 				rc = __cut_tail(bc, off, fs);
 				break;
 			}
-			fprintf(stderr, "bitcask: %s/" DATA_FILE ": the record "
+			fprintf(stderr, "bitcask: %s/%s: the record "
 			    "at offset %llu is corrupt and a valid record "
 			    "follows at offset %llu; refusing to open (the "
 			    "log is damaged, not torn: restore it, or cut it "
 			    "at %llu by hand to drop everything from there)\n",
-			    bc->dir, (unsigned long long)off,
+			    bc->dir, __file_of(bc), (unsigned long long)off,
 			    (unsigned long long)next, (unsigned long long)off);
 			rc = -1;
 			break;
 		}
-		kl = get_u32(hdr + 12);
-		vl = get_u32(hdr + 16);
+		kl = get_u32(hdr + 16);
+		vl = get_u32(hdr + 20);
 		if (vl != REC_BATCH) {
-			__rec_apply(bc, off, get_u64(hdr + 4), kl, vl, body,
+			__rec_apply(bc, off, get_u64(hdr + 8), kl, vl, body,
 			    now);
 		} else if (__batch_apply(bc, off + HDR_SIZE, body, body_len,
 		    now) != 0) {
-			fprintf(stderr, "bitcask: %s/" DATA_FILE ": malformed "
-			    "batch record at offset %llu\n", bc->dir,
+			fprintf(stderr, "bitcask: %s/%s: malformed "
+			    "batch record at offset %llu\n", bc->dir, __file_of(bc),
 			    (unsigned long long)off);
 			rc = -1;
 			break;
 		}
-		off += HDR_SIZE + body_len;
+		off += bc->hdr_size + body_len;
 	}
 	bc->write_offset = off;
 	bc->bytes_used = off;           /* every record kept is in use */
@@ -592,44 +683,104 @@ __fsync_dir(const char *dir)
 }
 
 /*
- * A directory from before the v2 records holds DIR/bitcask.data.  Its
- * records are valid v2 log content, so rename it to `path` (the v2
- * name) and fsync the directory so the rename is durable.  An older
- * binary that meets a v2 log then sees no file of its own and starts
- * empty, rather than truncating the log at the first v2 record.
+ * Check the older log's files and say what bitcask_open must do with
+ * this directory: 0 open bitcask.v2, 1 convert bitcask.v1 into it, or
+ * -1 refuse (or a rename, unlink or directory fsync failed).
  *
- * Both files present means an older binary ran on a v2 directory.  It
- * creates bitcask.data when it opens, so an EMPTY one holds nothing it
- * acknowledged: it is removed, with a warning.  One with data holds
- * writes neither file can drop silently, so the open is refused, with
- * a message that names both files.  Returns 0, or -1 (refused, or a
- * rename, unlink or directory fsync failed).
+ * The conversion runs in steps, each durable before the next, so a
+ * crash at any point resumes at the next open:
+ *
+ *   bitcask.data alone             renamed to bitcask.v1, then 1.
+ *   bitcask.v1, no bitcask.v2      1.  A temp file a crash left in the
+ *                                  middle of the merge is removed first.
+ *   bitcask.v1 and bitcask.v2      bitcask.v2 appears only by the
+ *                                  merge's rename, so it is whole:
+ *                                  bitcask.v1 is removed, then 0.
+ *   bitcask.data and bitcask.v1    refused: no step leaves both.
+ *
+ * An older binary pointed at a converted directory finds no
+ * bitcask.data and starts empty, but creates an empty one.  An EMPTY
+ * bitcask.data next to bitcask.v2 holds nothing it acknowledged, so it
+ * is removed, with a warning.  One with data holds writes neither file
+ * can drop silently, so the open is refused, naming both files.
  */
 static int
-__adopt_v1(const char *dir, const char *path)
+__adopt_v1(const char *dir)
 {
-	char v1[512];
+	char data[512], v1[512], v2[512], tmp[512];
 	struct stat sb;
+	int has_data, has_v1, has_v2;
 
-	snprintf(v1, sizeof v1, "%s/bitcask.data", dir);
-	if (stat(v1, &sb) != 0)
-		return 0;
-	if (access(path, F_OK) == 0) {
+	snprintf(data, sizeof data, "%s/bitcask.data", dir);
+	snprintf(v1, sizeof v1, "%s/" V1_FILE, dir);
+	snprintf(v2, sizeof v2, "%s/" DATA_FILE, dir);
+	snprintf(tmp, sizeof tmp, "%s/" TMP_FILE, dir);
+	has_data = stat(data, &sb) == 0;
+	has_v1 = access(v1, F_OK) == 0;
+	has_v2 = access(v2, F_OK) == 0;
+
+	if (has_data && has_v1) {
+		fprintf(stderr, "bitcask: %s and %s (an older log in the "
+		    "middle of its conversion) both exist; refusing to pick "
+		    "one: move one away\n", data, v1);
+		return -1;
+	}
+	if (has_data && has_v2) {
 		if (sb.st_size != 0) {
 			fprintf(stderr, "bitcask: %s (%lld bytes, written by "
 			    "an older rexis) and %s both exist; refusing to "
-			    "pick one: move one away\n", v1,
-			    (long long)sb.st_size, path);
+			    "pick one: move one away\n", data,
+			    (long long)sb.st_size, v2);
 			return -1;
 		}
 		fprintf(stderr, "bitcask: removing the empty %s an older "
-		    "rexis left next to %s\n", v1, path);
-		if (unlink(v1) != 0)
+		    "rexis left next to %s\n", data, v2);
+		if (unlink(data) != 0)
 			return -1;
-	} else if (rename(v1, path) != 0) {
-		return -1;
+		return __fsync_dir(dir);
 	}
-	return __fsync_dir(dir);
+	if (has_data) {
+		if (rename(data, v1) != 0 || __fsync_dir(dir) != 0)
+			return -1;
+		has_v1 = 1;
+	}
+	if (!has_v1)
+		return 0;
+	if (has_v2) {
+		if (unlink(v1) != 0 || __fsync_dir(dir) != 0)
+			return -1;
+		return 0;
+	}
+	if (unlink(tmp) != 0 && errno != ENOENT)
+		return -1;
+	return 1;
+}
+
+/*
+ * Convert the older log: read bitcask.v1 with its 20-byte headers (the
+ * same torn and damaged rules as bitcask.v2), write the live keys to
+ * bitcask.v2 with the merge, then remove bitcask.v1.  On return bc
+ * holds bitcask.v2 open.  Returns 0 or -1.
+ */
+static int
+__convert_v1(struct bitcask *bc)
+{
+	char v1[512];
+
+	snprintf(v1, sizeof v1, "%s/" V1_FILE, bc->dir);
+	if ((bc->fd = open(v1, O_RDWR)) < 0)
+		return -1;
+	bc->hdr_size = HDR_V1;
+	if (__recover(bc) != 0)
+		return -1;
+	bc->hdr_size = HDR_SIZE;
+	if (bitcask_compact(bc) != 0)
+		return -1;
+	fprintf(stderr, "bitcask: converted %s to %s/" DATA_FILE "\n", v1,
+	    bc->dir);
+	if (unlink(v1) != 0 || __fsync_dir(bc->dir) != 0)
+		return -1;
+	return 0;
 }
 
 int
@@ -637,6 +788,8 @@ bitcask_open(const char *dir, bitcask_t **out)
 {
 	bitcask_t *bc;
 	char path[512];
+	int rc;
+
 	if (dir == NULL || out == NULL) return -1;
 	bc = calloc(1, sizeof *bc);
 	if (bc == NULL) return -1;
@@ -648,19 +801,22 @@ bitcask_open(const char *dir, bitcask_t **out)
 	pthread_mutex_init(&bc->lock, NULL);
 	snprintf(bc->dir, sizeof bc->dir, "%s", dir);
 	snprintf(path, sizeof path, "%s/" DATA_FILE, dir);
-	if (__adopt_v1(dir, path) != 0) {
-		lh_destroy(&bc->idx, __idx_mfree, NULL);
+	bc->fd = -1;
+	bc->hdr_size = HDR_SIZE;
+	rc = __adopt_v1(dir);
+	if (rc == 1)
+		rc = __convert_v1(bc);
+	else if (rc == 0 && (bc->fd = open(path, O_RDWR | O_CREAT, 0644)) >= 0)
+		rc = __recover(bc);
+	else
+		rc = -1;
+	if (rc != 0) {
+		if (bc->fd >= 0)
+			(void)close(bc->fd);
+		__idx_free_all(bc);
+		pthread_mutex_destroy(&bc->lock);
 		free(bc);
 		return -1;
-	}
-	bc->fd = open(path, O_RDWR | O_CREAT, 0644);
-	if (bc->fd < 0) {
-		lh_destroy(&bc->idx, __idx_mfree, NULL);
-		free(bc);
-		return -1;
-	}
-	if (__recover(bc) != 0) {
-		(void)close(bc->fd); __idx_free_all(bc); free(bc); return -1;
 	}
 	*out = bc;
 	return 0;
@@ -709,7 +865,6 @@ bitcask_put_meta(bitcask_t *bc, const void *key, size_t key_len,
                  const void *val, size_t val_len, const bitcask_meta_t *m)
 {
 	uint8_t hdr[HDR_SIZE], meta[META_SIZE];
-	uint8_t hdr_for_crc[HDR_SIZE - 4];
 	struct iovec iov[4];
 	uint64_t ts = (uint64_t)now_ns();
 	uint32_t crc, vl;
@@ -730,15 +885,11 @@ bitcask_put_meta(bitcask_t *bc, const void *key, size_t key_len,
 		meta_len = META_SIZE;
 	}
 
-	put_u64(hdr_for_crc + 0, ts);
-	put_u32(hdr_for_crc + 8, (uint32_t)key_len);
-	put_u32(hdr_for_crc + 12, vl);
-	crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
+	crc = __hdr_seal(hdr, ts, (uint32_t)key_len, vl, SEED_TOP);
 	crc = crc32(key, key_len, crc);
 	crc = crc32(meta, meta_len, crc);
 	crc = crc32(val, val_len, crc);
-	put_u32(hdr, crc);
-	memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
+	put_u32(hdr + 4, crc);
 
 	iov[0].iov_base = hdr;          iov[0].iov_len = HDR_SIZE;
 	iov[1].iov_base = (void *)key;  iov[1].iov_len = key_len;
@@ -808,22 +959,17 @@ bitcask_size(bitcask_t *bc, const void *key, size_t key_len, size_t *val_len)
  * Fill hdr with the header of a record whose body is `body` (`len`
  * bytes) and whose key_len and val_len fields are kl and kind: a
  * tombstone (kl = len, the key), a flush (no body) or a batch (kl =
- * len, the inner records).
+ * len, the inner records).  `seed` is SEED_TOP, or SEED_INNER for a
+ * record inside a batch.
  */
 static void
 __marker_hdr(uint8_t *hdr, const void *body, size_t len, uint32_t kl,
-    uint32_t kind)
+    uint32_t kind, uint32_t seed)
 {
-	uint8_t hdr_for_crc[HDR_SIZE - 4];
 	uint32_t crc;
 
-	put_u64(hdr_for_crc + 0, (uint64_t)now_ns());
-	put_u32(hdr_for_crc + 8, kl);
-	put_u32(hdr_for_crc + 12, kind);
-	crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
-	crc = crc32(body, len, crc);
-	put_u32(hdr, crc);
-	memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
+	crc = __hdr_seal(hdr, (uint64_t)now_ns(), kl, kind, seed);
+	put_u32(hdr + 4, crc32(body, len, crc));
 }
 
 /* Append a record with no value bytes: a tombstone (key) or a flush
@@ -835,7 +981,7 @@ __rec_marker(struct bitcask *bc, const void *key, size_t key_len,
 	uint8_t hdr[HDR_SIZE];
 	struct iovec iov[2];
 
-	__marker_hdr(hdr, key, key_len, (uint32_t)key_len, kind);
+	__marker_hdr(hdr, key, key_len, (uint32_t)key_len, kind, SEED_TOP);
 	iov[0].iov_base = hdr;          iov[0].iov_len = HDR_SIZE;
 	iov[1].iov_base = (void *)key;  iov[1].iov_len = key_len;
 	if (__rec_append(bc, iov, 2, HDR_SIZE + key_len) != 0)
@@ -914,11 +1060,12 @@ bitcask_del_many(bitcask_t *bc, const void *const *keys,
 	p = buf + HDR_SIZE;
 	for (i = 0; i < n; i++) {
 		__marker_hdr(p, keys[i], lens[i], (uint32_t)lens[i],
-		    TOMBSTONE);
+		    TOMBSTONE, SEED_INNER);
 		memcpy(p + HDR_SIZE, keys[i], lens[i]);
 		p += HDR_SIZE + lens[i];
 	}
-	__marker_hdr(buf, buf + HDR_SIZE, inner, (uint32_t)inner, REC_BATCH);
+	__marker_hdr(buf, buf + HDR_SIZE, inner, (uint32_t)inner, REC_BATCH,
+	    SEED_TOP);
 	iov[0].iov_base = buf;
 	iov[0].iov_len = HDR_SIZE + inner;
 
@@ -1023,7 +1170,7 @@ static int
 __compact_one(struct bitcask *bc, int tfd, struct idx_entry *e,
     uint64_t *off)
 {
-	uint8_t hdr[HDR_SIZE], hdr_for_crc[HDR_SIZE - 4], meta[META_SIZE];
+	uint8_t hdr[HDR_SIZE], meta[META_SIZE];
 	struct iovec iov[4];
 	uint8_t *val = NULL;
 	size_t meta_len = 0, total;
@@ -1045,15 +1192,12 @@ __compact_one(struct bitcask *bc, int tfd, struct idx_entry *e,
 		put_u64(meta + 1, (uint64_t)e->expire_at);
 		meta_len = META_SIZE;
 	}
-	put_u64(hdr_for_crc + 0, e->timestamp);
-	put_u32(hdr_for_crc + 8, (uint32_t)e->key_len);
-	put_u32(hdr_for_crc + 12, vl);
-	crc = crc32(hdr_for_crc, sizeof hdr_for_crc, 0);
+	crc = __hdr_seal(hdr, e->timestamp, (uint32_t)e->key_len, vl,
+	    SEED_TOP);
 	crc = crc32(e->key, e->key_len, crc);
 	crc = crc32(meta, meta_len, crc);
 	crc = crc32(val, e->val_len, crc);
-	put_u32(hdr, crc);
-	memcpy(hdr + 4, hdr_for_crc, sizeof hdr_for_crc);
+	put_u32(hdr + 4, crc);
 
 	iov[0].iov_base = hdr;     iov[0].iov_len = HDR_SIZE;
 	iov[1].iov_base = e->key;  iov[1].iov_len = e->key_len;
@@ -1096,7 +1240,7 @@ bitcask_compact(bitcask_t *bc)
 
 	if (bc == NULL) return -1;
 
-	snprintf(tmp_path, sizeof tmp_path, "%s/bitcask.compact", bc->dir);
+	snprintf(tmp_path, sizeof tmp_path, "%s/" TMP_FILE, bc->dir);
 	snprintf(data_path, sizeof data_path, "%s/" DATA_FILE, bc->dir);
 
 	pthread_mutex_lock(&bc->lock);

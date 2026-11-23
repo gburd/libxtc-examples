@@ -33,13 +33,19 @@
  * synchronous on the calling thread.
  *
  * The data file is DIR/bitcask.v2.  A directory written by an older
- * rexis holds DIR/bitcask.data, whose records are all still valid:
- * bitcask_open renames it to bitcask.v2 and carries on.  An older
- * binary then finds no bitcask.data and starts empty, leaving
- * bitcask.v2 alone, instead of truncating the log at the first record
- * it cannot parse.  It does create an empty bitcask.data; the next
- * bitcask_open removes that, and refuses to open a directory whose
- * bitcask.data holds records next to a bitcask.v2.
+ * rexis holds DIR/bitcask.data, whose records have a different header:
+ * bitcask_open converts it to bitcask.v2 (bitcask.c says how, and how a
+ * crash in the middle resumes) and carries on.  An older binary cannot
+ * read a converted directory: it finds no bitcask.data and starts
+ * empty, leaving bitcask.v2 alone.  It does create an empty
+ * bitcask.data; the next bitcask_open removes that, and refuses to open
+ * a directory whose bitcask.data holds records next to a bitcask.v2.
+ *
+ * At open, a torn tail (a record whose header checks out but whose
+ * body runs past the end of the file, which is what a crash in the
+ * middle of the last write leaves) is cut off.  Any other damage
+ * refuses the open, unless it is in the last record and nothing valid
+ * follows it: then it is cut like a torn tail.
  */
 
 #ifndef BITCASK_H
@@ -73,7 +79,7 @@ typedef struct bitcask_stats {
 
 /* Open / create a Bitcask at the given directory.  The directory
  * must already exist; the data file is named "bitcask.v2" inside (an
- * older "bitcask.data" is renamed to it, see above). */
+ * older "bitcask.data" is converted to it, see above). */
 int   bitcask_open(const char *dir, bitcask_t **out);
 
 /* Close + flush.  Subsequent opens of the same directory will

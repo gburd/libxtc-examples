@@ -8,6 +8,7 @@
  */
 
 #include <errno.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -330,48 +331,170 @@ test_meta_flush_expiry(void)
 	printf("  ok   meta_flush_expiry\n");
 }
 
+/* CRC32 (IEEE), as the older rexis wrote it, for the v1 records. */
+static uint32_t
+v1_crc(const uint8_t *p, size_t len, uint32_t c)
+{
+	size_t i;
+	int k;
+
+	c = ~c;
+	for (i = 0; i < len; i++) {
+		c ^= p[i];
+		for (k = 0; k < 8; k++)
+			c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
+	}
+	return ~c;
+}
+
+static void
+be32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
 /*
- * A directory written by an older rexis (DIR/bitcask.data, v1 records)
- * is adopted: renamed to bitcask.v2 with its keys intact.  An empty
- * bitcask.data next to bitcask.v2 is removed; a non-empty one is
- * refused rather than one file silently dropped.
+ * Append a record in the older rexis's format to the file at `path`:
+ * a 20-byte header (crc, timestamp, key_len, val_len) and the key and
+ * value; val NULL writes a tombstone.
+ */
+static void
+v1_append(const char *path, const char *key, const char *val)
+{
+	uint8_t rec[128];
+	size_t kl = strlen(key), vl = val != NULL ? strlen(val) : 0;
+	int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+	ASSERT(fd >= 0 && 20 + kl + vl <= sizeof rec);
+	memset(rec + 4, 0, 8);
+	rec[11] = 1;                         /* timestamp 1 */
+	be32(rec + 12, (uint32_t)kl);
+	be32(rec + 16, val != NULL ? (uint32_t)vl : 0xffffffffu);
+	memcpy(rec + 20, key, kl);
+	memcpy(rec + 20 + kl, val != NULL ? val : "", vl);
+	be32(rec, v1_crc(rec + 4, 16 + kl + vl, 0));
+	ASSERT(write(fd, rec, 20 + kl + vl) == (ssize_t)(20 + kl + vl));
+	ASSERT(close(fd) == 0);
+}
+
+/* Copy file `from` to `to`, its first `len` bytes (all if -1). */
+static void
+copy_prefix(const char *from, const char *to, long len)
+{
+	char buf[4096];
+	ssize_t n;
+	int in = open(from, O_RDONLY);
+	int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+	ASSERT(in >= 0 && out >= 0);
+	while ((n = read(in, buf, sizeof buf)) > 0) {
+		if (len >= 0 && n > len)
+			n = (ssize_t)len;
+		ASSERT(write(out, buf, (size_t)n) == n);
+		if (len >= 0 && (len -= n) == 0)
+			break;
+	}
+	ASSERT(close(in) == 0 && close(out) == 0);
+}
+
+/* The keyspace of the older log written in test_adopt_v1_log. */
+static void
+assert_v1_keys(const char *dir)
+{
+	bitcask_t *bc;
+	char buf[16];
+	size_t n;
+
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	ASSERT(bitcask_get(bc, "k", 1, buf, sizeof buf, &n) == 0);
+	ASSERT(n == 2 && memcmp(buf, "v2", 2) == 0);
+	ASSERT(bitcask_get(bc, "gone", 4, buf, sizeof buf, &n) == 1);
+	ASSERT(bitcask_get(bc, "x", 1, buf, sizeof buf, &n) == 0);
+	ASSERT(n == 3 && memcmp(buf, "xyz", 3) == 0);
+	ASSERT(bitcask_get(bc, "e", 1, buf, sizeof buf, &n) == 0 && n == 0);
+	bitcask_close(bc);
+}
+
+/*
+ * A directory written by an older rexis (DIR/bitcask.data, 20-byte
+ * headers) is converted: renamed to bitcask.v1, merged into bitcask.v2
+ * (a temp file renamed in), and bitcask.v1 removed.  A crash after any
+ * step leaves one of the states below on disk; each must open with the
+ * older log's keyspace.  Then: an empty bitcask.data next to bitcask.v2
+ * is removed, and one with records, or bitcask.data next to bitcask.v1,
+ * is refused with both files kept.
  */
 static void
 test_adopt_v1_log(void)
 {
 	const char *dir = mkdir_temp();
+	char data[512], v1[512], v2[512], tmp[512], orig[512], conv[512];
 	bitcask_t *bc;
-	char v1[512], v2[512], buf[16];
-	size_t n;
 	int fd;
 
-	snprintf(v1, sizeof v1, "%s/bitcask.data", dir);
+	snprintf(data, sizeof data, "%s/bitcask.data", dir);
+	snprintf(v1, sizeof v1, "%s/bitcask.v1", dir);
 	snprintf(v2, sizeof v2, "%s/bitcask.v2", dir);
-	ASSERT(bitcask_open(dir, &bc) == 0);
-	ASSERT(bitcask_put(bc, "k", 1, "v1", 2) == 0);
-	bitcask_close(bc);
-	ASSERT(rename(v2, v1) == 0);          /* now an old directory */
+	snprintf(tmp, sizeof tmp, "%s/bitcask.compact", dir);
+	snprintf(orig, sizeof orig, "%s/orig.data", dir);
+	snprintf(conv, sizeof conv, "%s/conv.v2", dir);
+	v1_append(orig, "k", "v1");
+	v1_append(orig, "gone", "g");
+	v1_append(orig, "x", "xyz");
+	v1_append(orig, "k", "v2");
+	v1_append(orig, "gone", NULL);
+	v1_append(orig, "e", "");
 
-	ASSERT(bitcask_open(dir, &bc) == 0);
-	ASSERT(bitcask_get(bc, "k", 1, buf, sizeof buf, &n) == 0);
-	ASSERT(n == 2 && memcmp(buf, "v1", 2) == 0);
-	bitcask_close(bc);
-	ASSERT(access(v1, F_OK) != 0 && access(v2, F_OK) == 0);
+	/* Before the v1 rename: bitcask.data alone. */
+	copy_prefix(orig, data, -1);
+	assert_v1_keys(dir);
+	ASSERT(access(data, F_OK) != 0 && access(v1, F_OK) != 0);
+	ASSERT(access(tmp, F_OK) != 0);
+	copy_prefix(v2, conv, -1);            /* a whole conversion */
 
-	/* An older binary run once on the v2 directory leaves an empty
-	 * bitcask.data: removed, and the open goes on. */
-	ASSERT(close(open(v1, O_CREAT | O_WRONLY, 0644)) == 0);
-	ASSERT(bitcask_open(dir, &bc) == 0);
-	ASSERT(bitcask_get(bc, "k", 1, buf, sizeof buf, &n) == 0);
-	bitcask_close(bc);
+	/* After the v1 removal: bitcask.v2 alone. */
+	assert_v1_keys(dir);
+
+	/* After the v1 rename: bitcask.v1 alone. */
+	ASSERT(unlink(v2) == 0);
+	copy_prefix(orig, v1, -1);
+	assert_v1_keys(dir);
 	ASSERT(access(v1, F_OK) != 0);
 
+	/* In the middle of the merge: bitcask.v1 and part of the temp. */
+	ASSERT(unlink(v2) == 0);
+	copy_prefix(orig, v1, -1);
+	copy_prefix(conv, tmp, 30);
+	assert_v1_keys(dir);
+	ASSERT(access(v1, F_OK) != 0 && access(tmp, F_OK) != 0);
+
+	/* After the v2 rename: bitcask.v1 and a whole bitcask.v2. */
+	copy_prefix(orig, v1, -1);
+	assert_v1_keys(dir);
+	ASSERT(access(v1, F_OK) != 0);
+
+	/* bitcask.data next to bitcask.v1: no step leaves both. */
+	copy_prefix(orig, v1, -1);
+	copy_prefix(orig, data, -1);
+	ASSERT(bitcask_open(dir, &bc) == -1);
+	ASSERT(access(data, F_OK) == 0 && access(v1, F_OK) == 0);
+	ASSERT(unlink(v1) == 0 && unlink(data) == 0);
+
+	/* An older binary run on the converted directory leaves an empty
+	 * bitcask.data: removed, and the open goes on. */
+	ASSERT(close(open(data, O_CREAT | O_WRONLY, 0644)) == 0);
+	assert_v1_keys(dir);
+	ASSERT(access(data, F_OK) != 0);
+
 	/* One with records is refused, and both files are kept. */
-	fd = open(v1, O_CREAT | O_WRONLY, 0644);
+	fd = open(data, O_CREAT | O_WRONLY, 0644);
 	ASSERT(fd >= 0 && write(fd, "x", 1) == 1 && close(fd) == 0);
 	ASSERT(bitcask_open(dir, &bc) == -1);
-	ASSERT(access(v1, F_OK) == 0 && access(v2, F_OK) == 0);
-	(void)unlink(v1);
+	ASSERT(access(data, F_OK) == 0 && access(v2, F_OK) == 0);
+	(void)unlink(data);
+	(void)unlink(orig);
+	(void)unlink(conv);
 	rmrf(dir);
 	printf("  ok   adopt_v1_log\n");
 }
@@ -466,6 +589,77 @@ test_corrupt_vs_torn(void)
 }
 
 /*
+ * Flip one bit of every byte of a log (bit i % 8 of byte i) and open
+ * it.  Each flip must refuse the open and leave the file as it was, or,
+ * for a flip in the last record, cut the log back to exactly the
+ * record before it.  So no flip drops an acknowledged record silently:
+ * a damaged length no longer passes for a torn tail (the header CRC),
+ * and a damaged batch's inner records never pass for records of the
+ * log (their own CRC seed), so a batch as the last record is cut.
+ */
+static void
+test_flip_sweep(void)
+{
+	const char *dir = mkdir_temp();
+	const void *keys[3] = { "k1", "k2", "k3" };
+	const size_t lens[3] = { 2, 2, 2 };
+	bitcask_meta_t m = { 2, 0 };
+	char path[512], key[16];
+	uint8_t *img;
+	bitcask_t *bc;
+	off_t size, last, batch;
+	int i, fd, refused = 0, cut = 0;
+
+	snprintf(path, sizeof path, "%s/bitcask.v2", dir);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	for (i = 0; i < 6; i++) {
+		snprintf(key, sizeof key, "k%d", i);
+		ASSERT(bitcask_put(bc, key, 2, "vvvvvvvv", 8) == 0);
+	}
+	ASSERT(bitcask_put_meta(bc, "l", 1, "listbody", 8, &m) == 0);
+	batch = file_size(path);
+	ASSERT(bitcask_del_many(bc, keys, lens, 3) == 0);
+	last = file_size(path);
+	ASSERT(bitcask_put(bc, "last", 4, "xxxxxxxxxx", 10) == 0);
+	bitcask_close(bc);
+	size = file_size(path);
+	img = malloc((size_t)size);
+	fd = open(path, O_RDONLY);
+	ASSERT(img != NULL && fd >= 0);
+	ASSERT(read(fd, img, (size_t)size) == size && close(fd) == 0);
+
+	for (i = 0; i < size; i++) {
+		img[i] ^= (uint8_t)(1u << (i % 8));
+		fd = open(path, O_WRONLY | O_TRUNC);
+		ASSERT(fd >= 0 && write(fd, img, (size_t)size) == size);
+		ASSERT(close(fd) == 0);
+		img[i] ^= (uint8_t)(1u << (i % 8));
+		if (bitcask_open(dir, &bc) != 0) {
+			ASSERT(i < last && file_size(path) == size);
+			refused++;
+			continue;
+		}
+		bitcask_close(bc);
+		ASSERT(i >= last && file_size(path) == last);
+		cut++;
+	}
+
+	/* The batch as the last record, its CRC flipped: cut, not refused
+	 * for the valid-looking tombstones inside it. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	img[batch + 4] ^= 1;
+	ASSERT(fd >= 0 && write(fd, img, (size_t)last) == last);
+	ASSERT(close(fd) == 0);
+	ASSERT(bitcask_open(dir, &bc) == 0);
+	bitcask_close(bc);
+	ASSERT(file_size(path) == batch);
+	free(img);
+	rmrf(dir);
+	printf("  ok   flip_sweep (%d flips: %d refused, %d cut at the last "
+	    "record)\n", refused + cut, refused, cut);
+}
+
+/*
  * The in-memory index must grow with the key count.  A fixed 4,096-bucket
  * chained index walked ~N/4096 entries on EVERY put (to find the old
  * record), so a 5M-key load fell from 254k to 7.6k puts/s.  Time a fixed
@@ -546,6 +740,7 @@ main(void)
 	test_meta_flush_expiry();
 	test_adopt_v1_log();
 	test_corrupt_vs_torn();
+	test_flip_sweep();
 	test_index_grows();
 	printf("All bitcask tests passed.\n");
 	return 0;
