@@ -402,13 +402,21 @@ test_del(const MunitParameter p[], void *f)
 	rt_t *t = f;
 	(void)p;
 
+	/* An empty key with an empty value, as the log's first record: a
+	 * put with no body bytes, read before any buffer exists. */
+	RT_EXPECT(t, "+OK\r\n", "SET", "", "");
+	rt_restart(t);
+	RT_EXPECT(t, "$0\r\n\r\n", "GET", "");
 	RT_EXPECT(t, "+OK\r\n", "SET", "s", "v");
 	RT_EXPECT(t, ":1\r\n", "RPUSH", "l", "x");
 	RT_EXPECT(t, ":1\r\n", "HSET", "h", "k", "v");
 	RT_EXPECT(t, "+OK\r\n", "SET", "", "empty key");
+	RT_EXPECT(t, "+OK\r\n", "SET", "ev", "");          /* empty value */
 	rt_restart(t);
 	RT_EXPECT(t, "$9\r\nempty key\r\n", "GET", "");
-	RT_EXPECT(t, ":4\r\n", "DEL", "s", "l", "h", "");
+	RT_EXPECT(t, "$0\r\n\r\n", "GET", "ev");
+	RT_EXPECT(t, ":5\r\n", "DEL", "s", "l", "h", "", "ev");
+
 	RT_EXPECT(t, ":1\r\n", "RPUSH", "s", "now a list");
 	rt_restart(t);
 	RT_EXPECT(t, ":1\r\n", "DBSIZE");

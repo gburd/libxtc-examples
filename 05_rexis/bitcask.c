@@ -463,8 +463,11 @@ __recover(struct bitcask *bc)
 			rc = __cut_tail(bc, off);
 			break;
 		}
-		if (body_len > body_cap) {
-			void *nb = realloc(body, body_len);
+		/* Always a buffer, even for an empty body: an empty key
+		 * with an empty value is a put of 0 body bytes, and its key
+		 * pointer must not be NULL (memcpy in __idx_put). */
+		if (body_len > body_cap || body == NULL) {
+			void *nb = realloc(body, body_len > 0 ? body_len : 1);
 			if (nb == NULL) { rc = -1; break; }
 			body = nb;
 			body_cap = body_len;
