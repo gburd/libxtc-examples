@@ -28,8 +28,9 @@ xtc-sim` gives its link line.  In a libxtc build tree, `make check` runs
 both halves (`check-jobq`; a native build makes its own simulation
 library in `jobq-sim/` the first time), and `make check-jobq-sweep
 JOBQ_SEEDS=100000` runs a longer sweep.  20,000 seeds (four shards of
-5,000 from bases 0, 5000, 10000 and 15000) pass, with 92,763 injected
-crashes and 32,000 network cuts.
+5,000 from bases 0, 5000, 10000 and 15000) pass, with 92,688 injected
+crashes and 32,194 network cuts (libxtc 2.3 development, 2026-11-22;
+the counts move when the library's own buggify sites change).
 
 ## What deterministic simulation testing is
 
@@ -48,8 +49,8 @@ seed that fails fails the same way every time, on any machine, so you
 can rerun it, add a print, and watch it fail again.
 
 Because a run takes no real time, a seed costs milliseconds: this
-harness runs 300 seeds of a four-loop service, each twice, with 1,401
-injected crashes and 458 network cuts per pass, in about a second.  Hours of simulated failure fit in a
+harness runs 300 seeds of a four-loop service, each twice, with 1,421
+injected crashes and 467 network cuts per pass, in about a second.  Hours of simulated failure fit in a
 `make check`.  FoundationDB built its database this way; TigerBeetle
 built its ledger this way.  libxtc runs its own test suite this way
 (`make check-dst`), and `xtc_sim.h` lets you do it to your program.
@@ -167,9 +168,9 @@ reached the dangerous states proves little:
 
 ```
 OK: 300 seeds, each run twice and replayed identically
-  nemesis: 674 queue kills, 727 worker kills, 458 network cuts
-  seeds where the queue restarted 212, a lease was granted again 257, the store fenced a stale write 166
-  buggify jq.worker.pause_before_write reached in   452 runs, on in   174
+  nemesis: 654 queue kills, 767 worker kills, 467 network cuts
+  seeds where the queue restarted 207, a lease was granted again 257, the store fenced a stale write 174
+  buggify jq.worker.pause_before_write reached in   452 runs, on in   182
   ...
 ```
 
@@ -196,7 +197,7 @@ Each is a legal behaviour a real deployment produces sooner or later.
 The pause before the write and the queue's restarts are what reach the
 fence.  Without them a stale write needs a lease to expire at the exact
 instant a worker is between its check and its write, which a random
-schedule seldom hits.  With them, the store refuses a stale write in 166
+schedule seldom hits.  With them, the store refuses a stale write in 174
 of the 300 seeds of `make check`.
 
 ### Planted bugs: does the harness catch anything?
@@ -209,9 +210,9 @@ builds each and requires the 300-seed run to fail:
 
 | plant | the bug | caught at | as |
 |---|---|---|---|
-| 1 | the store accepts a write without checking the fence | seed 3 | FENCE |
+| 1 | the store accepts a write without checking the fence | seed 2 | FENCE |
 | 2 | the queue acknowledges a submit before its journal write | seed 7 | ACKED-LOST |
-| 3 | a restarted queue reuses its old epoch, so tokens repeat | seed 3 | DOUBLE-EXEC |
+| 3 | a restarted queue reuses its old epoch, so tokens repeat | seed 2 | DOUBLE-EXEC |
 
 The number to watch is how many seeds a bug survives.  A bug the sweep
 catches in a handful of seeds is a bug you will not ship.  A planted
