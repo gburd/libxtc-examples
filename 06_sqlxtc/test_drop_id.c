@@ -65,7 +65,16 @@ static uint32_t
 table_id(const char *name)
 {
 	uint32_t id = 0;
-	return xstore_table_id(sx_storage_bt(), name, &id) ? id : 0;
+	return xstore_table_id(sx_storage_bt(), name, &id) > 0 ? id : 0;
+}
+
+/* The largest rowid of table `tid` (any version), or -1 when it cannot
+ * be read. */
+static int64_t
+max_rowid(uint32_t tid)
+{
+	int64_t mx = 0;
+	return xstore_max_rowid(sx_storage_bt(), tid, &mx) == XTC_OK ? mx : -1;
 }
 
 /* The id of index `name` on `table`, or 0 if there is none. */
@@ -181,8 +190,8 @@ drop_case(int mode)
 	 * allows. */
 	CK(sx_storage_close() == SX_OK);
 	CK(sx_storage_open(path, 256) == SX_OK);
-	CK(xstore_max_rowid(sx_storage_bt(), tb) == 0);
-	CK(xstore_max_rowid(sx_storage_bt(), ta) == 1);
+	CK(max_rowid(tb) == 0);
+	CK(max_rowid(ta) == 1);
 	CK(cat_has(0, tb) == 0);
 	CK(cat_has(IDXCAT, ix) == 0);
 	CK(cat_has(IDXCAT, inew) == 1);
@@ -224,7 +233,7 @@ orphan_case(void)
 	CK(td > ta + 4);
 	CK(one(h, "SELECT count(*) FROM d") == 0);
 	sx_close(h);
-	CK(xstore_max_rowid(sx_storage_bt(), ta + 4) == 1);
+	CK(max_rowid(ta + 4) == 1);
 	CK(sx_storage_close() == SX_OK);
 	unlink_store(path);
 }
@@ -281,11 +290,11 @@ unmarked_case(int live_a)
 	CK(td > tb);
 	CK(inew > ix);
 	CK(one(h, "SELECT count(*) FROM d") == 0);
-	CK(xstore_max_rowid(sx_storage_bt(), tb) == 1);
+	CK(max_rowid(tb) == 1);
 	CK(sx_exec(h, "DROP TABLE d", NULL) == SX_OK);
 	sx_close(h);
 	reopen(path, REOPEN_CLEAN);
-	CK(xstore_max_rowid(sx_storage_bt(), tb) == 0);
+	CK(max_rowid(tb) == 0);
 	CK(sx_storage_close() == SX_OK);
 	unlink_store(path);
 }
@@ -335,7 +344,7 @@ snapshot_case(void)
 	xstore_scan_close(s);
 	CK(sx_exec(h, "COMMIT", NULL) == SX_OK);
 	CK(xstore_gc_run(h2) >= 0);
-	CK(xstore_max_rowid(sx_storage_bt(), tb) == 0);
+	CK(max_rowid(tb) == 0);
 	sx_close(h);
 	sx_close(h2);
 	CK(sx_storage_close() == SX_OK);

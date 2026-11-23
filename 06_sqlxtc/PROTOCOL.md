@@ -92,6 +92,10 @@ NULL            -> null
 * Max columns per row: 1024.
 * Max rows per response: bounded by `limit` if given, otherwise by the
   client's read rate (we backpressure the server's write buffer).
+* Max rows one UPDATE, DELETE or INSERT (VALUES or SELECT) changes:
+  100,000.  A statement over it changes nothing and fails with the error
+  `too many rows: UPDATE on t changes more than 100000 rows, the limit
+  for one statement`.
 
 ## Errors
 

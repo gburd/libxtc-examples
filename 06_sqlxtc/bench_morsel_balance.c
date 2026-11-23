@@ -132,7 +132,7 @@ load(sx_db *db, bt_t *bt, const char *tab, long rows, int skew, int64_t *hi)
 
 	snprintf(sql, sizeof sql,
 	    "CREATE TABLE %s(k INTEGER PRIMARY KEY, a INT, g INT)", tab);
-	if (sx_exec(db, sql, NULL) != SX_OK || !xstore_table_id(bt, tab, &tid))
+	if (sx_exec(db, sql, NULL) != SX_OK || xstore_table_id(bt, tab, &tid) != 1)
 		return -1;
 	rec[0] = 2;
 	rec[1] = 1;
@@ -149,7 +149,9 @@ load(sx_db *db, bt_t *bt, const char *tab, long rows, int skew, int64_t *hi)
 		if (xstore_put_rec(bt, tid, rid, rec, (int)sizeof rec) != 0)
 			return -1;
 	}
-	*hi = xstore_max_rowid(bt, tid) + 1;
+	if (xstore_max_rowid(bt, tid, hi) != XTC_OK)
+		return -1;
+	*hi += 1;
 	return (int)tid;
 }
 

@@ -728,6 +728,7 @@ struct namevec {
 	 * file-scoped: see vx_prepare_select. */
 	const char *otab;
 	bt_t       *bt;
+	struct xsql *db;   /* bt's connection: where a read error is told */
 };
 
 static int
@@ -770,6 +771,21 @@ nv_add(struct namevec *nv, const sql_str_t *s)
 	return nv->n++;
 }
 
+/* xstore_table_schema for the executor: a catalog read that failed is
+ * recorded as the statement's read error (xstore_read_err_catalog), so
+ * the caller's decline reports it instead of "unsupported SQL" or "no
+ * such table".  Returns what xstore_table_schema returns; NB: a result
+ * below -1 is an error, not "no schema", and must fail the statement. */
+static int
+vx_table_schema(struct xsql *db, bt_t *bt, const char *table,
+    xstore_col_t *cols, int cap)
+{
+	int n = xstore_table_schema(bt, table, cols, cap);
+	if (n < -1)
+		xstore_read_err_catalog(db, n);
+	return n;
+}
+
 /* Resolve each source column (by name, in nv order) against the table
  * schema.  Tries the native xstore catalog first (no VDBE, no
  * sqlite_master); falls back to PRAGMA table_info for non-xstore tables
@@ -788,7 +804,8 @@ resolve_schema(struct xsql *db, const char *table, struct namevec *nv, int *pay)
 	{
 		bt_t *bt = xstore_bt_of(db);
 		xstore_col_t cols[64];
-		int nc = bt ? xstore_table_schema(bt, table, cols, 64) : 0;
+		int nc = bt ? vx_table_schema(db, bt, table, /* RDERR_OK: rd_err set */
+		    cols, 64) : 0;
 		if (nc > 0) {
 			int c;
 			for (c = 0; c < nc; c++)
@@ -1341,7 +1358,8 @@ collect_columns(struct namevec *nv, const sql_expr_t *e)
 				if (icols == NULL) return -1;
 				memcpy(itab, q->from->table.p, q->from->table.len);
 				itab[q->from->table.len] = '\0';
-				inc = xstore_table_schema(nv->bt, itab, icols, 64);
+				inc = vx_table_schema(nv->db, nv->bt, itab, icols, 64);
+				if (inc < -1) { free(icols); return -1; }   /* unread */
 				for (i = 0; i < inc && i < 64; i++) innames[i] = icols[i].name;
 				if (inc > 0) inner = innames;
 			}
@@ -1955,7 +1973,8 @@ compile_exists(struct vx_compiler *c, const sql_expr_t *e)
 		if (icols == NULL) { c->fail = 1; return NULL; }
 		memcpy(itab, e->sel->from->table.p, e->sel->from->table.len);
 		itab[e->sel->from->table.len] = '\0';
-		inc = bt ? xstore_table_schema(bt, itab, icols, 64) : 0;
+		inc = bt ? vx_table_schema(c->st->db, bt, itab, icols, 64) : 0;
+		if (inc < -1) { free(icols); c->fail = 1; return NULL; }   /* unread */
 		for (i = 0; i < inc && i < 64; i++) innames[i] = icols[i].name;
 	}
 
@@ -4369,7 +4388,9 @@ src_open(struct vx_stmt *st, const char *table, const vx_apath_t *ap,
 			if (!ap_xval(&hic, &hi)) goto scan;
 			hashi = 1;
 		}
-		s->iscan = xstore_iscan_open((struct xsql *)st->db, table,
+		/* NULL is no usable index (a scan follows), never a failed read:
+		 * a read error is kept in the scan and fails its first next. */
+		s->iscan = xstore_iscan_open((struct xsql *)st->db, table, /* RDERR_OK: no read */
 		    ap->idx_id, eq, ap->neq, haslo ? &lo : NULL, ap->lo_incl,
 		    hashi ? &hi : NULL, ap->hi_incl, ap->reverse);
 		if (s->iscan != NULL) {
@@ -4388,7 +4409,10 @@ src_open(struct vx_stmt *st, const char *table, const vx_apath_t *ap,
 	}
 	if (ap->rowmax) {
 		int64_t m;
-		if (!xstore_max_live_rowid((struct xsql *)st->db, table, st->snap, 0, 0, &m)) {
+		int r = xstore_max_live_rowid((struct xsql *)st->db, table,
+		    st->snap, 0, 0, &m);
+		if (r < 0) { rc = -1; goto out; }   /* unread: not "empty" */
+		if (r == 0) {
 			s->empty = 1;
 			goto out;
 		}
@@ -4704,7 +4728,8 @@ vx_prepare_select_body(struct xsql *db, sql_arena_t *ast, const sql_select_t *se
 		/* Fetch the schema once (needs the native xstore catalog). */
 		bt_t *sbt = xstore_bt_of(db);
 		int sc;
-		proj_nsc = sbt ? xstore_table_schema(sbt, tabbuf, proj_scols, 64) : 0;
+		proj_nsc = sbt ? vx_table_schema(db, sbt, tabbuf, /* RDERR_OK: rd_err set */
+		    proj_scols, 64) : 0;
 		if (proj_nsc <= 0) goto fallback;
 		/* Count output columns: each star -> visible schema columns,
 		 * each expression -> one. */
@@ -4755,6 +4780,7 @@ vx_prepare_select_body(struct xsql *db, sql_arena_t *ast, const sql_select_t *se
 	if (!proj_has_star) {
 		nv.otab = st->corr_alias;   /* collect correlated-subquery outer refs */
 		nv.bt = xstore_bt_of(db);   /* inner-schema access for EXISTS refs */
+		nv.db = db;
 		for (it = sel->cols->head; it; it = it->next)
 			if (collect_columns(&nv, it->expr) != 0) goto fallback;
 		if (sel->where && collect_columns(&nv, sel->where) != 0) goto fallback;
@@ -4809,7 +4835,9 @@ vx_prepare_select_body(struct xsql *db, sql_arena_t *ast, const sql_select_t *se
 		 * (proj_scols is free here: a star would have added columns.) */
 		bt_t *sbt = xstore_bt_of(db);
 		sql_str_t nm;
-		if (sbt == NULL || xstore_table_schema(sbt, tabbuf, proj_scols, 64) <= 0)
+		if (sbt == NULL ||
+		    vx_table_schema(db, sbt, tabbuf, proj_scols, /* RDERR_OK: rd_err set */
+		    64) <= 0)
 			goto fallback;
 		nm.p = proj_scols[0].name; nm.len = (uint32_t)strlen(proj_scols[0].name);
 		if (nv_add(&nv, &nm) < 0) goto fallback;
@@ -5469,7 +5497,7 @@ vx_try_prepare_agg(struct xsql *db, sql_arena_t *ast, const sql_select_t *sel,
 		snprintf(st->corr_alias, sizeof st->corr_alias, "%s", tabbuf);
 	sc = (xstore_col_t *)malloc(sizeof(xstore_col_t) * 64);
 	if (sc == NULL) goto oom;
-	nsc = xstore_table_schema(st->bt, tabbuf, sc, 64);
+	nsc = vx_table_schema(db, st->bt, tabbuf, sc, 64); /* RDERR_OK: rd_err set */
 	if (nsc <= 0) goto fallback;
 
 	memset(&nv, 0, sizeof nv);
@@ -5606,8 +5634,10 @@ is_col_ref(const sql_expr_t *e)
  * collect_columns' supported-construct gate. */
 /* Load each side's catalog schema into jc (heap).  A side whose schema
  * is unknown keeps nsc == 0 (unqualified names then fail to resolve
- * there).  Pair with jc_schema_free on every exit. */
-static void
+ * there).  Returns 0, or -1 when a side's catalog read failed (an
+ * unqualified name would then resolve to the other side alone).  Pair
+ * with jc_schema_free on every exit. */
+static int
 jc_schema_load(struct xsql *db, struct vx_joinctx *jc)
 {
 	bt_t *bt = xstore_bt_of(db);
@@ -5618,9 +5648,12 @@ jc_schema_load(struct xsql *db, struct vx_joinctx *jc)
 		if (bt == NULL) continue;
 		jc->sc[side] = (xstore_col_t *)malloc(sizeof(xstore_col_t) * 64);
 		if (jc->sc[side] == NULL) continue;
-		n = xstore_table_schema(bt, jc->tab[side], jc->sc[side], 64);
+		n = vx_table_schema(db, bt, jc->tab[side], jc->sc[side], 64);
+		if (n < -1)
+			return -1;
 		jc->nsc[side] = n > 0 ? n : 0;
 	}
+	return 0;
 }
 
 static void
@@ -5865,7 +5898,7 @@ vx_try_prepare_join(struct xsql *db, sql_arena_t *ast, const sql_select_t *sel,
 	memcpy(jc.tab[1], s1->table.p, s1->table.len); jc.tab[1][s1->table.len] = '\0';
 	if (s0->alias.len && s0->alias.len < 64) { memcpy(jc.alias[0], s0->alias.p, s0->alias.len); jc.alias[0][s0->alias.len] = '\0'; }
 	if (s1->alias.len && s1->alias.len < 64) { memcpy(jc.alias[1], s1->alias.p, s1->alias.len); jc.alias[1][s1->alias.len] = '\0'; }
-	jc_schema_load(db, &jc);
+	if (jc_schema_load(db, &jc) != 0) { rc = -1; goto fallback; }
 
 	/* SELECT * is not supported on the join path (column expansion +
 	 * dedup across two tables); fall back. */
@@ -6180,7 +6213,7 @@ vx_try_prepare_njoin(struct xsql *db, sql_arena_t *ast, const sql_select_t *sel,
 			jc.alias[side][src[side]->alias.len] = '\0';
 		}
 	}
-	jc_schema_load(db, &jc);
+	if (jc_schema_load(db, &jc) != 0) { rc = -1; goto fallback; }
 
 	/* SELECT * + aggregates fall back on the join path. */
 	for (it = sel->cols ? sel->cols->head : NULL; it; it = it->next) {
@@ -6754,7 +6787,7 @@ jsrc_build(struct xsql *db, const char *table, char names[][64], int ncol,
 	js->ncol = ncol;
 	if (ncol > (int)(sizeof js->pay / sizeof js->pay[0])) return -1;
 	if (bt == NULL) return -1;
-	nc = xstore_table_schema(bt, table, cols, 64);
+	nc = vx_table_schema(db, bt, table, cols, 64);
 	if (nc <= 0) return -1;   /* not an xstore table -> fall back (no SQLite source) */
 	for (i = 0; i < ncol; i++) js->pay[i] = -2;
 	for (i = 0; i < ncol; i++)
@@ -8515,7 +8548,9 @@ morsel_bounds(bt_t *bt, uint32_t tid, int64_t lo, int64_t hi, int n_workers,
 	if (b == NULL) return -1;
 	b[0] = lo;
 	if (nm > 1)
-		got = xstore_rowid_split_points(bt, tid, lo, hi, nm - 1, b + 1);
+		/* A hint: with too few cut points the split is uniform. */
+		got = xstore_rowid_split_points(bt, tid, lo, hi, /* RDERR_OK: hint */
+		    nm - 1, b + 1);
 	if (got != nm - 1)                     /* too few separators: uniform */
 		for (i = 1; i < nm; i++) b[i] = lo + (int64_t)i * target;
 	b[nm] = hi;
@@ -8562,8 +8597,17 @@ run_parallel_plan(vx_stmt_t *plan, struct xsql *db, int n_workers,
 	 * rowid (counts tombstones -> a safe upper bound) + 1 for hi and the
 	 * start of the table for lo -- no SQLite call.  An empty table gives
 	 * max 0 -> hi 0 -> no rows. */
-	if (bt != NULL && xstore_table_id(bt, plan->table, &tid)) {
-		int64_t mx = xstore_max_rowid(bt, tid);
+	if (bt != NULL && (i = xstore_table_id(bt, plan->table, &tid)) < 0) {
+		xstore_read_err_catalog(db, i);
+		rc = -1; goto cleanup;           /* unread: not an empty table */
+	}
+	if (bt != NULL && i > 0) {
+		int64_t mx;
+		/* The _txn variant sets the statement's read error; its bound
+		 * also covers buffered rows, still a safe upper bound. */
+		if (xstore_max_rowid_txn(db, tid, &mx) != 0) {
+			rc = -1; goto cleanup;   /* unread: not an empty table */
+		}
 		lo = (mx > 0) ? 1 : 0;
 		hi = (mx > 0) ? mx + 1 : 0;   /* empty -> no scan */
 	}
@@ -8784,7 +8828,8 @@ load_wschema(struct xsql *db, const char *table, struct wschema *ws)
 	{
 		bt_t *bt = xstore_bt_of(db);
 		xstore_col_t cols[64];
-		int nc = bt ? xstore_table_schema(bt, table, cols, 64) : 0, c;
+		int nc = bt ? vx_table_schema(db, bt, table, /* RDERR_OK: rd_err set */
+		    cols, 64) : 0, c;
 		if (nc > 0) {
 			for (c = 0; c < nc && ws->n < 64; c++) {
 				snprintf(ws->name[ws->n], sizeof ws->name[0], "%.*s",
@@ -8948,9 +8993,11 @@ encode_payload(const vx_cell_t *cells, int npay, uint8_t *out, int cap)
 #define VX_MSG_TOOBIG "row too large: the native engine stores at most " \
 	"4096 bytes per row (all columns, encoded)"
 
-/* Upper bound on rows a single native DELETE / UPDATE will touch.  A
- * range matching more than this falls back to the VDBE rather than run
- * unbounded work (and an unbounded native buffer) on one statement. */
+/* Upper bound on rows a single native DELETE, UPDATE, INSERT ... SELECT
+ * or INSERT VALUES will change.  A statement over it fails with "too
+ * many rows" (vx_too_many_err) before it writes anything, rather than
+ * run unbounded work (and an unbounded native buffer) on one statement;
+ * there is no other engine to take it. */
 #define XS_NATIVE_MAX_ROWS  100000
 
 /* Does `e` name the primary-key column (unqualified or table-qualified)? */
@@ -8974,9 +9021,9 @@ lit_int(const sql_expr_t *e, int64_t *out, const vx_cell_t *binds, int nbinds)
  * a rowid range or index prefix from it, and every candidate row is
  * re-checked against the full predicate.  The rows come from the
  * read-your-writes view at the statement snapshot (xstore_stmt_begin).
- * Returns the count into `out` (<= cap), -1 if more than cap rows match
- * OR the predicate is not compilable (the statement is declined), or -2
- * on a scan/setup error. */
+ * Returns the count into `out` (<= cap), -1 if the predicate is not
+ * compilable (the statement is declined), -3 if more than cap rows match
+ * (vx_too_many_err), or -2 on a scan/setup error. */
 static int
 collect_matching(struct xsql *db, bt_t *bt, const char *table,
                  const sql_expr_t *where, int64_t *out, int cap,
@@ -9027,7 +9074,7 @@ collect_matching(struct xsql *db, bt_t *bt, const char *table,
 			if (eval_bool(st, st->filter, st->srcrow, &rowarena) != 1)
 				continue;
 		}
-		if (n >= cap) { ret = -1; goto out; }   /* too many: decline */
+		if (n >= cap) { ret = -3; goto out; }   /* too many */
 		out[n++] = rid;
 	}
 	ret = (step < 0) ? -2 : n;
@@ -9041,6 +9088,20 @@ out:
 	return ret;
 }
 
+/* The error of a statement that changes more than XS_NATIVE_MAX_ROWS
+ * rows: no other engine runs it, so it fails, and says why. */
+static void
+vx_too_many_err(char **errmsg, const char *verb, const char *table)
+{
+	char m[160];
+	if (errmsg == NULL) return;
+	free(*errmsg);
+	snprintf(m, sizeof m, "too many rows: %s on %s changes more than %d "
+	    "rows, the limit for one statement", verb, table,
+	    XS_NATIVE_MAX_ROWS);
+	*errmsg = strdup(m);
+}
+
 /* Read the current visible payload record of one rowid into buf (latest
  * snapshot).  Returns the record length (>=1) if the row exists, 0 if it
  * does not (or is tombstoned), or -1 on error. */
@@ -9048,11 +9109,13 @@ static int
 read_one_row(struct xsql *db, bt_t *bt, const char *table, int64_t rowid, uint8_t *buf, int cap)
 {
 	xstore_scan_t *s;
-	int64_t rid; const uint8_t *rec; int reclen, got = 0;
+	int64_t rid; const uint8_t *rec; int reclen, got = 0, step;
 	(void)bt;
 	s = xstore_scan_open_txn(db, table, 0, rowid, 1, rowid, 1);
 	if (s == NULL) return -1;
-	if (xstore_scan_next(s, &rid, &rec, &reclen) == 1 && rid == rowid) {
+	step = xstore_scan_next(s, &rid, &rec, &reclen);
+	if (step < 0) got = -1;   /* the row is unknown, not absent */
+	if (step == 1 && rid == rowid) {
 		if (reclen > cap) { xstore_scan_close(s); return -1; }
 		memcpy(buf, rec, (size_t)reclen);
 		got = reclen;
@@ -9193,9 +9256,10 @@ vx_write_uniq_err(struct xsql *db, char **errmsg, const char *table,
 }
 
 /* Apply one INSERTed row.  REPLACE overwrites; a plain INSERT must not
- * find the key, checked atomically with the write (xstore_insert_txn),
- * so two concurrent INSERTs of one key cannot both succeed.  Returns 0,
- * or -1 with *errmsg set. */
+ * find the key, checked atomically with the write or, in a transaction
+ * (a multi-row statement's implicit one too), again at the commit
+ * (xstore_insert_txn), so two concurrent INSERTs of one key cannot both
+ * succeed.  Returns 0, or -1 with *errmsg set. */
 static int
 vx_insert_row(struct xsql *db, uint32_t tableid, int64_t rowid,
     const uint8_t *rec, int reclen, int replace, const char *table,
@@ -9251,6 +9315,47 @@ vx_run_write_p(struct xsql *db, const char *sql,
 	return vx_run_write_ast(db, arena, root, binds, nbinds, nchanges, errmsg);
 }
 
+/* End the statement's implicit transaction (a no-op when
+ * xstore_stmt_implicit_begin opened none) and return its result: rc as
+ * it was when the statement failed (its rows are then discarded, so even
+ * a decline to another path is safe) or every row committed, or -1 when
+ * the commit failed.  A UNIQUE violation found by the commit gets the
+ * message the row's own check would have given. */
+static int
+vx_stmt_commit(struct xsql *db, int rc, const char *table, const char *pk,
+    char **errmsg)
+{
+	int e = xstore_stmt_implicit_end(db, rc == 1);
+	if (e == 0 || rc != 1)
+		return rc;          /* a failed statement's rows are discarded */
+	if (e == 1)
+		vx_write_uniq_err(db, errmsg, table, pk);
+	return -1;
+}
+
+/* The rowid of a keyless INSERT row of table `tableid`: past *maxr, the
+ * largest rowid this statement has used or seen.  The table's largest
+ * rowid (this transaction's buffered rows included) is read once, at the
+ * statement's first keyless row, so an INSERT that names every key reads
+ * it never; *have records that it was read.  Returns 0 with *rowid set,
+ * or -1 when that read failed (the statement's read error is set): an
+ * unread maximum is not "empty", since rowid 1 may be taken. */
+static int
+vx_auto_rowid(struct xsql *db, uint32_t tableid, int *have, int64_t *maxr,
+    int64_t *rowid)
+{
+	int64_t m;
+	if (!*have) {
+		if (xstore_max_rowid_txn(db, tableid, &m) != 0)
+			return -1;
+		if (m > *maxr)
+			*maxr = m;
+		*have = 1;
+	}
+	*rowid = *maxr = xstore_next_rowid(db, tableid, *maxr);
+	return 0;
+}
+
 /* The write path over a parsed statement.  Takes ownership of `arena`
  * (destroyed before returning) when it is non-NULL; a cached statement
  * passes NULL and keeps its AST. */
@@ -9267,8 +9372,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	struct wschema ws;
 	struct vx_arena_blk *cell_arena = NULL, *rowarena = NULL;
 	struct vx_stmt *sst = NULL;     /* UPDATE: SET-expression plan */
-	int rc = 0, r, applied = 0;
-	int64_t maxr;
+	int rc = 0, r, applied = 0, have_maxr = 0;
+	int64_t maxr = INT64_MIN;    /* see vx_auto_rowid */
 
 	if (nchanges) *nchanges = 0;
 	if (errmsg) *errmsg = NULL;
@@ -9311,7 +9416,11 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	tabbuf[tname->len] = '\0';
 
 	bt = xstore_bt_of(db);
-	if (bt == NULL || !xstore_table_id(bt, tabbuf, &tableid)) {
+	if (bt != NULL && (r = xstore_table_id(bt, tabbuf, &tableid)) < 0) {
+		xstore_read_err_catalog(db, r);
+		sql_arena_destroy(arena); return -1;  /* unread: not "not ours" */
+	}
+	if (bt == NULL || r == 0) {
 		sql_arena_destroy(arena); return 0;   /* not an xstore table -> VDBE */
 	}
 	if (load_wschema(db, tabbuf, &ws) != 0 || ws.pk_col != 0) {
@@ -9336,8 +9445,10 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		if (rids == NULL) { rc = -1; goto done; }
 		nr = collect_matching(db, bt, tabbuf, root->u.del->where,
 		                      rids, XS_NATIVE_MAX_ROWS, binds, nbinds);
-		if (nr == -1) { free(rids); sql_arena_destroy(arena); return 0; }  /* too many / not compilable -> VDBE */
+		if (nr == -1) { free(rids); sql_arena_destroy(arena); return 0; }  /* not compilable -> VDBE */
+		if (nr == -3) vx_too_many_err(errmsg, "DELETE", tabbuf);
 		if (nr < 0) { free(rids); rc = -1; goto done; }
+		if (nr > 1) (void)xstore_stmt_implicit_begin(db);
 		for (i = 0; i < nr; i++) {
 			if (xstore_write_txn(db, tableid, rids[i], NULL, 0, 1) != 0) {
 				free(rids);
@@ -9428,7 +9539,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		if (rids == NULL) { rc = -1; goto done; }
 		nr = collect_matching(db, bt, tabbuf, up->where,
 		                      rids, XS_NATIVE_MAX_ROWS, binds, nbinds);
-		if (nr == -1) { free(rids); rc = 0; goto done; }  /* too many / not compilable -> VDBE */
+		if (nr == -1) { free(rids); rc = 0; goto done; }  /* not compilable -> VDBE */
+		if (nr == -3) vx_too_many_err(errmsg, "UPDATE", tabbuf);
 		if (nr < 0) { free(rids); rc = -1; goto done; }
 
 		/* A pk reassign sets the primary key to a single constant.  More
@@ -9447,6 +9559,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 				if (pl > 0) { free(rids); rc = 0; goto done; }  /* collision -> VDBE */
 			}
 		}
+		if (nr > 1 || (pk_reassign && nr == 1 && pk_newval.i != rids[0]))
+			(void)xstore_stmt_implicit_begin(db);
 		for (i = 0; i < nr; i++) {
 			uint8_t cur[XS_REC_MAX]; int curlen;
 			vx_cell_t cells[64];
@@ -9532,10 +9646,9 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	}
 
 	/* ---- INSERT INTO t [(col,...)] VALUES (...) ... ----------------- */
-	/* Auto-rowid base includes this txn's buffered rows (so an in-txn
-	 * auto-PK INSERT does not reuse a buffered rowid); outside a txn this
-	 * is the committed max. */
-	maxr = xstore_max_rowid_txn(db, tableid);
+	/* A keyless row's rowid comes from vx_auto_rowid, whose base includes
+	 * this txn's buffered rows (so an in-txn auto-PK INSERT does not reuse
+	 * a buffered rowid); outside a txn it is the committed max. */
 
 	/* ---- INSERT INTO t DEFAULT VALUES -------------------------------
 	 * One row: PK auto-assigned (max committed + 1), every non-PK column
@@ -9547,7 +9660,10 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		vx_cell_t cells[64];
 		uint8_t rec[XS_REC_MAX];
 		int ci, reclen;
-		int64_t rowid = xstore_next_rowid(db, tableid, maxr);
+		int64_t rowid;
+		if (vx_auto_rowid(db, tableid, &have_maxr, &maxr, &rowid) != 0) {
+			rc = -1; goto done;
+		}
 		for (ci = 0; ci < ws.n; ci++) { cells[ci].type = VX_NULL; cells[ci].nbytes = 0; }
 		reclen = encode_payload(&cells[1], ws.n - 1, rec, (int)sizeof rec);
 		if (reclen < 0) {   /* unexpected */
@@ -9612,7 +9728,8 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	 * must return exactly ncolmap columns (one per target slot).  An
 	 * in-txn INSERT..SELECT, a parametrized SELECT, an arity mismatch,
 	 * a non-integer PK, a duplicate PK, or a too-large row falls back
-	 * (writing nothing first).  REPLACE..SELECT overwrites on conflict. */
+	 * (writing nothing first); more than XS_NATIVE_MAX_ROWS rows fail
+	 * with "too many rows".  REPLACE..SELECT overwrites on conflict. */
 	if (ins->select != NULL) {
 		vx_result_t *sres = NULL;
 		const char *ssrc = ins->select->src;
@@ -9634,6 +9751,13 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		scol = vx_result_ncol(sres);
 		if (scol != ncolmap) { vx_result_free(sres); rc = 0; goto done; }
 		srow = vx_result_nrow(sres);
+		/* Before the per-row key checks, which cost time in the row
+		 * count. */
+		if (srow > XS_NATIVE_MAX_ROWS) {
+			vx_result_free(sres);
+			vx_too_many_err(errmsg, "INSERT", tabbuf);
+			rc = -1; goto done;
+		}
 
 		for (sr = 0; sr < srow; sr++) {
 			vx_cell_t cells[64];
@@ -9664,7 +9788,10 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 			if (cells[0].type == VX_INT) {
 				rowid = cells[0].i; if (rowid > maxr) maxr = rowid;
 			} else if (cells[0].type == VX_NULL) {
-				rowid = maxr = xstore_next_rowid(db, tableid, maxr);
+				if (vx_auto_rowid(db, tableid, &have_maxr, &maxr,
+				    &rowid) != 0) {
+					free(buf2); vx_result_free(sres); rc = -1; goto done;
+				}
 			} else { free(buf2); vx_result_free(sres); rc = 0; goto done; }
 
 			if (cells[0].type == VX_INT && !ins->replace) {
@@ -9686,7 +9813,6 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 				if (nn == NULL) { free(buf2); vx_result_free(sres); rc = -1; goto done; }
 				buf2 = nn; cap2 = nc;
 			}
-			if (nb2 >= XS_NATIVE_MAX_ROWS) { free(buf2); vx_result_free(sres); rc = 0; goto done; }
 			reclen = encode_payload(&cells[1], ws.n - 1, buf2[nb2].rec, (int)sizeof buf2[nb2].rec);
 			if (reclen < 0) {
 				free(buf2); vx_result_free(sres);
@@ -9697,6 +9823,7 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 		}
 		vx_result_free(sres);
 
+		if (nb2 > 1) (void)xstore_stmt_implicit_begin(db);
 		for (r = 0; r < nb2; r++) {
 			if (vx_insert_row(db, tableid, buf2[r].rowid, buf2[r].rec,
 			    buf2[r].reclen, ins->replace, tabbuf, ws.name[0],
@@ -9714,11 +9841,18 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	/* Two passes: validate + buffer EVERY row first (no writes); only if
 	 * all rows are literal-only with the right arity and an integer/NULL
 	 * PK do we apply.  Any unsupported row -> return 0 with zero writes,
-	 * a clean VDBE fallback (never a partial native apply). */
+	 * a clean VDBE fallback (never a partial native apply).  More than
+	 * XS_NATIVE_MAX_ROWS tuples fail with "too many rows". */
 	{
 		struct { int64_t rowid; uint8_t rec[XS_REC_MAX]; int reclen; } *buf;
 		int nb = 0;
 
+		/* The buffer takes XS_REC_MAX bytes a tuple, so the limit
+		 * bounds it as it bounds the other statements' buffers. */
+		if (ins->n_rows > XS_NATIVE_MAX_ROWS) {
+			vx_too_many_err(errmsg, "INSERT", tabbuf);
+			rc = -1; goto done;
+		}
 		buf = (void *)calloc((size_t)ins->n_rows, sizeof *buf);
 		if (buf == NULL) { rc = -1; goto done; }
 
@@ -9751,7 +9885,10 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 				rowid = cells[0].i;
 				if (rowid > maxr) maxr = rowid;
 			} else if (cells[0].type == VX_NULL) {
-				rowid = maxr = xstore_next_rowid(db, tableid, maxr);
+				if (vx_auto_rowid(db, tableid, &have_maxr, &maxr,
+				    &rowid) != 0) {
+					free(buf); rc = -1; goto done;
+				}
 			} else { free(buf); rc = 0; goto done; }   /* non-int PK -> VDBE */
 
 			/* PRIMARY KEY uniqueness: a plain INSERT onto an existing
@@ -9791,10 +9928,11 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 			nb++;
 		}
 
-		/* All rows validated: apply.  In a transaction each row is
-		 * buffered (atomic at COMMIT); in autocommit each row commits on
-		 * its own, and a key taken concurrently since the check above
-		 * fails the statement with a UNIQUE error (rows before it stay). */
+		/* All rows validated: apply.  Each row is buffered (atomic at
+		 * COMMIT): in a transaction, or in the statement's implicit one,
+		 * whose commit fails the whole statement if a key was taken
+		 * concurrently since the check above. */
+		if (nb > 1) (void)xstore_stmt_implicit_begin(db);
 		for (r = 0; r < nb; r++) {
 			if (vx_insert_row(db, tableid, buf[r].rowid, buf[r].rec,
 			    buf[r].reclen, ins->replace, tabbuf, ws.name[0],
@@ -9811,6 +9949,9 @@ vx_run_write_ast(struct xsql *db, sql_arena_t *arena, const sql_stmt_t *root,
 	rc = 1;
 
 done:
+	/* The statement's implicit transaction (vx_stmt_commit): its rows
+	 * commit now, all or none. */
+	rc = vx_stmt_commit(db, rc, tabbuf, ws.name[0], errmsg);
 	arena_free(cell_arena);
 	arena_free(rowarena);
 	if (sst != NULL) {
@@ -10376,9 +10517,9 @@ vx_pragma_table_info(struct xsql *db, const char *table, vx_result_t **res)
 	*res = NULL;
 	if (bt == NULL || table == NULL)
 		return 0;
-	nc = xstore_table_schema(bt, table, cols, 64);
+	nc = vx_table_schema(db, bt, table, cols, 64);
 	if (nc <= 0)
-		return 0;                       /* unknown table */
+		return nc < -1 ? -1 : 0;        /* unread / unknown table */
 
 	/* Count user-visible columns (skip a synthetic implicit-rowid). */
 	{
@@ -10458,7 +10599,9 @@ vx_unknown_table(struct xsql *db, const char *sql)
 		if (fr->subquery || fr->table.len == 0 || fr->table.len >= sizeof t)
 			continue;
 		memcpy(t, fr->table.p, fr->table.len); t[fr->table.len] = '\0';
-		if (xstore_table_id(bt, t, &id)) continue;          /* table exists */
+		/* A message only: an unread name is not named missing. */
+		if (xstore_table_id(bt, t, &id) != 0) /* RDERR_OK: message */
+			continue;
 		if (xstore_view_sql(bt, t, vtmp, (int)sizeof vtmp)) continue; /* view */
 		snprintf(namebuf, sizeof namebuf, "%s", t);
 		found = namebuf;

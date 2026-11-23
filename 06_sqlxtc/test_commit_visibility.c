@@ -39,6 +39,7 @@
 #include "xtc_exec.h"
 #include "xtc_proc.h"
 #include "t_tmp.h"
+#include "t_stack.h"
 
 #define ROWS    8
 #define TXNS    150
@@ -178,7 +179,8 @@ main(void)
 	bm_t *bm = NULL;
 	sx_db *ddl = NULL;
 	xtc_exec_t *ex = NULL;
-	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "cv" };
+	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "cv",
+	    .stack_size = T_SQL_STACK };
 	xtc_pid_t pid;
 	int fd, i, nloops;
 

@@ -302,9 +302,11 @@ scenario(int kill, const char *name)
  * boss holds row 2's intent in an open transaction; the connection's
  * autocommit UPDATE of row 2 waits for it; the boss kills the
  * connection while it waits.  The kill must wait for the statement:
- * the proc is still alive 300 ms later, the UPDATE completes once the
+ * the proc is still alive 300 ms later, the UPDATE ends once the
  * holder commits, and only then does the proc exit -- and tear down
- * (EOF, conn slot), which a kill used to skip.
+ * (EOF, conn slot), which a kill used to skip.  The statement ends
+ * without writing: a kill pending at its end discards its row, as it
+ * does a multi-row statement's, so row 2 keeps the holder's value.
  */
 static void
 mid_statement(void)
@@ -363,7 +365,7 @@ mid_statement(void)
 	close(sv[1]);
 	CK(xtc_atomic_load_i32(&g_srv.n, xtc_mo_seq_cst) == 0);
 	v2 = one(h, "SELECT v FROM t WHERE k = 2");
-	CK(v2 == 5);                    /* the statement ran to its end */
+	CK(v2 == 50);                   /* the dead statement wrote nothing */
 	CK(sx_exec(h, "UPDATE t SET v = 1 WHERE k = 2", NULL) == SX_OK);
 	sx_close(h);
 	free(c);

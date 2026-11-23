@@ -220,7 +220,7 @@ main(void)
 	CK(wal_ockpt_begin(w, path, &ok) == XTC_OK);
 	if (ok != NULL) {
 		ok->src_off = 0;
-		CK(wal_ockpt_finish(ok) == XTC_OK);
+		CK(wal_ockpt_finish(ok, NULL) == XTC_OK);
 	}
 	wal_close(w);
 	memset(&s, 0, sizeof s);

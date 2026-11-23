@@ -20,8 +20,13 @@
  *	  (1) commits completed WHILE a checkpoint was between its start
  *	      point and its swap (the quiesced version: 0 -- every commit
  *	      waits at the gate for the whole dump);
- *	  (2) the online checkpoints copied live frames (commits landed in
- *	      the old log during the dump and were carried over);
+ *	  (2) each online checkpoint copied, and counted, at least one live
+ *	      frame per commit acknowledged inside it.  The window is not
+ *	      left to the scheduler: xstore_checkpoint_online_hook holds each
+ *	      checkpoint after its dump and catch-up rounds until a committer
+ *	      has run a whole commit, whose frame only the quiesced finish
+ *	      can then copy.  So the check holds under any load, and it fails
+ *	      if the finish's copies go uncounted (*tail read before it);
  *	  (3) after a crash (no flush, no clean marker) recovery from the
  *	      compacted log alone restores every row's last acknowledged
  *	      value, and the big table intact;
@@ -62,6 +67,7 @@ static char         g_path[256], g_wal[300];
 static int g_left, g_stop, g_in_ckpt;
 static long g_commits, g_during, g_last[NHOT];
 static uint64_t     g_tail;
+static long g_wgen, g_wcommits;  /* the hook's window: odd = open */
 static long         g_max_wal;
 
 #ifdef CK
@@ -91,8 +97,13 @@ committer(void *arg)
 		int row = (int)id + NCMT * (int)(r % (NHOT / NCMT));
 		long val = r * 100 + id;
 		int during = xtc_atomic_load_i32(&g_in_ckpt, xtc_mo_seq_cst);
+		long gen = xtc_atomic_load_long(&g_wgen, xtc_mo_seq_cst);
 		snprintf(sql, sizeof sql, "UPDATE hot SET v=%ld WHERE k=%d", val, row);
 		if (sx_exec(h, sql, NULL) != SX_OK) { g_fail = 1; break; }
+		/* Began and was acknowledged inside one hook window. */
+		if ((gen & 1) &&
+		    xtc_atomic_load_long(&g_wgen, xtc_mo_seq_cst) == gen)
+			xtc_atomic_fetch_add_long(&g_wcommits, 1, xtc_mo_seq_cst);
 		xtc_atomic_store_long(&g_last[row], val, xtc_mo_seq_cst);
 		xtc_atomic_fetch_add_long(&g_commits, 1, xtc_mo_seq_cst);
 		if (during && xtc_atomic_load_i32(&g_in_ckpt, xtc_mo_seq_cst))
@@ -105,6 +116,27 @@ out:
 		sx_storage_quiesce();
 }
 
+/*
+ * xstore_checkpoint_online_hook: runs on the checkpointer between the
+ * checkpoint's catch-up rounds and its quiesced finish, with commits
+ * running.  Opens a window and waits (parked, so the committers on this
+ * loop run) until a commit has both begun and been acknowledged inside
+ * it, then closes it.  That commit's frame is durable, past the start
+ * point and past every catch-up round, so the finish copies it.  Gives
+ * up after ~60 s so a wedged committer fails the test, not hangs it.
+ */
+static void
+ock_window(void)
+{
+	long c0 = xtc_atomic_load_long(&g_wcommits, xtc_mo_seq_cst);
+	int ms;
+	xtc_atomic_fetch_add_long(&g_wgen, 1, xtc_mo_seq_cst);
+	for (ms = 0; ms < 60000 &&
+	    xtc_atomic_load_long(&g_wcommits, xtc_mo_seq_cst) == c0; ms++)
+		(void)xtc_proc_sleep(1000LL * 1000);
+	xtc_atomic_fetch_add_long(&g_wgen, 1, xtc_mo_seq_cst);
+}
+
 static void
 checkpointer(void *arg)
 {
@@ -113,7 +145,7 @@ checkpointer(void *arg)
 	(void)xtc_proc_sleep(20LL * 1000 * 1000);     /* let commits start */
 	for (i = 0; i < CHECKPOINTS; i++) {
 		uint64_t tail = 0;
-		long sz;
+		long sz, w0 = xtc_atomic_load_long(&g_wcommits, xtc_mo_seq_cst);
 		xtc_atomic_store_i32(&g_in_ckpt, 1, xtc_mo_seq_cst);
 		if (g_quiesced) {
 			xstore_quiesce_begin();
@@ -125,6 +157,12 @@ checkpointer(void *arg)
 			    sx_storage_wal(), sx_storage_wal_path(), &tail) == XTC_OK);
 		}
 		xtc_atomic_store_i32(&g_in_ckpt, 0, xtc_mo_seq_cst);
+		if (!g_quiesced) {
+			long seen = xtc_atomic_load_long(&g_wcommits,
+			    xtc_mo_seq_cst) - w0;
+			CK(seen >= 1);
+			CK(tail >= (uint64_t)seen);   /* one frame per commit, at least */
+		}
 		g_tail += tail;
 		if ((sz = wal_bytes()) > g_max_wal) g_max_wal = sz;
 		(void)xtc_proc_sleep(5LL * 1000 * 1000);
@@ -238,6 +276,8 @@ main(void)
 	sx_close(h);
 
 	xtc_atomic_store_i32(&g_left, NCMT, xtc_mo_seq_cst);
+	if (!g_quiesced)
+		xstore_checkpoint_online_hook(ock_window);
 	if (xtc_loop_create(&loop) != XTC_OK) return 1;
 	CK(sx_storage_run(loop) == SX_OK);
 	for (i = 0; i < NCMT; i++)
@@ -248,6 +288,7 @@ main(void)
 		return 1;
 	if (xtc_loop_run(loop) != XTC_OK) return 1;
 	xtc_loop_destroy(loop);
+	xstore_checkpoint_online_hook(NULL);
 
 	/* crash, then recover from the (compacted) log alone */
 	sx_storage_abandon();
@@ -270,7 +311,6 @@ main(void)
 	    xtc_atomic_load_long(&g_during, xtc_mo_seq_cst),
 	    (unsigned long long)g_tail, g_max_wal / 1024, bad);
 	CK(xtc_atomic_load_long(&g_during, xtc_mo_seq_cst) > 0);
-	CK(g_quiesced || g_tail > 0);
 	CK(bad == 0);
 	CK(g_max_wal < 16L * 1024 * 1024);          /* compacted (~4 MB live) */
 	(void)sx_storage_close();

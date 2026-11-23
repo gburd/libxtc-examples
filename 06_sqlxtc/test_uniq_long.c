@@ -43,7 +43,8 @@
  *	    a failed cursor read ended the scan early.  A failed scan says
  *	    so ("index error: cannot read index r_g on r: I/O error"), not
  *	    "unsupported SQL (native engine)", and a failed scan left open
- *	    holds no latch: a write into its leaf goes through.
+ *	    holds no latch: a write into its leaf goes through.  Each
+ *	    failed read is counted in xstore_read_errors() (read_errors=).
  *	(7) The same for a transaction whose buffered rows were spilled to
  *	    the STEAL staging area: the n-th read fails, and the first n of
  *	    them are the staging area's (bringing a spilled payload back).
@@ -403,11 +404,13 @@ sweep_count(sx_db *h, const char *sql, const char *v, int64_t want)
 	sx_stmt *st = NULL;
 	int n, rc, errs = 0;
 	int64_t got;
+	uint64_t e0;
 	for (n = 1; n < 1000; n++) {
 		got = -1;
 		CK(sx_prepare(h, sql, -1, &st, NULL) == SX_OK);
 		if (v != NULL)
 			sx_bind_text(st, 1, v, -1);
+		e0 = xstore_read_errors();
 		xstore_index_read_fail_at(n);
 		rc = sx_step(st);
 		if (rc == SX_ROW)
@@ -415,6 +418,8 @@ sweep_count(sx_db *h, const char *sql, const char *v, int64_t want)
 		sx_finalize(st);
 		if (xstore_index_read_fail_at(0) > 0)
 			break; /* fewer than n reads: nothing failed */
+		/* The metric (read_errors=) counts every failed read. */
+		CK(rc == SX_ROW || xstore_read_errors() > e0);
 		if (rc == SX_ROW && got != want) {
 			fprintf(stderr,
 			    "  %s: read %d failed, count %lld, "
@@ -562,11 +567,13 @@ t_read_errors(sx_db *h)
 	/* A duplicate long value, then a new one: the duplicate never goes
 	 * in, the new one goes in or fails. */
 	for (n = 1; n < 1000; n++) {
+		uint64_t e0 = xstore_read_errors();
 		xstore_index_read_fail_at(n);
 		rc = ins_tab(h, "r", 2000 + n, a);
 		if (xstore_index_read_fail_at(0) > 0)
 			break;
 		CK(rc != SX_DONE);
+		CK(rc == SX_CONSTRAINT || xstore_read_errors() > e0);
 	}
 	CK(n > 1 && n < 1000);
 	CK(ins_tab(h, "r", 2000, a) != SX_DONE);

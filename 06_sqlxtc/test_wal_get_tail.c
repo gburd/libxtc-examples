@@ -133,7 +133,7 @@ main(void)
 	fn(ctx, "ock", 3);
 	CK(wal_commit_sync(w, "concurrent", 10, &lsn) == XTC_OK);
 	CK(wal_ockpt_catchup(k, &left) == XTC_OK);
-	CK(wal_ockpt_finish(k) == XTC_OK);
+	CK(wal_ockpt_finish(k, NULL) == XTC_OK);
 	CK(same_as_scan(w, path, "online checkpoint"));
 	wal_close(w);
 

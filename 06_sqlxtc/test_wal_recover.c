@@ -38,6 +38,7 @@
 #include "xtc_loop.h"
 #include "xtc_proc.h"
 #include "t_tmp.h"
+#include "t_stack.h"
 
 #define N_TXN     40          /* explicit transactions, 2 rows each */
 #define N_AUTO    20          /* autocommit single-row inserts */
@@ -106,7 +107,8 @@ int
 main(void)
 {
 	xtc_loop_t *loop = NULL;
-	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "rec-worker" };
+	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "rec-worker",
+	    .stack_size = T_SQL_STACK };
 	xtc_pid_t w;
 	wal_opts_t wo = { 0 };
 	bm_opts_t bo = BM_OPTS_DEFAULT, b2 = BM_OPTS_DEFAULT;

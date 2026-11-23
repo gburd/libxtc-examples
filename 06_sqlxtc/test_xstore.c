@@ -32,6 +32,7 @@
 #include "xtc_loop.h"
 #include "xtc_proc.h"
 #include "t_tmp.h"
+#include "t_stack.h"
 
 #define N_ROWS    4000
 #define ROW_BYTES 200
@@ -165,7 +166,8 @@ scenario_onloop(void)
 	xtc_loop_t *loop = NULL;
 	bm_opts_t bo = BM_OPTS_DEFAULT;
 	char path[256]; t_tmpl(path, sizeof path, "sqlxtc-xstore2");
-	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "sql" };
+	xtc_proc_opts_t po = { .size = sizeof(xtc_proc_opts_t), .name = "sql",
+	    .stack_size = T_SQL_STACK };
 	xtc_pid_t pid;
 	int fd;
 

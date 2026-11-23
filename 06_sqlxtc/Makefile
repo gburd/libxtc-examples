@@ -187,7 +187,7 @@ clean:
 	rm -f test_btree_loop
 	rm -f test_btree_mt
 	rm -f test_btree_stale_descent test_btree_limits test_btree_sample bench_morsel_balance bench_point_iscan
-	rm -f test_btree_seek test_btree_seek_latched test_point_read test_index_walk test_group_exact test_xs_ctr
+	rm -f test_btree_seek test_btree_seek_latched test_point_read test_index_walk test_group_exact test_xs_ctr test_read_errors test_stmt_atomic test_insert_race
 	rm -f $(LATCHED_TESTS:=_latched)
 	rm -f test_xs_ctr test_bm_reuse_version test_kill_stmt test_cat_lock_shared test_conn_sup test_storage_sup
 	rm -f test_sql_results test_txn_fastpath test_wal_crc_once
@@ -318,6 +318,12 @@ test_torn_smo: test_torn_smo.c $(ENGINE_NATIVE)
 
 test-torn-smo: test_torn_smo
 	./test_torn_smo
+
+# Read-error gate: every B-tree read's error propagates or carries an
+# RDERR_OK marker (test/test_rderr_sites.py).
+test: test-rderr-sites
+test-rderr-sites:
+	python3 -B test/test_rderr_sites.py .
 
 # Elias-Fano chunks, the keydir's static stage (STORAGE_DESIGN 5.2).
 test: test-ef
@@ -731,8 +737,10 @@ test_idx_trust: test_idx_trust.c $(ENGINE_NATIVE)
 test-idx-trust: test_idx_trust
 	TMPDIR=$${TMPDIR:-/tmp} ./test_idx_trust
 
-# The crash oracle: 8 seeds in `test` (~10 s); the long sweep takes
-# ORACLE_SEEDS / ORACLE_FIRST.
+# The crash oracle (kill -9 at a random time, one-row, explicit-txn and
+# multi-row autocommit statements, plus planned kills of each multi-row
+# kind before and after its commit record is durable): 8 seeds in `test`
+# (~40 s); the long sweep takes ORACLE_SEEDS / ORACLE_FIRST.
 test_crash_oracle: test_crash_oracle.c $(ENGINE_NATIVE)
 	$(CC) $(CFLAGS) -o $@ test_crash_oracle.c $(ENGINE_NATIVE) $(LDFLAGS)
 
@@ -1119,6 +1127,31 @@ test_index_walk: test_index_walk.c $(ENGINE_NATIVE)
 test-index-walk: test_index_walk
 	./test_index_walk
 
+# A failed read of one row or catalog entry is an error, never "absent".
+test: test-read-errors
+test_read_errors: test_read_errors.c $(ENGINE_NATIVE)
+	$(CC) $(CFLAGS) -o $@ test_read_errors.c $(ENGINE_NATIVE) $(LDFLAGS)
+
+test-read-errors: test_read_errors
+	./test_read_errors
+
+# A multi-row autocommit statement that fails partway commits no row.
+test: test-stmt-atomic
+test_stmt_atomic: test_stmt_atomic.c $(ENGINE_NATIVE)
+	$(CC) $(CFLAGS) -o $@ test_stmt_atomic.c $(ENGINE_NATIVE) $(LDFLAGS)
+
+test-stmt-atomic: test_stmt_atomic
+	./test_stmt_atomic
+
+# Multi-row autocommit INSERTs racing on a key report UNIQUE, not a
+# serialization failure, and stay atomic (plain threads).
+test: test-insert-race
+test_insert_race: test_insert_race.c $(ENGINE_NATIVE)
+	$(CC) $(CFLAGS) -o $@ test_insert_race.c $(ENGINE_NATIVE) $(LDFLAGS)
+
+test-insert-race: test_insert_race
+	TMPDIR=$${TMPDIR:-/tmp} ./test_insert_race
+
 # GROUP BY / DISTINCT keep integer keys exact (2^53 vs 2^53+1).
 test: test-group-exact
 test_group_exact: test_group_exact.c $(ENGINE_NATIVE)
@@ -1182,6 +1215,7 @@ test/test_sql_parse: test/test_sql_parse.c \
         sql_parse.o $(LIME_OBJ)
 	$(CC) $(CFLAGS) -o $@ $< sql_parse.o $(LIME_OBJ)
 
+.PHONY: test-rderr-sites
 .PHONY: test-quack test-quack-range test-sql-parse-par-ord-join-run test-oracle test-compat
 
 # ---- NUMA buffer-pool sharing-degree PREMISE PROBE (research spike) ----

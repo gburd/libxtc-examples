@@ -84,6 +84,7 @@
 #define XS_LK_SSI  9u   /* SSI registry */
 /* slot 10 (XS_LK_SNAP, the snapshot registry) retired: lock-free now */
 #define XS_LK_COMMIT 11u /* commit validation + timestamp + in-flight registry */
+#define XS_LK_DDL  12u  /* one DDL statement at a time (xstore_ddl_lock) */
 static uint64_t g_cat_locks; /* XS_LK_CAT acquisitions (metric) */
 static uint64_t g_cat_scans; /* catalog-tree scans (metric) */
 /*
@@ -326,6 +327,9 @@ static void xs_visible_catchup_locked(void);
  * lock.  g_wal_busy counts log writes in progress (any xs_wal_emit). */
 static int g_ckpt_gate;
 static int g_wal_busy;
+/* Set by xstore_quiesce_final (the engine is stopping and holds the gate
+ * for good), cleared when a log is attached (xs_commit_state_reset). */
+static int g_xs_stopped;
 static void xs_gate_wait_locked(void);
 
 /* The static engine amutexes, cached: xtc_amutex_static takes a global
@@ -559,6 +563,8 @@ typedef struct xstore_ctx {
 	 */
 	int              native_mode;       /* 1 == driver owns autocommit */
 	int              native_autocommit; /* 1 == autocommit (native_mode only) */
+	int              implicit;     /* an autocommit statement's own txn */
+	uint64_t         stmt_snap;    /* the statement's pinned snapshot */
 
 	/* (tableid,rowid) -> newest wbuf index (O(1) read-your-writes) and
 	 * (unique index, key tuple hash) -> wbuf index (own-write UNIQUE
@@ -567,10 +573,13 @@ typedef struct xstore_ctx {
 	int              wmap_n, wmap_cap, wmap_bad;
 	struct xs_umap { uint64_t h; uint32_t idx_id; int wi; } *umap;
 	int              umap_n, umap_cap;
+	int              umap_bad;    /* a row is missing from the umap */
 	uint64_t         uniq_vis;    /* horizon of the txn's UNIQUE checks */
 	uint64_t         uniq_gen;    /* index generation at those checks */
 	char             uniq_err[192]; /* last UNIQUE violation message */
-	char             rd_err[192];   /* this statement's index read error */
+	char             rd_err[192];   /* this statement's first read error */
+	uint32_t         rd_tid;        /* or a table read error, named later */
+	int              rd_rc;         /* its XTC_E_* code; 0: none */
 	/* Largest buffered rowid per table (xstore_max_rowid_txn), kept by
 	 * wbuf_add; a truncate/clear invalidates it (wmax_ok = 0) and the
 	 * next query rebuilds it with one pass. */
@@ -671,6 +680,7 @@ wbuf_clear(xstore_ctx_t *c)
 	for (i = 0; i < c->umap_cap; i++) c->umap[i].wi = -1;
 	c->wmap_n = c->umap_n = 0;
 	c->wmap_bad = 0;
+	c->umap_bad = 0;
 	c->uniq_vis = 0;
 	c->wmax_n = 0;
 	c->wmax_ok = 1;
@@ -762,7 +772,7 @@ rset_add(xstore_ctx_t *c, uint32_t tableid, int64_t rowid)
  *
  * The outgoing edge (something I read was overwritten by a committed
  * transaction after my snapshot) is detected from the shared B-tree's
- * version timestamps (xs_newest_ts), so it catches overwrites by any
+ * version timestamps (xs_newer_than), so it catches overwrites by any
  * committer regardless of its isolation level.  The incoming edge
  * (someone read what I am about to write) cannot be read from the
  * B-tree -- reads leave no version -- so serializable transactions
@@ -1324,29 +1334,164 @@ xstore_ctx_of(struct xsql *db)
 	return e != NULL ? e->ctx : NULL;
 }
 
+static int g_row_failat;    /* test hook: the row read to fail, 1-based */
+static int g_row_faults;    /* test hook: reads it has failed */
+static uint64_t g_rd_errors; /* reads that failed (metric) */
+
+/* Count a read of the tree that failed with rc (any XTC_E_* but
+ * XTC_E_NOTFOUND): the read-error metric (xstore_read_errors).  Returns
+ * rc, so a caller can count and return in one step. */
+static int
+xs_rd_count(int rc)
+{
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+		xtc_atomic_fetch_add_u64(&g_rd_errors, 1, xtc_mo_relaxed);
+	return rc;
+}
+
+/* Should this read of one row's or one catalog entry's versions, outside
+ * a scan, fail (xstore_row_read_fail_at)?  One relaxed load when
+ * disarmed. */
+static int
+xs_row_fault(void)
+{
+	if (xtc_atomic_load_i32(&g_row_failat, xtc_mo_relaxed) <= 0 ||
+	    xtc_atomic_fetch_sub_i32(&g_row_failat, 1, xtc_mo_relaxed) != 1)
+		return 0;
+	(void)xtc_atomic_fetch_add_i32(&g_row_faults, 1, xtc_mo_relaxed);
+	return 1;
+}
+
+int
+xstore_row_read_fail_at(int n)
+{
+	return xtc_atomic_exchange_i32(&g_row_failat, n, xtc_mo_relaxed);
+}
+
+static int g_reap_fail;     /* test hook: every reap read fails */
+
+/* Should this read of the UNIQUE reap's reuse check fail
+ * (xstore_reap_read_fail)?  One relaxed load when disarmed. */
+static int
+xs_reap_fault(void)
+{
+	if (xtc_atomic_load_i32(&g_reap_fail, xtc_mo_relaxed) == 0)
+		return 0;
+	(void)xtc_atomic_fetch_add_i32(&g_row_faults, 1, xtc_mo_relaxed);
+	return 1;
+}
+
+int
+xstore_reap_read_fail(int on)
+{
+	return xtc_atomic_exchange_i32(&g_reap_fail, on != 0, xtc_mo_relaxed);
+}
+
+int
+xstore_row_read_faults(void)
+{
+	return xtc_atomic_load_i32(&g_row_faults, xtc_mo_relaxed);
+}
+
+/* Record that a read of table `tid` failed with rc, as the statement's
+ * first read error unless it has one.  xstore_read_err() formats it as
+ * "cannot read table T: <rc>"; the name is looked up there, since the
+ * caller may hold the commit lock, which ranks after the cat lock. */
+static void
+xs_rd_err_tid(xstore_ctx_t *cx, uint32_t tid, int rc)
+{
+	if (cx == NULL || cx->rd_err[0] != '\0' || cx->rd_rc != 0)
+		return;
+	cx->rd_tid = tid;
+	cx->rd_rc = rc;
+}
+
+/* Forget the statement's read error. */
+static void
+xs_rd_err_clear(xstore_ctx_t *cx)
+{
+	cx->rd_err[0] = '\0';
+	cx->rd_rc = 0;
+}
+
+/* True if the running statement must not commit: one of its reads failed
+ * (a failed read need not fail the step that made it: a subquery reads
+ * as NULL), or a kill is pending for the connection's proc.  Every
+ * autocommit commit of a statement checks it, the one-row direct write
+ * and the implicit transaction alike, so a failed statement leaves
+ * nothing on every path. */
+static int
+xs_stmt_doomed(const xstore_ctx_t *cx)
+{
+	return cx->rd_rc != 0 || cx->rd_err[0] != '\0' ||
+	    xtc_cancel_requested();
+}
+
+uint64_t
+xstore_read_errors(void)
+{
+	return xtc_atomic_load_u64(&g_rd_errors, xtc_mo_relaxed);
+}
+
+/* Open a cursor over catalog `cat` (from its first key) for a walk of
+ * its entries; one read of the row-read fault hook.  XTC_OK or the
+ * error, counted. */
+static int
+xs_cat_open(bt_t *bt, uint32_t cat, bt_cursor_t **cur)
+{
+	uint8_t startk[XS_VKLEN];
+	int rc;
+	enc_vkey(cat, INT64_MIN, ~(uint64_t)0, startk);
+	rc = bt_cursor_open(bt, startk, XS_VKLEN, cur);
+	if (rc == XTC_OK && xs_row_fault()) {
+		bt_cursor_close(*cur);
+		*cur = NULL;
+		rc = XTC_E_IO;
+	}
+	return xs_rd_count(rc);
+}
+
+/* The next entry of a catalog walk: XTC_OK, XTC_E_NOTFOUND at the end of
+ * the tree, or a read's error, counted.  One read of the row-read fault
+ * hook per entry, so a test can fail a walk between entries. */
+static int
+xs_cat_next(bt_cursor_t *cur, const void **k, uint16_t *klen,
+    const void **vv, uint16_t *vl)
+{
+	int rc = bt_cursor_next(cur, k, klen, vv, vl);
+	if (rc == XTC_OK && xs_row_fault())
+		rc = XTC_E_IO;
+	return xs_rd_count(rc);
+}
+
 /* Look up `name` in the persisted catalog (table-id 0): the newest
  * non-tombstone catalog row whose value equals `name`.  Returns its id
- * (the row's rowid), or 0 if the catalog has no override for it. */
+ * (the row's rowid), or 0 if the catalog has no row for it; a read that
+ * failed returns 0 with its XTC_E_* code in *err (the name may well be
+ * taken: a caller must not create it or call it gone). */
 static uint32_t
-xs_cat_lookup(bt_t *bt, const char *name)
+xs_cat_lookup(bt_t *bt, const char *name, int *err)
 {
 	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
 	size_t want = strlen(name);
-	int64_t last_rowid = 0; int have_last = 0;
+	int64_t last_rowid = 0; int have_last = 0, rc;
 	uint32_t found = 0;
 
+	*err = 0;
 	xtc_atomic_fetch_add_u64(&g_cat_scans, 1, xtc_mo_relaxed);
-	enc_vkey(XS_CAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
+	if ((rc = xs_cat_open(bt, XS_CAT_TABLEID, &cur)) != XTC_OK) {
+		*err = rc;
 		return 0;
+	}
 	for (;;) {
 		const void *k = NULL, *vv = NULL;
 		uint16_t klen = 0, vl = 0;
 		const uint8_t *kb, *vb;
 		int64_t rid;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN)
+		rc = xs_cat_next(cur, &k, &klen, &vv, &vl);
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+			*err = rc;
+		if (rc != XTC_OK || klen != XS_VKLEN)
 			break;
 		kb = (const uint8_t *)k; vb = (const uint8_t *)vv;
 		if (dec_tableid(kb) != XS_CAT_TABLEID)
@@ -1392,7 +1537,10 @@ xs_cat_prime(bt_t *bt, const char *name, uint32_t id)
 	uint8_t val[1024];
 	int vlen, i, j;
 	if (id == 0 || strlen(name) >= sizeof g_cat[0].name) return;
-	vlen = xs_cat_value(bt, name, val, (int)sizeof val - 1);
+	/* A cache fill: unread, nothing is cached. */
+	vlen = xs_cat_value(bt, name, val, (int)sizeof val - 1);   /* RDERR_OK: fill */
+	if (vlen < 0)
+		return;      /* unread: a cache entry would lack the schema */
 	xs_cat_lock();
 	for (i = 0; i < g_cat_n; i++)
 		if (g_cat[i].bt == bt && strcasecmp(g_cat[i].name, name) == 0) {
@@ -1418,17 +1566,23 @@ xs_cat_prime(bt_t *bt, const char *name, uint32_t id)
 
 static int xs_put(bt_t *bt, uint32_t tableid, int64_t rowid,
     const void *blob, int n, int deleted);   /* defined below */
-static uint32_t xs_cat_high(bt_t *bt, uint32_t cat);   /* defined below */
+static int xs_cat_high(bt_t *bt, uint32_t cat, uint32_t *out);   /* below */
 
 /* Map (bt, name) to its allocated table-id: the in-process cache, then
  * the persisted catalog, else allocate a fresh dense id and persist it.
- * Returns the id (>= 1), or 0 only if a new id could not be written. */
+ * Returns the id (>= 1), or 0 if a new id could not be written or the
+ * catalog could not be read; *rderr (if not NULL) is then the read's
+ * XTC_E_* code, or 0 for a failed write.  *created (if not NULL) is set
+ * to 1 when this call allocated the id. */
 static uint32_t
-xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs)
+xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs,
+    int *created, int *rderr)
 {
-	uint32_t id = 0, maxid;
-	int i, do_persist = 0;
+	uint32_t id = 0, maxid = 0;
+	int i, do_persist = 0, err;
 
+	if (created != NULL) *created = 0;
+	if (rderr != NULL) *rderr = 0;
 	xs_cat_lock();
 	for (i = 0; i < g_cat_n; i++)            /* seen in this process? */
 		if (g_cat[i].bt == bt && strcasecmp(g_cat[i].name, name) == 0) {
@@ -1436,11 +1590,19 @@ xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs)
 			xs_cat_unlock();
 			return id;
 		}
-	id = xs_cat_lookup(bt, name);            /* persisted (create/rename/recovery)? */
-	if (id == 0) {
+	/* Persisted (create/rename/recovery)?  An unread lookup or mark
+	 * returns id 0, this function's failure. */
+	id = xs_cat_lookup(bt, name, &err);   /* RDERR_OK: err: 0 */
+	if (err == 0 && id == 0)
 		/* New table: allocate past both the persisted high-water id
 		 * and any id reserved in-process but not yet written. */
-		maxid = xs_cat_high(bt, XS_CAT_TABLEID);
+		err = xs_cat_high(bt, XS_CAT_TABLEID, &maxid);   /* RDERR_OK: err: 0 */
+	if (err != 0) {                          /* unread: nothing known */
+		xs_cat_unlock();
+		if (rderr != NULL) *rderr = err;
+		return 0;
+	}
+	if (id == 0) {
 		for (i = 0; i < g_cat_n; i++)
 			if (g_cat[i].bt == bt && g_cat[i].tableid > maxid)
 				maxid = g_cat[i].tableid;
@@ -1490,6 +1652,7 @@ xs_cat_find_or_create(bt_t *bt, const char *name, const char *coldefs)
 		xs_cat_unlock();
 		if (prc != SX_OK)
 			return 0;
+		if (created != NULL) *created = 1;
 		return id;
 	}
 	xs_cat_unlock();
@@ -1654,6 +1817,7 @@ struct xs_idx_rt {
 	char     kind;              /* 'p' / 'u' / 'i' */
 	int      kmax;              /* bt_max_key: the entry bound */
 	uint64_t k0, k1;            /* SipHash key of truncated entries */
+	int      broken;            /* XTC_E_* of a failed rebuild, or 0 */
 };
 struct xs_idx_ent {
 	bt_t    *bt;
@@ -1663,7 +1827,14 @@ struct xs_idx_ent {
 	char     col[XS_IDX_NCOL][64];
 };
 static struct xs_idx_ent g_idx[XS_IDX_MAX];
+/* g_idx[] and g_idx_n change only under the cat lock.  The "any index?"
+ * fast paths read g_idx_n without it, so every write of g_idx_n is a
+ * release store (XS_IDX_N_SET, after the entry it exposes is written) and
+ * every unlocked read an acquire load (XS_IDX_ANY).  Only the count is read
+ * without the lock; the entries are always read under it. */
 static int g_idx_n;
+#define XS_IDX_N_SET(v) xtc_atomic_store_i32(&g_idx_n, (v), xtc_mo_release)
+#define XS_IDX_ANY() (xtc_atomic_load_i32(&g_idx_n, xtc_mo_acquire) > 0)
 static uint64_t g_idx_gen; /* bumped by every index create */
 /* Set when an index entry may be missing (an insert failed, a build ran
  * short, an index is not maintained): the indexes are then not trusted at
@@ -1717,7 +1888,11 @@ xs_idx_cache_forget_locked(bt_t *bt)
 {
 	int i;
 	for (i = 0; i < g_idx_n; ) {
-		if (g_idx[i].bt == bt) { g_idx[i] = g_idx[--g_idx_n]; XS_CATC_BUMP(); }
+		if (g_idx[i].bt == bt) {
+			g_idx[i] = g_idx[g_idx_n - 1];
+			XS_IDX_N_SET(g_idx_n - 1);
+			XS_CATC_BUMP();
+		}
 		else i++;
 	}
 }
@@ -1878,14 +2053,16 @@ xs_idx_prefix(uint32_t idx_id, uint8_t *out)
 }
 
 /* Resolve index columns `col[0..ncol)` of `table` to payload positions
- * (0-based over the non-rowid columns; -1 = the rowid).  Returns 0, or
- * -1 if the table or a column is unknown. */
+ * (0-based over the non-rowid columns; -1 = the rowid).  Returns 0, -1
+ * if the table or a column is unknown, or the XTC_E_* code (below -1)
+ * of a catalog read that failed. */
 static int
 xs_idx_resolve(bt_t *bt, const char *table, char col[][64], int ncol, int *pay)
 {
 	xstore_col_t cols[64];
 	int n, i, c;
 	n = xstore_table_schema(bt, table, cols, 64);
+	if (n < -1) return n;                /* unread */
 	if (n <= 0) return -1;
 	for (i = 0; i < ncol; i++) {
 		pay[i] = -2;
@@ -2062,7 +2239,7 @@ xs_idx_for_table(bt_t *bt, uint32_t tableid, struct xs_idx_rt *hits, int cap)
 	static _Thread_local unsigned tnext;
 	uint64_t g;
 	int n = 0, i, k;
-	if (g_idx_n == 0) return 0;
+	if (!XS_IDX_ANY()) return 0;
 	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_acquire);
 	for (k = 0; k < 4; k++)
 		if (tc[k].gen == g && tc[k].bt == bt && tc[k].tid == tableid &&
@@ -2120,20 +2297,34 @@ static int xs_inflight_writes(uint32_t tid, int64_t rid);
 
 /* Does any version of (rt->tableid, rowid) committed at or after `ts`
  * carry index key `key` (with rowid suffix)?  Such a version (re)uses
- * the entry, so it must survive the reap. */
+ * the entry, so it must survive the reap.  A read that fails answers
+ * "used" (counted): a stale entry costs a candidate fetch, a missing one
+ * lets a duplicate UNIQUE value in. */
 static int
 xs_idx_key_reused(bt_t *bt, const struct xs_idx_rt *rt, int64_t rowid,
     uint64_t ts, const uint8_t *key, int klen)
 {
 	bt_cursor_t *cur = NULL;
 	uint8_t startk[XS_VKLEN], kk[XS_IDX_KMAX];
-	int used = 0, kl;
+	int used = 0, kl, rc;
 	enc_vkey(rt->tableid, rowid, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) return 1;
+	rc = bt_cursor_open(bt, startk, XS_VKLEN, &cur);   /* RDERR_OK: "used" */
+	if (rc != XTC_OK) {
+		(void)xs_rd_count(rc);
+		return 1;
+	}
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t kln = 0, vl = 0;
 		const uint8_t *kb;
-		if (bt_cursor_next(cur, &k, &kln, &vv, &vl) != XTC_OK || kln != XS_VKLEN)
+		rc = bt_cursor_next(cur, &k, &kln, &vv, &vl);   /* RDERR_OK: "used" */
+		if (rc == XTC_OK && (xs_row_fault() || xs_reap_fault()))
+			rc = XTC_E_IO;
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+			(void)xs_rd_count(rc);
+			used = !XTC_DST_BUG(XTC_DST_BUG_REAPREAD); /* planted 86 */
+			break;
+		}
+		if (rc != XTC_OK || kln != XS_VKLEN)
 			break;
 		kb = (const uint8_t *)k;
 		if (dec_tableid(kb) != rt->tableid || dec_rowid(kb) != rowid ||
@@ -2192,7 +2383,9 @@ xs_idx_reap(bt_t *bt)
 			free(d->key);
 			continue;                     /* retry on a later reap */
 		}
-		keep = xs_idx_key_reused(bt, &rt, d->rowid, d->ts, d->key, d->klen);
+		/* A read error answers "used": the entry is kept. */
+		keep = xs_idx_key_reused(bt, &rt, d->rowid, /* RDERR_OK: kept */
+		    d->ts, d->key, d->klen);
 		if (!keep)
 			(void)bt_delete(bt, d->key, d->klen);
 		xs_commit_unlock();
@@ -2228,7 +2421,9 @@ xs_idx_drain(bt_t *bt)
 		if (d.ts > hz || xs_inflight_writes(d.tableid, d.rowid))
 			xtc_atomic_fetch_add_u64(&g_idx_garbage, 1,
 			    xtc_mo_relaxed); /* a snapshot still needs it */
-		else if (!xs_idx_key_reused(bt, &rt, d.rowid, d.ts, d.key, d.klen))
+		/* A read error answers "used": the entry is kept. */
+		else if (!xs_idx_key_reused(bt, &rt, /* RDERR_OK: kept */
+		    d.rowid, d.ts, d.key, d.klen))
 			(void)bt_delete(bt, d.key, d.klen);
 		xs_commit_unlock();
 		free(d.key);
@@ -2390,9 +2585,10 @@ xs_idx_preimage(bt_t *bt, uint32_t tableid, int64_t rowid,
     uint8_t *buf, int cap)
 {
 	int n;
-	if (g_idx_n == 0) return 0;   /* no indexes: skip the read entirely */
+	if (!XS_IDX_ANY()) return 0;  /* no indexes: skip the read entirely */
 	n = xs_read_rec(bt, tableid, rowid, buf, cap);
 	if (n < 0) {
+		(void)xs_rd_count(n);
 		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 		return 0;
 	}
@@ -2478,7 +2674,7 @@ umap_put(xstore_ctx_t *c, uint64_t h, uint32_t idx_id, int wi)
 		int nc = c->umap_cap ? c->umap_cap * 2 : 64, k;
 		struct xs_umap *nm = malloc(sizeof *nm * (size_t)nc), *om = c->umap;
 		int ocap = c->umap_cap;
-		if (nm == NULL) return;   /* commit-time validation still catches it */
+		if (nm == NULL) { c->umap_bad = 1; return; }
 		for (k = 0; k < nc; k++) nm[k].wi = -1;
 		c->umap = nm; c->umap_cap = nc; c->umap_n = 0;
 		for (k = 0; k < ocap; k++)
@@ -2502,6 +2698,7 @@ wmaps_rebuild(xstore_ctx_t *c)
 	for (i = 0; i < c->umap_cap; i++) c->umap[i].wi = -1;
 	c->wmap_n = c->umap_n = 0;
 	c->wmap_bad = 0;
+	c->umap_bad = 0;
 	for (i = 0; i < c->wn; i++) {
 		wmap_put(c, c->wbuf[i].tableid, c->wbuf[i].rowid, i);
 		xs_umap_index(c, i);
@@ -2579,6 +2776,7 @@ typedef struct xstore_cursor {
 	uint16_t     vlen;
 	bt_cursor_t *btc;            /* persistent scan cursor, parked between calls */
 	uint64_t     visited;        /* version keys examined (metric, flushed at close) */
+	int          err;            /* XTC_E_* that ended the walk, or 0 */
 } xstore_cursor_t;
 
 /*
@@ -2714,7 +2912,8 @@ xs_connect(xsql *db, void *pAux, int argc, const char *const *argv,
 	/* argv[2] is the table name: map it to a stable per-B-tree id and
 	 * persist its column schema (cdp) so the native paths read the
 	 * schema from the catalog, not sqlite_master. */
-	v->tableid = xs_cat_find_or_create(v->ctx->bt, argv[2], cdp);
+	v->tableid = xs_cat_find_or_create(v->ctx->bt, argv[2], cdp, NULL,
+	    NULL);
 	if (v->tableid == 0) {
 		xsql_free(v);
 		return SX_ERROR;
@@ -2813,12 +3012,40 @@ xs_stash(xstore_cursor_t *c, int64_t rowid, const uint8_t *val, uint16_t vl)
 	if (c->vlen) memcpy(c->val, val + 1, c->vlen);
 }
 
+static int g_scan_failat;   /* test hook: the scan read to fail, 1-based */
+/* Test hook (xstore_implicit_commit_hook); NULL in production. */
+static void (*g_icommit_hook)(int phase);
+
+void
+xstore_implicit_commit_hook(void (*fn)(int phase))
+{
+	g_icommit_hook = fn;
+}
+
+/* Should this cursor read of a base-table scan fail
+ * (xstore_scan_read_fail_at)?  One relaxed load when disarmed. */
+static int
+xs_scan_fault(void)
+{
+	return xtc_atomic_load_i32(&g_scan_failat, xtc_mo_relaxed) > 0 &&
+	    xtc_atomic_fetch_sub_i32(&g_scan_failat, 1, xtc_mo_relaxed) == 1;
+}
+
+int
+xstore_scan_read_fail_at(int n)
+{
+	return xtc_atomic_exchange_i32(&g_scan_failat, n, xtc_mo_relaxed);
+}
+
 /* Position the scan's B-tree cursor for the next step: open it (one
  * descent to the table's first key, or the lo bound) or resume it past
- * the last key consumed.  0, or -1 at the end (c->eof set). */
+ * the last key consumed.  0, or -1 at the end (c->eof set); a cursor
+ * that could not be opened or resumed also leaves its error in c->err. */
 static int
 xs_cur_resume(xstore_cursor_t *c)
 {
+	int rc;
+
 	if (c->btc == NULL) {
 		uint8_t startbuf[XS_VKLEN];
 		const uint8_t *start;
@@ -2832,11 +3059,14 @@ xs_cur_resume(xstore_cursor_t *c)
 			    ~(uint64_t)0, startbuf);
 			start = startbuf;
 		}
-		if (bt_cursor_open(c->bt, start, XS_VKLEN, &c->btc) != XTC_OK) {
-			c->eof = 1;
-			return -1;
-		}
-	} else if (bt_cursor_resume(c->btc) != XTC_OK) {
+		rc = bt_cursor_open(c->bt, start, XS_VKLEN, &c->btc);
+	} else {
+		rc = bt_cursor_resume(c->btc);
+	}
+	if (rc == XTC_OK && xs_scan_fault())
+		rc = XTC_E_IO;
+	if (rc != XTC_OK) {
+		c->err = rc;
 		c->eof = 1;
 		return -1;
 	}
@@ -2846,8 +3076,10 @@ xs_cur_resume(xstore_cursor_t *c)
 /* One step of the visibility walk on a positioned cursor (latch held):
  * 1 with the next visible row -- its rowid and stored value (flag byte
  * first; valid until the next cursor call) -- or 0 at the end (c->eof
- * set).  Visible = the newest non-tombstone version of each rowid with
- * commit_ts <= snap (PostgreSQL HeapTupleSatisfiesMVCC). */
+ * set).  A cursor read error also ends the walk, with c->err set: the
+ * rows not read are unknown, not absent.  Visible = the newest
+ * non-tombstone version of each rowid with commit_ts <= snap
+ * (PostgreSQL HeapTupleSatisfiesMVCC). */
 static int
 xs_cur_step(xstore_cursor_t *c, int64_t *rid_out, const uint8_t **val,
     uint16_t *vlen)
@@ -2865,9 +3097,14 @@ xs_cur_step(xstore_cursor_t *c, int64_t *rid_out, const uint8_t **val,
 		const uint8_t *kb, *vb;
 		int64_t rid;
 		uint64_t ts;
+		int rc;
 
-		if (bt_cursor_next(c->btc, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN) {
+		rc = bt_cursor_next(c->btc, &k, &klen, &vv, &vl);
+		if (rc == XTC_OK && xs_scan_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+			c->err = rc;
+		if (rc != XTC_OK || klen != XS_VKLEN) {
 			c->eof = 1;
 			return 0;
 		}
@@ -2917,9 +3154,11 @@ xs_advance(xstore_cursor_t *c)
 		c->eof = 1;
 		return;
 	}
-	if (xs_cur_resume(c) != 0)
+	/* Both set c->err and c->eof on a read error; every caller of
+	 * xs_advance tests c->err. */
+	if (xs_cur_resume(c) != 0)   /* RDERR_OK: c->err */
 		return;
-	if (xs_cur_step(c, &rid, &vb, &vl))
+	if (xs_cur_step(c, &rid, &vb, &vl))   /* RDERR_OK: c->err */
 		xs_stash(c, rid, vb, vl);
 	bt_cursor_park(c->btc);            /* release the latch before returning */
 }
@@ -2960,6 +3199,8 @@ struct xstore_scan {
 	 * batch); then batches grow 16, 32, .. XS_RA_MAX rows. */
 	struct xs_ra   *ra;
 	int             ra_n, ra_i, ra_want;
+	xstore_ctx_t   *err_cx;    /* connection a read error is reported to */
+	char            name[64];  /* the table, for that report */
 };
 
 /* A read-ahead batch: up to XS_RA_MAX rows, their payloads packed in
@@ -2980,17 +3221,25 @@ xs_i64_cmp(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
-xstore_scan_t *
-xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
-                 int64_t lo, int has_lo, int64_t hi, int has_hi)
+/* xstore_scan_open, saying why it returned NULL: *err is XTC_E_NOTFOUND
+ * (no such table), XTC_E_NOMEM, or the catalog read's error. */
+static xstore_scan_t *
+xs_scan_new(bt_t *bt, const char *table, uint64_t snap, int64_t lo,
+    int has_lo, int64_t hi, int has_hi, int *err)
 {
 	xstore_scan_t *s;
 	uint32_t tid;
+	int r;
+	*err = XTC_E_NOTFOUND;
 	if (bt == NULL || table == NULL) return NULL;
-	if (!xstore_table_id(bt, table, &tid))
-		return NULL;                       /* unknown table */
+	if ((r = xstore_table_id(bt, table, &tid)) <= 0) {
+		if (r < 0) *err = r;               /* unread, not unknown */
+		return NULL;
+	}
+	*err = XTC_E_NOMEM;
 	s = (xstore_scan_t *)calloc(1, sizeof *s);
 	if (s == NULL) return NULL;
+	*err = XTC_OK;
 	s->c.bt = bt;
 	s->c.tableid = tid;
 	s->c.snap = snap ? snap : xs_visible();
@@ -3000,6 +3249,14 @@ xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
 	s->c.eof = 0;
 	s->c.btc = NULL;
 	return s;
+}
+
+xstore_scan_t *
+xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
+                 int64_t lo, int has_lo, int64_t hi, int has_hi)
+{
+	int err;
+	return xs_scan_new(bt, table, snap, lo, has_lo, hi, has_hi, &err);
 }
 
 /*
@@ -3014,7 +3271,8 @@ xstore_scan_open(bt_t *bt, const char *table, uint64_t snap,
  * the connection's buffered writes are merged: a buffered row above the
  * committed answer wins, a buffered DELETE hides a committed row.
  * `snap` 0 = the connection's read snapshot (as xstore_scan_open_txn).
- * Returns 1 with *out, or 0 if the table has no live row (<= hi).
+ * Returns 1 with *out, 0 if the table has no live row (<= hi), or -1
+ * when a read failed (rd_err says which table): the answer is unknown.
  */
 static int xs_point_get(bt_t *bt, uint32_t tid, int64_t rid, uint64_t snap,
     uint8_t *out, int cap, int *err);
@@ -3027,10 +3285,15 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 	uint8_t bound[XS_VKLEN], k[XS_VKLEN + 8];
 	uint32_t tid;
 	int64_t bmax = 0, rid;
-	int have_b = 0, guard, i;
+	int have_b = 0, guard, i, rc, err = 0;
 
-	if (bt == NULL || table == NULL || !xstore_table_id(bt, table, &tid))
+	if (bt == NULL || table == NULL)
 		return 0;
+	if ((rc = xstore_table_id(bt, table, &tid)) <= 0) {
+		if (rc == 0) return 0;           /* unknown table */
+		xs_rd_err_tid(cx, XS_CAT_TABLEID, rc);   /* counted by the read */
+		return -1;
+	}
 	if (cx != NULL) {
 		uint64_t rs =
 		    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed);
@@ -3065,8 +3328,15 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 		uint8_t val[1 + XS_VMAX];
 		const xs_wrec_t *w;
 		int live;
-		if (bt_seek_lt(bt, bound, XS_VKLEN, k, sizeof k, &klen, NULL, 0, NULL)
-		    != XTC_OK || klen != XS_VKLEN || dec_tableid(k) != tid)
+		rc = bt_seek_lt(bt, bound, XS_VKLEN, k, sizeof k, &klen, NULL, 0,
+		    NULL);
+		if (rc == XTC_OK && xs_row_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+			err = rc;
+			break;
+		}
+		if (rc != XTC_OK || klen != XS_VKLEN || dec_tableid(k) != tid)
 			break;                       /* no lower rowid in this table */
 		rid = dec_rowid(k);
 		if (have_b && bmax >= rid) {     /* a buffered row is the answer */
@@ -3080,12 +3350,21 @@ xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
 			live = !w->deleted;
 		else
 			live = xs_point_get(bt, tid, rid, snap, val,
-			           (int)sizeof val, NULL) != 0;
+			           (int)sizeof val, &err) != 0;
+		if (err == 0 && w == NULL && xs_row_fault())
+			err = XTC_E_IO;
+		if (err != 0)
+			break;
 		if (live) {
 			*out = rid;
 			return 1;
 		}
 		enc_vkey(tid, rid, ~(uint64_t)0, bound);   /* below every version */
+	}
+	if (err != 0) {
+		(void)xs_rd_count(err);
+		xs_rd_err_tid(cx, tid, err);
+		return -1;
 	}
 	if (have_b) { *out = bmax; return 1; }
 	return 0;
@@ -3106,6 +3385,7 @@ xstore_scan_open_txn(struct xsql *db, const char *table, uint64_t snap,
 	bt_t *bt = xstore_bt_of(db);
 	xstore_ctx_t *ctx = xstore_ctx_of(db);
 	xstore_scan_t *s;
+	int err;
 	/* Effective read snapshot, mirroring the vtab cursor (xs_filter): an
 	 * explicit ctx->read_snap (AS OF), else the txn's frozen snapshot for
 	 * REPEATABLE READ and stricter, else the latest committed clock for
@@ -3121,8 +3401,14 @@ xstore_scan_open_txn(struct xsql *db, const char *table, uint64_t snap,
 			snap = ctx->stmt_base;   /* one snapshot for a DML statement */
 		/* else leave 0 -> xstore_scan_open uses the latest clock */
 	}
-	s = xstore_scan_open(bt, table, snap, lo, has_lo, hi, has_hi);
-	if (s == NULL) return NULL;
+	s = xs_scan_new(bt, table, snap, lo, has_lo, hi, has_hi, &err);
+	if (s == NULL) {
+		if (err != XTC_E_NOTFOUND && err != XTC_E_NOMEM)
+			xs_rd_err_tid(ctx, XS_CAT_TABLEID, err);
+		return NULL;
+	}
+	s->err_cx = ctx;
+	snprintf(s->name, sizeof s->name, "%s", table);
 	/* Inside a txn, attach the connection ctx so the scan can (a) overlay
 	 * the write buffer for read-your-writes (when it has buffered writes)
 	 * and (b) record each read into the SSI read set (when serializable),
@@ -3160,16 +3446,35 @@ xstore_scan_open_txn(struct xsql *db, const char *table, uint64_t snap,
 	return s;
 }
 
+/* Copy buffered write `w`'s payload into the scan's staging buffer,
+ * first bringing it back from the STEAL staging area if it was spilled.
+ * 0, or -1 with s->c.err set when the spilled payload cannot be read:
+ * the row is unknown, so the scan must fail rather than return it. */
+static int
+xs_scan_load_buffered(xstore_scan_t *s, const xs_wrec_t *w)
+{
+	int rc;
+	if (w->spilled && xs_scan_fault())
+		rc = SX_ERROR;
+	else
+		rc = xs_wrec_ensure(s->ryw_ctx, (xs_wrec_t *)w);
+	if (rc != SX_OK) {
+		s->c.err = rc == SX_NOMEM ? XTC_E_NOMEM : XTC_E_IO;
+		return -1;
+	}
+	if (w->len && w->data) memcpy(s->ryw_val, w->data, w->len);
+	return 0;
+}
+
 /* Return buffered row `rowid` (its newest write) through the scan outs;
- * 0 if that write is a delete. */
+ * 0 if that write is a delete, -1 if its payload cannot be read. */
 static int
 xs_scan_emit_buffered(xstore_scan_t *s, int64_t rid, int64_t *rowid,
     const uint8_t **rec, int *reclen)
 {
 	const xs_wrec_t *w = wbuf_find(s->ryw_ctx, s->c.tableid, rid);
 	if (w == NULL || w->deleted) return 0;
-	(void)xs_wrec_ensure(s->ryw_ctx, (xs_wrec_t *)w);
-	if (w->len && w->data) memcpy(s->ryw_val, w->data, w->len);
+	if (xs_scan_load_buffered(s, w) != 0) return -1;
 	if (rowid) *rowid = rid;
 	if (rec) *rec = s->ryw_val;
 	if (reclen) *reclen = (int)w->len;
@@ -3195,10 +3500,12 @@ xs_scan_fill(xstore_scan_t *s)
 	}
 	if (s->ra == NULL && (s->ra = malloc(sizeof *s->ra)) == NULL)
 		return -1;
-	if (xs_cur_resume(c) != 0)
+	/* A read error is in c->err; 0 ends the scan in xs_scan_end, which
+	 * reports it. */
+	if (xs_cur_resume(c) != 0)   /* RDERR_OK: c->err */
 		return 0;
 	while (s->ra_n < s->ra_want && used <= XS_RA_BYTES &&
-	    xs_cur_step(c, &rid, &vb, &vl)) {
+	    xs_cur_step(c, &rid, &vb, &vl)) {   /* RDERR_OK: c->err */
 		n = vl > 1 ? (uint16_t)(vl - 1) : 0;
 		if (n > XS_VMAX) n = XS_VMAX;
 		if (n) memcpy(s->ra->buf + used, vb + 1, n);
@@ -3218,7 +3525,8 @@ xs_scan_fill(xstore_scan_t *s)
  * xs_advance would open a B-tree cursor (an allocation, a latched
  * descent, a close) and walk the row's newer versions.  Kept out of
  * line: its value buffer is a page, and the per-row scan path should
- * not carry that frame.  Fills s->c (rowid, val); 0 at none. */
+ * not carry that frame.  Fills s->c (rowid, val); 0 at none, or when
+ * the row could not be read, with s->c.err set. */
 #if defined(__GNUC__) || defined(__clang__)
 #define XS_NOINLINE __attribute__((noinline))
 #else
@@ -3231,20 +3539,44 @@ xs_scan_point(xstore_scan_t *s)
 	int n;
 
 	s->c.visited++;
-	n = xs_point_get(s->c.bt, s->c.tableid, s->c.lo, s->c.snap, v,
-	    (int)sizeof v, NULL);
-	if (n == 0)
+	/* The error is in s->c.err; xs_scan_end reports it. */
+	n = xs_point_get(s->c.bt, s->c.tableid, /* RDERR_OK: c.err */
+	    s->c.lo, s->c.snap, v,
+	    (int)sizeof v, &s->c.err);
+	if (s->c.err == 0 && xs_scan_fault())
+		s->c.err = XTC_E_IO;
+	if (n == 0 || s->c.err != 0)
 		return 0;
 	xs_stash(&s->c, s->c.lo, v, (uint16_t)(n < 0 ? 1 : n + 1));
 	return 1;
+}
+
+/* End scan `s`: 0 at the true end, or -1 (on this call and every later
+ * one) if a read failed, so a caller never takes a short walk for the
+ * whole table. */
+static int
+xs_scan_end(xstore_scan_t *s)
+{
+	s->done = 1;
+	if (s->c.err == 0 || XTC_DST_BUG(XTC_DST_BUG_SCANSHORT))
+		return 0;   /* planted 82: a failed read is the table's end */
+	(void)xs_rd_count(s->c.err);
+	/* The statement's first read error is the one the client sees. */
+	if (s->err_cx != NULL && s->err_cx->rd_err[0] == '\0' &&
+	    s->err_cx->rd_rc == 0)
+		snprintf(s->err_cx->rd_err, sizeof s->err_cx->rd_err,
+		    "cannot read table %s: %s", s->name, xtc_strerror(s->c.err));
+	return -1;
 }
 
 int
 xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
                  const uint8_t **rec, int *reclen)
 {
+	int r;
+
 	if (s == NULL) return -1;
-	if (s->done) return 0;
+	if (s->done) return xs_scan_end(s);
 
 	/* Plain committed scan: no txn, or a txn that needs neither the
 	 * write-buffer overlay nor SSI read tracking. */
@@ -3259,7 +3591,7 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 		if (s->ra_want == 0 && s->c.has_lo && s->c.has_hi &&
 		    s->c.lo == s->c.hi) {             /* a point: one seek */
 			s->done = 1;                     /* the only row */
-			if (!xs_scan_point(s)) return 0;
+			if (!xs_scan_point(s)) return xs_scan_end(s);
 			if (rowid) *rowid = s->c.rowid;
 			if (rec) *rec = s->c.val;
 			if (reclen) *reclen = (int)s->c.vlen;
@@ -3269,16 +3601,18 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 			s->ra_want = 16;
 			s->c.eof = 0;
 			xs_advance(&s->c);
-			if (s->c.eof) { s->done = 1; return 0; }
+			if (s->c.eof) return xs_scan_end(s);
 			if (rowid) *rowid = s->c.rowid;
 			if (rec) *rec = s->c.val;
 			if (reclen) *reclen = (int)s->c.vlen;
 			return 1;
 		}
-		if (s->c.eof) { s->done = 1; return 0; }
+		if (s->c.eof) return xs_scan_end(s);
 		switch (xs_scan_fill(s)) {
-		case -1: return -1;                   /* no memory for a batch */
-		case 0: s->done = 1; return 0;
+		case -1:                              /* no memory for a batch */
+			s->c.err = XTC_E_NOMEM;
+			return xs_scan_end(s);
+		case 0: return xs_scan_end(s);
 		default: break;
 		}
 		s->ra_i = 1;
@@ -3298,6 +3632,7 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 			if (!s->ryw_held) {
 				s->c.eof = 0;
 				xs_advance(&s->c);
+				if (s->c.err != 0) return xs_scan_end(s);
 				if (s->c.eof) { s->ryw_phase = 1; break; }
 				s->ryw_held = 1;
 				if (s->ryw_track) {
@@ -3306,9 +3641,10 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 				}
 			}
 			if (s->ryw_ii < s->ryw_nins && s->ryw_ins[s->ryw_ii] < s->c.rowid) {
-				if (xs_scan_emit_buffered(s, s->ryw_ins[s->ryw_ii++], rowid,
-				    rec, reclen))
-					return 1;
+				r = xs_scan_emit_buffered(s, s->ryw_ins[s->ryw_ii++], rowid,
+				    rec, reclen);
+				if (r < 0) return xs_scan_end(s);
+				if (r > 0) return 1;
 				continue;
 			}
 			while (s->ryw_ii < s->ryw_nins && s->ryw_ins[s->ryw_ii] == s->c.rowid)
@@ -3324,8 +3660,7 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 			}
 			if (w->deleted) continue;        /* buffered DELETE: hide it */
 			/* buffered UPDATE: return the buffered payload. */
-			(void)xs_wrec_ensure(s->ryw_ctx, (xs_wrec_t *)w);
-			if (w->len && w->data) memcpy(s->ryw_val, w->data, w->len);
+			if (xs_scan_load_buffered(s, w) != 0) return xs_scan_end(s);
 			if (rowid) *rowid = s->c.rowid;
 			if (rec) *rec = s->ryw_val;
 			if (reclen) *reclen = (int)w->len;
@@ -3334,12 +3669,13 @@ xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
 	}
 
 	/* Phase 1: the buffered rows past the last committed row, in order. */
-	while (s->ryw_ii < s->ryw_nins)
-		if (xs_scan_emit_buffered(s, s->ryw_ins[s->ryw_ii++], rowid, rec,
-		    reclen))
-			return 1;
-	s->done = 1;
-	return 0;
+	while (s->ryw_ii < s->ryw_nins) {
+		r = xs_scan_emit_buffered(s, s->ryw_ins[s->ryw_ii++], rowid, rec,
+		    reclen);
+		if (r < 0) return xs_scan_end(s);
+		if (r > 0) return 1;
+	}
+	return xs_scan_end(s);
 }
 
 /* Base-table version keys examined by storage scans (the rows-visited
@@ -3645,7 +3981,7 @@ int
 xstore_table_id(bt_t *bt, const char *name, uint32_t *tableid)
 {
 	uint32_t id;
-	int i;
+	int i, err;
 	if (bt == NULL || name == NULL) return 0;
 	if (xs_tcat_get(bt, name, &id, NULL)) {      /* this thread's copy */
 		if (tableid) *tableid = id;
@@ -3666,8 +4002,9 @@ xstore_table_id(bt_t *bt, const char *name, uint32_t *tableid)
 			return 1;
 		}
 	xs_cat_unlock();
-	id = xs_cat_lookup(bt, name);
-	if (id == 0) return 0;
+	id = xs_cat_lookup(bt, name, &err);
+	if (err != 0) return err;   /* unread: not known to be absent */
+	if (id == 0) return 0;      /* unknown */
 	xs_cat_prime(bt, name, id);
 	if (tableid) *tableid = id;
 	return 1;
@@ -3694,25 +4031,28 @@ xs_affinity_of(const char *ty)
 }
 
 /* Read the catalog value (name + optional NUL + coldefs) for the newest
- * live entry whose name matches `name`.  Returns the value length into
- * *vlen with the bytes copied to `out` (capacity `cap`), or 0 if not
- * found. */
+ * live entry whose name matches `name`.  Returns the value length with
+ * the bytes copied to `out` (capacity `cap`), 0 if not found, or a
+ * read's XTC_E_* code. */
 static int
 xs_cat_value(bt_t *bt, const char *name, uint8_t *out, int cap)
 {
 	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
 	size_t want = strlen(name);
-	int64_t last_rowid = 0; int have_last = 0, got = 0;
+	int64_t last_rowid = 0; int have_last = 0, got = 0, rc;
 
-	enc_vkey(XS_CAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
 	xtc_atomic_fetch_add_u64(&g_cat_scans, 1, xtc_mo_relaxed);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) return 0;
+	if ((rc = xs_cat_open(bt, XS_CAT_TABLEID, &cur)) != XTC_OK)
+		return rc == XTC_E_NOTFOUND ? 0 : rc;
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
 		const uint8_t *kb, *vb; int64_t rid; size_t nlen, j;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN) break;
+		rc = xs_cat_next(cur, &k, &klen, &vv, &vl);
+		if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+			got = rc;
+			break;
+		}
+		if (rc != XTC_OK || klen != XS_VKLEN) break;
 		kb = (const uint8_t *)k; vb = (const uint8_t *)vv;
 		if (dec_tableid(kb) != XS_CAT_TABLEID) break;
 		rid = dec_rowid(kb);
@@ -3790,7 +4130,7 @@ xs_table_schema_parse(bt_t *bt, const char *name, xstore_col_t *cols, int cap)
 {
 	uint8_t val[1024];
 	char    cached[512];
-	int vlen, i, ncol = 0, pass;
+	int vlen, i, ncol = 0, pass, r;
 	const char *cd; int cdlen;
 
 	if (bt == NULL || name == NULL || cols == NULL || cap <= 0) return -1;
@@ -3819,15 +4159,15 @@ xs_table_schema_parse(bt_t *bt, const char *name, xstore_col_t *cols, int cap)
 		xs_cat_unlock();
 		if (hit)
 			break;                      /* cached (coldefs may not fit) */
-		if (pass == 0 && !xstore_table_id(bt, name, &pid))
-			return 0;                   /* no such table */
+		if (pass == 0 && (r = xstore_table_id(bt, name, &pid)) <= 0)
+			return r;                   /* no such table, or unread */
 	}
 	if (cached[0] != '\0') {
 		cd = cached;
 		cdlen = (int)strlen(cached);
 	} else {
 		vlen = xs_cat_value(bt, name, val, (int)sizeof val);
-		if (vlen <= 0) return 0;
+		if (vlen <= 0) return vlen;      /* none recorded, or unread */
 		/* The coldefs follow the name and a NUL. */
 		for (i = 0; i < vlen; i++) if (val[i] == 0) break;
 		if (i >= vlen - 1) return 0;          /* no schema recorded */
@@ -3866,8 +4206,8 @@ xs_table_schema_parse(bt_t *bt, const char *name, xstore_col_t *cols, int cap)
 	return ncol > 0 ? ncol : 0;
 }
 
-int64_t
-xstore_max_rowid(bt_t *bt, uint32_t tableid)
+int
+xstore_max_rowid(bt_t *bt, uint32_t tableid, int64_t *out)
 {
 	/* The largest rowid in the table sorts last within the table's key
 	 * range (keys are (tableid, rowid ^ signbit, ~ts), big-endian, so
@@ -3882,17 +4222,28 @@ xstore_max_rowid(bt_t *bt, uint32_t tableid)
 	 * empty table, 16.5 ms at 400k rows (review156 P1). */
 	uint8_t hi[XS_VKLEN + 1], k[XS_VKLEN + 8];
 	uint16_t klen = 0;
-	int i;
+	int i, rc;
 
-	if (bt == NULL) return 0;
+	*out = 0;
+	if (bt == NULL) return XTC_OK;
 	for (i = 3; i >= 0; i--) hi[3 - i] = (uint8_t)(tableid >> (8 * i));
 	memset(hi + 4, 0xFF, sizeof hi - 4);
-	if (bt_seek_lt(bt, hi, (uint16_t)sizeof hi, k, (uint16_t)sizeof k,
-	    &klen, NULL, 0, NULL) != XTC_OK)
-		return 0;
+	rc = bt_seek_lt(bt, hi, (uint16_t)sizeof hi, k, (uint16_t)sizeof k,
+	    &klen, NULL, 0, NULL);
+	if (rc == XTC_OK && xs_row_fault())
+		rc = XTC_E_IO;
+	/* A descent that failed is not an empty table: the caller would
+	 * hand out rowid 1 over a committed row. */
+	if (rc == XTC_E_NOTFOUND)
+		return XTC_OK;               /* nothing below: empty */
+	if (rc != XTC_OK && XTC_DST_BUG(XTC_DST_BUG_MAXROWID))
+		return XTC_OK;  /* planted 85: a failed descent is an empty table */
+	if (rc != XTC_OK)
+		return xs_rd_count(rc);
 	if (klen != XS_VKLEN || dec_tableid(k) != tableid)
-		return 0;                    /* empty table */
-	return dec_rowid(k) > 0 ? dec_rowid(k) : 0;
+		return XTC_OK;               /* empty table */
+	*out = dec_rowid(k) > 0 ? dec_rowid(k) : 0;
+	return XTC_OK;
 }
 
 int
@@ -3930,7 +4281,9 @@ xstore_rowid_split_points(bt_t *bt, uint32_t tableid, int64_t lo, int64_t hi,
 	for (depth = 1; depth <= 4 && m < n; depth++) {
 		got = 0;
 		m = 0;
-		if (bt_sample_keys(bt, klo, XS_VKLEN, khi, XS_VKLEN, depth, keys,
+		/* A hint: with fewer cut points the caller splits uniformly. */
+		if (bt_sample_keys(   /* RDERR_OK: a hint */
+		    bt, klo, XS_VKLEN, khi, XS_VKLEN, depth, keys,
 		    XS_VKLEN, lens, CAP, &got) != XTC_OK)
 			break;
 		for (i = 0; i < got; i++) {
@@ -4169,9 +4522,12 @@ xs_gate_wait_locked(void)
 static int g_ock_cancel; /* xstore_checkpoint_cancel */
 
 /* Take the checkpoint gate and drain the commits in flight.  With
- * `cancellable`, give up (returning 0, gate not taken) once
- * xstore_checkpoint_cancel is set: the engine is stopping and its final
- * quiesce holds the gate for good.  Returns 1 when quiesced. */
+ * `cancellable` XS_QB_CKPT, give up (returning 0, gate not taken) once
+ * xstore_checkpoint_cancel is set; with XS_QB_STOP, once
+ * xstore_quiesce_final has run.  Either way the engine is stopping and
+ * its final quiesce holds the gate for good.  Returns 1 when quiesced. */
+#define XS_QB_CKPT 1
+#define XS_QB_STOP 2
 static int
 xs_quiesce_begin(int cancellable)
 {
@@ -4179,8 +4535,10 @@ xs_quiesce_begin(int cancellable)
 	xs_commit_lock();
 	while (g_ckpt_gate) {          /* one checkpoint at a time */
 		xs_commit_unlock();
-		if (cancellable &&
-		    xtc_atomic_load_i32(&g_ock_cancel, xtc_mo_acquire))
+		if (((cancellable & XS_QB_CKPT) &&
+		    xtc_atomic_load_i32(&g_ock_cancel, xtc_mo_acquire)) ||
+		    ((cancellable & XS_QB_STOP) &&
+		    xtc_atomic_load_i32(&g_xs_stopped, xtc_mo_acquire)))
 			return 0;
 		xs_nap();
 		xs_commit_lock();
@@ -4202,6 +4560,51 @@ void
 xstore_quiesce_begin(void)
 {
 	(void)xs_quiesce_begin(0);
+}
+
+/* The engine's last quiesce: mark the store stopped, so a DDL statement
+ * that meets it fails instead of waiting for a gate that never opens,
+ * then quiesce as xstore_quiesce_begin does. */
+void
+xstore_quiesce_final(void)
+{
+	xtc_atomic_store_i32(&g_xs_stopped, 1, xtc_mo_release);
+	(void)xs_quiesce_begin(0);
+}
+
+/* How long one wait for the DDL lock lasts before the stopped flag is
+ * checked again. */
+#define XS_DDL_WAIT_NS (10LL * 1000 * 1000)
+
+/* One DDL statement at a time (see xstore.h).  Ranks before every
+ * other engine lock: a DDL statement takes it first and holds it across
+ * the cat and commit locks its steps take, and the parks of an index
+ * build.  The wait is cut into XS_DDL_WAIT_NS slices so a stopped store
+ * is noticed: its holder may be parked at the closed gate for good. */
+int
+xstore_ddl_lock(void)
+{
+	xtc_amutex_t *m = xs_lk_get(XS_LK_DDL);
+	(void)xtc_mask_enter();
+	for (;;) {
+		if (xtc_atomic_load_i32(&g_xs_stopped, xtc_mo_acquire))
+			break;
+		if (xtc_amutex_lock(m, XS_DDL_WAIT_NS) != XTC_OK)
+			continue;
+		/* Stopped while this waited: the statement could not commit. */
+		if (!xtc_atomic_load_i32(&g_xs_stopped, xtc_mo_acquire))
+			return XTC_OK;
+		(void)xtc_amutex_unlock(m);
+		break;
+	}
+	(void)xtc_mask_leave();
+	return XTC_E_STATE;
+}
+
+void
+xstore_ddl_unlock(void)
+{
+	xs_unlk(XS_LK_DDL);
 }
 
 void
@@ -4436,7 +4839,8 @@ xs_spill_payloads(xstore_ctx_t *cx)
 	}
 }
 
-static uint64_t xs_newest_ts(bt_t *bt, uint32_t tableid, int64_t rowid);
+static int xs_newer_than(bt_t *bt, uint32_t tableid, int64_t rowid,
+    uint64_t base);
 
 /*
  * In-flight commit registry.  A commit takes its timestamp and registers
@@ -4614,6 +5018,7 @@ xs_commit_state_reset(void)
 	g_inflight = NULL;
 	xtc_atomic_store_i32(&g_ndone, 0, xtc_mo_seq_cst);
 	g_ckpt_gate = 0;
+	xtc_atomic_store_i32(&g_xs_stopped, 0, xtc_mo_release);
 	xtc_atomic_store_i32(&g_wal_busy, 0, xtc_mo_relaxed);
 	xtc_atomic_store_u64(&g_xvisible,
 	    xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed), xtc_mo_seq_cst);
@@ -4761,16 +5166,18 @@ xs_wait_visible(uint64_t ts)
  * conflicts if the row has a committed version newer than the snapshot
  * the write was computed against (w->base), or if a commit still in
  * flight writes the same row (it has a timestamp after every snapshot
- * that cannot see it).  Returns 1 on a conflict.
+ * that cannot see it).  Returns 1 on a conflict, or the XTC_E_* code of
+ * a read that failed (*bad set to the row's table).
  */
 static int
 xs_ww_conflict_locked(bt_t *bt, const xs_wrec_t *ws, int wn)
 {
 	const struct xs_inflight *e;
-	int i;
+	int i, r;
 	for (i = 0; i < wn; i++) {
-		if (xs_newest_ts(bt, ws[i].tableid, ws[i].rowid) > ws[i].base)
-			return 1;
+		if ((r = xs_newer_than(bt, ws[i].tableid, ws[i].rowid,
+		    ws[i].base)) != 0)
+			return r;
 		for (e = g_inflight; e != NULL; e = e->next)
 			if (xs_inflight_has(e, ws[i].tableid, ws[i].rowid))
 				return 1;
@@ -4780,28 +5187,36 @@ xs_ww_conflict_locked(bt_t *bt, const xs_wrec_t *ws, int wn)
 
 /* The early half of the write-write check, WITHOUT the commit lock: is
  * any row of the write set committed past its base?  Returns 1 on a
- * conflict (certain: committed versions never go away).  Read the
- * horizon *v0 before calling; xs_ww_recheck_locked then finishes. */
+ * conflict (certain: committed versions never go away), or a read's
+ * XTC_E_* code with *bad set to its table.  Read the horizon *v0 before
+ * calling; xs_ww_recheck_locked then finishes. */
 static int
-xs_ww_probe(bt_t *bt, const xs_wrec_t *ws, int wn)
+xs_ww_probe(bt_t *bt, const xs_wrec_t *ws, int wn, uint32_t *bad)
 {
-	int i;
+	int i, r;
 	for (i = 0; i < wn; i++)
-		if (xs_newest_ts(bt, ws[i].tableid, ws[i].rowid) > ws[i].base)
-			return 1;
+		if ((r = xs_newer_than(bt, ws[i].tableid, ws[i].rowid,
+		    ws[i].base)) != 0) {
+			*bad = ws[i].tableid;
+			return r;
+		}
 	return 0;
 }
 
 /* Commit lock held, after xs_ww_probe passed at horizon v0: the full
- * check only for rows registered (stamped) after v0 -- see g_row_cts. */
+ * check only for rows registered (stamped) after v0 -- see g_row_cts.
+ * Returns as xs_ww_probe. */
 static int
-xs_ww_recheck_locked(bt_t *bt, const xs_wrec_t *ws, int wn, uint64_t v0)
+xs_ww_recheck_locked(bt_t *bt, const xs_wrec_t *ws, int wn, uint64_t v0,
+    uint32_t *bad)
 {
-	int i;
+	int i, r;
 	for (i = 0; i < wn; i++)
 		if (g_row_cts[xs_row_slot(ws[i].tableid, ws[i].rowid)] > v0 &&
-		    xs_ww_conflict_locked(bt, &ws[i], 1))
-			return 1;
+		    (r = xs_ww_conflict_locked(bt, &ws[i], 1)) != 0) {
+			*bad = ws[i].tableid;
+			return r;
+		}
 	return 0;
 }
 
@@ -4816,7 +5231,8 @@ xs_put(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n, int d
 
 /* An INSERT reads "the key is absent".  Caller holds the commit lock.
  * Wait (dropping the lock) until no in-flight commit writes the key --
- * its outcome decides -- then report whether a live version exists.
+ * its outcome decides -- then report whether a live version exists
+ * (xs_row_live: 1, 0, or a read's XTC_E_* code).
  * In-flight commits never wait on an inserter, so this terminates. */
 static int
 xs_key_live_locked(bt_t *bt, uint32_t tableid, int64_t rowid)
@@ -4845,7 +5261,9 @@ xs_key_live_locked(bt_t *bt, uint32_t tableid, int64_t rowid)
  * vis: return only once the write is visible (the caller holds no
  * engine lock); else only once its in-flight entry is unlinked.
  * A UNIQUE conflict returns SX_CONSTRAINT and a UNIQUE probe that could
- * not run its negative XTC_E_* code, both with *ubad set to the index. */
+ * not run its negative XTC_E_* code, both with *ubad set to the index;
+ * a primary-key or write-write check that could not read the row
+ * returns its negative XTC_E_* code with *ubad left 0. */
 static int
 xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
     int deleted, uint64_t base, int insert, uint64_t *out_ts, uint32_t *ubad,
@@ -4867,19 +5285,19 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	fl.rid = rowid;
 	fl.rec = deleted ? NULL : (const uint8_t *)blob;
 	fl.reclen = deleted ? 0 : n;
-	if (!deleted && blob != NULL && g_idx_n > 0 &&
+	if (!deleted && blob != NULL && XS_IDX_ANY() &&
 	    tableid != XS_CAT_TABLEID && tableid < XS_IDXCAT_TABLEID)
 		nuq = xs_uniq_collect(bt, NULL, tableid, uq, 16);
 	memset(&probe, 0, sizeof probe);
 	probe.tableid = tableid; probe.rowid = rowid; probe.base = base;
 	v0 = xs_visible();             /* before the probe: see g_row_cts */
-	if (base != 0 && xs_ww_probe(bt, &probe, 1))
-		return SX_BUSY;
+	if (base != 0 && (rc = xs_ww_probe(bt, &probe, 1, &bad)) != 0)
+		return rc > 0 ? SX_BUSY : rc;   /* rc < 0: unread */
 	xs_commit_lock();
 	xs_gate_wait_locked();
-	if (insert && xs_key_live_locked(bt, tableid, rowid)) {
+	if (insert && (rc = xs_key_live_locked(bt, tableid, rowid)) != 0) {
 		xs_commit_unlock();
-		return SX_CONSTRAINT;
+		return rc > 0 ? SX_CONSTRAINT : rc;   /* rc < 0: unread */
 	}
 	/* UNIQUE indexes: the check and the in-flight registration are one
 	 * step, so two concurrent writers of one key cannot both pass. */
@@ -4893,9 +5311,10 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 		/* rc < 0: the probe's error */
 		return rc > 0 ? SX_CONSTRAINT : rc;
 	}
-	if (base != 0 && xs_ww_recheck_locked(bt, &probe, 1, v0)) {
+	if (base != 0 && (rc = xs_ww_recheck_locked(bt, &probe, 1, v0,
+	    &bad)) != 0) {
 		xs_commit_unlock();
-		return SX_BUSY;
+		return rc > 0 ? SX_BUSY : rc;
 	}
 	/* From registration to removal the commit is masked: its entry lives
 	 * on this stack, so a kill in between would leave g_inflight pointing
@@ -4921,10 +5340,12 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	}
 	/* The pre-image for index maintenance: read while registered, so no
 	 * other writer of the row can interleave (first-committer-wins). */
-	idx = g_idx_n > 0 && tableid != XS_CAT_TABLEID &&
+	idx = XS_IDX_ANY() && tableid != XS_CAT_TABLEID &&
 	    tableid < XS_IDXCAT_TABLEID;
 	if (idx && (pre = malloc(XS_VMAX)) != NULL)
-		prelen = xs_idx_preimage(bt, tableid, rowid, pre, XS_VMAX);
+		/* An unread pre-image taints the indexes (a rebuild follows). */
+		prelen = xs_idx_preimage(bt, tableid, rowid, pre, /* RDERR_OK: taints */
+		    XS_VMAX);
 	enc_vkey(tableid, rowid, ts, key);
 	buf[0] = deleted ? XS_F_DELETED : 0;
 	if (!deleted && n > 0) memcpy(buf + 1, blob, (size_t)n);
@@ -4949,26 +5370,39 @@ xs_put_ts(bt_t *bt, uint32_t tableid, int64_t rowid, const void *blob, int n,
 	return rc;
 }
 
-/* The commit_ts of the newest committed version of `rowid`, or 0 if the
- * rowid has no version.  Used by serializable validation to detect a
- * concurrent write to a key this transaction read. */
-static uint64_t
-xs_newest_ts(bt_t *bt, uint32_t tableid, int64_t rowid)
+/* Has `rowid` a committed version newer than `base`?  1 if so, 0 if
+ * not (or it has no version), or the XTC_E_* code of a read that
+ * failed: nothing is then known, and a write-write or serializable
+ * check that took it for "no" would let an update be lost.  Used by
+ * those checks to detect a concurrent write to a key this transaction
+ * read or writes. */
+static int
+xs_newer_than(bt_t *bt, uint32_t tableid, int64_t rowid, uint64_t base)
 {
 	bt_cursor_t *cur = NULL;
 	uint8_t startk[XS_VKLEN];
 	const void *k = NULL, *vv = NULL;
 	uint16_t klen = 0, vl = 0;
 	uint64_t ts = 0;
+	int rc;
 	enc_vkey(tableid, rowid, ~(uint64_t)0, startk);   /* newest version sorts first */
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
-	if (bt_cursor_next(cur, &k, &klen, &vv, &vl) == XTC_OK &&
-	    klen == XS_VKLEN && dec_tableid((const uint8_t *)k) == tableid &&
-	    dec_rowid((const uint8_t *)k) == rowid)
-		ts = dec_ts((const uint8_t *)k);
-	bt_cursor_close(cur);
-	return ts;
+	rc = bt_cursor_open(bt, startk, XS_VKLEN, &cur);
+	if (rc == XTC_OK) {
+		rc = bt_cursor_next(cur, &k, &klen, &vv, &vl);
+		if (rc == XTC_OK && xs_row_fault())
+			rc = XTC_E_IO;
+		if (rc == XTC_OK && klen == XS_VKLEN &&
+		    dec_tableid((const uint8_t *)k) == tableid &&
+		    dec_rowid((const uint8_t *)k) == rowid)
+			ts = dec_ts((const uint8_t *)k);
+		bt_cursor_close(cur);
+	}
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+		(void)xs_rd_count(rc);
+		/* planted 84: the unread row has no newer version */
+		return XTC_DST_BUG(XTC_DST_BUG_WWREAD) ? 0 : rc;
+	}
+	return ts > base;
 }
 
 /*
@@ -5088,8 +5522,15 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 		in_group = 0;     /* planted: the row state restarts per batch */
 #endif
 
-		if (bt_cursor_open(bt, start, have_resume ? XS_VKLEN : 0, &cur) != XTC_OK)
+		rc = bt_cursor_open(bt, start, have_resume ? XS_VKLEN : 0, &cur);
+		if (rc == XTC_OK && xs_row_fault()) {
+			bt_cursor_close(cur);
+			rc = XTC_E_IO;
+		}
+		if (rc != XTC_OK) {
+			(void)xs_rd_count(rc);   /* stop: the rest only leaks */
 			break;
+		}
 		for (;;) {
 			const void *k = NULL, *vv = NULL;
 			uint16_t klen = 0, vl = 0;
@@ -5097,7 +5538,8 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			uint32_t tid;
 			int is_cat;
 
-			if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK)
+			rc = xs_rd_count(bt_cursor_next(cur, &k, &klen, &vv, &vl));
+			if (rc != XTC_OK)
 				break;
 			/* The tables end at the index namespace (index entries
 			 * are not versions, and one can be 20 bytes long too).
@@ -5108,7 +5550,8 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 			if (klen >= 1 && ((const uint8_t *)k)[0] == XS_IDX_LEAD) {
 				bt_cursor_close(cur);
 				cur = NULL;
-				if (bt_cursor_open(bt, &past, 1, &cur) != XTC_OK)
+				if ((rc = xs_rd_count(bt_cursor_open(bt, &past, 1,
+				    &cur))) != XTC_OK)
 					break;
 				continue;
 			}
@@ -5162,16 +5605,17 @@ xs_gc(bt_t *bt, uint64_t horizon, int *out_reclaimed)
 				break;
 			}
 		}
-		bt_cursor_close(cur);
+		if (cur != NULL)
+			bt_cursor_close(cur);
 		for (i = 0; i < ndead; i++) {
 			if (bt_delete(bt, dead[i], XS_VKLEN) == XTC_OK) reclaimed++;
 		}
 		if (ndead < g_gc_batch)
-			break;     /* scanned to the end */
+			break;     /* scanned to the end, or stopped on a read */
 	}
 	free(dropped.id);
 	if (out_reclaimed != NULL) *out_reclaimed = reclaimed;
-	return rc;
+	return rc == XTC_E_NOTFOUND ? XTC_OK : rc;
 }
 
 /*
@@ -5192,14 +5636,17 @@ xs_prune_rowid(bt_t *bt, uint32_t tableid, int64_t rowid, uint64_t horizon)
 	int ndead = 0, i, survivor_found = 0, first = 1, reclaimed = 0;
 
 	enc_vkey(tableid, rowid, ~(uint64_t)0, startk);    /* newest version first */
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
+	/* A read error stops the prune (counted): versions leak, no more. */
+	if (xs_rd_count(bt_cursor_open( /* RDERR_OK: a leak */
+	    bt, startk, XS_VKLEN, &cur)) != XTC_OK)
+		return 0;                 /* a read error stops it: a leak only */
 	for (;;) {
 		const void *k = NULL, *vv = NULL;
 		uint16_t klen = 0, vl = 0;
 		uint64_t ts; int deleted;
 
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
+		if (xs_rd_count(bt_cursor_next( /* RDERR_OK: a leak */
+		    cur, &k, &klen, &vv, &vl)) != XTC_OK ||
 		    klen != XS_VKLEN ||
 		    dec_tableid((const uint8_t *)k) != tableid ||
 		    dec_rowid((const uint8_t *)k) != rowid)
@@ -5251,7 +5698,8 @@ xs_maybe_prune(bt_t *bt, uint32_t tableid, int64_t rowid)
 	int reclaimed, iv;
 	if (xtc_atomic_fetch_sub_i32(&g_av_countdown, 1, xtc_mo_relaxed) > 1)
 		return;                               /* not this write */
-	reclaimed = xs_prune_rowid(bt, tableid, rowid,
+	/* A count of versions reclaimed: an error reclaims 0. */
+	reclaimed = xs_prune_rowid(bt, tableid, rowid, /* RDERR_OK: count */
 	    snap_horizon(xs_visible()));
 	xtc_atomic_fetch_add_u64(&g_av_prunes, 1, xtc_mo_relaxed);
 	if (reclaimed > 0) {
@@ -5471,14 +5919,15 @@ xs_ilk_wait_clear(xstore_ctx_t *cx)
  * waiting for another holder to finish, and check that no version was
  * committed past `base` (the snapshot the write was computed against).
  * Returns 0, or the conflict (XS_CONFL_STALE: a newer committed
- * version; XS_CONFL_HARD: a deadlock, or a wait past the cap).
+ * version; XS_CONFL_HARD: a deadlock, or a wait past the cap), or -1
+ * when the row could not be read (rd_err says why).
  */
 static int xs_stmt_restartable(const xstore_ctx_t *cx);
 
 static int
 xs_intent_take(xstore_ctx_t *cx, uint32_t tid, int64_t rid, uint64_t base)
 {
-	int hslot = 0, r, dl = 0;
+	int hslot = 0, r, nr, dl = 0;
 	uint64_t hseq = 0;
 	int64_t waited = 0, nap = XS_ILK_NAP0_NS;
 	if (tid == XS_CAT_TABLEID || tid >= XS_IDXCAT_TABLEID) return 0;
@@ -5497,8 +5946,16 @@ xs_intent_take(xstore_ctx_t *cx, uint32_t tid, int64_t rid, uint64_t base)
 		 * the snapshot the re-run had just taken, and the statement
 		 * burned its 8 re-runs without waiting once (TPC-C Payment's
 		 * warehouse UPDATE: 1.35M retries in 60 s at 32 threads). */
-		if (base != 0 && !(r == 1 && xs_stmt_restartable(cx)) &&
-		    xs_newest_ts(cx->bt, tid, rid) > base) {
+		nr = 0;
+		if (base != 0 && !(r == 1 && xs_stmt_restartable(cx)))
+			nr = xs_newer_than(cx->bt, tid, rid, base);
+		if (nr < 0) {                      /* unread: unknown */
+			if (r == 0) xs_ilk_drop(cx->bt, tid, rid, cx->ilk_slot, cx->ilk_seq);
+			xs_ilk_wait_clear(cx);
+			xs_rd_err_tid(cx, tid, nr);
+			return -1;
+		}
+		if (nr > 0) {
 			if (r == 0) xs_ilk_drop(cx->bt, tid, rid, cx->ilk_slot, cx->ilk_seq);
 			xs_ilk_wait_clear(cx);
 			xtc_atomic_fetch_add_u64(&g_ilk_conflicts, 1,
@@ -5688,6 +6145,8 @@ xs_put_pruned(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid, const void *blo
 		if (ubad != 0)
 			xs_idx_err_msg(cx->bt, ubad, rc, cx->uniq_err,
 			    sizeof cx->uniq_err);
+		else
+			xs_rd_err_tid(cx, tableid, rc);
 		rc = SX_ERROR;
 	}
 	if (rc == SX_OK) {
@@ -5741,7 +6200,7 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		if (!cx->ilk_skip && (rc = xs_intent_take(cx, tableid, rowid,
 		    cx->txn_iso >= XS_ISO_REPEATABLE_READ ? cx->txn_snap
 		    : cx->stmt_base)) != 0) {
-			cx->last_conflict = rc;
+			if (rc > 0) cx->last_conflict = rc;
 			return -1;
 		}
 		/* UNIQUE: against committed rows and this txn's own writes now;
@@ -5756,15 +6215,24 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		                  deleted ? 0 : reclen, deleted);
 		return rc == SX_OK ? 0 : -1;
 	}
-	/* Autocommit: an UPDATE/DELETE computed this row from its read at
-	 * stmt_base; xs_put_ts refuses it (SX_BUSY) if the row was committed
-	 * past that since, or a commit writing it is in flight.  Holding the
-	 * row's intent for the put makes it wait for a transaction that
-	 * holds the row (and that transaction wait for it). */
+	/* Autocommit (a one-row statement; a multi-row one runs in an
+	 * implicit transaction): an UPDATE/DELETE computed this row from its
+	 * read at stmt_base; xs_put_ts refuses it (SX_BUSY) if the row was
+	 * committed past that since, or a commit writing it is in flight.
+	 * Holding the row's intent for the put makes it wait for a
+	 * transaction that holds the row (and that transaction wait for
+	 * it). */
 	/* base 0: xs_put_ts makes the stale-read check under the commit lock */
 	if ((rc = xs_intent_take(cx, tableid, rowid, 0)) != 0) {
 		xs_intents_release(cx);
-		cx->last_conflict = rc;
+		if (rc > 0) cx->last_conflict = rc;
+		return -1;
+	}
+	/* A read error the statement made, or a kill pending once the row
+	 * is ours (the wait above is the last park), discards a one-row
+	 * statement, as xstore_stmt_implicit_end discards a multi-row one. */
+	if (xs_stmt_doomed(cx)) {
+		xs_intents_release(cx);
 		return -1;
 	}
 	rc = xs_put_pruned(cx, tableid, rowid, deleted ? NULL : rec,
@@ -5785,8 +6253,9 @@ xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 
 /* INSERT of one new row: like xstore_write_txn, but the key must not
  * exist.  Autocommit checks that atomically with the write (see
- * xs_put_ts); in a transaction the statement checked it and the commit's
- * write-write check catches a row committed since the snapshot.
+ * xs_put_ts); in a transaction (a multi-row statement's implicit one
+ * too) the statement checked it and the commit's write-write check
+ * catches a row committed since the snapshot.
  * Returns 0, 1 if the key exists (unique violation), or -1 on error. */
 int
 xstore_insert_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
@@ -5805,6 +6274,8 @@ xstore_insert_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
 		cx->ilk_skip = 0;
 		return rc;
 	}
+	if (xs_stmt_doomed(cx))
+		return -1;            /* as in xstore_write_txn */
 	cx->uniq_err[0] = '\0';
 	rc = xs_put_pruned(cx, tableid, rowid, rec, reclen, 0, 1);
 	if (rc == SX_OK) {
@@ -5824,22 +6295,53 @@ xstore_uniq_err(struct xsql *db)
 	return cx != NULL ? cx->uniq_err : "";
 }
 
-/* The current statement's first index read error ("index error: cannot
- * read index t_g on t: I/O error"), or "" if none. */
+/* The current statement's first read error ("index error: cannot read
+ * index t_g on t: ...", "cannot read table t: ...", "cannot read the
+ * catalog: ..."), or "" if none. */
 const char *
 xstore_read_err(struct xsql *db)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
-	return cx != NULL ? cx->rd_err : "";
+	char name[64];
+	int i;
+	if (cx == NULL)
+		return "";
+	if (cx->rd_err[0] == '\0' && cx->rd_rc != 0 &&
+	    cx->rd_tid == XS_CAT_TABLEID) {
+		snprintf(cx->rd_err, sizeof cx->rd_err,
+		    "cannot read the catalog: %s", xtc_strerror(cx->rd_rc));
+	} else if (cx->rd_err[0] == '\0' && cx->rd_rc != 0) {
+		snprintf(name, sizeof name, "id %u", (unsigned)cx->rd_tid);
+		xs_cat_lock();
+		for (i = 0; i < g_cat_n; i++)
+			if (g_cat[i].bt == cx->bt && g_cat[i].tableid == cx->rd_tid) {
+				snprintf(name, sizeof name, "%s", g_cat[i].name);
+				break;
+			}
+		xs_cat_unlock();
+		/* Out of memory is not a failed read: say so. */
+		snprintf(cx->rd_err, sizeof cx->rd_err,
+		    cx->rd_rc == XTC_E_NOMEM ? "cannot load table %s: %s" :
+		    "cannot read table %s: %s", name, xtc_strerror(cx->rd_rc));
+	}
+	return cx->rd_err;
 }
 
-/* Clear the connection's index read error (see xstore.h). */
+/* Record a failed catalog read as the statement's read error (see
+ * xstore.h). */
+void
+xstore_read_err_catalog(struct xsql *db, int rc)
+{
+	xs_rd_err_tid(xstore_ctx_of(db), XS_CAT_TABLEID, rc);
+}
+
+/* Clear the connection's read error (see xstore.h). */
 void
 xstore_read_err_clear(struct xsql *db)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
 	if (cx != NULL)
-		cx->rd_err[0] = '\0';
+		xs_rd_err_clear(cx);
 }
 
 /* Statement atomicity inside a transaction: a failed statement undoes
@@ -5952,11 +6454,12 @@ xs_stmt_pin(xstore_ctx_t *cx, struct xsql *db)
 {
 	xs_enter_ctx(cx, db);
 	cx->stmt_puts = 0;
-	cx->rd_err[0] = '\0';
+	cx->last_conflict = 0;       /* an INSERT must not see the last one's */
+	xs_rd_err_clear(cx);
 	if (!cx->in_txn &&
 	    xtc_atomic_load_u64(&cx->read_snap, xtc_mo_relaxed) == 0)
-		return snap_pin_visible(&cx->snap_slot);
-	return xs_visible();
+		return cx->stmt_snap = snap_pin_visible(&cx->snap_slot);
+	return cx->stmt_snap = xs_visible();
 }
 
 /* Pin only (no statement snapshot or conflict base), for a statement
@@ -6013,14 +6516,30 @@ xstore_last_conflict(struct xsql *db)
  *     (PostgreSQL takes a REPEATABLE READ snapshot at the first
  *     statement too).  Not SERIALIZABLE: its SSI slot holds the old one;
  *   - autocommit before the statement applied any row (applied rows
- *     cannot be undone).
+ *     cannot be undone), which covers every multi-row statement, since
+ *     its implicit transaction applies nothing until it commits (the
+ *     caller rolled that back).  The re-run first waits until every
+ *     commit so far is visible (below).
  * Returns 1 and prepares the re-run, or 0. */
 int
 xstore_stmt_restart(struct xsql *db)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
 	if (cx == NULL || cx->last_conflict != XS_CONFL_STALE) return 0;
-	if (!cx->in_txn) return cx->stmt_puts == 0;
+	if (!cx->in_txn) {
+		if (cx->stmt_puts != 0) return 0;
+		/* The conflicting commit may be applied but not yet visible
+		 * (an older commit is still in flight).  A re-run before it is
+		 * would miss it again: an INSERT, which takes no row intent to
+		 * wait on, would re-run until the cap.  Nothing is held here,
+		 * and in-flight commits never wait on us.  NB the wait is as
+		 * bounded as the commits it follows: a commit parked in
+		 * wal_commit with no log writer left never becomes visible, so
+		 * this wait does not return either, just as that commit's own
+		 * xs_wait_visible does not. */
+		xs_wait_visible(xtc_atomic_load_u64(&g_xclock, xtc_mo_seq_cst));
+		return 1;
+	}
 	if (cx->txn_iso < XS_ISO_REPEATABLE_READ) return 1;
 	if (!cx->stmt_first || cx->serializable || cx->wn != 0) return 0;
 	cx->txn_snap = snap_pin_visible(&cx->snap_slot);
@@ -6028,6 +6547,96 @@ xstore_stmt_restart(struct xsql *db)
 	cx->rn = 0;
 	cx->did_scan = 0;
 	return 1;
+}
+
+static int xs_commit_ctx(xstore_ctx_t *cx);
+
+/*
+ * Statement atomicity in autocommit.  A statement that writes more than
+ * one row runs as an implicit transaction: xstore_stmt_implicit_begin
+ * opens it before the first write, so each row is buffered and checked
+ * as a transaction's is (row intents, UNIQUE against committed rows and
+ * the statement's own), and xstore_stmt_implicit_end commits them at one
+ * timestamp or discards them all.  A one-row statement is atomic as it
+ * is and keeps the direct autocommit write.
+ *
+ * Its snapshot is the statement's own (stmt_snap, pinned before the
+ * statement read anything), at SNAPSHOT isolation, so every buffered
+ * write is checked against it: a row committed by another writer after
+ * the statement read it fails the commit (SX_BUSY, a conflict the
+ * engine re-runs the statement for), and so does a key another INSERT
+ * committed after this one's key check: that statement's re-run finds
+ * the key and reports UNIQUE, as PostgreSQL does.
+ *
+ * Its row intents are held to the end of the statement, so two such
+ * statements that take the same rows in opposite orders (one in key
+ * order, one through an index whose order runs the other way) can
+ * deadlock.  The wait-for
+ * walk in xs_intent_take finds the cycle at once (xs_ilk_victim) and
+ * fails its youngest member with XS_CONFL_HARD, well before the 10 s
+ * wait cap.  That statement is not re-run (it could deadlock again);
+ * its rows are discarded and the client gets the serialization error,
+ * as PostgreSQL reports a deadlock.  In a 2-thread probe of 200 such
+ * pairs, one of each pair failed this way, in about 3 ms a pair.
+ *
+ * No SSI: an autocommit statement is not serializable today, and stays
+ * so.  The commit is the
+ * transaction commit (xs_commit_ctx), so the log holds the same record a
+ * BEGIN ... COMMIT of those rows writes.
+ */
+int
+xstore_stmt_implicit_begin(struct xsql *db)
+{
+	xstore_ctx_t *cx = xstore_ctx_of(db);
+	if (cx == NULL) return -1;
+	xs_enter_ctx(cx, db);
+	if (cx->in_txn) return 0;               /* a transaction is open */
+	if (XTC_DST_BUG(XTC_DST_BUG_STMTATOMIC))
+		return 0;     /* planted 87: each row commits on its own */
+	cx->native_autocommit = 0;              /* xs_enter_ctx keeps it open */
+	cx->in_txn = 1;
+	cx->implicit = 1;
+	cx->txn_snap = cx->stmt_snap != 0 ? cx->stmt_snap : xs_visible();
+	snap_set(&cx->snap_slot, cx->txn_snap);
+	wbuf_clear(cx);
+	cx->steal_txn = 0;
+	cx->rn = 0;
+	cx->did_scan = 0;
+	cx->txn_iso = XS_ISO_SNAPSHOT;
+	cx->touched = 0;
+	cx->serializable = 0;
+	cx->ssi = NULL;
+	/* Wait for a row's holder before checking the row, as a re-runnable
+	 * statement does (see xs_intent_take). */
+	cx->stmt_first = 1;
+	return 1;
+}
+
+/* End the implicit transaction, if one is open: commit its rows when
+ * `ok` (the statement succeeded), no read of the statement failed and no
+ * kill is pending for the connection's proc (a dead connection must not
+ * commit a statement it never answered), else discard them.  Returns 0
+ * (committed, or nothing to do), 1 for a UNIQUE violation at the commit
+ * (xstore_uniq_err says which), or -1 (discarded, or the commit failed:
+ * last_conflict, the read error or the log says why). */
+int
+xstore_stmt_implicit_end(struct xsql *db, int ok)
+{
+	xstore_ctx_t *cx = xstore_ctx_of(db);
+	int rc;
+	if (cx == NULL || !cx->implicit) return 0;
+	cx->native_autocommit = 1;
+	if (!ok || xs_stmt_doomed(cx)) {
+		cx->implicit = 0;
+		(void)xs_rollback_ctx(cx);
+		return -1;
+	}
+	cx->uniq_err[0] = '\0';
+	rc = xs_commit_ctx(cx);   /* cx->implicit tells its test hook */
+	cx->implicit = 0;
+	if (rc == SX_OK) return 0;
+	if (rc == SX_BUSY) cx->last_conflict = XS_CONFL_STALE;
+	return rc == SX_CONSTRAINT ? 1 : -1;
 }
 
 /* True if the connection currently has an open (non-autocommit)
@@ -6109,7 +6718,9 @@ xs_update(xsql_vtab *pv, int argc, xsql_value **argv,
 		uint8_t rec[XS_VMAX];
 		int reclen;
 		if (xsql_value_type(argv[2]) == SQLITE_NULL) {
-			int64_t mx = xstore_max_rowid(cx->bt, v->tableid), i;
+			int64_t mx, i;
+			if (xstore_max_rowid(cx->bt, v->tableid, &mx) != XTC_OK)
+				return SQLITE_IOERR;
 			for (i = 0; i < cx->wn; i++)
 				if (cx->wbuf[i].tableid == v->tableid &&
 				    cx->wbuf[i].rowid > mx)
@@ -6156,14 +6767,15 @@ xs_begin(xsql_vtab *pv)
 /*
  * Serializable validation (Cahill SSI pivot detection).  Returns
  * SX_BUSY if this transaction is a dangerous pivot (BOTH an
- * outgoing and an incoming rw-antidependency), else SX_OK.  Shared
+ * outgoing and an incoming rw-antidependency), else SX_OK, or the
+ * XTC_E_* code of a read that failed (rd_err says which table).  Shared
  * by the vtab xSync (2PC phase 1) and the native commit path.
  */
 static int
 xs_ssi_validate_locked(xstore_ctx_t *cx)
 {
 	const struct xs_inflight *e;
-	int i, out_edge = 0, in_edge;
+	int i, r, out_edge = 0, in_edge;
 	xs_rkey_t *wr;
 	int nwr;
 	if (!cx->in_txn || !cx->serializable)
@@ -6180,8 +6792,13 @@ xs_ssi_validate_locked(xstore_ctx_t *cx)
 	 * write skew can no longer both validate before either is visible).
 	 */
 	for (i = 0; i < cx->rn && !out_edge; i++) {
-		if (xs_newest_ts(cx->bt, cx->rset[i].tableid, cx->rset[i].rowid)
-		    > cx->txn_snap) { out_edge = 1; break; }
+		r = xs_newer_than(cx->bt, cx->rset[i].tableid, cx->rset[i].rowid,
+		    cx->txn_snap);
+		if (r < 0) {                 /* unread: nothing is proven */
+			xs_rd_err_tid(cx, cx->rset[i].tableid, r);
+			return r;
+		}
+		if (r > 0) { out_edge = 1; break; }
 		for (e = g_inflight; e != NULL; e = e->next)
 			if (xs_inflight_has(e, cx->rset[i].tableid, cx->rset[i].rowid)) {
 				out_edge = 1;
@@ -6285,6 +6902,30 @@ xs_wal_log(xstore_ctx_t *cx, uint64_t ts, uint64_t *clsn)
 	return rc;
 }
 
+/* STEAL: bring the transaction's spilled payloads back before COMMIT
+ * logs them.  One that cannot be read back would go to the log as a
+ * record with no payload, so the transaction cannot commit.  SX_OK, or
+ * SX_ERROR with the statement's read error set (the caller rolls
+ * back). */
+static int
+xs_commit_unspill(xstore_ctx_t *cx)
+{
+	int i, rc;
+	for (i = 0; i < cx->wn; i++) {
+		xs_wrec_t *w = &cx->wbuf[i];
+		rc = w->spilled && xs_row_fault() ? SX_ERROR
+		    : xs_wrec_ensure(cx, w);
+		if (rc != SX_OK) {
+			if (rc != SX_NOMEM)
+				(void)xs_rd_count(XTC_E_IO);
+			xs_rd_err_tid(cx, w->tableid,
+			    rc == SX_NOMEM ? XTC_E_NOMEM : XTC_E_IO);
+			return SX_ERROR;
+		}
+	}
+	return SX_OK;
+}
+
 static int
 xs_commit_ctx(xstore_ctx_t *cx)
 {
@@ -6307,9 +6948,10 @@ xs_commit_ctx(xstore_ctx_t *cx)
 		return SX_OK;
 	}
 	{
-		if (cx->steal_txn != 0)              /* STEAL: bring spilled payloads back */
-			for (i = 0; i < cx->wn; i++)
-				(void)xs_wrec_ensure(cx, &cx->wbuf[i]);
+		if (cx->steal_txn != 0 && xs_commit_unspill(cx) != SX_OK) {
+			(void)xs_rollback_ctx(cx);
+			return SX_ERROR;
+		}
 		/* First-committer-wins write-write check, the timestamp, and
 		 * the in-flight registration are one atomic step under the
 		 * commit lock; the log write and the apply run outside it so
@@ -6325,17 +6967,23 @@ xs_commit_ctx(xstore_ctx_t *cx)
 		 * lock; a dangerous pivot or a write-write conflict rolls back
 		 * with SX_BUSY, a UNIQUE violation with SX_CONSTRAINT. */
 		v0 = xs_visible();            /* before the probe: see g_row_cts */
-		if (xs_ww_probe(cx->bt, cx->wbuf, cx->wn)) {
+		if ((rc = xs_ww_probe(cx->bt, cx->wbuf, cx->wn, &ubad)) != 0) {
+			if (rc < 0) xs_rd_err_tid(cx, ubad, rc);
 			(void)xs_rollback_ctx(cx);
-			return SX_BUSY;           /* committed past our snapshot */
+			return rc > 0 ? SX_BUSY : SX_ERROR;   /* committed past us */
 		}
 		xs_commit_lock();
 		xs_gate_wait_locked();
-		if (xs_ssi_validate_locked(cx) != SX_OK ||
-		    xs_ww_recheck_locked(cx->bt, cx->wbuf, cx->wn, v0)) {
+		rc = xs_ssi_validate_locked(cx);
+		if (rc == SX_OK && (rc = xs_ww_recheck_locked(cx->bt, cx->wbuf,
+		    cx->wn, v0, &ubad)) != 0) {
+			if (rc < 0) xs_rd_err_tid(cx, ubad, rc);
+			else rc = SX_BUSY;
+		}
+		if (rc != SX_OK) {
 			xs_commit_unlock();
 			(void)xs_rollback_ctx(cx);
-			return SX_BUSY;           /* serialization failure */
+			return rc > 0 ? SX_BUSY : SX_ERROR;   /* rc < 0: unread */
 		}
 		rc = 0;
 		if (nuq > 0)
@@ -6363,6 +7011,8 @@ xs_commit_ctx(xstore_ctx_t *cx)
 		xs_uniq_stamp_locked(cx, 0, NULL, 0, 0, uq, nuq, fl.ts);
 		xs_commit_unlock();
 		ts = fl.ts;
+		if (cx->implicit && g_icommit_hook != NULL)
+			g_icommit_hook(XS_ICOMMIT_PRELOG);
 		if (g_xwal != NULL) {
 			uint64_t clsn = 0;
 			/* Durable BEFORE apply.  If the log write fails the
@@ -6385,6 +7035,8 @@ xs_commit_ctx(xstore_ctx_t *cx)
 			if (clsn != 0)
 				bt_set_lsn(cx->bt, clsn);
 		}
+		if (cx->implicit && g_icommit_hook != NULL)
+			g_icommit_hook(XS_ICOMMIT_LOGGED);
 		for (i = 0; i < cx->wn; i++) {
 			uint8_t key[XS_VKLEN];
 			uint8_t buf[1 + XS_VMAX];
@@ -6395,7 +7047,9 @@ xs_commit_ctx(xstore_ctx_t *cx)
 			 * it), so index maintenance can remove the stale entry. */
 			if (!wbuf_is_newest(cx, i))
 				continue;   /* a later write of the row in this txn wins */
-			prelen = xs_idx_preimage(cx->bt, w->tableid, w->rowid, pre, (int)sizeof pre);
+			/* An unread pre-image taints the indexes. */
+			prelen = xs_idx_preimage(cx->bt, /* RDERR_OK: taints */
+			    w->tableid, w->rowid, pre, (int)sizeof pre);
 			enc_vkey(w->tableid, w->rowid, ts, key);
 			buf[0] = w->deleted ? XS_F_DELETED : 0;
 			if (!w->deleted && w->len) memcpy(buf + 1, w->data, w->len);
@@ -6595,7 +7249,8 @@ xstore_gc_run(struct xsql *db)
 	if (c == NULL) return -1;
 	now = xs_visible();             /* readers may sit at the horizon */
 	horizon = snap_horizon(now);
-	(void)xs_gc(c->bt, horizon, &reclaimed);
+	/* GC stops on a read error (counted): versions leak, no more. */
+	(void)xs_gc(c->bt, horizon, &reclaimed);   /* RDERR_OK: a leak */
 	if (horizon > xtc_atomic_load_u64(&g_gc_horizon, xtc_mo_relaxed))
 		xtc_atomic_store_u64(&g_gc_horizon, horizon, xtc_mo_relaxed);
 	return reclaimed;
@@ -6609,7 +7264,8 @@ xstore_gc_close(bt_t *bt)
 	int reclaimed = 0;
 	if (bt == NULL) return 0;
 	horizon = snap_horizon(xs_visible());
-	(void)xs_gc(bt, horizon, &reclaimed);
+	/* GC stops on a read error (counted): versions leak, no more. */
+	(void)xs_gc(bt, horizon, &reclaimed);   /* RDERR_OK: a leak */
 	if (horizon > xtc_atomic_load_u64(&g_gc_horizon, xtc_mo_relaxed))
 		xtc_atomic_store_u64(&g_gc_horizon, horizon, xtc_mo_relaxed);
 	return (uint64_t)reclaimed;
@@ -6645,11 +7301,14 @@ xstore_stage_rows(bt_t *bt)
 	uint64_t n = 0;
 	if (bt == NULL) return 0;
 	enc_vkey(XS_STAGE_TID, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) return 0;
+	/* A test metric (staging keys left): short on a read error. */
+	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) /* RDERR_OK: metric */
+		return 0;
 	for (;;) {
 		const void *k = NULL, *v = NULL;
 		uint16_t kl = 0, vl = 0;
-		if (bt_cursor_next(cur, &k, &kl, &v, &vl) != XTC_OK || kl != XS_VKLEN ||
+		if (bt_cursor_next(cur, &k, &kl, &v, &vl) != XTC_OK || /* RDERR_OK: metric */
+		    kl != XS_VKLEN ||
 		    dec_tableid((const uint8_t *)k) != XS_STAGE_TID)
 			break;
 		n++;
@@ -6816,8 +7475,10 @@ xstore_rollback_to(struct xsql *db, int level)
 /* Largest rowid in `tableid` INCLUDING this connection's uncommitted
  * buffered writes -- the auto-rowid base for an in-txn INSERT, so a
  * buffered row's rowid is not reused (matching the vtab xUpdate auto-
- * rowid path).  Outside a txn this equals xstore_max_rowid.  Returns 0
- * for an empty table / unknown db. */
+ * rowid path).  Outside a txn this equals xstore_max_rowid.  Sets *out
+ * (0 for an empty table / unknown db) and returns 0, or -1 when a read
+ * failed (the statement's read error is set; *out is 0 and must not be
+ * used). */
 static uint64_t g_wmax_scanned; /* wbuf entries scanned (metric) */
 
 uint64_t
@@ -6826,14 +7487,19 @@ xstore_wbuf_scan_count(void)
 	return xtc_atomic_load_u64(&g_wmax_scanned, xtc_mo_relaxed);
 }
 
-int64_t
-xstore_max_rowid_txn(struct xsql *db, uint32_t tableid)
+int
+xstore_max_rowid_txn(struct xsql *db, uint32_t tableid, int64_t *out)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
 	int64_t mx;
-	int i;
+	int i, rc;
+	*out = 0;
 	if (cx == NULL) return 0;
-	mx = xstore_max_rowid(cx->bt, tableid);
+	rc = xstore_max_rowid(cx->bt, tableid, &mx);
+	if (rc != XTC_OK) {
+		xs_rd_err_tid(cx, tableid, rc);
+		return -1;
+	}
 	if (!cx->wmax_ok) {                  /* rebuild after a truncate */
 		cx->wmax_n = 0;
 		cx->wmax_ok = 1;
@@ -6847,18 +7513,23 @@ xstore_max_rowid_txn(struct xsql *db, uint32_t tableid)
 		for (i = 0; i < cx->wmax_n; i++)
 			if (cx->wmax[i].tableid == tableid && cx->wmax[i].max > mx)
 				mx = cx->wmax[i].max;
-		return mx;
+		*out = mx;
+		return 0;
 	}
 	for (i = 0; i < cx->wn; i++)        /* shortcut: > 8 tables in one txn scans */
 		if (cx->wbuf[i].tableid == tableid && cx->wbuf[i].rowid > mx)
 			mx = cx->wbuf[i].rowid;
 	xtc_atomic_fetch_add_u64(&g_wmax_scanned, (uint64_t)cx->wn,
 	    xtc_mo_relaxed);
-	return mx;
+	*out = mx;
+	return 0;
 }
 
 /* Is `rowid` a live committed row of `tableid` (newest version present
- * and not a tombstone)?  Used by the in-txn uniqueness check. */
+ * and not a tombstone)?  1 if live, 0 if not, or the XTC_E_* code of a
+ * read that failed: the row is then unknown, and an INSERT that took it
+ * for absent would put in a duplicate primary key.  Used by the
+ * primary-key checks of INSERT. */
 static int
 xs_row_live(bt_t *bt, uint32_t tableid, int64_t rowid)
 {
@@ -6866,13 +7537,25 @@ xs_row_live(bt_t *bt, uint32_t tableid, int64_t rowid)
 	uint8_t startk[XS_VKLEN];
 	const void *k = NULL, *vv = NULL;
 	uint16_t klen = 0, vl = 0;
-	int live = 0;
+	int live = 0, rc;
 	if (bt == NULL) return 0;
 	enc_vkey(tableid, rowid, ~(uint64_t)0, startk);   /* newest version first */
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
-	if (bt_cursor_next(cur, &k, &klen, &vv, &vl) == XTC_OK &&
-	    klen == XS_VKLEN &&
+	rc = bt_cursor_open(bt, startk, XS_VKLEN, &cur);
+	if (rc == XTC_OK) {
+		rc = bt_cursor_next(cur, &k, &klen, &vv, &vl);
+		if (rc == XTC_OK && xs_row_fault())
+			rc = XTC_E_IO;
+		if (rc != XTC_OK)
+			bt_cursor_close(cur);
+	}
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+		(void)xs_rd_count(rc);
+		/* planted 83: the unread row is absent, so the key is free */
+		return XTC_DST_BUG(XTC_DST_BUG_PKREAD) ? 0 : rc;
+	}
+	if (rc != XTC_OK)
+		return 0;                       /* the end of the tree */
+	if (klen == XS_VKLEN &&
 	    dec_tableid((const uint8_t *)k) == tableid &&
 	    dec_rowid((const uint8_t *)k) == rowid)
 		live = !(vl >= 1 && (((const uint8_t *)vv)[0] & XS_F_DELETED));
@@ -6885,18 +7568,24 @@ xs_row_live(bt_t *bt, uint32_t tableid, int64_t rowid)
  * a committed row; a buffered upsert reveals one.  Lets the native
  * INSERT enforce PK uniqueness INSIDE a transaction (where a plain
  * committed-B-tree probe would miss buffered rows).  Returns 1 if live,
- * 0 otherwise. */
+ * 0 otherwise, or -1 when the row could not be read (rd_err says why). */
 int
 xstore_row_exists_txn(struct xsql *db, uint32_t tableid, int64_t rowid)
 {
 	xstore_ctx_t *cx = xstore_ctx_of(db);
+	int r;
 	if (cx == NULL) return 0;
 	if (cx->in_txn) {
 		const xs_wrec_t *w = wbuf_find(cx, tableid, rowid);
 		if (w != NULL)
 			return w->deleted ? 0 : 1;   /* buffered write decides */
 	}
-	return xs_row_live(cx->bt, tableid, rowid);
+	r = xs_row_live(cx->bt, tableid, rowid);
+	if (r < 0) {
+		xs_rd_err_tid(cx, tableid, r);
+		return -1;
+	}
+	return r;
 }
 
 /*
@@ -6914,12 +7603,19 @@ xstore_row_exists_txn(struct xsql *db, uint32_t tableid, int64_t rowid)
  * the native driver, where there is no VDBE to keep in sync.
  */
 uint32_t
-xstore_create_table(struct xsql *db, const char *name, const char *coldefs)
+xstore_create_table(struct xsql *db, const char *name, const char *coldefs,
+    int *created)
 {
 	bt_t *bt = xstore_bt_of(db);
+	uint32_t id;
+	int rderr;
 	xs_cat_gen_bump();
+	if (created != NULL) *created = 0;
 	if (bt == NULL || name == NULL) return 0;
-	return xs_cat_find_or_create(bt, name, coldefs);
+	id = xs_cat_find_or_create(bt, name, coldefs, created, &rderr);
+	if (id == 0 && rderr != 0)
+		xstore_read_err_catalog(db, rderr);
+	return id;
 }
 
 /* Register a view (CREATE VIEW name AS <select>): record the SELECT
@@ -7018,7 +7714,8 @@ xs_hw_parse(const uint8_t *p, int n)
  * writes its tombstone, so a crash between the two leaves the object in
  * place and the mark already past it.  Holds the cat lock across the
  * read and the write, so two DROPs cannot lower the mark.  Returns
- * SX_OK, or the xs_put error (the DROP must then fail).
+ * SX_OK, or the xs_put error or the read's XTC_E_* code (the DROP must
+ * then fail).
  */
 static int
 xs_hw_raise(bt_t *bt, uint32_t cat, uint32_t id)
@@ -7026,7 +7723,12 @@ xs_hw_raise(bt_t *bt, uint32_t cat, uint32_t id)
 	uint8_t cur[16], val[16];
 	int n, rc = SX_OK;
 	xs_cat_lock();
-	n = xs_read_rec(bt, cat, 0, cur, (int)sizeof cur);
+	n = xs_row_fault() ? XTC_E_IO : xs_read_rec(bt, cat, 0, cur,
+	    (int)sizeof cur);
+	if (n < 0) {                  /* the mark is unknown: do not lower it */
+		xs_cat_unlock();
+		return xs_rd_count(n);
+	}
 	if (xs_hw_parse(cur, n) < id) {
 		val[0] = 0;
 		n = 1 + snprintf((char *)val + 1, sizeof val - 1, "%u",
@@ -7055,17 +7757,24 @@ xs_drop_gap(const char *site)
  * Version keys of the user tables sort below the index namespace
  * (XS_IDX_LEAD), so this is the key just below it: one descent.  It
  * covers a store from before the high-water row, where GC already
- * removed a dropped table's tombstone and left its rows.
+ * removed a dropped table's tombstone and left its rows.  XTC_OK with
+ * *out, or a read's XTC_E_* code.
  */
-static uint32_t
-xs_data_max_id(bt_t *bt)
+static int
+xs_data_max_id(bt_t *bt, uint32_t *out)
 {
 	uint8_t hi[1] = { XS_IDX_LEAD }, k[XS_VKLEN + 8];
 	uint16_t klen = 0;
-	if (bt_seek_lt(bt, hi, 1, k, (uint16_t)sizeof k, &klen, NULL, 0,
-	    NULL) != XTC_OK || klen != XS_VKLEN)
-		return 0;
-	return dec_tableid(k);
+	int rc;
+	*out = 0;
+	rc = bt_seek_lt(bt, hi, 1, k, (uint16_t)sizeof k, &klen, NULL, 0, NULL);
+	if (rc == XTC_OK && xs_row_fault())
+		rc = XTC_E_IO;
+	if (rc != XTC_OK)
+		return rc == XTC_E_NOTFOUND ? XTC_OK : xs_rd_count(rc);
+	if (klen == XS_VKLEN)
+		*out = dec_tableid(k);
+	return XTC_OK;
 }
 
 /*
@@ -7073,25 +7782,25 @@ xs_data_max_id(bt_t *bt)
  * high-water row, and (for the table catalog) the largest table id with
  * rows left in the tree.  The next allocation takes one past it.  Covers
  * ids recovered from the WAL, since the catalog is replayed before any
- * connect.
+ * connect.  XTC_OK with *out, or a read's XTC_E_* code: an id read as
+ * "max 0" would hand out one already in use.
  */
-static uint32_t
-xs_cat_high(bt_t *bt, uint32_t cat)
+static int
+xs_cat_high(bt_t *bt, uint32_t cat, uint32_t *out)
 {
 	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
-	uint32_t maxid = 0, hw = 0, data;
-	int seen0 = 0;
+	uint32_t maxid = 0, hw = 0, data = 0;
+	int seen0 = 0, rc;
 
-	enc_vkey(cat, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK)
-		return 0;
+	*out = 0;
+	if ((rc = xs_cat_open(bt, cat, &cur)) != XTC_OK)
+		return rc == XTC_E_NOTFOUND ? XTC_OK : rc;
 	for (;;) {
 		const void *k = NULL, *vv = NULL;
 		uint16_t klen = 0, vl = 0;
 		int64_t rid;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN)
+		rc = xs_cat_next(cur, &k, &klen, &vv, &vl);
+		if (rc != XTC_OK || klen != XS_VKLEN)
 			break;
 		if (dec_tableid((const uint8_t *)k) != cat)
 			break;                       /* past the catalog */
@@ -7106,29 +7815,37 @@ xs_cat_high(bt_t *bt, uint32_t cat)
 			maxid = (uint32_t)rid;
 	}
 	bt_cursor_close(cur);
-	data = cat == XS_CAT_TABLEID ? xs_data_max_id(bt) : 0;
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+		return rc;
+	if (cat == XS_CAT_TABLEID && (rc = xs_data_max_id(bt, &data)) != XTC_OK)
+		return rc;
 	if (data > hw)
 		hw = data;
 #if XTC_DST_BUG(XTC_DST_BUG_IDREUSE)
 	hw = 0;       /* planted: a dropped id comes back after GC */
 #endif
-	return hw > maxid ? hw : maxid;
+	*out = hw > maxid ? hw : maxid;
+	return XTC_OK;
 }
 
 /* The largest index id handed out (xs_cat_high over the index catalog),
  * or a larger one allocated in-process whose catalog row is not visible
- * yet.  The next index takes one past it, so an id is never reused. */
-static uint32_t
-xs_idxcat_max_id(bt_t *bt)
+ * yet.  The next index takes one past it, so an id is never reused.
+ * XTC_OK with *out, or a read's XTC_E_* code. */
+static int
+xs_idxcat_max_id(bt_t *bt, uint32_t *out)
 {
-	uint32_t maxid = xs_cat_high(bt, XS_IDXCAT_TABLEID);
-	int i;
+	uint32_t maxid;
+	int i, rc = xs_cat_high(bt, XS_IDXCAT_TABLEID, &maxid);
+	if (rc != XTC_OK)
+		return rc;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id > maxid)
 			maxid = g_idx[i].rt.idx_id;
 	xs_cat_unlock();
-	return maxid;
+	*out = maxid;
+	return XTC_OK;
 }
 
 /* Split a comma-joined column list into col[] (up to XS_IDX_NCOL).
@@ -7154,14 +7871,16 @@ xs_split_cols(const char *csv, char col[][64])
 
 /* Add (or replace) an in-process index-cache entry, resolving its table
  * id and payload map now (a table not resolvable yet keeps tableid 0:
- * never maintained, never chosen). */
-static void
+ * never maintained, never chosen).  XTC_OK, or the error of a catalog
+ * read that failed: the entry is not added then, since an unresolved
+ * index is neither maintained nor enforced. */
+static int
 xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
     char col[][64], int ncol, uint32_t descmask, int unique, char kind,
     const uint64_t *sipk)
 {
 	struct xs_idx_ent e;
-	int i;
+	int i, r;
 	memset(&e, 0, sizeof e);
 	e.bt = bt;
 	e.rt.idx_id = idx_id;
@@ -7176,8 +7895,13 @@ xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
 	snprintf(e.table, sizeof e.table, "%s", table);
 	for (i = 0; i < ncol; i++)
 		snprintf(e.col[i], sizeof e.col[i], "%s", col[i]);
-	if (!xstore_table_id(bt, table, &e.rt.tableid) ||
-	    xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay) != 0) {
+	r = xstore_table_id(bt, table, &e.rt.tableid);
+	if (r < 0)
+		return r;                        /* unread: not unresolved */
+	r = r == 0 ? -1 : xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay);
+	if (r < -1)
+		return r;
+	if (r != 0) {
 		/* Not maintained while unresolved: if its table appears later
 		 * the index would be trusted with no entries -- do not. */
 		e.rt.tableid = 0;
@@ -7187,10 +7911,11 @@ xs_idx_cache_add(bt_t *bt, uint32_t idx_id, const char *name, const char *table,
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && strcmp(g_idx[i].name, name) == 0)
 			break;
-	if (i == g_idx_n && g_idx_n < XS_IDX_MAX) g_idx_n++;
 	if (i < XS_IDX_MAX) g_idx[i] = e;
+	if (i == g_idx_n && g_idx_n < XS_IDX_MAX) XS_IDX_N_SET(g_idx_n + 1);
 	XS_CATC_BUMP();
 	xs_cat_unlock();
+	return XTC_OK;
 }
 
 /* Parse an index-catalog value: the current six-field form
@@ -7243,24 +7968,27 @@ xs_idxcat_tail(char *vbuf, size_t cap, size_t off, const struct xs_idx_rt *rt)
 }
 
 /* Load every persisted (non-tombstoned) index-catalog row for `bt` into
- * the in-process cache.  Called at open before rebuilding entries. */
-static void
+ * the in-process cache.  Called at open before rebuilding entries.
+ * XTC_OK, or the XTC_E_* code of a read that failed: the cache then
+ * holds only the definitions read before it. */
+static int
 xs_idxcat_load(bt_t *bt)
 {
 	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_VKLEN];
 	int64_t last_rid = 0; int have_last = 0;
 	struct { uint32_t id; char v[1100]; int vl; } *rows = NULL;
-	int nrows = 0, i;
+	int nrows = 0, i, rc;
 	rows = malloc(sizeof *rows * XS_IDX_MAX);
-	if (rows == NULL) return;
-	enc_vkey(XS_IDXCAT_TABLEID, INT64_MIN, ~(uint64_t)0, startk);
-	if (bt_cursor_open(bt, startk, XS_VKLEN, &cur) != XTC_OK) { free(rows); return; }
+	if (rows == NULL) return XTC_E_NOMEM;
+	if ((rc = xs_cat_open(bt, XS_IDXCAT_TABLEID, &cur)) != XTC_OK) {
+		free(rows);
+		return rc == XTC_E_NOTFOUND ? XTC_OK : rc;
+	}
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
 		const uint8_t *kb, *vb; int64_t rid;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK ||
-		    klen != XS_VKLEN) break;
+		rc = xs_cat_next(cur, &k, &klen, &vv, &vl);
+		if (rc != XTC_OK || klen != XS_VKLEN) break;
 		kb = (const uint8_t *)k; vb = (const uint8_t *)vv;
 		if (dec_tableid(kb) != XS_IDXCAT_TABLEID) break;
 		rid = dec_rowid(kb);
@@ -7276,6 +8004,12 @@ xs_idxcat_load(bt_t *bt)
 		nrows++;
 	}
 	bt_cursor_close(cur);
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND) {
+		/* A definition not loaded would not be maintained or
+		 * enforced: the caller must not run on a part of the list. */
+		free(rows);
+		return rc;
+	}
 	/* Resolve outside the cursor: cache add reads the table catalog. */
 	for (i = 0; i < nrows; i++) {
 		const char *nm, *tb, *cl;
@@ -7287,11 +8021,12 @@ xs_idxcat_load(bt_t *bt)
 		        &dm, &kd, sk))
 			continue;
 		nc = xs_split_cols(cl, col);
-		if (nc > 0)
-			xs_idx_cache_add(bt, rows[i].id, nm, tb, col, nc, dm,
-			    uq, kd, sk);
+		if (nc > 0 && (rc = xs_idx_cache_add(bt, rows[i].id, nm, tb, col,
+		    nc, dm, uq, kd, sk)) != XTC_OK)
+			break;
 	}
 	free(rows);
+	return rc == XTC_E_NOTFOUND ? XTC_OK : rc;
 }
 
 /* Delete every index entry under `idx_id` (a range over the [0xFE][id]
@@ -7306,27 +8041,37 @@ xs_idx_clear(bt_t *bt, uint32_t idx_id)
 	enum { KMAX = XS_IDX_KMAX, BATCH = 32 };
 	uint8_t (*dead)[KMAX];
 	uint16_t deadlen[BATCH];
+	int rc = XTC_OK;
 	dead = malloc(sizeof *dead * BATCH);
-	if (dead == NULL) return;
+	if (dead == NULL) {
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+		return;
+	}
 	(void)xs_idx_prefix(idx_id, prefix);
 	for (;;) {
 		bt_cursor_t *cur = NULL;
 		int ndead = 0, j;
-		if (bt_cursor_open(bt, prefix, 5, &cur) != XTC_OK) break;
+		if ((rc = xs_rd_count(bt_cursor_open(bt, prefix, 5, &cur))) !=
+		    XTC_OK)
+			break;
 		for (;;) {
 			const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
-			if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK) break;
+			rc = xs_rd_count(bt_cursor_next(cur, &k, &klen, &vv, &vl));
+			if (rc != XTC_OK) break;
 			if (klen < 5 || memcmp(k, prefix, 5) != 0) break;   /* past this index */
 			if (klen > KMAX) continue;   /* unreachable: keys <= BT_MAX_KEY */
 			memcpy(dead[ndead], k, klen); deadlen[ndead] = klen;
 			if (++ndead >= BATCH) break;
 		}
 		bt_cursor_close(cur);
-		if (ndead == 0) break;
 		for (j = 0; j < ndead; j++)
 			(void)bt_delete(bt, dead[j], deadlen[j]);
 		if (ndead < BATCH) break;
 	}
+	/* Entries left behind are stale (readers check each against its
+	 * row), but no reap knows them: do not trust the indexes. */
+	if (rc != XTC_OK && rc != XTC_E_NOTFOUND)
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	free(dead);
 }
 
@@ -7387,7 +8132,11 @@ xs_kbuf_cmp(const void *pa, const void *pb)
  * sorted order (sequential leaf fills, no cursor open while inserting).
  * For a UNIQUE index, two live rows with the same non-NULL key tuple
  * fail the build: returns -1 (CREATE UNIQUE INDEX over duplicates is a
- * UNIQUE constraint error in SQLite) and inserts nothing.  0 on success.
+ * UNIQUE constraint error in SQLite) and inserts nothing.  A build that
+ * cannot see every row (the scan failed a read, or memory ran out)
+ * also inserts nothing and returns the XTC_E_* code, which is below -1:
+ * an index built from part of the table would answer short.  0 on
+ * success.
  */
 static int
 xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
@@ -7397,32 +8146,38 @@ xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
 	int64_t rowid; const uint8_t *rec; int reclen;
 	uint8_t key[XS_IDX_KMAX];
 	size_t *ord = NULL, i;
-	int rc = 0, klen, isnull;
+	int rc = 0, klen, isnull, step;
 	char *nullf = NULL;
 	if (e->rt.tableid == 0) return 0;
 	memset(&kb, 0, sizeof kb);
 	s = xstore_scan_open(bt, e->table, 0, 0, 0, 0, 0);
-	if (s == NULL) return 0;
-	while (xstore_scan_next(s, &rowid, &rec, &reclen) == 1) {
+	if (s == NULL) {  /* the table went away, no memory, or unread */
+		rc = xstore_table_id(bt, e->table, NULL);
+		return rc < 0 ? rc : rc > 0 ? XTC_E_NOMEM : XTC_E_NOTFOUND;
+	}
+	while ((step = xstore_scan_next(s, &rowid, &rec, &reclen)) == 1) {
 		klen = xs_idx_rowkey(&e->rt, rec, reclen, rowid, 1, key,
 		    (int)sizeof key, &isnull);
-		if (klen < 0) { /* a page too small: built short */
-			rc = -2;
+		if (klen < 0) { /* a page too small for the key */
+			rc = XTC_E_INTERNAL;
 			break;
 		}
 		/* Carry the NULL flag in the key's slot via a side array. */
-		if (xs_kbuf_add(&kb, key, klen) != 0) { rc = -2; break; }
+		if (xs_kbuf_add(&kb, key, klen) != 0) { rc = XTC_E_NOMEM; break; }
 		if (e->rt.unique) {
 			char *nf = realloc(nullf, kb.ncap);
-			if (nf == NULL) { rc = -2; break; }
+			if (nf == NULL) { rc = XTC_E_NOMEM; break; }
 			nullf = nf;
 			nullf[kb.n - 1] = (char)isnull;
 		}
 	}
+	/* The scan's own error has no code of its own: a failed read. */
+	if (rc == 0 && step < 0)
+		rc = XTC_E_IO;
 	xstore_scan_close(s);
 	if (rc == 0 && kb.n > 0) {
 		ord = malloc(kb.n * sizeof *ord);
-		if (ord == NULL) rc = -2;
+		if (ord == NULL) rc = XTC_E_NOMEM;
 	}
 	if (rc == 0 && kb.n > 0) {
 		for (i = 0; i < kb.n; i++) ord[i] = i;
@@ -7446,9 +8201,7 @@ xs_idx_build_one(bt_t *bt, const struct xs_idx_ent *e)
 	}
 	free(ord); free(nullf);
 	free(kb.bytes); free(kb.off); free(kb.len);
-	if (rc == -2)                      /* out of memory: built short */
-		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
-	return rc == -1 ? -1 : 0;
+	return rc;
 }
 
 /*
@@ -7469,19 +8222,63 @@ struct xs_rb_job {
 	int next, left;
 };
 
+/* Take index `idx_id` out of the in-process cache (its catalog row, if
+ * any, is the caller's to handle). */
+static void
+xs_idx_cache_drop(bt_t *bt, uint32_t idx_id)
+{
+	int i;
+	xs_cat_lock();
+	for (i = 0; i < g_idx_n; i++)
+		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
+			g_idx[i] = g_idx[g_idx_n - 1];
+			XS_IDX_N_SET(g_idx_n - 1);
+			XS_CATC_BUMP();
+			break;
+		}
+	xs_cat_unlock();
+}
+
+/* Index `idx_id` could not be rebuilt (code rc): it misses entries for
+ * the rest of the run.  The planner and the index scan skip it, and a
+ * UNIQUE probe through it fails the write; the taint rebuilds it at the
+ * next open, and a later rebuild of this run replaces the entry. */
+static void
+xs_idx_mark_broken(bt_t *bt, uint32_t idx_id, int rc)
+{
+	int i;
+	xs_cat_lock();
+	for (i = 0; i < g_idx_n; i++)
+		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
+			g_idx[i].rt.broken = rc;
+			XS_CATC_BUMP();
+			break;
+		}
+	xs_cat_unlock();
+	xs_cat_gen_bump();           /* re-plan without it */
+}
+
 static int
 xs_rb_worker(void *arg)
 {
 	struct xs_rb_job *j = arg;
-	int i;
+	int i, rc;
 	while ((i = xtc_atomic_fetch_add_i32(&j->next, 1, xtc_mo_relaxed)) <
 	    j->n) {
 #if XTC_DST_BUG(XTC_DST_BUG_IDXSKIP)
 		if (j->n > 1 && i == j->n - 1)
 			continue;               /* planted: one index never rebuilt */
 #endif
-		if (xs_idx_build_one(j->bt, &j->e[i]) != 0)   /* UNIQUE dup: empty */
+		/* A UNIQUE duplicate builds nothing; a failed read or no
+		 * memory builds nothing either.  Either way the index is
+		 * incomplete: not used this run, not trusted at the next
+		 * open. */
+		rc = xs_idx_build_one(j->bt, &j->e[i]);
+		if (rc != 0) {
 			xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+			xs_idx_mark_broken(j->bt, j->e[i].rt.idx_id,
+			    rc < -1 ? rc : XTC_E_INTERNAL);
+		}
 	}
 	xtc_atomic_fetch_sub_i32(&j->left, 1, xtc_mo_acq_rel);
 	return 0;
@@ -7490,20 +8287,25 @@ xs_rb_worker(void *arg)
 /* Load the persisted catalog and rebuild every index of `bt` from the
  * base rows, on up to `workers` threads.  clear = 0 when the index
  * namespace is known empty (a tree rebuilt from the log on a fresh page
- * file). */
-static void
+ * file).  XTC_OK, or the error of a catalog that could not be read (no
+ * index is rebuilt then). */
+static int
 xs_idx_rebuild(bt_t *bt, int clear, int workers)
 {
 	struct xs_rb_job j;
-	int i, nw;
+	int i, nw, rc;
 	memset(&j, 0, sizeof j);
 	xs_idx_dead_forget(bt);      /* every entry is rebuilt from the base */
 	xtc_atomic_store_u64(&g_idx_garbage, 0, xtc_mo_relaxed);
-	xs_idxcat_load(bt);          /* refresh cache from persisted catalog */
+	/* Refresh the cache from the persisted catalog. */
+	if ((rc = xs_idxcat_load(bt)) != XTC_OK) {
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+		return rc;
+	}
 	j.e = malloc(sizeof *j.e * XS_IDX_MAX);
 	if (j.e == NULL) {
 		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
-		return;
+		return XTC_E_NOMEM;
 	}
 	j.bt = bt;
 	xs_cat_lock();
@@ -7529,14 +8331,14 @@ xs_idx_rebuild(bt_t *bt, int clear, int workers)
 			(void)xtc_proc_sleep(1000LL * 1000);
 	}
 	free(j.e);
+	return XTC_OK;
 }
 
 int
 xstore_index_rebuild_all(bt_t *bt)
 {
 	if (bt == NULL) return 0;
-	xs_idx_rebuild(bt, 1, 1);
-	return 0;
+	return xs_idx_rebuild(bt, 1, 1);
 }
 
 uint64_t
@@ -7547,8 +8349,9 @@ xstore_index_trust_tag(bt_t *bt)
 		return 0;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
-		if (g_idx[i].bt == bt && g_idx[i].rt.tableid == 0)
-			unresolved = 1;            /* not maintained this run */
+		if (g_idx[i].bt == bt && (g_idx[i].rt.tableid == 0 ||
+		    g_idx[i].rt.broken != 0))
+			unresolved = 1;            /* not complete this run */
 	xs_cat_unlock();
 	return unresolved ? 0 : XS_IDX_TRUST_TAG;
 }
@@ -7557,19 +8360,22 @@ int
 xstore_index_open(bt_t *bt, uint64_t tag, uint64_t garbage, int fresh,
     int workers)
 {
+	int rc;
 	if (bt == NULL) return 0;
 	xtc_atomic_store_i32(&g_idx_taint, 0, xtc_mo_release);
 	if (!fresh && tag == XS_IDX_TRUST_TAG && garbage < XS_IDX_GARBAGE_MAX) {
 		xs_idx_dead_forget(bt);
 		xtc_atomic_store_u64(&g_idx_garbage, garbage, xtc_mo_relaxed);
-		xs_idxcat_load(bt);        /* the entries are complete: trust them */
+		/* The entries are complete: trust them. */
+		if ((rc = xs_idxcat_load(bt)) != XTC_OK)
+			return rc;
 		/* Loading may taint (an unresolvable index): rebuild then. */
 		if (!xtc_atomic_load_i32(&g_idx_taint, xtc_mo_acquire))
 			return 1;
 		xtc_atomic_store_i32(&g_idx_taint, 0, xtc_mo_release);
 	}
-	xs_idx_rebuild(bt, !fresh, workers);
-	return 0;
+	rc = xs_idx_rebuild(bt, !fresh, workers);
+	return rc != XTC_OK ? rc : 0;
 }
 
 uint64_t
@@ -7591,7 +8397,8 @@ xstore_index_rebuild_count(void)
  * rows whose newest committed version has no entry (a seek or a UNIQUE
  * check would miss the row), *stale counts entries the row's newest
  * committed version does not carry (harmless: readers filter them).
- * Run quiesced (tests, tools).  Returns the number of indexes checked.
+ * Run quiesced (tests, tools).  Returns the number of indexes checked,
+ * or the XTC_E_* code of a read that failed (the counts are then short).
  */
 int
 xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale)
@@ -7599,7 +8406,7 @@ xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale)
 	struct xs_idx_ent *snap;
 	uint8_t key[XS_IDX_KMAX], kk[XS_IDX_KMAX], pfx[5];
 	uint8_t *rec = NULL;
-	int ns = 0, i, kl, rl;
+	int ns = 0, i, kl, rl, step = 0, rc, err = 0;
 	uint64_t miss = 0, st = 0;
 	if (bt == NULL) return 0;
 	snap = malloc(sizeof *snap * XS_IDX_MAX);
@@ -7615,39 +8422,52 @@ xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale)
 		bt_cursor_t *cur = NULL;
 		int64_t rowid; const uint8_t *r; int rlen;
 		uint16_t vl;
-		while (s != NULL && xstore_scan_next(s, &rowid, &r, &rlen) == 1) {
+		if (s == NULL) err = XTC_E_NOMEM;
+		while (s != NULL &&
+		    (step = xstore_scan_next(s, &rowid, &r, &rlen)) == 1) {
 			kl = xs_idx_rowkey(&snap[i].rt, r, rlen, rowid, 1, key,
 			    (int)sizeof key, NULL);
-			if (kl < 0 ||
-			    bt_lookup(bt, key, (uint16_t)kl, kk, 0, &vl) !=
-			        XTC_OK)
+			rc = kl < 0 ? XTC_E_NOTFOUND :
+			    bt_lookup(bt, key, (uint16_t)kl, kk, 0, &vl);
+			if (rc == XTC_E_NOTFOUND)
 				miss++;
+			else if (rc != XTC_OK)
+				err = rc;     /* unread: not "missing" */
 		}
+		if (step < 0) err = XTC_E_IO;
 		xstore_scan_close(s);
 		(void)xs_idx_prefix(snap[i].rt.idx_id, pfx);
-		if (bt_cursor_open(bt, pfx, 5, &cur) != XTC_OK) continue;
+		if ((rc = bt_cursor_open(bt, pfx, 5, &cur)) != XTC_OK) {
+			err = rc;
+			continue;
+		}
 		for (;;) {
 			const void *k = NULL, *vv = NULL; uint16_t klen = 0, vlen = 0;
 			int64_t rid;
-			if (bt_cursor_next(cur, &k, &klen, &vv, &vlen) != XTC_OK ||
-			    klen < 13 || memcmp(k, pfx, 5) != 0)
+			rc = bt_cursor_next(cur, &k, &klen, &vv, &vlen);
+			if (rc != XTC_OK && rc != XTC_E_NOTFOUND) err = rc;
+			if (rc != XTC_OK || klen < 13 || memcmp(k, pfx, 5) != 0)
 				break;
 			memcpy(key, k, klen);
 			kl = klen;
 			rid = (int64_t)(xs_get_be64(key + kl - 8) ^ 0x8000000000000000ull);
 			bt_cursor_park(cur);
 			rl = xs_read_rec(bt, snap[i].rt.tableid, rid, rec, XS_VMAX);
+			if (rl < 0) err = rl;
 			if (rl <= 0 || xs_idx_rowkey(&snap[i].rt, rec, rl, rid, 1, kk,
 			    (int)sizeof kk, NULL) != kl || memcmp(kk, key, (size_t)kl) != 0)
 				st++;
-			if (bt_cursor_resume(cur) != XTC_OK) break;
+			if ((rc = bt_cursor_resume(cur)) != XTC_OK) {
+				err = rc;
+				break;
+			}
 		}
 		bt_cursor_close(cur);
 	}
 	free(snap); free(rec);
 	if (missing) *missing = miss;
 	if (stale) *stale = st;
-	return ns;
+	return err != 0 ? err : ns;
 }
 
 int
@@ -7663,15 +8483,16 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	size_t off = 0, cl = 0;
 	if (bt == NULL || name == NULL || table == NULL || cols == NULL ||
 	    ncol < 1 || ncol > XS_IDX_NCOL) return 0;
-	if (!xstore_table_id(bt, table, &tableid)) return 0;   /* unknown table */
+	if ((rc = xstore_table_id(bt, table, &tableid)) <= 0)
+		return rc < 0 ? rc : 0;   /* unread / unknown table */
 	memset(&e, 0, sizeof e);
 	for (i = 0; i < ncol; i++) {
 		if (strlen(cols[i]) >= sizeof e.col[0]) return 0;
 		snprintf(e.col[i], sizeof e.col[i], "%s", cols[i]);
 		cl += strlen(cols[i]) + 1;
 	}
-	if (xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay) != 0)
-		return 0;                       /* unknown column */
+	if ((rc = xs_idx_resolve(bt, table, e.col, ncol, e.rt.pay)) != 0)
+		return rc < -1 ? rc : 0;        /* unread / unknown column */
 
 	/* Idempotent by name: if an index of this name already exists, keep it. */
 	xs_cat_lock();
@@ -7680,7 +8501,9 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	xs_cat_unlock();
 	if (exists) return 1;
 
-	idx_id = xs_idxcat_max_id(bt) + 1u;
+	if ((rc = xs_idxcat_max_id(bt, &idx_id)) != XTC_OK)
+		return rc;                      /* the ids in use are unknown */
+	idx_id++;
 	if (idx_id == 0u) idx_id = 1u;
 
 	/* Persist "<name>\0<table>\0<c1,c2,..>\0<u>\0<descmask>\0<kind>\0
@@ -7708,29 +8531,57 @@ xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 	/* Enter the cache BEFORE the build so a commit applied from here on
 	 * maintains the index; the barrier below waits out the commits in
 	 * flight (which may have missed it), and the build scans after it. */
-	xs_idx_cache_add(bt, idx_id, name, table, e.col, ncol, descmask, unique,
-	    kind ? (char)kind : 'i', sipk);
-	xtc_atomic_fetch_add_u64(&g_idx_gen, 1, xtc_mo_relaxed);
+	/* The resolve reads the catalog again when its cache is full: an
+	 * index not in the cache would be built from nothing, persisted, and
+	 * trusted empty at the next open. */
+	if ((rc = xs_idx_cache_add(bt, idx_id, name, table, e.col, ncol,
+	    descmask, unique, kind ? (char)kind : 'i', sipk)) != XTC_OK)
+		return rc;
+	xtc_atomic_fetch_add_u64(&g_idx_gen, 1, xtc_mo_release);
 	xs_cat_gen_bump();
-	xstore_quiesce_begin();
+	/* A store the engine has stopped never opens its gate: fail. */
+	if (!xs_quiesce_begin(XS_QB_STOP)) {
+		xs_idx_cache_drop(bt, idx_id);
+		return XTC_E_STATE;
+	}
 	xstore_quiesce_end();
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) { e = g_idx[i]; break; }
 	xs_cat_unlock();
+	/* A constraint index (CREATE TABLE's autoindex) is persisted before
+	 * its build: a build that fails leaves it durable and broken, so it
+	 * refuses writes and the next open rebuilds it.  Removing it instead
+	 * would leave the table without its constraint whenever the clean-up
+	 * DROP could not run (a crash, or a second failed read). */
+	if (kind != 0 && kind != 'i') {
+		if (xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf,
+		    (int)off, 0) != SX_OK) {
+			xs_idx_cache_drop(bt, idx_id);
+			return 0;
+		}
+		rc = xs_idx_build_one(bt, &e);
+		if (rc != 0) {
+			xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
+			xs_idx_mark_broken(bt, idx_id, rc < -1 ? rc : XTC_E_INTERNAL);
+		}
+		return rc != 0 ? rc : 1;
+	}
 	rc = xs_idx_build_one(bt, &e);
-	if (rc == -1) {
-		/* Duplicates: undo (SQLite refuses the index). */
+	if (rc != 0) {
+		/* Duplicates (SQLite refuses the index), or the table could not
+		 * be read whole: undo, so no index is left behind. */
 		xs_cat_lock();
 		for (i = 0; i < g_idx_n; i++)
 			if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
-				g_idx[i] = g_idx[--g_idx_n];
+				g_idx[i] = g_idx[g_idx_n - 1];
+				XS_IDX_N_SET(g_idx_n - 1);
 				XS_CATC_BUMP();
 				break;
 			}
 		xs_cat_unlock();
 		xs_idx_clear(bt, idx_id);
-		return -1;
+		return rc;
 	}
 	if (xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf, (int)off, 0) != SX_OK)
 		return 0;
@@ -7751,7 +8602,7 @@ xstore_drop_index(struct xsql *db, const char *name)
 {
 	bt_t *bt = xstore_bt_of(db);
 	uint32_t idx_id = 0;
-	int i, found = 0;
+	int i, found = 0, rc;
 	uint8_t vbuf[8];
 	xs_cat_gen_bump();
 	if (bt == NULL || name == NULL) return 0;
@@ -7760,34 +8611,62 @@ xstore_drop_index(struct xsql *db, const char *name)
 		if (g_idx[i].bt == bt && strcmp(g_idx[i].name, name) == 0) {
 			if (g_idx[i].rt.kind != 'i') { found = -1; break; }
 			idx_id = g_idx[i].rt.idx_id; found = 1;
-			g_idx_n--;
-			if (i != g_idx_n) g_idx[i] = g_idx[g_idx_n];
-			XS_CATC_BUMP();
 			break;
 		}
 	xs_cat_unlock();
 	if (found <= 0) return found;   /* unknown (0) / constraint index (-1) */
+	/* The mark first, before anything is removed: a mark that cannot
+	 * be read or written fails the DROP with the index whole.  Clearing
+	 * the entries of an index whose catalog row stays live would leave
+	 * an empty index that the next open trusts. */
+	if ((rc = xs_hw_raise(bt, XS_IDXCAT_TABLEID, idx_id)) != SX_OK)
+		return rc < -1 ? rc : XTC_E_IO;
+	xs_cat_lock();
+	for (i = 0; i < g_idx_n; i++)
+		if (g_idx[i].bt == bt && g_idx[i].rt.idx_id == idx_id) {
+			if (i != g_idx_n - 1) g_idx[i] = g_idx[g_idx_n - 1];
+			XS_IDX_N_SET(g_idx_n - 1);
+			XS_CATC_BUMP();
+			break;
+		}
+	xs_cat_unlock();
 	vbuf[0] = 0;
-	if (xs_hw_raise(bt, XS_IDXCAT_TABLEID, idx_id) == SX_OK &&
-	    !xs_drop_gap("xstore.drop.index_gap"))
-		(void)xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf, 1, 1);  /* tombstone catalog row */
+	if (xs_drop_gap("xstore.drop.index_gap") ||
+	    xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)idx_id, vbuf, 1, 1) != SX_OK)
+		xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 	xs_idx_clear(bt, idx_id);
 	return 1;
 }
 
-/* Drop every index of `table` (DROP TABLE). */
+/* The largest index id of `table`'s indexes, or 0 if it has none. */
+static uint32_t
+xs_idx_table_top(bt_t *bt, const char *table)
+{
+	uint32_t top = 0;
+	int i;
+	xs_cat_lock();
+	for (i = 0; i < g_idx_n; i++)
+		if (g_idx[i].bt == bt && strcmp(g_idx[i].table, table) == 0 &&
+		    g_idx[i].rt.idx_id > top)
+			top = g_idx[i].rt.idx_id;
+	xs_cat_unlock();
+	return top;
+}
+
+/* Drop every index of `table` (DROP TABLE), whose caller has raised the
+ * index id mark past them (xs_idx_table_top). */
 static void
 xs_idx_drop_table(bt_t *bt, const char *table)
 {
-	uint32_t ids[XS_IDX_MAX], top = 0;
+	uint32_t ids[XS_IDX_MAX];
 	uint8_t vbuf[8];
 	int n = 0, i, marked;
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; ) {
 		if (g_idx[i].bt == bt && strcmp(g_idx[i].table, table) == 0) {
 			ids[n++] = g_idx[i].rt.idx_id;
-			if (g_idx[i].rt.idx_id > top) top = g_idx[i].rt.idx_id;
-			g_idx[i] = g_idx[--g_idx_n];
+			g_idx[i] = g_idx[g_idx_n - 1];
+			XS_IDX_N_SET(g_idx_n - 1);
 			XS_CATC_BUMP();
 		} else {
 			i++;
@@ -7795,15 +8674,14 @@ xs_idx_drop_table(bt_t *bt, const char *table)
 	}
 	xs_cat_unlock();
 	vbuf[0] = 0;
-	/* No tombstone without the mark, as in xstore_drop_index.  If the
-	 * mark cannot be written (a fail-stopped log, so the store takes no
-	 * more writes) the catalog rows stay live: the next open loads the
-	 * definitions, finds no table and taints the indexes. */
-	marked = n > 0 && xs_hw_raise(bt, XS_IDXCAT_TABLEID, top) == SX_OK &&
-	    !xs_drop_gap("xstore.drop.index_gap");
+	/* A tombstone that cannot be written (a fail-stopped log, so the
+	 * store takes no more writes) leaves its catalog row live: taint,
+	 * so the next open rebuilds rather than trusts it. */
+	marked = !xs_drop_gap("xstore.drop.index_gap");
 	for (i = 0; i < n; i++) {
-		if (marked)
-			(void)xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)ids[i], vbuf, 1, 1);
+		if (!marked || xs_put(bt, XS_IDXCAT_TABLEID, (int64_t)ids[i], vbuf,
+		    1, 1) != SX_OK)
+			xtc_atomic_store_i32(&g_idx_taint, 1, xtc_mo_release);
 		xs_idx_clear(bt, ids[i]);
 	}
 }
@@ -7868,7 +8746,7 @@ xstore_index_list(bt_t *bt, const char *table, xstore_index_info_t *out,
 	g = xtc_atomic_load_u64(&g_catc_gen, xtc_mo_relaxed);
 	for (i = 0; i < g_idx_n && n < cap; i++) {
 		if (g_idx[i].bt != bt || strcasecmp(g_idx[i].table, table) != 0 ||
-		    g_idx[i].rt.tableid == 0)
+		    g_idx[i].rt.tableid == 0 || g_idx[i].rt.broken != 0)
 			continue;
 		memset(&out[n], 0, sizeof out[n]);
 		out[n].idx_id = g_idx[i].rt.idx_id;
@@ -7962,6 +8840,7 @@ xstore_index_lookup(bt_t *bt, const char *table, const char *col,
 	xs_cat_lock();
 	for (i = 0; i < g_idx_n; i++)
 		if (g_idx[i].bt == bt && g_idx[i].rt.tableid != 0 &&
+		    g_idx[i].rt.broken == 0 &&
 		    strcmp(g_idx[i].table, table) == 0 &&
 		    strcmp(g_idx[i].col[0], col) == 0 &&
 		    !(g_idx[i].rt.descmask & 1u)) {
@@ -7970,40 +8849,6 @@ xstore_index_lookup(bt_t *bt, const char *table, const char *col,
 		}
 	xs_cat_unlock();
 	return r;
-}
-
-/* Candidate rowids whose index entry's LEADING element equals the value
- * (the caller re-fetches each through MVCC and re-applies the WHERE, so
- * stale entries are filtered).  Returns the count, or -1 on overflow. */
-int
-xstore_index_seek_eq(bt_t *bt, uint32_t idx_id, int vclass,
-    int64_t ival, double rval, const uint8_t *bytes, int nbytes,
-    int64_t *out, int cap)
-{
-	bt_cursor_t *cur = NULL;
-	uint8_t startk[XS_IDX_KMAX];
-	int startlen, n = 0;
-	if (bt == NULL || out == NULL || cap <= 0) return -1;
-	xtc_atomic_fetch_add_u64(&g_idx_seeks, 1, xtc_mo_relaxed);
-	startlen = xs_idx_prefix(idx_id, startk);
-	startlen = xs_tup_elem(startk, startlen, (int)sizeof startk, vclass,
-	    ival, rval, bytes, nbytes, 0);
-	if (startlen < 0 || startlen + 8 > (int)bt_max_key(bt)) return -1;
-	if (bt_cursor_open(bt, startk, (uint16_t)startlen, &cur) != XTC_OK) return -1;
-	for (;;) {
-		const void *k = NULL, *vv = NULL; uint16_t klen = 0, vl = 0;
-		const uint8_t *kb;
-		if (bt_cursor_next(cur, &k, &klen, &vv, &vl) != XTC_OK) break;
-		kb = (const uint8_t *)k;
-		if (klen < startlen + 8 || memcmp(kb, startk, (size_t)startlen) != 0)
-			break;   /* past the value's range */
-		if (n < cap)
-			out[n] = (int64_t)(xs_get_be64(kb + klen - 8) ^ 0x8000000000000000ull);
-		n++;
-		if (n > cap) { bt_cursor_close(cur); return -1; }   /* overflow */
-	}
-	bt_cursor_close(cur);
-	return n;
 }
 
 /* Number of index seeks the planner has served (metric/test evidence
@@ -8069,8 +8914,13 @@ xs_umap_index(xstore_ctx_t *c, int wi)
 	const uint8_t *rec;
 	int nh, i, klen, isnull, rl = 0;
 	xs_wrec_t *w = &c->wbuf[wi];
-	if (w->deleted || g_idx_n == 0) return;
-	if (w->spilled && xs_wrec_ensure(c, w) != SX_OK) return;
+	if (w->deleted || !XS_IDX_ANY()) return;
+	/* A spilled payload that cannot be read back is left out: the
+	 * own-write UNIQUE check then walks the buffer (umap_bad). */
+	if (w->spilled && (xs_row_fault() || xs_wrec_ensure(c, w) != SX_OK)) {
+		c->umap_bad = 1;
+		return;
+	}
 	nh = xs_idx_for_table(c->bt, w->tableid, hits, 16);
 	rec = w->data; rl = (int)w->len;
 	for (i = 0; i < nh; i++) {
@@ -8102,7 +8952,11 @@ static void
 xs_idx_err_msg(bt_t *bt, uint32_t idx_id, int rc, char *out, size_t cap)
 {
 	struct xs_idx_ent e;
-	if (xs_idx_get(bt, idx_id, &e))
+	if (xs_idx_get(bt, idx_id, &e) && e.rt.broken != 0)
+		snprintf(out, cap, "index error: index %.48s is incomplete "
+		    "(%s); a restart rebuilds it", e.name,
+		    xtc_strerror(e.rt.broken));
+	else if (xs_idx_get(bt, idx_id, &e))
 		snprintf(out, cap, "index error: cannot check UNIQUE %s.%s: %s",
 		    e.table, e.col[0], xtc_strerror(rc));
 	else
@@ -8126,13 +8980,15 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 	bt_cursor_t *cur = NULL;
 	uint8_t *rec = NULL, kk[XS_IDX_KMAX];
 	int dup = 0, rc;
+	if (rt->broken != 0)
+		return rt->broken;   /* misses entries: proves nothing */
 	rc = bt_cursor_open(bt, key, (uint16_t)klen, &cur);
 	if (rc == XTC_OK && (xs_uniq_fail_now() || xs_rd_fault())) {
 		bt_cursor_close(cur);
 		rc = XTC_E_IO;
 	}
 	if (rc != XTC_OK) /* planted 72: the error reads as "no duplicate" */
-		return XTC_DST_BUG(XTC_DST_BUG_UNIQPROBE) ? 0 : rc;
+		return XTC_DST_BUG(XTC_DST_BUG_UNIQPROBE) ? 0 : xs_rd_count(rc);
 	for (;;) {
 		const void *k = NULL, *vv = NULL; uint16_t kl = 0, vl = 0;
 		int64_t rid;
@@ -8181,7 +9037,36 @@ xs_uniq_committed_dup(bt_t *bt, const struct xs_idx_rt *rt, const uint8_t *key,
 	}
 	bt_cursor_close(cur);
 	free(rec);
+	if (dup < 0 && dup != XTC_E_NOMEM)
+		(void)xs_rd_count(dup);
 	return dup;
+}
+
+/* xs_uniq_buffered_dup over the whole buffer, for when the umap misses
+ * a row: every newest live buffered row of the index's table.  Same
+ * answers. */
+static int
+xs_uniq_buffered_walk(xstore_ctx_t *c, const struct xs_idx_rt *rt,
+    const uint8_t *key, int klen, const struct xs_urow *w)
+{
+	uint8_t kk[XS_IDX_KMAX];
+	const uint8_t *rec;
+	int wi, rl, kl2, rc;
+	for (wi = 0; wi < c->wn; wi++) {
+		const xs_wrec_t *b = &c->wbuf[wi];
+		if (b->tableid != rt->tableid || b->rowid == w->rowid ||
+		    b->deleted || !wbuf_is_newest(c, wi))
+			continue;
+		rc = xs_wrec_payload(c, wi, &rec, &rl);
+		if (rc != XTC_OK)
+			return rc == XTC_E_NOMEM ? rc : xs_rd_count(rc);
+		kl2 = xs_idx_rowkey(rt, rec, rl, b->rowid, 0, kk,
+		    (int)sizeof kk, NULL);
+		if (xs_uniq_same(rt, kk, kl2, key, klen, rec, rl,
+		        b->rowid, w))
+			return 1;
+	}
+	return 0;
 }
 
 /* Does a buffered row of this transaction other than `rowid` carry key
@@ -8196,7 +9081,10 @@ xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
 	uint64_t h;
 	int i, m, wi, rl, kl2, rc;
 	const uint8_t *rec;
-	if (!c->in_txn || c->umap_cap == 0) return 0;
+	if (!c->in_txn) return 0;
+	if (c->umap_bad)
+		return xs_uniq_buffered_walk(c, rt, key, klen, w);
+	if (c->umap_cap == 0) return 0;
 	h = xs_bytes_hash(key, klen);
 	m = c->umap_cap - 1;
 	for (i = (int)(h & (uint64_t)m); c->umap[i].wi >= 0; i = (i + 1) & m) {
@@ -8206,8 +9094,8 @@ xs_uniq_buffered_dup(xstore_ctx_t *c, const struct xs_idx_rt *rt,
 		if (!wbuf_is_newest(c, wi) || c->wbuf[wi].deleted)
 			continue; /* superseded or deleted in this txn */
 		rc = xs_wrec_payload(c, wi, &rec, &rl);
-		if (rc != XTC_OK)
-			return rc; /* a spilled payload not read back */
+		if (rc != XTC_OK) /* a spilled payload not read back */
+			return rc == XTC_E_NOMEM ? rc : xs_rd_count(rc);
 		kl2 = xs_idx_rowkey(rt, rec, rl, c->wbuf[wi].rowid, 0, kk,
 		    (int)sizeof kk, NULL);
 		if (xs_uniq_same(rt, kk, kl2, key, klen, rec, rl,
@@ -8235,7 +9123,7 @@ xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid,
 	uint8_t key[XS_IDX_KMAX];
 	uint64_t vis;
 	int nh, i, klen, isnull, d;
-	if (g_idx_n == 0 || rec == NULL) return 0;
+	if (!XS_IDX_ANY() || rec == NULL) return 0;
 	nh = xs_idx_for_table(cx->bt, tableid, hits, 16);
 	if (nh == 0) return 0;
 	vis = xs_visible();
@@ -8260,7 +9148,7 @@ xs_uniq_check_stmt(xstore_ctx_t *cx, uint32_t tableid, int64_t rowid,
 	}
 	if (cx->in_txn && (cx->uniq_vis == 0 || vis < cx->uniq_vis)) {
 		cx->uniq_vis = vis;
-		cx->uniq_gen = xtc_atomic_load_u64(&g_idx_gen, xtc_mo_relaxed);
+		cx->uniq_gen = xtc_atomic_load_u64(&g_idx_gen, xtc_mo_acquire);
 	}
 	return 0;
 }
@@ -8316,7 +9204,7 @@ xs_uniq_collect(bt_t *bt, const xstore_ctx_t *cx, uint32_t tid1,
 	struct xs_idx_rt hits[16];
 	uint32_t seen[16];
 	int nseen = 0, n = 0, wi, nw, i, j, nh;
-	if (g_idx_n == 0) return 0;
+	if (!XS_IDX_ANY()) return 0;
 	nw = cx != NULL ? cx->wn : 1;
 	for (wi = 0; wi < nw; wi++) {
 		uint32_t tid = cx != NULL ? cx->wbuf[wi].tableid : tid1;
@@ -8354,7 +9242,7 @@ xs_uniq_validate_locked(bt_t *bt, xstore_ctx_t *cx, uint32_t tid1,
 	int skipok, d;
 	if (nu == 0) return 0;
 	skipok = cx != NULL && cx->uniq_vis != 0 &&
-	    cx->uniq_gen == xtc_atomic_load_u64(&g_idx_gen, xtc_mo_relaxed);
+	    cx->uniq_gen == xtc_atomic_load_u64(&g_idx_gen, xtc_mo_acquire);
 	for (wi = 0; wi < n; wi++) {
 		uint32_t tid = cx != NULL ? cx->wbuf[wi].tableid : tid1;
 		int64_t rid = cx != NULL ? cx->wbuf[wi].rowid : rid1;
@@ -8635,8 +9523,6 @@ xs_point_get(bt_t *bt, uint32_t tid, int64_t rid, uint64_t snap, uint8_t *buf,
 	enc_vkey(tid, rid, snap, probe);
 	rc = bt_seek_ge(bt, probe, XS_VKLEN, k, (uint16_t)sizeof k, &kl, buf,
 	    (uint16_t)(cap > 0xFFFF ? 0xFFFF : cap), &vl);
-	if (err != NULL && xs_rd_fault())
-		rc = XTC_E_IO;
 	if (rc != XTC_OK && rc != XTC_E_NOTFOUND && err != NULL)
 		*err = rc;
 	if (rc != XTC_OK || kl != XS_VKLEN || dec_tableid(k) != tid ||
@@ -8794,7 +9680,7 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 	(void)table;
 	if (bt == NULL) return NULL;
 	if (!xs_idx_get_rt(bt, idx_id, &rt) || rt.tableid == 0 ||
-	    neq > rt.ncol || ((lo || hi) && neq >= rt.ncol) ||
+	    rt.broken != 0 || neq > rt.ncol || ((lo || hi) && neq >= rt.ncol) ||
 	    ((lo || hi) && ((rt.descmask >> neq) & 1u)))
 		return NULL;
 	s = malloc(sizeof *s + (size_t)XS_ISCAN_NKEY * (size_t)rt.kmax);
@@ -8839,7 +9725,7 @@ xstore_iscan_open(struct xsql *db, const char *table, uint32_t idx_id,
 				continue;
 			rc = xs_wrec_payload(cx, wi, &rec, &rl);
 			if (rc != XTC_OK) { /* the first next fails */
-				s->err = rc;
+				s->err = rc == XTC_E_NOMEM ? rc : xs_rd_count(rc);
 				break;
 			}
 			kl = xs_idx_rowkey(&s->rt, rec, rl, cx->wbuf[wi].rowid,
@@ -8900,7 +9786,7 @@ static int
 xs_iscan_fail(xstore_iscan_t *s, int rc)
 {
 	if (s->err == 0)
-		s->err = rc;
+		s->err = rc == XTC_E_NOMEM ? rc : xs_rd_count(rc);
 	if (s->cur != NULL)
 		(void)bt_cursor_park(s->cur);
 	return -1;
@@ -9196,7 +10082,10 @@ xs_iscan_rows(xstore_iscan_t *s)
 		return 0;
 	if (s->ra_left > 0 && (s->ra_left -= n) <= 0)
 		s->ra_left = -1;
-	(void)bt_seek_ge_n(s->bt, pr, n, a->vbuf, (uint32_t)sizeof a->vbuf);
+	/* Every probe starts XTC_E_AGAIN; one the batch did not settle is
+	 * re-read by xs_point_get, which returns its error. */
+	(void)bt_seek_ge_n(s->bt, pr, n, a->vbuf, /* RDERR_OK: per probe */
+	    (uint32_t)sizeof a->vbuf);
 	for (i = 0; i < n; i++) {
 		const uint8_t *k = a->vbuf + pr[i].koff, *v = a->vbuf + pr[i].voff;
 		a->voff[i] = pr[i].voff;
@@ -9320,8 +10209,12 @@ xs_iscan_next1(xstore_iscan_t *s, int64_t *rowid, const uint8_t **rec,
 				return -1;
 			rl = xs_point_get(s->bt, s->rt.tableid, s->crid,
 			    s->snap, s->rec, 1 + XS_VMAX, &s->err);
-			if (s->err != 0)
+			if (s->err == 0 && xs_rd_fault())
+				s->err = XTC_E_IO;
+			if (s->err != 0) {
+				(void)xs_rd_count(s->err);
 				return -1;
+			}
 			if (rl == 0) continue;
 			if (rl < 0) rl = 0;
 		}
@@ -9475,7 +10368,7 @@ xs_iscan_err_msg(xstore_iscan_t *s)
 {
 	struct xs_idx_ent e;
 	int rc = s->err != 0 ? s->err : XTC_E_NOMEM;
-	if (s->cx == NULL || s->cx->rd_err[0] != '\0')
+	if (s->cx == NULL || s->cx->rd_err[0] != '\0' || s->cx->rd_rc != 0)
 		return;
 	if (xs_idx_get(s->bt, s->rt.idx_id, &e))
 		snprintf(s->cx->rd_err, sizeof s->cx->rd_err,
@@ -9539,12 +10432,17 @@ int
 xstore_drop_table(struct xsql *db, const char *name)
 {
 	bt_t *bt = xstore_bt_of(db);
-	uint32_t id;
+	uint32_t id, top;
 	uint8_t vbuf[256];
 	size_t nlen;
+	int err;
 	xs_cat_gen_bump();
 	if (bt == NULL || name == NULL) return -1;
-	id = xs_cat_lookup(bt, name);
+	id = xs_cat_lookup(bt, name, &err);
+	if (err != 0) {                      /* unread: not known to be gone */
+		xstore_read_err_catalog(db, err);
+		return -1;
+	}
 	if (id == 0) return 0;               /* not present: idempotent */
 	/* Tombstone the catalog row: a new version at (XS_CAT_TABLEID, id)
 	 * marked deleted, so xs_cat_lookup skips it.  Keep the name as the
@@ -9552,10 +10450,20 @@ xstore_drop_table(struct xsql *db, const char *name)
 	nlen = strlen(name);
 	if (nlen > sizeof vbuf) nlen = sizeof vbuf;
 	memcpy(vbuf, name, nlen);
-	/* The mark first: once GC takes the tombstone, it alone keeps the
-	 * id from coming back (see the table-id comment). */
-	if (xs_hw_raise(bt, XS_CAT_TABLEID, id) != SX_OK ||
-	    xs_drop_gap("xstore.drop.table_gap") ||
+	/* The marks first: once GC takes the tombstone, it alone keeps the
+	 * id from coming back (see the table-id comment).  The index mark
+	 * too, before the table goes: a DROP that cannot raise it fails
+	 * whole, rather than leave live index rows naming a dropped table
+	 * (a new table of the name would inherit them at the next open). */
+	top = xs_idx_table_top(bt, name);
+	if ((err = xs_hw_raise(bt, XS_CAT_TABLEID, id)) != SX_OK ||
+	    (top != 0 && (err = xs_hw_raise(bt, XS_IDXCAT_TABLEID, top)) !=
+	    SX_OK)) {
+		if (err < -1)
+			xstore_read_err_catalog(db, err);
+		return -1;
+	}
+	if (xs_drop_gap("xstore.drop.table_gap") ||
 	    xs_put(bt, XS_CAT_TABLEID, (int64_t)id, vbuf, (int)nlen, 1) != SX_OK)
 		return -1;
 	xs_idx_drop_table(bt, name);
@@ -9571,21 +10479,32 @@ int
 xstore_rename_table(struct xsql *db, const char *oldname, const char *newname)
 {
 	bt_t *bt = xstore_bt_of(db);
-	uint32_t id, exists;
+	uint32_t id, exists = 0;
 	uint8_t val[1024], vbuf[1024];
-	int vlen, i;
+	int vlen, i, err;
 	const char *coldefs = NULL;
 	size_t nlen, clen = 0, total;
 	xs_cat_gen_bump();
 	if (bt == NULL || oldname == NULL || newname == NULL) return -1;
-	id = xs_cat_lookup(bt, oldname);
-	if (id == 0) return 0;                       /* unknown: idempotent */
-	exists = xs_cat_lookup(bt, newname);
+	id = xs_cat_lookup(bt, oldname, &err);
+	if (id == 0 && err == 0) return 0;           /* unknown: idempotent */
+	if (err == 0)
+		exists = xs_cat_lookup(bt, newname, &err);
+	if (err != 0) {                              /* unread */
+		xstore_read_err_catalog(db, err);
+		return -1;
+	}
 	if (exists != 0 && exists != id) return -1;  /* target name taken */
 
 	/* Recover the column schema from the persisted catalog value
-	 * (name\0coldefs); fall back to the cached coldefs. */
+	 * (name\0coldefs); fall back to the cached coldefs.  A value that
+	 * cannot be read fails the rename: a new row without the schema
+	 * would lose the table's columns. */
 	vlen = xs_cat_value(bt, oldname, val, (int)sizeof val - 1);
+	if (vlen < 0) {
+		xstore_read_err_catalog(db, vlen);
+		return -1;
+	}
 	if (vlen > 0) {
 		val[vlen] = '\0';      /* the value is not NUL-terminated */
 		for (i = 0; i < vlen; i++) if (val[i] == 0) break;
@@ -9887,7 +10806,7 @@ xs_conn_rollback(void *p)
 static xstore_ctx_t *
 xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 {
-	xstore_ctx_t *ctx = malloc(sizeof *ctx);
+	xstore_ctx_t *ctx = calloc(1, sizeof *ctx);
 	int i, slot = -1;
 	if (ctx == NULL)
 		return NULL;
@@ -9906,41 +10825,16 @@ xs_ctx_init_and_map(struct xsql *db, bt_t *bt, int native)
 		free(ctx);
 		return NULL;
 	}
-	xtc_atomic_store_u64(&ctx->read_snap, 0, xtc_mo_seq_cst);
-	ctx->in_txn = 0;
-	ctx->txn_snap = 0;
-	ctx->wbuf = NULL;
-	ctx->wn = ctx->wcap = 0;
-	ctx->serializable = 0;
+	/* Zeroed by calloc: every field not set here starts at 0 / NULL
+	 * (no transaction, empty buffers and maps, no read error), so a new
+	 * field is zero unless it is listed below. */
 	ctx->isolation = XS_ISO_SNAPSHOT;
 	ctx->txn_iso = XS_ISO_SNAPSHOT;
-	ctx->touched = 0;
-	ctx->stmt_base = 0;
-	ctx->last_ts = 0;
-	ctx->last_conflict = 0;
-	ctx->stmt_puts = 0;
-	ctx->stmt_first = 0;
-	ctx->rset = NULL;
-	ctx->rn = ctx->rcap = 0;
-	ctx->did_scan = 0;
-	ctx->ssi = NULL;
 	ctx->snap_slot = -1;
 	ctx->autovacuum = xtc_atomic_load_i32(&g_av_default, xtc_mo_relaxed);
-	ctx->steal_txn = 0;
-	ctx->wbuf_bytes = 0;
-	ctx->sp_wn = NULL;
-	ctx->sp_rn = NULL;
-	ctx->sp_n = ctx->sp_cap = 0;
 	ctx->native_mode = native ? 1 : 0;
 	ctx->native_autocommit = 1;
-	ctx->wmap = NULL; ctx->wmap_n = ctx->wmap_cap = ctx->wmap_bad = 0;
-	ctx->wmax_n = 0; ctx->wmax_ok = 1;
-	ctx->ilk_slot = 0; ctx->ilk_seq = 0; ctx->ilk = NULL;
-	ctx->ilk_n = ctx->ilk_cap = 0; ctx->ilk_skip = 0;
-	ctx->umap = NULL; ctx->umap_n = ctx->umap_cap = 0;
-	ctx->uniq_vis = ctx->uniq_gen = 0;
-	ctx->uniq_err[0] = '\0';
-	ctx->rd_err[0] = '\0';
+	ctx->wmax_ok = 1;
 	return ctx;
 }
 
@@ -10516,8 +11410,10 @@ xs_dump_tree(wal_emit_fn emit, void *ectx, void *user)
 			/* NOTFOUND is the end of the tree; anything else would
 			 * leave a truncated image, which neither checkpoint
 			 * swaps in (the quiesced one gets XTC_E_IO below). */
-			if (n != XTC_E_NOTFOUND)
+			if (n != XTC_E_NOTFOUND) {
+				(void)xs_rd_count(n);
 				dc->cancelled = 1;
+			}
 			break;
 		}
 		/* Secondary-index entries (XS_IDX_LEAD keys, not version keys)
@@ -10623,7 +11519,8 @@ xstore_checkpoint_wal(bt_t *bt, struct wal *w, const char *wal_path)
  * checkpoint proc shares loop 0 with the WAL writer, and a dump on the
  * fiber would stall every commit's log ack anyway.  Under simulation the
  * pool runs inline (deterministic).  Returns XTC_OK, or an error with
- * the live log unchanged; *tail (optional) = live frames copied.
+ * the live log unchanged; *tail (optional) = live frames copied, by the
+ * catch-up rounds and the quiesced finish together.
  */
 static int    g_ock_slot = -1;           /* GC pin for the online dump */
 
@@ -10672,6 +11569,15 @@ xs_ock_body(void *arg)
 	return 0;
 }
 
+/* Test hook (xstore_checkpoint_online_hook); NULL in production. */
+static void (*g_ock_hook)(void);
+
+void
+xstore_checkpoint_online_hook(void (*fn)(void))
+{
+	g_ock_hook = fn;
+}
+
 void
 xstore_checkpoint_cancel(int on)
 {
@@ -10683,14 +11589,13 @@ xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
     uint64_t *tail)
 {
 	struct xs_ock_job j;
-	uint64_t frames;
 	int rc, res = 0;
 
 	if (bt == NULL || w == NULL || wal_path == NULL)
 		return XTC_E_INVAL;
 	memset(&j, 0, sizeof j);
 	j.dc.bt = bt;
-	if (!xs_quiesce_begin(1))
+	if (!xs_quiesce_begin(XS_QB_CKPT))
 		return XTC_E_AGAIN;
 	j.dc.snap = xtc_atomic_load_u64(&g_xclock, xtc_mo_relaxed);
 	if (j.dc.snap == 0)
@@ -10712,16 +11617,15 @@ xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
 		wal_ockpt_abort(j.k);
 		return j.rc;
 	}
+	if (g_ock_hook != NULL)
+		g_ock_hook();
 	xs_ock_yield("xstore.ockpt.finish");
-	if (!xs_quiesce_begin(1)) {
+	if (!xs_quiesce_begin(XS_QB_CKPT)) {
 		wal_ockpt_abort(j.k);
 		return XTC_E_AGAIN;
 	}
-	frames = wal_ockpt_frames(j.k);
-	rc = wal_ockpt_finish(j.k);       /* frees j.k */
+	rc = wal_ockpt_finish(j.k, tail);       /* frees j.k */
 	xstore_quiesce_end();
-	if (rc == XTC_OK && tail != NULL)
-		*tail = frames;
 	return rc;
 }
 

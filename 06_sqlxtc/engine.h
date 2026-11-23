@@ -148,6 +148,15 @@ struct bt;
 int  sx_open_bt(struct bt *bt, sx_db **out);
 void sx_close(sx_db *h);
 
+/* NB: running SQL needs a large stack.  On a fiber, sx_exec, sx_prepare
+ * and sx_step (and sx_column_* of a SELECT, which runs at the first
+ * step) need about 32 KiB natively for the write path's frame alone,
+ * and twice that under AddressSanitizer: more than the 64 KiB default
+ * fiber stack leaves for the caller.  The server gives every fiber
+ * 512 KiB (xtc_runtime_set_stack_size in main.c); an embedder that runs
+ * SQL on its own fibers should do the same, or set .stack_size on the
+ * fibers that run SQL.  A plain thread's stack is large enough. */
+
 /* One-shot statement (no result rows expected), e.g. a PRAGMA. */
 int  sx_exec(sx_db *h, const char *sql, char **errmsg);
 

@@ -542,7 +542,7 @@ sx_storage_open(const char *path, unsigned int n_frames)
 	wal_tail_t tail;
 	const char *dpath = (path && path[0]) ? path : "sqlxtc.xdb";
 	uint64_t clean = 0, clock = 0, idxtag = 0, idxgarb = 0;
-	int trusted = 0, i;
+	int trusted = 0, i, rc;
 
 	if (g_xbt != NULL)
 		return SX_OK;                 /* already open */
@@ -683,7 +683,7 @@ sx_storage_open(const char *path, unsigned int n_frames)
 	i = xtc_ncpus();
 	if (i > 16) i = 16;
 	if ((unsigned)i > o.n_frames / 1024u) i = (int)(o.n_frames / 1024u);
-	(void)xstore_index_open(g_xbt, trusted ? idxtag : 0, idxgarb, !trusted,
+	rc = xstore_index_open(g_xbt, trusted ? idxtag : 0, idxgarb, !trusted,
 	    i);
 	/* A trusted base that failed a page checksum while the open read it
 	 * (the index catalog load): drop it and rebuild from the log now,
@@ -694,6 +694,14 @@ sx_storage_open(const char *path, unsigned int n_frames)
 		/* Not a loop: this open made the clean flag durably 0 above,
 		 * so the next one takes the rebuild path. */
 		return sx_storage_open(path, n_frames);
+	}
+	/* Any other index catalog that cannot be read leaves the
+	 * definitions unknown: an index missing from the cache would be
+	 * neither maintained nor enforced, so the open fails (the base and
+	 * the log are untouched; a retry reads them again). */
+	if (rc < 0) {
+		sx_storage_abandon();
+		return SX_ERROR;
 	}
 	return SX_OK;
 }
@@ -906,7 +914,7 @@ sx_storage_quiesce(void)
 	sx_sw_stop();                      /* first: no restart mid-drain */
 	sx_ckpt_stop();
 	if (g_xwal != NULL)
-		xstore_quiesce_begin();        /* closed until the next open */
+		xstore_quiesce_final();        /* closed until the next open */
 	if (g_xwal != NULL) wal_writer_stop(g_xwal);
 	bm_trickler_stop(g_xbm);
 	bm_provider_stop(g_xbm);
@@ -1673,6 +1681,8 @@ sx_prepare(sx_db *h, const char *sql, int n_bytes, sx_stmt **out,
  * on the first step AND from sx_column_count / sx_column_name, since the
  * caller (exec_stmt) reads the column count BEFORE the first step. */
 #ifdef SQLXTC_HAVE_LIME
+static void nat_clear_err(sx_db *db);
+
 static int
 nat_select_run(struct sx_stmt *st)
 {
@@ -1681,6 +1691,7 @@ nat_select_run(struct sx_stmt *st)
 	int rc;
 	if (st->ran) return st->vres != NULL;
 	xstore_read_err_clear((struct xsql *)st->db);
+	nat_clear_err(st->db);
 	if (nat_aborted(st->db)) return 0;   /* sx_step reports it */
 	ck0 = g_xbm != NULL ? bm_cksum_failures(g_xbm, NULL) : 0;
 	if (st->nkind == SXN_PRAGMA_TABLE_INFO) {
@@ -1713,6 +1724,15 @@ nat_select_run(struct sx_stmt *st)
 		vx_result_free(st->vres);
 		st->vres = NULL;
 	}
+	/* A read that failed anywhere in the run (a correlated subquery's
+	 * inner run, which cannot fail its outer expression, leaves only
+	 * this): the result may be missing rows.  nat_set_run_error reports
+	 * it. */
+	if (xstore_read_err((struct xsql *)st->db)[0] != '\0' &&
+	    st->vres != NULL) {
+		vx_result_free(st->vres);
+		st->vres = NULL;
+	}
 	return (rc == 1 && st->vres != NULL);
 }
 
@@ -1731,10 +1751,17 @@ nat_select_run(struct sx_stmt *st)
 #define SX_MSG_WAL_IO "I/O error: write-ahead log write or fsync failed; " \
 	"the transaction was not committed and the database is read-only " \
 	"until restart"
+#define SX_MSG_STOPPED "cannot change the schema: the storage engine " \
+	"is shutting down"
 #define SX_MSG_SERIALIZE "could not serialize access due to concurrent " \
 	"update; transaction rolled back"
 #define SX_MSG_ABORTED "current transaction is aborted, commands ignored " \
 	"until end of transaction block"
+/* A write statement discarded because its connection's proc has a kill
+ * pending (xstore_write_txn, xstore_stmt_implicit_end).  The proc dies
+ * when sx_step returns, so only an embedder that reads sx_errmsg inside
+ * the mask sees it. */
+#define SX_MSG_CANCELLED "statement cancelled: the connection was killed"
 
 /* The page file failed a checksum (sx_cksum_cb): the error a statement
  * gets, naming the page.  Every later write is refused (the log is
@@ -1762,6 +1789,18 @@ nat_set_err(sx_db *db, const char *msg, int rc)
 	return rc;
 }
 
+/* Forget the connection's last error message: a statement starts with
+ * none, so a failure that sets no message cannot show an earlier one. */
+static void
+nat_clear_err(sx_db *db)
+{
+	struct sx_native_db *nd;
+	if (!sx_is_native_db(db)) return;
+	nd = (struct sx_native_db *)db;
+	free(nd->errmsg);
+	nd->errmsg = NULL;
+}
+
 static int
 nat_set_run_error(struct sx_stmt *st)
 {
@@ -1776,6 +1815,8 @@ nat_set_run_error(struct sx_stmt *st)
 	if (xstore_read_err((struct xsql *)st->db)[0] != '\0')
 		return nat_set_err(st->db,
 		    xstore_read_err((struct xsql *)st->db), SX_ERROR);
+	if (xtc_cancel_requested())
+		return nat_set_err(st->db, SX_MSG_CANCELLED, SX_ERROR);
 	nd = (struct sx_native_db *)st->db;
 	free(nd->errmsg);
 	/* A first unresolved base table name -> "no such table: NAME". */
@@ -1810,6 +1851,12 @@ nat_create_index(struct sx_stmt *st, const char *name, const char *table,
 	rc = xstore_create_index_ex(st->db, name, table, (const char *const *)cols,
 	    n, descmask, unique, kind);
 	if (rc == 1) return SX_DONE;
+	if (rc < -1) {
+		char m[256];
+		snprintf(m, sizeof m, "index error: cannot build index %s on %s: %s",
+		    name, table, xtc_strerror(rc));
+		return nat_set_err(st->db, m, SX_ERROR);
+	}
 	if (rc < 0) {
 		char m[400];
 		size_t off;
@@ -1823,17 +1870,16 @@ nat_create_index(struct sx_stmt *st, const char *name, const char *table,
 	return SX_ERROR;
 }
 
-/* CREATE TABLE: the table, then one UNIQUE autoindex per non-rowid
+/* Build the UNIQUE autoindexes CREATE TABLE declares, one per non-rowid
  * PRIMARY KEY / UNIQUE constraint ("p:c1,c2;u:c3;" after the coldefs),
- * named sqlite_autoindex_<t>_<n> as SQLite does. */
+ * named sqlite_autoindex_<t>_<n> as SQLite does.  Returns SX_DONE, or
+ * the first failure. */
 static int
-nat_create_table(struct sx_stmt *st)
+nat_create_autoindexes(struct sx_stmt *st)
 {
 	const char *ix = st->ddl_cols + strlen(st->ddl_cols) + 1;
 	char name[128], csv[1100];
 	int n = 0, rc;
-	if (xstore_create_table(st->db, st->ddl_name, st->ddl_cols) == 0)
-		return SX_ERROR;
 	while (*ix) {
 		char kind = ix[0];
 		const char *e = strchr(ix, ';');
@@ -1850,6 +1896,73 @@ nat_create_table(struct sx_stmt *st)
 	}
 	return SX_DONE;
 }
+
+/* CREATE TABLE: the table, then its autoindexes.  If an autoindex
+ * cannot be built, a table this statement created is dropped again; an
+ * existing table (IF NOT EXISTS) is left as it was.  An autoindex that
+ * failed its build stays defined and refuses writes (xstore.c), so a
+ * table the drop could not remove still enforces its constraint: the
+ * message says so, and the next open rebuilds the index. */
+static int
+nat_create_table(struct sx_stmt *st)
+{
+	char m[400];
+	int created = 0, rc;
+	if (xstore_create_table(st->db, st->ddl_name, st->ddl_cols,
+	    &created) == 0)
+		return SX_ERROR;
+	rc = nat_create_autoindexes(st);
+	if (rc == SX_DONE || !created)
+		return rc;
+	if (xstore_drop_table(st->db, st->ddl_name) == 0)
+		return rc;
+	snprintf(m, sizeof m, "%s; table %s was created but could not be "
+	    "dropped again: it refuses writes until a restart rebuilds its "
+	    "index", sx_errmsg(st->db), st->ddl_name);
+	return nat_set_err(st->db, m, SX_ERROR);
+}
+
+/* One DDL statement (CREATE / DROP TABLE, ALTER TABLE RENAME, CREATE /
+ * DROP INDEX), run under the DDL lock (xstore_ddl_lock) by sx_step. */
+static int
+nat_ddl(struct sx_stmt *st)
+{
+	char m[96];
+	int dr;
+	switch (st->nkind) {
+	case SXN_CREATE:
+		return nat_create_table(st);
+	case SXN_DROP:
+		return xstore_drop_table(st->db, st->ddl_name) == 0
+		    ? SX_DONE : SX_ERROR;
+	case SXN_ALTER:
+		return xstore_rename_table(st->db, st->ddl_name, st->ddl_cols) == 0
+		    ? SX_DONE : SX_ERROR;
+	case SXN_CREATE_INDEX: {
+		/* ddl_cols packs "table\0c1,c2\0unique\0descmask". */
+		const char *table = st->ddl_cols;
+		const char *cl = table + strlen(table) + 1;
+		const char *uq = cl + strlen(cl) + 1;
+		const char *dm = uq + strlen(uq) + 1;
+		return nat_create_index(st, st->ddl_name, table, cl, uq[0] == '1',
+		    (uint32_t)strtoul(dm, NULL, 10), 'i');
+	}
+	case SXN_DROP_INDEX:
+		/* Idempotent: dropping an unknown index is not an error. */
+		dr = xstore_drop_index(st->db, st->ddl_name);
+		if (dr < -1) {
+			snprintf(m, sizeof m, "cannot read the catalog: %s",
+			    xtc_strerror(dr));
+			return nat_set_err(st->db, m, SX_ERROR);
+		}
+		if (dr < 0)
+			return nat_set_err(st->db, "index associated with UNIQUE or "
+			    "PRIMARY KEY constraint cannot be dropped", SX_ERROR);
+		return SX_DONE;
+	default:
+		return SX_ERROR;
+	}
+}
 #endif
 
 static int sx_step_body(sx_stmt *st);
@@ -1864,7 +1977,10 @@ static int sx_step_body(sx_stmt *st);
  * connection leaked a shared latch on an internal node, a splitter
  * holding the SMO lock waited on it, and every commit behind it).  So a
  * step runs with cancellation masked and a kill raised meanwhile is
- * delivered when it returns -- kill latency is one statement.  Off a
+ * delivered when it returns -- kill latency is one statement.  A write
+ * statement with a kill pending writes nothing: its rows are discarded
+ * whether it changes one row or many (xstore_write_txn,
+ * xstore_stmt_implicit_end), and it fails with SX_MSG_CANCELLED.  Off a
  * proc both calls are no-ops.
  */
 int
@@ -1909,6 +2025,7 @@ sx_step_body(sx_stmt *st)
 		if (st->ran) return SX_DONE;   /* one-shot kinds */
 		st->ran = 1;
 		xstore_read_err_clear((struct xsql *)st->db);
+		nat_clear_err(st->db);
 		switch (st->nkind) {
 		case SXN_WRITE: {
 			int64_t nch = 0;
@@ -1921,7 +2038,9 @@ sx_step_body(sx_stmt *st)
 			/* UPDATE/DELETE compute rows from a read: give the statement
 			 * one snapshot and a write-write check against it.  An INSERT
 			 * reads only "the key is absent", which the insert path checks
-			 * atomically with the write (xstore_insert_txn). */
+			 * atomically with the write (xstore_insert_txn); a multi-row
+			 * INSERT's implicit transaction checks it again at its
+			 * commit, and the stale conflict re-runs it (below). */
 			rd = sx_word(&w, "UPDATE") || sx_word(&w, "DELETE");
 			/* In a transaction a failed statement undoes only its own
 			 * writes; the transaction stays open (SQLite statement
@@ -1941,7 +2060,10 @@ sx_step_body(sx_stmt *st)
 			/* A page failed its checksum: a read may have missed rows
 			 * (an UPDATE that found none would say "0 changed").  Undo
 			 * the statement and report the damage. */
-			if (g_xbm != NULL && bm_cksum_failures(g_xbm, NULL) != ck0) {
+			if ((g_xbm != NULL && bm_cksum_failures(g_xbm, NULL) != ck0) ||
+			    (rc == 1 && xstore_read_err(st->db)[0] != '\0')) {
+				/* Or a read failed where it could not fail its own
+				 * step (a correlated subquery): undo all the same. */
 				xstore_stmt_undo(st->db, mark);
 				free(verr);
 				return nat_set_run_error(st);
@@ -1952,9 +2074,14 @@ sx_step_body(sx_stmt *st)
 			 * waited for re-runs on a new snapshot where the client
 			 * cannot tell (READ COMMITTED, autocommit, a transaction's
 			 * first access: see xstore_stmt_restart) instead of failing.
-			 * Bounded: a hot row under constant churn still fails, with
-			 * the error below. */
-			if (rd && restarts < 8 && xstore_stmt_restart(st->db)) {
+			 * In autocommit that covers a multi-row INSERT too: its
+			 * implicit transaction's commit finds a key committed past
+			 * its snapshot, and the re-run's own key check then reports
+			 * the duplicate as UNIQUE, as PostgreSQL does.  Bounded: a
+			 * hot row under constant churn still fails, with the error
+			 * below. */
+			if ((rd || !xstore_in_txn(st->db)) && restarts < 8 &&
+			    xstore_stmt_restart(st->db)) {
 				free(verr); verr = NULL; nch = 0;
 				restarts++;
 				goto restart;
@@ -1976,6 +2103,7 @@ sx_step_body(sx_stmt *st)
 			if (verr != NULL &&
 			    (strncmp(verr, "UNIQUE", 6) == 0 ||
 			        strncmp(verr, "row too large", 13) == 0 ||
+			        strncmp(verr, "too many rows", 13) == 0 ||
 			        strncmp(verr, "index error", 11) == 0)) {
 				rc = nat_set_err(st->db, verr, verr[0] == 'U'
 				    ? SX_CONSTRAINT : SX_ERROR);
@@ -2024,10 +2152,14 @@ sx_step_body(sx_stmt *st)
 				return nat_set_err(st->db, xstore_uniq_err(st->db),
 				    SX_CONSTRAINT);
 			const char *ck = sx_cksum_msg(ckbuf, sizeof ckbuf);
-			/* A UNIQUE probe that failed left its reason. */
+			/* A UNIQUE probe or a row read that failed left its
+			 * reason. */
 			if (ck == NULL && !xstore_wal_failed() &&
 			    xstore_uniq_err(st->db)[0] != '\0')
 				ck = xstore_uniq_err(st->db);
+			if (ck == NULL && !xstore_wal_failed() &&
+			    xstore_read_err(st->db)[0] != '\0')
+				ck = xstore_read_err(st->db);
 			return nat_set_err(st->db, ck != NULL ? ck :
 			    xstore_wal_failed() ? SX_MSG_WAL_IO
 			    : "commit failed; transaction rolled back", SX_ERROR);
@@ -2080,34 +2212,32 @@ sx_step_body(sx_stmt *st)
 			return SX_DONE;
 		}
 		case SXN_CREATE:
-			return nat_create_table(st);
 		case SXN_DROP:
-			return xstore_drop_table(st->db, st->ddl_name) == 0
-			    ? SX_DONE : SX_ERROR;
+		case SXN_ALTER:
+		case SXN_CREATE_INDEX:
+		case SXN_DROP_INDEX: {
+			int drc;
+			if (xstore_ddl_lock() != XTC_OK)
+				return nat_set_err(st->db, SX_MSG_STOPPED, SX_ERROR);
+			drc = nat_ddl(st);
+			xstore_ddl_unlock();
+			/* A DDL step that failed without a message of its own: a
+			 * catalog read it recorded, or the fail-stopped log. */
+			if (drc == SX_ERROR && sx_errmsg(st->db)[0] == '\0') {
+				if (xstore_read_err(st->db)[0] != '\0')
+					return nat_set_err(st->db, xstore_read_err(st->db),
+					    SX_ERROR);
+				if (xstore_wal_failed())
+					return nat_set_err(st->db, SX_MSG_WAL_IO, SX_ERROR);
+			}
+			return drc;
+		}
 		case SXN_CREATE_VIEW:
 			return xstore_create_view(st->db, st->ddl_name, st->ddl_cols) != 0
 			    ? SX_DONE : SX_ERROR;
 		case SXN_DROP_VIEW:
 			return xstore_drop_view(st->db, st->ddl_name) != 0
 			    ? SX_DONE : SX_ERROR;
-		case SXN_ALTER:
-			return xstore_rename_table(st->db, st->ddl_name, st->ddl_cols) == 0
-			    ? SX_DONE : SX_ERROR;
-		case SXN_CREATE_INDEX: {
-			/* ddl_cols packs "table\0c1,c2\0unique\0descmask". */
-			const char *table = st->ddl_cols;
-			const char *cl = table + strlen(table) + 1;
-			const char *uq = cl + strlen(cl) + 1;
-			const char *dm = uq + strlen(uq) + 1;
-			return nat_create_index(st, st->ddl_name, table, cl, uq[0] == '1',
-			    (uint32_t)strtoul(dm, NULL, 10), 'i');
-		}
-		case SXN_DROP_INDEX:
-			/* Idempotent: dropping an unknown index is not an error. */
-			if (xstore_drop_index(st->db, st->ddl_name) < 0)
-				return nat_set_err(st->db, "index associated with UNIQUE or "
-				    "PRIMARY KEY constraint cannot be dropped", SX_ERROR);
-			return SX_DONE;
 		case SXN_PRAGMA_NOP:
 			return SX_DONE;   /* value-setting PRAGMA: no-op, no rows */
 		default:
@@ -2130,6 +2260,10 @@ sx_reset(sx_stmt *st)
 #endif
 	return SX_OK;
 }
+#ifdef SQLXTC_HAVE_LIME
+static void bind_slot_release(sx_stmt *st, int idx);
+#endif
+
 int
 sx_clear_bindings(sx_stmt *st)
 {
@@ -2137,12 +2271,13 @@ sx_clear_bindings(sx_stmt *st)
 #ifdef SQLXTC_HAVE_LIME
 	if (st->native) {
 		int i;
-		for (i = 0; i < st->nbind; i++)
-			if ((st->binds[i].type == VX_TEXT || st->binds[i].type == VX_BLOB) &&
-			    st->binds[i].bytes != NULL) {
-				free((void *)st->binds[i].bytes);
-				st->binds[i].bytes = NULL;
-			}
+		/* Every slot becomes NULL, as in SQLite: a later bind of a
+		 * higher slot raises nbind past these again. */
+		for (i = 0; i < st->nbind; i++) {
+			bind_slot_release(st, i + 1);
+			st->binds[i].type = VX_NULL;
+			st->binds[i].nbytes = 0;
+		}
 		st->nbind = 0;
 		return SX_OK;
 	}
@@ -2173,6 +2308,21 @@ sx_finalize(sx_stmt *st)
 	free(st);
 }
 
+#ifdef SQLXTC_HAVE_LIME
+/* Free the bytes a TEXT or BLOB bind holds in slot idx (1-based), so a
+ * rebind of the slot, of any type, does not leak them.  A compiled plan
+ * copies bind bytes into its own arena, so nothing still points here. */
+static void
+bind_slot_release(sx_stmt *st, int idx)
+{
+	vx_cell_t *c = &st->binds[idx - 1];
+
+	if ((c->type == VX_TEXT || c->type == VX_BLOB) && c->bytes != NULL)
+		free((void *)c->bytes);
+	c->bytes = NULL;
+}
+#endif
+
 int
 sx_bind_count(sx_stmt *st)
 {
@@ -2187,6 +2337,7 @@ sx_bind_int64(sx_stmt *st, int idx, int64_t v)
 #ifdef SQLXTC_HAVE_LIME
 	if (st->native) {
 		if (idx < 1 || idx > 32) return SX_ERROR;
+		bind_slot_release(st, idx);
 		st->binds[idx-1].type = VX_INT; st->binds[idx-1].i = v;
 		if (idx > st->nbind) st->nbind = idx;
 		return SX_OK;
@@ -2200,6 +2351,7 @@ sx_bind_double(sx_stmt *st, int idx, double v)
 #ifdef SQLXTC_HAVE_LIME
 	if (st->native) {
 		if (idx < 1 || idx > 32) return SX_ERROR;
+		bind_slot_release(st, idx);
 		st->binds[idx-1].type = VX_REAL; st->binds[idx-1].r = v;
 		if (idx > st->nbind) st->nbind = idx;
 		return SX_OK;
@@ -2217,10 +2369,11 @@ sx_bind_text(sx_stmt *st, int idx, const char *s, int n)
 		if (n < 0) n = s ? (int)strlen(s) : 0;
 		p = (uint8_t *)malloc((size_t)n + 1);
 		if (p == NULL) return SX_NOMEM;
+		bind_slot_release(st, idx);
 		if (n && s) memcpy(p, s, (size_t)n);
 		p[n] = '\0';
-		/* The bind buffer is owned by the cell and freed on finalize/
-		 * reset/clear (see bind cleanup). */
+		/* The cell owns the buffer until a rebind, sx_clear_bindings()
+		 * or sx_finalize(). */
 		st->binds[idx-1].type = VX_TEXT; st->binds[idx-1].bytes = p;
 		st->binds[idx-1].nbytes = (uint32_t)n;
 		if (idx > st->nbind) st->nbind = idx;
@@ -2239,6 +2392,7 @@ sx_bind_blob(sx_stmt *st, int idx, const void *p, int n)
 		if (n < 0) n = 0;
 		b = (uint8_t *)malloc((size_t)n + 1);
 		if (b == NULL) return SX_NOMEM;
+		bind_slot_release(st, idx);
 		if (n && p) memcpy(b, p, (size_t)n);
 		b[n] = '\0';
 		st->binds[idx-1].type = VX_BLOB; st->binds[idx-1].bytes = b;
@@ -2255,6 +2409,7 @@ sx_bind_null(sx_stmt *st, int idx)
 #ifdef SQLXTC_HAVE_LIME
 	if (st->native) {
 		if (idx < 1 || idx > 32) return SX_ERROR;
+		bind_slot_release(st, idx);
 		st->binds[idx-1].type = VX_NULL; st->binds[idx-1].nbytes = 0;
 		if (idx > st->nbind) st->nbind = idx;
 		return SX_OK;
@@ -2392,6 +2547,8 @@ sx_vexec_try(sx_db *h, const char *sql, int n_workers, sx_vx_result **out)
 	rc = vx_run((struct xsql *)h, sql, n_workers, &r, &verr);
 	xstore_stmt_end((struct xsql *)h);
 	if (verr) free(verr);          /* the caller falls back; no message needed */
+	if (rc == 1 && xstore_read_err((struct xsql *)h)[0] != '\0')
+		rc = -1;                   /* a read failed: rows may be missing */
 	if (rc == 1) { *out = (sx_vx_result *)r; return 1; }
 	if (r) vx_result_free(r);
 	return rc;                     /* 0 fallback / <0 error */
@@ -2412,6 +2569,8 @@ sx_vexec_try_p(sx_db *h, const char *sql, const void *binds, int nbinds,
 	              n_workers, &r, &verr);
 	xstore_stmt_end((struct xsql *)h);
 	if (verr) free(verr);
+	if (rc == 1 && xstore_read_err((struct xsql *)h)[0] != '\0')
+		rc = -1;                   /* a read failed: rows may be missing */
 	if (rc == 1) { *out = (sx_vx_result *)r; return 1; }
 	if (r) vx_result_free(r);
 	return rc;

@@ -30,7 +30,19 @@
 #define XTC_DST_BUG_UNIQPROBE  72  /* xstore.c: a failed UNIQUE probe reads as "no duplicate" */
 #define XTC_DST_BUG_LONGKEY    73  /* xstore.c: a key longer than a B-tree key is not indexed */
 #define XTC_DST_BUG_IDREUSE    79  /* xstore.c: a new table / index takes a dropped one's id */
-#define XTC_DST_BUG_UNIQREAD   80  /* xstore.c: a UNIQUE candidate row that cannot be read reads as absent */
+/* xstore.c: a UNIQUE candidate row that cannot be read reads as absent */
+#define XTC_DST_BUG_UNIQREAD   80
 #define XTC_DST_BUG_POINTEND   81  /* btree.c: a key prefix "ends" with its leaf, fence unchecked */
+/* xstore.c: a failed base-scan read ends the scan as the table's end */
+#define XTC_DST_BUG_SCANSHORT  82
+#define XTC_DST_BUG_PKREAD     83  /* xstore.c: a row the INSERT key check cannot read is absent */
+/* xstore.c: a row the write-write check cannot read has no newer version */
+#define XTC_DST_BUG_WWREAD     84
+/* xstore.c: a failed max-rowid descent reads as an empty table */
+#define XTC_DST_BUG_MAXROWID   85
+/* xstore.c: a failed step of the UNIQUE reap's reuse check reads "not reused" */
+#define XTC_DST_BUG_REAPREAD   86
+/* xstore.c: a multi-row autocommit statement commits each row on its own */
+#define XTC_DST_BUG_STMTATOMIC 87
 
 #endif /* SQLXTC_SX_DST_H */

@@ -54,6 +54,28 @@ int  xstore_wal_failed(void);
  * keep running.  Pair with xstore_quiesce_end.  Call from a proc or off
  * a loop, holding no engine lock. */
 void xstore_quiesce_begin(void);
+/* The engine's final quiesce (sx_storage_quiesce): as
+ * xstore_quiesce_begin, and the store is marked stopped until a log is
+ * attached again, so a DDL statement that meets it fails (see
+ * xstore_ddl_lock) instead of waiting for the gate. */
+void xstore_quiesce_final(void);
+/* Serialize DDL statements (the engine holds it across one CREATE /
+ * DROP / ALTER, including a CREATE TABLE's autoindex build and its
+ * clean-up), so a concurrent CREATE of the same table cannot find a
+ * half-made one and report it created.  A parking lock: hold it on a
+ * proc or an OS thread, never across a wait on another DDL.
+ *
+ * It is held for the whole statement, so its hold time is the
+ * statement's: a CREATE INDEX or a CREATE TABLE with constraints holds
+ * it across a scan of the whole table (the index build), and every
+ * other DDL statement, an unrelated CREATE TABLE included, waits that
+ * long.  Writes and reads do not take it.  The holder runs masked, so a
+ * kill of its connection takes effect when the statement ends.  Returns
+ * XTC_OK when held, or XTC_E_STATE when the store has been stopped
+ * (xstore_quiesce_final): its holder may be parked at the closed gate
+ * for good, and a DDL statement there could not commit anyway. */
+int  xstore_ddl_lock(void);
+void xstore_ddl_unlock(void);
 void xstore_quiesce_end(void);
 
 /* Recover the B-tree from the log at `wal_path`: replay every committed
@@ -91,9 +113,18 @@ int xstore_checkpoint_wal(bt_t *bt, struct wal *w, const char *wal_path);
  * xstore_checkpoint_wal, but commits are quiesced only to take the start
  * point and to swap files, not for the dump (see xstore.c).  Call from a
  * proc or off a loop, NOT quiesced.  *tail (optional) receives the live
- * log frames copied after the dump.  The live log is unchanged on error. */
+ * log frames copied after the dump: every frame made durable between the
+ * start point and the quiesced finish, which copies the rest, so at least
+ * one per commit acknowledged in that window.  The live log is unchanged
+ * on error. */
 int xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
     uint64_t *tail);
+/* Test hook: fn() runs inside each online checkpoint, on its caller,
+ * after the dump and the catch-up rounds and before the quiesced finish,
+ * with commits running.  A commit acknowledged while fn() runs is copied
+ * by the finish alone, and counts in *tail.  NULL disarms.  Note that
+ * the hook is one for the process. */
+void xstore_checkpoint_online_hook(void (*fn)(void));
 /* Make a running (and any later) online checkpoint give up promptly and
  * leave the live log as it is: set before stopping the engine; cleared
  * when the storage procs start. */
@@ -169,7 +200,8 @@ xstore_scan_t *xstore_scan_open(bt_t *bt, const char *table,
                                 int64_t hi, int has_hi);
 /* MAX(rowid) of `table` at `snap` (0 = the connection's snapshot), with
  * the connection's buffered writes, optionally <= hi: O(log n) per dead
- * rowid skipped.  1 with *out, 0 if no live row. */
+ * rowid skipped.  1 with *out, 0 if no live row, -1 if a read failed
+ * (xstore_read_err says why). */
 int xstore_max_live_rowid(struct xsql *db, const char *table, uint64_t snap,
     int64_t hi, int has_hi, int64_t *out);
 /* Like xstore_scan_open, but honours the connection's uncommitted
@@ -188,6 +220,42 @@ xstore_scan_t *xstore_scan_open_txn(struct xsql *db, const char *table,
  * The table's resolved id is 0 (not found) -> open returns NULL. */
 int xstore_scan_next(xstore_scan_t *s, int64_t *rowid,
                      const uint8_t **rec, int *reclen);
+/* Test hook: the n-th cursor read (1-based) of a base-table scan from
+ * now fails with XTC_E_IO, as a page read can; 0 disarms.  A read is a
+ * cursor open, resume or step, or bringing back a spilled payload.  The
+ * scan's xstore_scan_next must then return < 0.  Returns the previous
+ * setting: still positive when fewer reads ran.  Note that the count is
+ * one for the process. */
+int xstore_scan_read_fail_at(int n);
+/* Test hook, as xstore_scan_read_fail_at, for the reads of one row's or
+ * one catalog entry's versions outside a scan: the primary-key check of
+ * an INSERT, the write-write and serializable checks, a row's pre-image
+ * and a spilled payload brought back at COMMIT, MAX(rowid), the catalog
+ * lookups and id allocation, and version GC. */
+int xstore_row_read_fail_at(int n);
+/* Test hook: while on, every cursor step of the UNIQUE reap's check that
+ * a newer version reuses a superseded entry fails with XTC_E_IO, and no
+ * other read does, so a test fails the reads the reap makes whatever the
+ * reads around them.  Its faults count in xstore_row_read_faults.
+ * Returns the previous setting. */
+int xstore_reap_read_fail(int on);
+/* Test hook: fn(phase) runs inside the commit of a multi-row autocommit
+ * statement's implicit transaction, on the committing proc, at two
+ * points: XS_ICOMMIT_PRELOG once the commit has its timestamp and before
+ * its log record is written (a crash there must leave none of the
+ * statement's rows), and XS_ICOMMIT_LOGGED once the record is durable
+ * and before any row is applied (a crash there must leave all of them,
+ * redone by recovery).  The crash oracle kills its process from it.
+ * NULL disarms.  Note that the hook is one for the process. */
+#define XS_ICOMMIT_PRELOG 0
+#define XS_ICOMMIT_LOGGED 1
+void xstore_implicit_commit_hook(void (*fn)(int phase));
+/* Test hook: how many reads xstore_row_read_fail_at has failed so far. */
+int xstore_row_read_faults(void);
+/* Reads of the tree that failed with an error (not "no such key"), over
+ * the process: the read-error metric.  A read that GC could not make
+ * counts here too, though GC only stops early. */
+uint64_t xstore_read_errors(void);
 
 void xstore_scan_close(xstore_scan_t *s);
 
@@ -247,14 +315,19 @@ int xstore_index_elem(uint8_t *out, int cap, const xstore_val_t *v, int desc);
  */
 
 /* Resolve a table name to its catalog id.  Returns 1 with *tableid set,
- * or 0 if the table is unknown (read-only catalog lookup). */
+ * 0 if the table is unknown, or the XTC_E_* code of a catalog read that
+ * failed (the table may well exist: a caller must not take it for
+ * unknown).  Read-only catalog lookup. */
 int xstore_table_id(bt_t *bt, const char *name, uint32_t *tableid);
 
 /* The smallest rowid strictly greater than every existing rowid in the
  * table (max existing + 1, or 1 for an empty table) -- the value SQLite
  * would assign to a NULL INTEGER PRIMARY KEY.  Snapshot value; callers
- * needing concurrency-safe allocation must serialize. */
-int64_t xstore_max_rowid(bt_t *bt, uint32_t tableid);
+ * needing concurrency-safe allocation must serialize.  Sets *out to the
+ * largest rowid (0 for an empty table) and returns XTC_OK, or returns the
+ * XTC_E_* code of a read that failed (counted; *out is 0, and must not be
+ * taken for an empty table). */
+int xstore_max_rowid(bt_t *bt, uint32_t tableid, int64_t *out);
 /* Approximately equi-depth rowid cut points of `tableid` inside the
  * rowid range [lo, hi), from the B-tree's upper separators
  * (bt_sample_keys, O(fanout) page reads -- never a scan): up to n
@@ -267,8 +340,9 @@ int xstore_rowid_split_points(bt_t *bt, uint32_t tableid, int64_t lo,
                               int64_t hi, int n, int64_t *out);
 /* Largest rowid in `tableid` including this connection's uncommitted
  * buffered writes -- the auto-rowid base for an in-txn INSERT (a
- * db-handle variant of xstore_max_rowid that also scans the wbuf). */
-int64_t xstore_max_rowid_txn(struct xsql *db, uint32_t tableid);
+ * db-handle variant of xstore_max_rowid that also scans the wbuf).
+ * 0 with *out set, or -1 when a read failed (xstore_read_err says why). */
+int xstore_max_rowid_txn(struct xsql *db, uint32_t tableid, int64_t *out);
 /* Buffered writes examined by xstore_max_rowid_txn so far (metric: an
  * in-txn bulk INSERT must not rescan the buffer per row). */
 uint64_t xstore_wbuf_scan_count(void);
@@ -279,9 +353,13 @@ uint64_t xstore_wbuf_scan_count(void);
 int xstore_row_exists_txn(struct xsql *db, uint32_t tableid, int64_t rowid);
 /* INSERT one new row (the key must not already exist).  Autocommit
  * checks absence atomically with the write, waiting out an in-flight
- * writer of the key; in a transaction the commit's write-write check
- * refuses a row committed since the snapshot.  Returns 0, 1 on a unique
- * violation, -1 on any other error. */
+ * writer of the key; in a transaction, the implicit one of a multi-row
+ * statement included, the commit's write-write check refuses a row
+ * committed since the snapshot (a stale conflict: the engine re-runs an
+ * autocommit statement, whose key check then reports UNIQUE).  Returns
+ * 0, 1 on a unique violation, -1 on any other error (an autocommit
+ * insert refuses to commit after a read error or with a kill pending,
+ * as xstore_write_txn does). */
 int xstore_insert_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
                       const uint8_t *rec, int reclen);
 /* Reserve an auto-assigned rowid for `tableid`: greater than `floor`
@@ -307,7 +385,8 @@ typedef struct xstore_col {
 /* Fill `cols` (capacity `cap`) with the schema of `name` from the
  * persisted catalog.  Returns the column count (>=1) on success, 0 if
  * the table is unknown or has no recorded schema (caller falls back to
- * sqlite_master), or <0 on error / overflow. */
+ * sqlite_master), -1 on a bad argument, or the XTC_E_* code (below -1)
+ * of a catalog read that failed. */
 int xstore_table_schema(bt_t *bt, const char *name,
                         xstore_col_t *cols, int cap);
 
@@ -323,15 +402,38 @@ int xstore_put_rec(bt_t *bt, uint32_t tableid, int64_t rowid,
 int xstore_delete_rec(bt_t *bt, uint32_t tableid, int64_t rowid);
 
 /* Transaction-aware native write: buffers into the connection's write
- * set when a BEGIN..COMMIT is open (committing atomically at one
- * timestamp with any other writes in the transaction, VDBE or native),
- * or autocommits immediately in autocommit mode.  `deleted` writes a
- * tombstone (rec/reclen ignored).  Returns 0 on success, <0 on error. */
+ * set when a transaction is open, a BEGIN..COMMIT or a multi-row
+ * statement's implicit one (committing atomically at one timestamp with
+ * the transaction's other writes), or autocommits the row at once (a
+ * one-row statement).  A one-row write fails instead of committing
+ * when the statement already recorded a read error (a failed subquery
+ * read that did not fail its own step; xstore_read_err) or a kill is
+ * pending for the connection's proc, as xstore_stmt_implicit_end
+ * discards a multi-row statement, so a failed statement leaves nothing.
+ * `deleted` writes a tombstone (rec/reclen ignored).  Returns 0 on
+ * success, <0 on error. */
 int xstore_write_txn(struct xsql *db, uint32_t tableid, int64_t rowid,
                      const uint8_t *rec, int reclen, int deleted);
 
 /* True if the connection has an open (non-autocommit) transaction. */
 int xstore_in_txn(struct xsql *db);
+/* Statement atomicity in autocommit: a statement about to write more
+ * than one row opens an implicit transaction (begin returns 1; 0 inside
+ * a transaction, where it does nothing), and ends it after its last
+ * write, committing every row at one timestamp when ok and nothing
+ * failed, else discarding them all.  end returns 0, 1 (a UNIQUE
+ * violation at the commit; xstore_uniq_err), or -1.  See xstore.c.
+ *
+ * NB the one-fsync gain holds only while the statement's buffered rows
+ * stay under the 256 KiB spill mark (XS_SPILL_HI).  Past it, older rows
+ * spill (STEAL) as stage records, and each one waits for its own fsync
+ * (xs_wal_emit_stage), so a statement with large or many rows runs at
+ * about the per-row commit speed it had before: 1,443 rows/s for a
+ * 5,000-row UPDATE of 100-byte rows, against 117,000 for 40-byte ones.
+ * Memory at the commit is not bounded by the spill either: the commit
+ * reads every spilled row back and logs them in one record. */
+int xstore_stmt_implicit_begin(struct xsql *db);
+int xstore_stmt_implicit_end(struct xsql *db, int ok);
 
 /*
  * 1 if the current transaction holds any buffered (uncommitted) write
@@ -375,7 +477,10 @@ int  xstore_last_conflict(struct xsql *db);
 /* After a write statement failed on a stale-read conflict: 1 if it may
  * re-run on a fresh snapshot (READ COMMITTED; the first access of a
  * snapshot transaction, whose snapshot then moves; autocommit before
- * any row applied).  Prepares the re-run. */
+ * any row applied, which covers every multi-row statement, since its
+ * implicit transaction applies nothing until it commits).  An autocommit
+ * re-run first waits until every commit so far is visible.  Prepares
+ * the re-run. */
 int  xstore_stmt_restart(struct xsql *db);
 /* Native C-API equivalents of the MVCC SQL functions. */
 int64_t xstore_clock_now(void);              /* xstore_now() */
@@ -407,10 +512,12 @@ int xstore_rollback_to(struct xsql *db, int level);
  * comma-joined column list, first column the INTEGER PRIMARY KEY), the
  * same catalog row the vtab xConnect writes -- vexec / the native write
  * path then operate on the table with no SQLite schema.  Returns the
- * tableid (>0) or 0.  drop_table tombstones the catalog row (lookup
- * skips it).  Returns 0 / -1.  These bypass SQLite's schema -- for the
- * native driver, where there is no VDBE to keep in sync. */
-uint32_t xstore_create_table(struct xsql *db, const char *name, const char *coldefs);
+ * tableid (>0) or 0; *created (if not NULL) says whether this call
+ * created the table (0: it existed).  drop_table tombstones the catalog
+ * row (lookup skips it).  Returns 0 / -1.  These bypass SQLite's schema
+ * -- for the native driver, where there is no VDBE to keep in sync. */
+uint32_t xstore_create_table(struct xsql *db, const char *name,
+    const char *coldefs, int *created);
 int xstore_drop_table(struct xsql *db, const char *name);
 /* ALTER TABLE oldname RENAME TO newname (re-keys the catalog entry). */
 int xstore_rename_table(struct xsql *db, const char *oldname, const char *newname);
@@ -439,9 +546,10 @@ int xstore_drop_view(struct xsql *db, const char *name);
  * descmask, unique 0/1, kind 'i' (CREATE INDEX) / 'p' (PRIMARY KEY) /
  * 'u' (UNIQUE constraint).  Persists the catalog row and builds entries
  * from the existing rows.  Returns 1 on success (also when an index of
- * that name exists), 0 on failure (unknown table / column), or -1 when
- * a UNIQUE index cannot be built because existing rows duplicate a key
- * (nothing is created). */
+ * that name exists), 0 on failure (unknown table / column), -1 when a
+ * UNIQUE index cannot be built because existing rows duplicate a key,
+ * or an XTC_E_* code (below -1) when the table could not be read whole
+ * or memory ran out.  Nothing is created on -1 or below. */
 int xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
                            const char *const *cols, int ncol, uint32_t descmask,
                            int unique, int kind);
@@ -449,7 +557,9 @@ int xstore_create_index_ex(struct xsql *db, const char *name, const char *table,
 int xstore_create_index(struct xsql *db, const char *name, const char *table,
                         const char *col, int unique);
 /* Drop CREATE INDEX `name`.  1 on success, 0 if unknown, -1 if it is a
- * constraint index (PRIMARY KEY / UNIQUE: not droppable, as SQLite). */
+ * constraint index (PRIMARY KEY / UNIQUE: not droppable, as SQLite), or
+ * the XTC_E_* code (below -1) of a catalog read or write that failed
+ * (the index is left whole). */
 int xstore_drop_index(struct xsql *db, const char *name);
 
 /* The indexes of `table` (planner support): up to cap entries. */
@@ -470,14 +580,6 @@ int xstore_index_list(bt_t *bt, const char *table, xstore_index_info_t *out,
 int xstore_index_lookup(bt_t *bt, const char *table, const char *col,
                         uint32_t *idx_id);
 
-/* Candidate rowids whose index entry's leading column equals the typed
- * value (XSTORE_C_*), into out (cap).  Returns the count, or -1 on
- * overflow (caller scans).  Candidates may be stale: the caller
- * re-fetches each through MVCC and re-applies the WHERE. */
-int xstore_index_seek_eq(bt_t *bt, uint32_t idx_id, int vclass,
-                         int64_t ival, double rval,
-                         const uint8_t *bytes, int nbytes,
-                         int64_t *out, int cap);
 
 /* xstore_val_t (a typed value: XSTORE_C_*, p/n for TEXT/BLOB) is
  * defined with the record codec above; it also carries index bounds. */
@@ -509,12 +611,18 @@ void xstore_iscan_hint(xstore_iscan_t *s, int64_t nrows);
 /* The connection's last UNIQUE-index violation message ("UNIQUE
  * constraint failed: t.a, t.b"), "" if none (a rowid-key conflict). */
 const char *xstore_uniq_err(struct xsql *db);
-/* The current statement's first index scan read error ("index error:
- * cannot read index t_g on t: I/O error"), "" if none.  Cleared when a
- * statement starts (xstore_read_err_clear, xstore_stmt_begin,
- * xstore_stmt_pin). */
+/* The current statement's first read error, "" if none: an index scan's
+ * ("index error: cannot read index t_g on t: I/O error"), a table's
+ * ("cannot read table t: I/O error"), or the catalog's ("cannot read the
+ * catalog: I/O error").  Cleared when a statement starts
+ * (xstore_read_err_clear, xstore_stmt_begin, xstore_stmt_pin). */
 const char *xstore_read_err(struct xsql *db);
-/* Forget the last statement's index read error.  The engine calls it
+/* Record that a catalog read of the current statement failed with rc
+ * (an XTC_E_* code from xstore_table_id or xstore_table_schema), so
+ * xstore_read_err says "cannot read the catalog: ...".  A statement's
+ * first read error wins. */
+void xstore_read_err_catalog(struct xsql *db, int rc);
+/* Forget the last statement's read error.  The engine calls it
  * when any statement starts, so a statement that never reaches the store
  * (PRAGMA table_info) cannot report an earlier one's. */
 void xstore_read_err_clear(struct xsql *db);
@@ -548,7 +656,8 @@ uint64_t xstore_intent_wait_ns(void);    /* total nap time of those waits */
 uint64_t xstore_index_seek_count(void);
 
 /* Rebuild every catalog-recorded index for `bt` from its base rows
- * (clearing the old entries first).  Returns 0. */
+ * (clearing the old entries first).  Returns 0, or the XTC_E_* code of
+ * an index catalog that could not be read. */
 int xstore_index_rebuild_all(bt_t *bt);
 
 /*
@@ -562,7 +671,10 @@ int xstore_index_rebuild_all(bt_t *bt);
  * tag on a trusted base, with little garbage, loads the index catalog and
  * keeps the entries (returns 1); anything else -- 0 after a crash, a
  * tainted run, another format, too many stale entries -- rebuilds every
- * index (returns 0).  fresh = 1: the tree was rebuilt from the log on an
+ * index (returns 0).  An index catalog that cannot be read returns its
+ * XTC_E_* code: the definitions are unknown, so the store must not run
+ * (an index missing from the cache is neither maintained nor enforced).
+ * fresh = 1: the tree was rebuilt from the log on an
  * empty page file (no entries to clear).  A rebuild runs one index per
  * thread on up to `workers` threads (the caller and blocking-pool
  * workers; 1 under simulation).  Each pins a few frames at a time, so
@@ -576,7 +688,8 @@ uint64_t xstore_index_close(bt_t *bt);
 uint64_t xstore_index_rebuild_count(void);
 /* Check every index against the base: *missing = live rows with no entry
  * (wrong answers), *stale = entries no row's newest version carries
- * (harmless).  Quiesced only.  Returns the number of indexes checked. */
+ * (harmless).  Quiesced only.  Returns the number of indexes checked,
+ * or the XTC_E_* code of a read that failed. */
 int      xstore_index_check(bt_t *bt, uint64_t *missing, uint64_t *stale);
 /* Test hook: the next n index entry inserts fail (as bt_insert can). */
 void     xstore_index_fail_inject(int n);

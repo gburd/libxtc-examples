@@ -232,7 +232,9 @@ int wal_checkpoint(wal_t *w, const char *path,
  *                                 past the start point, re-numbered;
  *                                 *left = durable bytes still uncopied.
  *   wal_ockpt_finish  (quiesced)  copy the rest, fsync, rename over path,
- *                                 rebind; frees the handle.
+ *                                 rebind; frees the handle.  On XTC_OK
+ *                                 *frames (optional) = live-log frames
+ *                                 copied, by catchup and finish both.
  *   wal_ockpt_abort               drop it (old log untouched).
  *
  * The caller owns correctness of the image (it must be the state as of
@@ -244,9 +246,8 @@ typedef struct wal_ock wal_ock_t;
 int  wal_ockpt_begin(wal_t *w, const char *path, wal_ock_t **out);
 void wal_ockpt_emitter(wal_ock_t *k, wal_emit_fn *fn, void **ctx);
 int  wal_ockpt_catchup(wal_ock_t *k, uint64_t *left);
-int  wal_ockpt_finish(wal_ock_t *k);
+int  wal_ockpt_finish(wal_ock_t *k, uint64_t *frames);
 void wal_ockpt_abort(wal_ock_t *k);
-uint64_t wal_ockpt_frames(const wal_ock_t *k);   /* live frames copied */
 
 /*
  * Segments (wal_opts_t.segment_bytes != 0).  The log is a sequence of
