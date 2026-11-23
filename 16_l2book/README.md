@@ -89,8 +89,8 @@ separate rule the venue turns on.
 ## Numbers (this host, measured; regenerate on yours)
 
 Measured on libxtc 2.1.1-37 (`a2134a08`), examples `7748ab9` plus the
-order-id map fix, on a two-socket 64-core x86-64 bare-metal host (Xeon
-Ice Lake, 128 threads), Debian 13, everything on NUMA node 0; medians of
+order-id map fix, in 2026-11, on a two-socket 64-core x86-64 bare-metal
+host (128 threads), Debian 13, everything on NUMA node 0; medians of
 5 runs (`make bench`) and 3 runs (the rest).
 
 | what | how | result |
