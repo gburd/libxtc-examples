@@ -113,9 +113,18 @@ int xstore_checkpoint_wal(bt_t *bt, struct wal *w, const char *wal_path);
  * xstore_checkpoint_wal, but commits are quiesced only to take the start
  * point and to swap files, not for the dump (see xstore.c).  Call from a
  * proc or off a loop, NOT quiesced.  *tail (optional) receives the live
- * log frames copied after the dump.  The live log is unchanged on error. */
+ * log frames copied after the dump: every frame made durable between the
+ * start point and the quiesced finish, which copies the rest, so at least
+ * one per commit acknowledged in that window.  The live log is unchanged
+ * on error. */
 int xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
     uint64_t *tail);
+/* Test hook: fn() runs inside each online checkpoint, on its caller,
+ * after the dump and the catch-up rounds and before the quiesced finish,
+ * with commits running.  A commit acknowledged while fn() runs is copied
+ * by the finish alone, and counts in *tail.  NULL disarms.  Note that
+ * the hook is one for the process. */
+void xstore_checkpoint_online_hook(void (*fn)(void));
 /* Make a running (and any later) online checkpoint give up promptly and
  * leave the live log as it is: set before stopping the engine; cleared
  * when the storage procs start. */

@@ -2603,12 +2603,6 @@ wal_ockpt_emitter(wal_ock_t *k, wal_emit_fn *fn, void **ctx)
 	*ctx = &k->c;
 }
 
-uint64_t
-wal_ockpt_frames(const wal_ock_t *k)
-{
-	return k == NULL ? 0 : k->frames;
-}
-
 /* Copy the live log's frames in [src_off, end) to the compacted file,
  * re-numbered.  `end` is a durable frame boundary.  Stops after about
  * `max` bytes (0 = no limit) so a caller can check for cancellation
@@ -2700,7 +2694,7 @@ wal_ockpt_catchup(wal_ock_t *k, uint64_t *left)
 }
 
 int
-wal_ockpt_finish(wal_ock_t *k)
+wal_ockpt_finish(wal_ock_t *k, uint64_t *frames)
 {
 	wal_t *w = k->w;
 	int rc;
@@ -2731,6 +2725,8 @@ wal_ockpt_finish(wal_ock_t *k)
 	rc = wal_rebind_at(w, k->path, k->c.off, k->c.lsn);
 	if (rc == XTC_OK)
 		w->last_pos = (uint64_t)k->c.last;
+	if (rc == XTC_OK && frames != NULL)
+		*frames = k->frames;
 	k->tmp[0] = '\0';                /* renamed: nothing to unlink */
 	wal_ockpt_abort(k);              /* release the rest */
 	return rc;

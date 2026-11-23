@@ -271,9 +271,15 @@ succeeded).  The log is bounded by checkpointing, which compacts it in
 place (a checkpoint record plus a dump of the live tree atomically
 replace the old log); the server checkpoints from a background proc
 whenever the log passes max(--checkpoint-mb, 2 x its post-checkpoint
-size).  After a crash the server rebuilds the tree from the compacted
-log onto a fresh page file; the in-place path (double-write buffer +
-page-LSN-gated redo, xstore_recover_inplace) is exercised by tests only.
+size).  That checkpoint is online (xstore_checkpoint_wal_online):
+commits wait only while it takes its start point and while it swaps the
+files.  It dumps the tree as of the start point, and copies into the new
+log every frame the old one made durable past it, the last of them with
+commits held, so every commit acknowledged during the checkpoint is in
+the log that replaces it.  After a crash the server rebuilds the tree
+from the compacted log onto a fresh page file; the in-place path
+(double-write buffer + page-LSN-gated redo, xstore_recover_inplace) is
+exercised by tests only.
 
 A failed or short log write or fdatasync fail-stops the log: every
 commit in that batch gets XTC_E_IO (the client sees an I/O error), and

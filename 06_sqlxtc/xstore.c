@@ -11519,7 +11519,8 @@ xstore_checkpoint_wal(bt_t *bt, struct wal *w, const char *wal_path)
  * checkpoint proc shares loop 0 with the WAL writer, and a dump on the
  * fiber would stall every commit's log ack anyway.  Under simulation the
  * pool runs inline (deterministic).  Returns XTC_OK, or an error with
- * the live log unchanged; *tail (optional) = live frames copied.
+ * the live log unchanged; *tail (optional) = live frames copied, by the
+ * catch-up rounds and the quiesced finish together.
  */
 static int    g_ock_slot = -1;           /* GC pin for the online dump */
 
@@ -11568,6 +11569,15 @@ xs_ock_body(void *arg)
 	return 0;
 }
 
+/* Test hook (xstore_checkpoint_online_hook); NULL in production. */
+static void (*g_ock_hook)(void);
+
+void
+xstore_checkpoint_online_hook(void (*fn)(void))
+{
+	g_ock_hook = fn;
+}
+
 void
 xstore_checkpoint_cancel(int on)
 {
@@ -11579,7 +11589,6 @@ xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
     uint64_t *tail)
 {
 	struct xs_ock_job j;
-	uint64_t frames;
 	int rc, res = 0;
 
 	if (bt == NULL || w == NULL || wal_path == NULL)
@@ -11608,16 +11617,15 @@ xstore_checkpoint_wal_online(bt_t *bt, struct wal *w, const char *wal_path,
 		wal_ockpt_abort(j.k);
 		return j.rc;
 	}
+	if (g_ock_hook != NULL)
+		g_ock_hook();
 	xs_ock_yield("xstore.ockpt.finish");
 	if (!xs_quiesce_begin(XS_QB_CKPT)) {
 		wal_ockpt_abort(j.k);
 		return XTC_E_AGAIN;
 	}
-	frames = wal_ockpt_frames(j.k);
-	rc = wal_ockpt_finish(j.k);       /* frees j.k */
+	rc = wal_ockpt_finish(j.k, tail);       /* frees j.k */
 	xstore_quiesce_end();
-	if (rc == XTC_OK && tail != NULL)
-		*tail = frames;
 	return rc;
 }
 
